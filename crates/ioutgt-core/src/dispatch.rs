@@ -61,6 +61,9 @@ pub struct AdminState<B> {
     /// Namespace inventory changed since the host last read the
     /// Changed-NS log page.
     pub ns_changed: Cell<bool>,
+    /// Connection teardown in progress: parked AERs must resolve so
+    /// their slots stop counting as executing.
+    pub closing: Cell<bool>,
 }
 
 /// IO-queue state.
@@ -101,6 +104,7 @@ impl<B: Backend> ConnCtx<B> {
                 // (nvmet behaves the same).
                 aec: Cell::new(crate::AEN_CFG_NS_ATTR),
                 ns_changed: Cell::new(false),
+                closing: Cell::new(false),
             }),
         })
     }
@@ -142,6 +146,19 @@ impl<B: Backend> ConnCtx<B> {
             cid,
             status_code,
         )
+    }
+
+    /// Begin teardown: resolve parked AER futures (their completions go
+    /// nowhere — the socket is gone — but the slots leave `Executing`,
+    /// letting the drain finish instead of timing out and leaking the
+    /// queue). The userspace analog of nvmet_async_events_failall().
+    pub fn close(&self) {
+        if let Role::Admin(admin) = &self.role {
+            admin.closing.set(true);
+            for waker in admin.aer_wakers.borrow_mut().drain(..) {
+                waker.wake();
+            }
+        }
     }
 
     /// Namespace inventory changed: complete one parked AER with the

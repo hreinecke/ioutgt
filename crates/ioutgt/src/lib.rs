@@ -131,6 +131,7 @@ fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
             loop {
                 match rx.recv().await {
                     Ok(AdminMsg::Conn(conn)) => {
+                        live.borrow_mut().retain(|weak| weak.strong_count() > 0);
                         let live = Rc::clone(&live);
                         tokio::task::spawn_local(async move {
                             run_queue(conn, |ctx| {
