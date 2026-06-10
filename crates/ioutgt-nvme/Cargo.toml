@@ -9,6 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+zerocopy = { workspace = true }
+crc32c = { workspace = true }
 
 [lints]
 workspace = true

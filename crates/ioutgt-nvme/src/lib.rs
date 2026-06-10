@@ -8,3 +8,14 @@
 //! This crate performs no IO and owns no sockets: the target data path, the
 //! control-thread handshake, the integration-test client, and the fuzzer all
 //! share this one codec.
+//!
+//! All wire integers are little-endian per the NVMe base specification;
+//! the zerocopy types use explicit `U16`/`U32`/`U64` little-endian wrappers
+//! so reinterpreting received bytes is endian-correct on any host.
+
+pub mod digest;
+pub mod fabrics;
+pub mod identify;
+pub mod pdu;
+pub mod spec;
+pub mod status;
