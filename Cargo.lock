@@ -282,6 +282,7 @@ version = "0.1.0"
 dependencies = [
  "ioutgt-nvme",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]
@@ -299,6 +300,7 @@ dependencies = [
  "ioutgt-core",
  "ioutgt-nvme",
  "ioutgt-uring",
+ "libc",
  "tokio",
  "tracing",
  "zerocopy",

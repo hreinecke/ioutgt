@@ -8,12 +8,20 @@
 //!
 //! Everything is single-threaded per queue (`Rc`/`Cell`, no atomics); the
 //! only cross-thread types are the configuration snapshots handed to queue
-//! threads at startup.
+//! threads at startup and the controller registry.
 
+pub mod admin;
 pub mod backend;
 pub mod controller;
 pub mod dispatch;
+pub mod fabrics_exec;
 pub mod queue;
 pub mod subsystem;
 
 pub use backend::{Backend, BackendError, LbaRange};
+
+/// Largest queue we accept (CAP.MQES advertises this minus one).
+pub const MAX_QUEUE_ENTRIES: u16 = 1024;
+
+/// In-capsule data we advertise via IOCCSZ (16 KiB, nvmet's default).
+pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
