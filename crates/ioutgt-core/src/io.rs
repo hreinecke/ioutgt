@@ -43,7 +43,8 @@ pub async fn execute<B: Backend>(
     let Some(subsys) = io.subsys.get() else {
         return err_outcome(ctx, cid, status::CMD_SEQ_ERROR | status::DNR);
     };
-    let Some(ns) = subsys.namespace(sqe.nsid.get()) else {
+    let table = io.ns_cache.get(subsys);
+    let Some(ns) = table.get(&sqe.nsid.get()) else {
         return err_outcome(ctx, cid, status::INVALID_NS | status::DNR);
     };
 

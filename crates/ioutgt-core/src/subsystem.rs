@@ -1,8 +1,16 @@
-//! Subsystems, namespaces, and the port configuration handed to queue
-//! threads at startup.
+//! Subsystems, namespaces, and the port configuration shared with queue
+//! threads.
+//!
+//! The namespace table supports runtime add/remove while IO queues stay
+//! lock-free: readers cache an `Arc` snapshot and revalidate it with one
+//! relaxed atomic generation load per command, refreshing only when the
+//! control plane changed something (the userspace analog of nvmet's
+//! xarray + RCU table).
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
 
@@ -15,9 +23,11 @@ pub struct Namespace<B> {
     pub uuid: [u8; 16],
 }
 
-/// An NVM subsystem definition (immutable snapshot; runtime namespace
-/// changes arrive as fresh snapshots via queue-thread mailboxes in a
-/// later milestone).
+/// Immutable namespace-table snapshot.
+pub type NsMap<B> = Arc<BTreeMap<u32, Arc<Namespace<B>>>>;
+
+/// An NVM subsystem. Identity is immutable; the namespace table is
+/// versioned (see module docs).
 pub struct Subsystem<B> {
     /// Subsystem NQN.
     pub nqn: String,
@@ -25,24 +35,104 @@ pub struct Subsystem<B> {
     pub serial: String,
     /// Model number (`mn`, ≤ 40 ASCII chars).
     pub model: String,
-    /// NSID → namespace, ordered (Identify active-NS list requirement).
-    pub namespaces: BTreeMap<u32, Arc<Namespace<B>>>,
-    /// Highest IO queue id offered to controllers (≤ number of IO
-    /// threads).
+    /// Highest IO queue id offered to controllers (≤ IO threads).
     pub max_qid: u16,
-    /// Accept any hostnqn (host ACLs arrive with the control plane).
+    /// Accept any hostnqn (host ACLs are future control-plane work).
     pub allow_any_host: bool,
+    namespaces: RwLock<NsMap<B>>,
+    generation: AtomicU64,
 }
 
 impl<B: Backend> Subsystem<B> {
-    /// Look up a namespace by NSID.
-    pub fn namespace(&self, nsid: u32) -> Option<&Arc<Namespace<B>>> {
-        self.namespaces.get(&nsid)
+    /// Build with an initial namespace table.
+    pub fn new(
+        nqn: String,
+        serial: String,
+        model: String,
+        max_qid: u16,
+        allow_any_host: bool,
+        namespaces: BTreeMap<u32, Arc<Namespace<B>>>,
+    ) -> Self {
+        Subsystem {
+            nqn,
+            serial,
+            model,
+            max_qid,
+            allow_any_host,
+            namespaces: RwLock::new(Arc::new(namespaces)),
+            generation: AtomicU64::new(1),
+        }
+    }
+
+    /// Current table snapshot (control plane and admin/cold paths).
+    pub fn snapshot(&self) -> NsMap<B> {
+        Arc::clone(&self.namespaces.read().expect("ns table poisoned"))
+    }
+
+    /// Table version; bumped on every change.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Add a namespace. Errors if the NSID is taken.
+    pub fn add_namespace(&self, ns: Namespace<B>) -> Result<(), String> {
+        let mut guard = self.namespaces.write().expect("ns table poisoned");
+        if guard.contains_key(&ns.nsid) {
+            return Err(format!("nsid {} already exists", ns.nsid));
+        }
+        let mut table = BTreeMap::clone(guard.as_ref());
+        table.insert(ns.nsid, Arc::new(ns));
+        *guard = Arc::new(table);
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove a namespace; in-flight IO holding the old snapshot
+    /// completes against the still-alive backend Arc.
+    pub fn remove_namespace(&self, nsid: u32) -> Result<(), String> {
+        let mut guard = self.namespaces.write().expect("ns table poisoned");
+        if !guard.contains_key(&nsid) {
+            return Err(format!("nsid {nsid} not found"));
+        }
+        let mut table = BTreeMap::clone(guard.as_ref());
+        table.remove(&nsid);
+        *guard = Arc::new(table);
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     /// Highest allocated NSID (Identify Controller `nn`).
     pub fn max_nsid(&self) -> u32 {
-        self.namespaces.keys().next_back().copied().unwrap_or(0)
+        self.snapshot().keys().next_back().copied().unwrap_or(0)
+    }
+}
+
+/// Per-connection generation-validated cache of a subsystem's table:
+/// one atomic generation load per command, an `Arc` refresh only when
+/// the control plane changed the table.
+pub struct NsCache<B> {
+    generation: Cell<u64>,
+    map: RefCell<Option<NsMap<B>>>,
+}
+
+impl<B: Backend> Default for NsCache<B> {
+    fn default() -> Self {
+        NsCache {
+            generation: Cell::new(0),
+            map: RefCell::new(None),
+        }
+    }
+}
+
+impl<B: Backend> NsCache<B> {
+    /// Current table for `subsys`, refreshed if stale.
+    pub fn get(&self, subsys: &Subsystem<B>) -> NsMap<B> {
+        let generation = subsys.generation();
+        if self.generation.get() != generation || self.map.borrow().is_none() {
+            *self.map.borrow_mut() = Some(subsys.snapshot());
+            self.generation.set(generation);
+        }
+        self.map.borrow().as_ref().expect("filled above").clone()
     }
 }
 

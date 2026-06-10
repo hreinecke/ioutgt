@@ -87,7 +87,8 @@ fn identify<B: Backend>(
             let Some(subsys) = subsys.as_ref() else {
                 return Outcome::status(ctx.cqe(0, cid, status::INVALID_NS | status::DNR));
             };
-            match subsys.namespace(sqe.nsid.get()) {
+            let table = subsys.snapshot();
+            match table.get(&sqe.nsid.get()) {
                 Some(ns) => {
                     let id = build_id_ns(ns.backend.as_ref());
                     let len = fill_slot(ctx, tag, id.as_bytes());
@@ -106,13 +107,8 @@ fn identify<B: Backend>(
             let mut list = [0u8; 4096];
             if let Some(subsys) = admin.subsys.borrow().as_ref() {
                 let start = sqe.nsid.get();
-                for (i, nsid) in subsys
-                    .namespaces
-                    .keys()
-                    .filter(|&&n| n > start)
-                    .take(1024)
-                    .enumerate()
-                {
+                let table = subsys.snapshot();
+                for (i, nsid) in table.keys().filter(|&&n| n > start).take(1024).enumerate() {
                     list[i * 4..i * 4 + 4].copy_from_slice(&nsid.to_le_bytes());
                 }
             }
@@ -126,7 +122,7 @@ fn identify<B: Backend>(
                 .subsys
                 .borrow()
                 .as_ref()
-                .and_then(|s| s.namespace(nsid).map(|ns| ns.uuid));
+                .and_then(|s| s.snapshot().get(&nsid).map(|ns| ns.uuid));
             match uuid {
                 Some(uuid) => {
                     desc[0] = 3; // NIDT: UUID
@@ -168,6 +164,9 @@ fn build_id_ctrl<B: Backend>(
     }
     id.cntlid.set(admin.cntlid.get());
     id.ver.set(0x0001_0300);
+    // OAES: the host masks its AEC against this; without the NS_ATTR
+    // bit it never enables namespace-change notices.
+    id.oaes.set(crate::AEN_CFG_NS_ATTR);
     id.cntrltype = if discovery { 2 } else { 1 };
     id.kas.set(KAS_UNITS);
     id.sqes = 0x66;
@@ -287,7 +286,22 @@ fn get_log_page<B: Backend>(
             let n = fill_slot(ctx, tag, window);
             Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n)
         }
-        log_page::ERROR | log_page::SMART | log_page::FW_SLOT | log_page::CHANGED_NS => {
+        log_page::CHANGED_NS => {
+            // 0xFFFFFFFF in the first entry: "more changed than fits";
+            // the Linux host rescans everything. Reading clears it.
+            let mut page = [0u8; 4096];
+            if admin.ns_changed.replace(false) {
+                page[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            let n = len.min(4096);
+            #[allow(clippy::cast_possible_truncation)]
+            let n32 = n as u32;
+            let take = usize::try_from(n).expect("<=4096");
+            let written = fill_slot(ctx, tag, &page[..take]);
+            debug_assert_eq!(written, n32);
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n32)
+        }
+        log_page::ERROR | log_page::SMART | log_page::FW_SLOT => {
             // Zero-filled pages: nothing to report yet.
             let n = len.min(4096);
             let slot = ctx.queue.slot(tag);
