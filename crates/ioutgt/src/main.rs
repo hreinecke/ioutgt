@@ -24,6 +24,14 @@ struct Args {
     /// Pin queue threads to cores.
     #[arg(long)]
     pin: bool,
+
+    /// NVM subsystem NQN.
+    #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
+    subsys_nqn: String,
+
+    /// Memory-backend namespace size in MiB.
+    #[arg(long, default_value_t = 64)]
+    mem_size_mb: u64,
 }
 
 fn main() -> std::io::Result<()> {
@@ -40,6 +48,8 @@ fn main() -> std::io::Result<()> {
         allow_hdgst: !args.no_hdgst,
         allow_ddgst: !args.no_ddgst,
         pin_threads: args.pin,
+        subsys_nqn: args.subsys_nqn,
+        mem_size_mb: args.mem_size_mb,
     };
     let addr = ioutgt::spawn_target(config)?;
     eprintln!("ioutgt listening on {addr}");

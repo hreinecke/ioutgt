@@ -4,11 +4,15 @@
 //! Exposed as a library so integration tests can start a full target
 //! in-process on an ephemeral port.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
+use ioutgt_backend::{AnyBackend, MemoryBackend};
+use ioutgt_core::controller::Registry;
+use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_tcp::connection::{QueueConn, run_queue};
 use ioutgt_tcp::handshake::{accept_handshake, read_connect};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
@@ -27,6 +31,11 @@ pub struct TargetConfig {
     pub allow_ddgst: bool,
     /// Pin queue threads to cores (sequential map; disable in tests).
     pub pin_threads: bool,
+    /// NVM subsystem NQN served on this port.
+    pub subsys_nqn: String,
+    /// Memory-backend namespace size in MiB (the M4 bring-up backend;
+    /// file/block backends arrive next milestone).
+    pub mem_size_mb: u64,
 }
 
 impl Default for TargetConfig {
@@ -37,6 +46,8 @@ impl Default for TargetConfig {
             allow_hdgst: true,
             allow_ddgst: true,
             pin_threads: false,
+            subsys_nqn: "nqn.2026-06.io.ioutgt:test".into(),
+            mem_size_mb: 64,
         }
     }
 }
@@ -44,11 +55,10 @@ impl Default for TargetConfig {
 /// Connect CATTR bit 2: host requests SQ flow control disabled.
 const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
 
-fn spawn_queue_thread(
-    name: String,
-    core_id: Option<usize>,
-) -> io::Result<MailboxSender<QueueConn>> {
-    let (tx, mut rx): (MailboxSender<QueueConn>, Mailbox<QueueConn>) = mailbox()?;
+type Conn = QueueConn<AnyBackend>;
+
+fn spawn_queue_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<Conn>> {
+    let (tx, mut rx): (MailboxSender<Conn>, Mailbox<Conn>) = mailbox()?;
     std::thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
@@ -85,11 +95,40 @@ fn spawn_queue_thread(
     Ok(tx)
 }
 
+/// Build the port snapshot: one NVM subsystem with a memory namespace.
+fn build_port(config: &TargetConfig) -> Arc<PortConfig<AnyBackend>> {
+    let backend = Arc::new(AnyBackend::Memory(MemoryBackend::new(
+        config.mem_size_mb << 20,
+        9, // 512B blocks: the most interop-tested format
+    )));
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&0x696F_7574_6774_0001u64.to_be_bytes()); // "ioutgt"
+    uuid[8] = 0x80;
+    let namespace = Arc::new(Namespace {
+        nsid: 1,
+        backend,
+        uuid,
+    });
+    let subsystem = Arc::new(Subsystem {
+        nqn: config.subsys_nqn.clone(),
+        serial: "IOUTGT0001".into(),
+        model: "ioutgt".into(),
+        namespaces: BTreeMap::from([(1u32, namespace)]),
+        max_qid: u16::try_from(config.io_threads.max(1)).unwrap_or(1),
+        allow_any_host: true,
+    });
+    Arc::new(PortConfig {
+        traddr: config.listen.ip().to_string(),
+        trsvcid: config.listen.port().to_string(),
+        subsystems: BTreeMap::from([(config.subsys_nqn.clone(), subsystem)]),
+    })
+}
+
 /// Start every thread of a target; returns the bound address (for
 /// ephemeral-port tests). Runs until the process exits.
 pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
     let admin_tx = spawn_queue_thread("ioutgt-admin".into(), None)?;
-    let io_txs: Vec<MailboxSender<QueueConn>> = (0..config.io_threads)
+    let io_txs: Vec<MailboxSender<Conn>> = (0..config.io_threads)
         .map(|i| spawn_queue_thread(format!("ioutgt-io{i}"), config.pin_threads.then_some(i + 1)))
         .collect::<io::Result<_>>()?;
 
@@ -118,10 +157,12 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
 
 async fn control_loop(
     config: TargetConfig,
-    admin_tx: MailboxSender<QueueConn>,
-    io_txs: Vec<MailboxSender<QueueConn>>,
+    admin_tx: MailboxSender<Conn>,
+    io_txs: Vec<MailboxSender<Conn>>,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
+    let registry = Registry::new();
+    let port = build_port(&config);
     let listener = match tokio::net::TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -147,9 +188,19 @@ async fn control_loop(
         let io_txs = io_txs.clone();
         let allow_hdgst = config.allow_hdgst;
         let allow_ddgst = config.allow_ddgst;
+        let registry = Arc::clone(&registry);
+        let port = Arc::clone(&port);
         tokio::task::spawn_local(async move {
-            if let Err(err) =
-                setup_connection(stream, allow_hdgst, allow_ddgst, &admin_tx, &io_txs).await
+            if let Err(err) = setup_connection(
+                stream,
+                allow_hdgst,
+                allow_ddgst,
+                &admin_tx,
+                &io_txs,
+                port,
+                registry,
+            )
+            .await
             {
                 warn!(%peer, "connection setup failed: {err}");
             }
@@ -159,12 +210,15 @@ async fn control_loop(
 
 /// ICReq/ICResp + first Connect capsule, then hand the socket to the
 /// queue thread selected by qid.
+#[allow(clippy::too_many_arguments)]
 async fn setup_connection(
     mut stream: tokio::net::TcpStream,
     allow_hdgst: bool,
     allow_ddgst: bool,
-    admin_tx: &MailboxSender<QueueConn>,
-    io_txs: &[MailboxSender<QueueConn>],
+    admin_tx: &MailboxSender<Conn>,
+    io_txs: &[MailboxSender<Conn>],
+    port: Arc<PortConfig<AnyBackend>>,
+    registry: Arc<Registry>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let negotiated = accept_handshake(
@@ -196,6 +250,9 @@ async fn setup_connection(
         sqsize: entries as u16,
         sqhd_disabled,
         connect_sqe: first.sqe,
+        connect_data: first.data,
+        port,
+        registry,
     };
     if qid == 0 {
         admin_tx.send(conn);

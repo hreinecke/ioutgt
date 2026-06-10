@@ -1,30 +1,185 @@
-//! Command dispatch: routes a received SQE to its handler.
+//! Command dispatch: per-connection context and routing.
 //!
-//! M3 scope: structure + stubs. Fabrics/admin handlers land in M4, the
-//! IO path in M5; until then every command completes with
-//! INVALID_OPCODE so the slot/response machinery can be exercised end
-//! to end.
+//! Every command arrives in a slot; the slot task calls [`execute`]
+//! which routes by queue role and opcode. Fabrics handlers live in
+//! [`crate::fabrics_exec`], admin handlers in [`crate::admin`]; the IO
+//! path proper lands with the IO milestone.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use ioutgt_nvme::spec::{Cqe, Sqe};
+use ioutgt_nvme::fabrics::ConnectData;
+use ioutgt_nvme::spec::{Cqe, Sqe, admin_opcode};
 use ioutgt_nvme::status;
 
+use crate::backend::Backend;
+use crate::controller::{RegisterState, Registry};
 use crate::queue::QueueCore;
+use crate::subsystem::{PortConfig, Subsystem};
 
-/// Dispatch one command on an IO queue. Returns the CQE and the number
-/// of C2H data bytes left in the slot buffer for the send path.
-pub async fn execute_io(queue: &Rc<QueueCore>, tag: u16, sqe: &Sqe) -> (Cqe, u32) {
-    let _ = tag;
-    let status = status::INVALID_OPCODE | status::DNR;
-    let cqe = Cqe::new(0, queue.advance_sqhd(), queue.qid, sqe.cid.get(), status);
-    (cqe, 0)
+/// Per-connection dispatch context (single-threaded, shared by the
+/// connection's tasks via `Rc`).
+#[allow(missing_docs)]
+pub struct ConnCtx<B> {
+    pub queue: Rc<QueueCore>,
+    pub port: Arc<PortConfig<B>>,
+    pub registry: Arc<Registry>,
+    /// Connect data of this queue's Connect command.
+    pub connect_data: Box<ConnectData>,
+    pub role: Role<B>,
 }
 
-/// Dispatch one command on the admin queue (stub, see module docs).
-pub async fn execute_admin(queue: &Rc<QueueCore>, tag: u16, sqe: &Sqe) -> (Cqe, u32) {
-    let _ = tag;
-    let status = status::INVALID_OPCODE | status::DNR;
-    let cqe = Cqe::new(0, queue.advance_sqhd(), queue.qid, sqe.cid.get(), status);
-    (cqe, 0)
+/// Queue role, fixed at Connect routing time by qid.
+#[allow(missing_docs)]
+pub enum Role<B> {
+    Admin(AdminState<B>),
+    Io(IoState<B>),
+}
+
+/// Admin-queue controller state (the controller lives and dies with its
+/// admin queue connection, as on fabrics).
+#[allow(missing_docs)]
+pub struct AdminState<B> {
+    pub regs: RefCell<RegisterState>,
+    /// Set once Connect executes.
+    pub cntlid: Cell<u16>,
+    pub subsys: RefCell<Option<Arc<Subsystem<B>>>>,
+    /// This controller serves the well-known discovery subsystem.
+    pub discovery: Cell<bool>,
+    /// Negotiated keep-alive timeout in milliseconds (0 = disabled).
+    pub kato_ms: Cell<u32>,
+    /// Deadline bumped by every received command; the keep-alive watchdog
+    /// closes the connection past it. Milliseconds of `Instant` elapsed.
+    pub last_heard: Cell<std::time::Instant>,
+    /// Pending async events (result dwords) and the wakers of parked
+    /// AER futures.
+    pub events: RefCell<std::collections::VecDeque<u32>>,
+    pub aer_wakers: RefCell<Vec<std::task::Waker>>,
+    /// Async event configuration (Set Features AEC).
+    pub aec: Cell<u32>,
+}
+
+/// IO-queue state.
+#[allow(missing_docs)]
+pub struct IoState<B> {
+    /// Set once the IO-queue Connect validates against the registry.
+    pub cntlid: Cell<u16>,
+    pub subsys: RefCell<Option<Arc<Subsystem<B>>>>,
+}
+
+impl<B: Backend> ConnCtx<B> {
+    /// Context for an admin queue: owns the controller registers.
+    pub fn new_admin(
+        queue: Rc<QueueCore>,
+        port: Arc<PortConfig<B>>,
+        registry: Arc<Registry>,
+        connect_data: Box<ConnectData>,
+    ) -> Rc<Self> {
+        Rc::new(ConnCtx {
+            queue,
+            port,
+            registry,
+            connect_data,
+            role: Role::Admin(AdminState {
+                regs: RefCell::new(RegisterState::new(crate::MAX_QUEUE_ENTRIES)),
+                cntlid: Cell::new(0),
+                subsys: RefCell::new(None),
+                discovery: Cell::new(false),
+                kato_ms: Cell::new(0),
+                last_heard: Cell::new(std::time::Instant::now()),
+                events: RefCell::new(std::collections::VecDeque::new()),
+                aer_wakers: RefCell::new(Vec::new()),
+                aec: Cell::new(0),
+            }),
+        })
+    }
+
+    /// Context for an IO queue.
+    pub fn new_io(
+        queue: Rc<QueueCore>,
+        port: Arc<PortConfig<B>>,
+        registry: Arc<Registry>,
+        connect_data: Box<ConnectData>,
+    ) -> Rc<Self> {
+        Rc::new(ConnCtx {
+            queue,
+            port,
+            registry,
+            connect_data,
+            role: Role::Io(IoState {
+                cntlid: Cell::new(0),
+                subsys: RefCell::new(None),
+            }),
+        })
+    }
+
+    /// The admin state, when this is an admin-queue context.
+    pub fn admin(&self) -> Option<&AdminState<B>> {
+        match &self.role {
+            Role::Admin(state) => Some(state),
+            Role::Io(_) => None,
+        }
+    }
+
+    /// Build a CQE for this queue.
+    pub fn cqe(&self, result: u32, cid: u16, status_code: u16) -> Cqe {
+        Cqe::new(
+            result,
+            self.queue.advance_sqhd(),
+            self.queue.qid,
+            cid,
+            status_code,
+        )
+    }
+}
+
+/// Outcome of dispatching one command.
+#[allow(missing_docs)]
+pub struct Outcome {
+    pub cqe: Cqe,
+    /// C2H bytes the send path reads from the slot buffer.
+    pub data_len: u32,
+}
+
+#[allow(missing_docs)]
+impl Outcome {
+    pub fn status(cqe: Cqe) -> Outcome {
+        Outcome { cqe, data_len: 0 }
+    }
+
+    pub fn with_data(cqe: Cqe, data_len: u32) -> Outcome {
+        Outcome { cqe, data_len }
+    }
+}
+
+/// Route one command. `tag`'s slot holds any in-capsule payload.
+pub async fn execute<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, sqe: &Sqe) -> Outcome {
+    if let Role::Admin(admin) = &ctx.role {
+        admin.last_heard.set(std::time::Instant::now());
+    }
+
+    // Fabrics commands are legal on both queue types.
+    if sqe.opcode == admin_opcode::FABRICS {
+        return crate::fabrics_exec::execute(ctx, tag, sqe);
+    }
+
+    match &ctx.role {
+        Role::Admin(admin) => {
+            // Everything but Connect/Property requires an enabled
+            // controller.
+            if !admin.regs.borrow().ready() {
+                return Outcome::status(ctx.cqe(
+                    0,
+                    sqe.cid.get(),
+                    status::CONNECT_CTRL_BUSY | status::DNR,
+                ));
+            }
+            crate::admin::execute(ctx, admin, tag, sqe).await
+        }
+        Role::Io(_) => {
+            // IO commands land with the IO milestone.
+            Outcome::status(ctx.cqe(0, sqe.cid.get(), status::INVALID_OPCODE | status::DNR))
+        }
+    }
 }

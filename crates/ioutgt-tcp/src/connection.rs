@@ -8,15 +8,21 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
-use ioutgt_core::dispatch;
+use ioutgt_core::backend::Backend;
+use ioutgt_core::controller::Registry;
+use ioutgt_core::dispatch::{self, ConnCtx, Role};
 use ioutgt_core::queue::QueueCore;
+use ioutgt_core::subsystem::PortConfig;
+use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
 use ioutgt_nvme::spec::Sqe;
 use ioutgt_nvme::{digest, status};
 use ioutgt_uring::ops;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Admin-queue slot buffers: identify/log pages (4 KiB) plus margin.
 pub const ADMIN_SLOT_BUF: usize = 8 * 1024;
@@ -25,7 +31,7 @@ pub const IO_SLOT_BUF: usize = 128 * 1024;
 
 /// Everything a queue thread receives to run one connection.
 #[allow(missing_docs)]
-pub struct QueueConn {
+pub struct QueueConn<B> {
     pub fd: OwnedFd,
     pub hdr_digest: bool,
     pub data_digest: bool,
@@ -37,6 +43,12 @@ pub struct QueueConn {
     /// The already-consumed Connect command, to be executed as this
     /// queue's first command.
     pub connect_sqe: Sqe,
+    /// The Connect command's 1024-byte data payload.
+    pub connect_data: Box<ConnectData>,
+    /// Port configuration (subsystems reachable here).
+    pub port: Arc<PortConfig<B>>,
+    /// Cross-thread controller registry.
+    pub registry: Arc<Registry>,
 }
 
 /// Receive-side state across recv() completions.
@@ -60,7 +72,7 @@ enum RecvPhase {
 }
 
 /// Drive one queue connection to completion (EOF, error, or term).
-pub async fn run_queue(conn: QueueConn) {
+pub async fn run_queue<B: Backend>(conn: QueueConn<B>) {
     let slot_buf = if conn.qid == 0 {
         ADMIN_SLOT_BUF
     } else {
@@ -68,24 +80,72 @@ pub async fn run_queue(conn: QueueConn) {
     };
     let queue = QueueCore::new(conn.qid, conn.sqsize, slot_buf, conn.sqhd_disabled);
     let fd = conn.fd.as_raw_fd();
+    let ctx = if conn.qid == 0 {
+        ConnCtx::new_admin(
+            Rc::clone(&queue),
+            Arc::clone(&conn.port),
+            Arc::clone(&conn.registry),
+            conn.connect_data,
+        )
+    } else {
+        ConnCtx::new_io(
+            Rc::clone(&queue),
+            Arc::clone(&conn.port),
+            Arc::clone(&conn.registry),
+            conn.connect_data,
+        )
+    };
 
     // Persistent task per tag.
     let mut tasks: Vec<JoinHandle<()>> = (0..conn.sqsize)
         .map(|tag| {
             let queue = Rc::clone(&queue);
+            let ctx = Rc::clone(&ctx);
             tokio::task::spawn_local(async move {
                 loop {
                     let sqe = queue.await_command(tag).await;
-                    let (cqe, data_len) = if queue.qid == 0 {
-                        dispatch::execute_admin(&queue, tag, &sqe).await
-                    } else {
-                        dispatch::execute_io(&queue, tag, &sqe).await
-                    };
-                    queue.complete(tag, cqe, data_len);
+                    let outcome = dispatch::execute(&ctx, tag, &sqe).await;
+                    queue.complete(tag, outcome.cqe, outcome.data_len);
                 }
             })
         })
         .collect();
+
+    // Keep-alive watchdog (admin queues): close the socket when the host
+    // goes silent past KATO + grace, which unwinds the whole connection.
+    if let Role::Admin(_) = &ctx.role {
+        let ctx = Rc::clone(&ctx);
+        tasks.push(tokio::task::spawn_local(async move {
+            loop {
+                let Ok(sleep) = ops::sleep(Duration::from_secs(5)) else {
+                    return;
+                };
+                if sleep.await.is_err() {
+                    return;
+                }
+                let Role::Admin(admin) = &ctx.role else {
+                    return;
+                };
+                let kato = u64::from(admin.kato_ms.get());
+                if kato == 0 {
+                    continue;
+                }
+                let silent =
+                    u64::try_from(admin.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
+                if silent > kato * 2 + 5_000 {
+                    info!(
+                        cntlid = admin.cntlid.get(),
+                        silent_ms = silent,
+                        "keep-alive expired; closing connection"
+                    );
+                    // SAFETY: fd is valid for the connection's lifetime;
+                    // shutdown only signals, never frees.
+                    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                    return;
+                }
+            }
+        }));
+    }
 
     // Send path.
     {
@@ -111,6 +171,14 @@ pub async fn run_queue(conn: QueueConn) {
 
     for task in &tasks {
         task.abort();
+    }
+    // Tear down the controller when its admin queue dies.
+    if let Role::Admin(admin) = &ctx.role {
+        let cntlid = admin.cntlid.get();
+        if cntlid != 0 {
+            ctx.registry.remove(cntlid);
+            info!(cntlid, "controller removed");
+        }
     }
     // conn.fd drops here, closing the socket; in-flight ops orphan and
     // drain through the reactor.

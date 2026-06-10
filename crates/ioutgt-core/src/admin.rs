@@ -1,0 +1,333 @@
+//! Admin command handlers: Identify, Features, Log pages, Keep Alive,
+//! Async Event Requests. Values mirror kernel nvmet where interop
+//! depends on them.
+
+use std::rc::Rc;
+use std::sync::Arc;
+
+use ioutgt_nvme::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
+use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, oncs};
+use ioutgt_nvme::spec::{Sqe, admin_opcode, cns, feat, log_page};
+use ioutgt_nvme::status;
+use tracing::debug;
+use zerocopy::IntoBytes;
+
+use crate::backend::Backend;
+use crate::dispatch::{AdminState, ConnCtx, Outcome};
+use crate::subsystem::Subsystem;
+
+/// KAS granularity: 10 seconds in 100ms units, as nvmet.
+const KAS_UNITS: u16 = 100;
+
+fn ascii_pad(dst: &mut [u8], src: &str) {
+    dst.fill(b' ');
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src.as_bytes()[..n]);
+}
+
+/// Route one admin-queue command to its handler.
+pub async fn execute<B: Backend>(
+    ctx: &Rc<ConnCtx<B>>,
+    admin: &AdminState<B>,
+    tag: u16,
+    sqe: &Sqe,
+) -> Outcome {
+    match sqe.opcode {
+        admin_opcode::IDENTIFY => identify(ctx, admin, tag, sqe),
+        admin_opcode::GET_FEATURES => get_features(ctx, admin, sqe),
+        admin_opcode::SET_FEATURES => set_features(ctx, admin, sqe),
+        admin_opcode::GET_LOG_PAGE => get_log_page(ctx, admin, tag, sqe),
+        admin_opcode::KEEP_ALIVE => Outcome::status(ctx.cqe(0, sqe.cid.get(), status::SUCCESS)),
+        admin_opcode::ASYNC_EVENT => {
+            // Task-per-tag parking: this future resolves only when an
+            // event fires, so the AER occupies its slot until then.
+            let result = std::future::poll_fn(|cx| {
+                if let Some(event) = admin.events.borrow_mut().pop_front() {
+                    return std::task::Poll::Ready(event);
+                }
+                admin.aer_wakers.borrow_mut().push(cx.waker().clone());
+                std::task::Poll::Pending
+            })
+            .await;
+            Outcome::status(ctx.cqe(result, sqe.cid.get(), status::SUCCESS))
+        }
+        _ => {
+            debug!(opcode = sqe.opcode, "unsupported admin command");
+            Outcome::status(ctx.cqe(0, sqe.cid.get(), status::INVALID_OPCODE | status::DNR))
+        }
+    }
+}
+
+/// Copy `data` into the slot buffer, honoring the host's transfer
+/// length implied by the identify/log structure size.
+fn fill_slot<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, data: &[u8]) -> u32 {
+    let slot = ctx.queue.slot(tag);
+    let mut buf = slot.data();
+    let n = data.len().min(buf.len());
+    buf[..n].copy_from_slice(&data[..n]);
+    u32::try_from(n).expect("slot buffers < 4G")
+}
+
+fn identify<B: Backend>(
+    ctx: &Rc<ConnCtx<B>>,
+    admin: &AdminState<B>,
+    tag: u16,
+    sqe: &Sqe,
+) -> Outcome {
+    let cid = sqe.cid.get();
+    let which = (sqe.cdw10.get() & 0xFF) as u8;
+    match which {
+        cns::CONTROLLER => {
+            let id = build_id_ctrl(ctx, admin);
+            let len = fill_slot(ctx, tag, id.as_bytes());
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+        }
+        cns::NAMESPACE => {
+            let subsys = admin.subsys.borrow();
+            let Some(subsys) = subsys.as_ref() else {
+                return Outcome::status(ctx.cqe(0, cid, status::INVALID_NS | status::DNR));
+            };
+            match subsys.namespace(sqe.nsid.get()) {
+                Some(ns) => {
+                    let id = build_id_ns(ns.backend.as_ref());
+                    let len = fill_slot(ctx, tag, id.as_bytes());
+                    Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+                }
+                // Inactive NSID: all-zero structure, per spec.
+                None if sqe.nsid.get() <= subsys.max_nsid() => {
+                    let id = IdentifyNamespace::zeroed();
+                    let len = fill_slot(ctx, tag, id.as_bytes());
+                    Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+                }
+                None => Outcome::status(ctx.cqe(0, cid, status::INVALID_NS | status::DNR)),
+            }
+        }
+        cns::ACTIVE_NS_LIST => {
+            let mut list = [0u8; 4096];
+            if let Some(subsys) = admin.subsys.borrow().as_ref() {
+                let start = sqe.nsid.get();
+                for (i, nsid) in subsys
+                    .namespaces
+                    .keys()
+                    .filter(|&&n| n > start)
+                    .take(1024)
+                    .enumerate()
+                {
+                    list[i * 4..i * 4 + 4].copy_from_slice(&nsid.to_le_bytes());
+                }
+            }
+            let len = fill_slot(ctx, tag, &list);
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+        }
+        cns::NS_DESC_LIST => {
+            let mut desc = [0u8; 4096];
+            let nsid = sqe.nsid.get();
+            let uuid = admin
+                .subsys
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.namespace(nsid).map(|ns| ns.uuid));
+            match uuid {
+                Some(uuid) => {
+                    desc[0] = 3; // NIDT: UUID
+                    desc[1] = 16; // NIDL
+                    desc[4..20].copy_from_slice(&uuid);
+                    let len = fill_slot(ctx, tag, &desc);
+                    Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+                }
+                None => Outcome::status(ctx.cqe(0, cid, status::INVALID_NS | status::DNR)),
+            }
+        }
+        _ => Outcome::status(ctx.cqe(0, cid, status::INVALID_FIELD | status::DNR)),
+    }
+}
+
+fn build_id_ctrl<B: Backend>(
+    ctx: &Rc<ConnCtx<B>>,
+    admin: &AdminState<B>,
+) -> Box<IdentifyController> {
+    let mut id = Box::new(IdentifyController::zeroed());
+    let discovery = admin.discovery.get();
+    let subsys = admin.subsys.borrow();
+
+    id.vid.set(0);
+    id.ssvid.set(0);
+    ascii_pad(&mut id.fr, "1.0");
+    ascii_pad(&mut id.mn, "ioutgt");
+    match subsys.as_ref() {
+        Some(s) => {
+            ascii_pad(&mut id.sn, &s.serial);
+            ascii_pad(&mut id.subnqn, &s.nqn);
+            // subnqn is NUL-terminated, not space-padded.
+            nul_terminate(&mut id.subnqn, &s.nqn);
+        }
+        None => {
+            ascii_pad(&mut id.sn, "ioutgt-disc");
+            nul_terminate(&mut id.subnqn, fabrics::DISCOVERY_NQN);
+        }
+    }
+    id.cntlid.set(admin.cntlid.get());
+    id.ver.set(0x0001_0300);
+    id.cntrltype = if discovery { 2 } else { 1 };
+    id.kas.set(KAS_UNITS);
+    id.sqes = 0x66;
+    id.cqes = 0x44;
+    id.maxcmd.set(ctx.queue.sqsize);
+    id.acl = 3;
+    id.aerl = 3;
+    // MDTS: slot buffer / CAP.MPSMIN(4K) pages: 128K = 2^5 * 4K.
+    id.mdts = 5;
+    id.sgls.set(SGLS_BYTE_ALIGNED);
+
+    if discovery {
+        // Discovery controllers: no namespaces, no IO command set.
+        id.nn.set(0);
+    } else {
+        id.nn.set(subsys.as_ref().map_or(0, |s| s.max_nsid()));
+        id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
+        // IOCCSZ: (64B SQE + 16K inline) / 16; IORCSZ: one CQE.
+        id.ioccsz.set((64 + crate::INLINE_DATA_SIZE) / 16);
+        id.iorcsz.set(1);
+        id.icdoff.set(0);
+    }
+    id
+}
+
+fn nul_terminate(dst: &mut [u8; 256], s: &str) {
+    dst.fill(0);
+    let n = s.len().min(255);
+    dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+
+fn build_id_ns<B: Backend>(backend: &B) -> Box<IdentifyNamespace> {
+    let mut id = Box::new(IdentifyNamespace::zeroed());
+    let blocks = backend.nr_blocks();
+    id.nsze.set(blocks);
+    id.ncap.set(blocks);
+    id.nuse.set(blocks);
+    id.nlbaf = 0;
+    id.flbas = 0;
+    id.dlfeat = 0x01; // deallocated blocks read zeroes
+    id.lbaf[0].lbads = backend.block_shift();
+    id.lbaf[0].ms.set(0);
+    id.anagrpid.set(0);
+    id
+}
+
+fn get_features<B: Backend>(ctx: &Rc<ConnCtx<B>>, admin: &AdminState<B>, sqe: &Sqe) -> Outcome {
+    let cid = sqe.cid.get();
+    let fid = (sqe.cdw10.get() & 0xFF) as u8;
+    match fid {
+        feat::NUM_QUEUES => {
+            let queues = u32::from(io_queue_count(admin)) - 1;
+            Outcome::status(ctx.cqe(queues | (queues << 16), cid, status::SUCCESS))
+        }
+        feat::KATO => Outcome::status(ctx.cqe(admin.kato_ms.get(), cid, status::SUCCESS)),
+        feat::ASYNC_EVENT_CONFIG => Outcome::status(ctx.cqe(admin.aec.get(), cid, status::SUCCESS)),
+        _ => Outcome::status(ctx.cqe(0, cid, status::INVALID_FIELD | status::DNR)),
+    }
+}
+
+fn set_features<B: Backend>(ctx: &Rc<ConnCtx<B>>, admin: &AdminState<B>, sqe: &Sqe) -> Outcome {
+    let cid = sqe.cid.get();
+    let fid = (sqe.cdw10.get() & 0xFF) as u8;
+    match fid {
+        feat::NUM_QUEUES => {
+            // Grant min(requested, offered); 0-based in both directions.
+            let offered = u32::from(io_queue_count(admin)) - 1;
+            let requested = sqe.cdw11.get() & 0xFFFF;
+            let granted = requested.min(offered);
+            debug!(requested, granted, "set features NUM_QUEUES");
+            Outcome::status(ctx.cqe(granted | (granted << 16), cid, status::SUCCESS))
+        }
+        feat::KATO => {
+            admin.kato_ms.set(sqe.cdw11.get());
+            Outcome::status(ctx.cqe(0, cid, status::SUCCESS))
+        }
+        feat::ASYNC_EVENT_CONFIG => {
+            admin.aec.set(sqe.cdw11.get());
+            Outcome::status(ctx.cqe(0, cid, status::SUCCESS))
+        }
+        feat::HOST_ID => Outcome::status(ctx.cqe(0, cid, status::SUCCESS)),
+        _ => Outcome::status(ctx.cqe(0, cid, status::FEATURE_NOT_CHANGEABLE | status::DNR)),
+    }
+}
+
+/// IO queues this controller may use (subsystem max_qid; the discovery
+/// subsystem has none but hosts never ask).
+fn io_queue_count<B: Backend>(admin: &AdminState<B>) -> u16 {
+    admin
+        .subsys
+        .borrow()
+        .as_ref()
+        .map_or(1, |s: &Arc<Subsystem<B>>| s.max_qid.max(1))
+}
+
+fn get_log_page<B: Backend>(
+    ctx: &Rc<ConnCtx<B>>,
+    admin: &AdminState<B>,
+    tag: u16,
+    sqe: &Sqe,
+) -> Outcome {
+    let cid = sqe.cid.get();
+    let lid = (sqe.cdw10.get() & 0xFF) as u8;
+    // NUMD (0-based dwords, split across cdw10/11) and LPO.
+    let numdl = sqe.cdw10.get() >> 16;
+    let numdu = sqe.cdw11.get() & 0xFFFF;
+    let len = ((u64::from(numdu) << 16 | u64::from(numdl)) + 1) * 4;
+    let offset = u64::from(sqe.cdw13.get()) << 32 | u64::from(sqe.cdw12.get());
+
+    match lid {
+        log_page::DISCOVERY if admin.discovery.get() => {
+            let log = build_discovery_log(ctx);
+            let end = offset.saturating_add(len).min(log.len() as u64);
+            let start = offset.min(end);
+            let window = &log[usize::try_from(start).expect("log fits")
+                ..usize::try_from(end).expect("log fits")];
+            let n = fill_slot(ctx, tag, window);
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n)
+        }
+        log_page::ERROR | log_page::SMART | log_page::FW_SLOT | log_page::CHANGED_NS => {
+            // Zero-filled pages: nothing to report yet.
+            let n = len.min(4096);
+            let slot = ctx.queue.slot(tag);
+            slot.data()[..usize::try_from(n).expect("<=4096")].fill(0);
+            #[allow(clippy::cast_possible_truncation)]
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n as u32)
+        }
+        _ => Outcome::status(ctx.cqe(0, cid, status::INVALID_LOG_PAGE | status::DNR)),
+    }
+}
+
+/// Discovery log: header + one entry per NVM subsystem on this port.
+fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
+    let subsystems = &ctx.port.subsystems;
+    let mut log = Vec::with_capacity(1024 * (1 + subsystems.len()));
+
+    let mut header = DiscoveryLogHeader {
+        genctr: 1.into(),
+        numrec: (subsystems.len() as u64).into(),
+        recfmt: 0.into(),
+        resv: [0; 1006],
+    };
+    let _ = &mut header;
+    log.extend_from_slice(header.as_bytes());
+
+    for (index, (nqn, _subsys)) in subsystems.iter().enumerate() {
+        let mut entry = DiscoveryLogEntry::zeroed();
+        entry.trtype = fabrics::trtype::TCP;
+        entry.adrfam = 1; // IPv4
+        entry.subtype = fabrics::subtype::NVM;
+        entry.treq = 0;
+        entry.portid.set(u16::try_from(index).unwrap_or(0));
+        entry.cntlid.set(0xFFFF); // dynamic controllers
+        entry.asqsz.set(32);
+        ascii_pad(&mut entry.trsvcid, &ctx.port.trsvcid);
+        ascii_pad(&mut entry.traddr, &ctx.port.traddr);
+        entry.subnqn.fill(0);
+        let n = nqn.len().min(255);
+        entry.subnqn[..n].copy_from_slice(&nqn.as_bytes()[..n]);
+        log.extend_from_slice(entry.as_bytes());
+    }
+    log
+}

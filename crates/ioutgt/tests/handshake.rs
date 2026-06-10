@@ -17,6 +17,8 @@ fn start_target() -> std::net::SocketAddr {
         allow_hdgst: true,
         allow_ddgst: true,
         pin_threads: false,
+        subsys_nqn: "nqn.2026-06.io.ioutgt:test".into(),
+        mem_size_mb: 16,
     })
     .expect("target start")
 }
@@ -111,16 +113,15 @@ fn icreq_icresp_and_connect_pipeline() {
         assert_eq!(ddgst, want_ddgst, "ddgst negotiation");
 
         let cqe = send_connect_and_read_response(&mut stream, hdgst, ddgst, 0x77);
-        // M3: dispatch stubs every command with INVALID_OPCODE|DNR; the
-        // point is that the response came back through the queue-thread
-        // slot pipeline with the right CID.
+        // Connect must succeed and return a non-zero dynamic cntlid in
+        // DW0, through the queue-thread slot pipeline.
         assert_eq!(cqe.cid.get(), 0x77);
-        let status = cqe.status.get() >> 1;
         assert_eq!(
-            status,
-            ioutgt_nvme::status::INVALID_OPCODE | ioutgt_nvme::status::DNR,
-            "M3 stub status"
+            cqe.status.get() >> 1,
+            ioutgt_nvme::status::SUCCESS,
+            "connect status"
         );
+        assert!(cqe.result.get() >= 1, "cntlid allocated");
     }
 }
 
