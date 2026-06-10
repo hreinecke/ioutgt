@@ -42,6 +42,11 @@ pub async fn execute<B: Backend>(
             // Task-per-tag parking: this future resolves only when an
             // event fires, so the AER occupies its slot until then.
             let result = std::future::poll_fn(|cx| {
+                if admin.closing.get() {
+                    // Teardown: resolve with a dummy event; the response
+                    // is never sent (the connection is gone).
+                    return std::task::Poll::Ready(0);
+                }
                 if let Some(event) = admin.events.borrow_mut().pop_front() {
                     return std::task::Poll::Ready(event);
                 }

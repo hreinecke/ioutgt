@@ -86,7 +86,10 @@ enum RecvPhase {
 }
 
 /// Drive one queue connection to completion (EOF, error, or term).
-pub async fn run_queue<B: Backend>(conn: QueueConn<B>) {
+///
+/// `on_ctx` runs once the dispatch context exists — the binary's admin
+/// thread uses it to register live controllers for AER nudges.
+pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<ConnCtx<B>>)) {
     let slot_buf = if conn.qid == 0 {
         ADMIN_SLOT_BUF
     } else {
@@ -109,6 +112,8 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>) {
             conn.connect_data,
         )
     };
+
+    on_ctx(&ctx);
 
     // Persistent task per tag.
     let mut tasks: Vec<JoinHandle<()>> = (0..conn.sqsize)
@@ -182,6 +187,10 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>) {
     if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest).await {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
+
+    // Resolve parked AERs (their slots count as executing but reference
+    // no kernel-visible memory) so the drain below terminates promptly.
+    ctx.close();
 
     // Backend ops in flight reference slot memory: wait for executing
     // slots to finish before aborting tasks and freeing the queue.

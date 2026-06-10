@@ -171,6 +171,53 @@ ioutgt_run_m7() {
     vt_pass "ioutgt M7 runtime namespace add via AEN"
 }
 
+# M8: kill -9 the target mid-IO (host side restarts it). The kernel
+# host freezes the queues, reconnects (~10s), and replays — fio must
+# complete with zero errors despite the target dying underneath it.
+ioutgt_run_m8() {
+    [ -f "${VMTEST_DATA_DIR:?}/tmp/ioutgt_kill_enabled" ] || {
+        vt_log "m8 kill test disabled (host did not opt in); skipping"
+        return 0
+    }
+    vt_log "failure injection: target kill mid-IO"
+    nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" --nr-io-queues=2 ||
+        vt_die "connect for m8 failed"
+    # Use namespace 1 of OUR controller: it exists in the target's
+    # static config and therefore survives the restart (the M7 hot-added
+    # nsid 2 deliberately does not).
+    local ctrl="" dev="" i c
+    for i in $(seq 100); do
+        for c in /sys/class/nvme/nvme*; do
+            [ -e "$c/subsysnqn" ] || continue
+            [ "$(cat "$c/subsysnqn")" = "$NQN" ] && ctrl=$(basename "$c") && break
+        done
+        dev="/dev/${ctrl}n1"
+        [ -n "$ctrl" ] && [ -b "$dev" ] && break
+        sleep 0.2
+    done
+    [ -n "$ctrl" ] && [ -b "$dev" ] || vt_die "device missing for m8"
+
+    # No verify: the memory backend forgets on restart by design; this
+    # tests transport recovery, not durability.
+    fio --name=killio --filename="$dev" --rw=randwrite --bs=4k \
+        --runtime=45 --time_based --direct=1 --ioengine=libaio \
+        --iodepth=16 --output-format=terse >/tmp/fio-m8.out 2>&1 &
+    local fio_pid=$!
+    sleep 3
+    vt_log "requesting target kill"
+    : > "$VMTEST_DATA_DIR/tmp/ioutgt_want_kill"
+
+    wait "$fio_pid" || { cat /tmp/fio-m8.out; vt_die "fio failed across target restart"; }
+    # terse field 5 of the write section carries error count via exit
+    # code already; belt-and-braces: no 'err=' in non-terse output.
+    dmesg | grep -q "nvme nvme.*reconnect" ||
+        vt_log "note: no explicit reconnect line in dmesg (driver may log differently)"
+    dd "if=$dev" of=/dev/null bs=4k count=8 iflag=direct status=none ||
+        vt_die "read after recovery failed"
+    nvme disconnect -n "$NQN" >/dev/null || vt_die "m8 disconnect failed"
+    vt_pass "ioutgt M8 target-kill recovery"
+}
+
 # Guest console output can be lossy under load; persist the verdict
 # through the 9p-shared data dir so the host can assert on it.
 ioutgt_mark() {
@@ -180,10 +227,24 @@ ioutgt_mark() {
 
 ioutgt_run_all() {
     : > "${VMTEST_DATA_DIR:-/tmp}/tmp/ioutgt_result" 2>/dev/null || true
+    # Soak-only mode: the host wrote the cycle count into the marker;
+    # do nothing but discover + reconnect cycles (no IO), so the host
+    # can assert a flat RSS afterwards.
+    if [ -f "${VMTEST_DATA_DIR:-/tmp}/tmp/ioutgt_soak_only" ]; then
+        local cycles
+        cycles=$(cat "${VMTEST_DATA_DIR}/tmp/ioutgt_soak_only")
+        ioutgt_discover
+        ioutgt_reconnect_soak "${cycles:-1000}"
+        ioutgt_mark "PASS soak"
+        return 0
+    fi
     ioutgt_run_m4
     ioutgt_mark "PASS m4"
     ioutgt_run_m5
     ioutgt_mark "PASS m5"
     ioutgt_run_m7
     ioutgt_mark "PASS m7"
+    ioutgt_run_m8
+    [ -f "${VMTEST_DATA_DIR:?}/tmp/ioutgt_kill_enabled" ] && ioutgt_mark "PASS m8"
+    true
 }

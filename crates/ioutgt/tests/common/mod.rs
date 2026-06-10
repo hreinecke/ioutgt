@@ -114,14 +114,31 @@ impl Client {
         cqe
     }
 
+    /// Raw stream access (abuse tests).
+    pub fn stream(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
     pub fn connect(&mut self, qid: u16, sqsize: u16, cntlid: u16, cid: u16) -> u16 {
+        let kato = if qid == 0 { 60_000 } else { 0 };
+        self.connect_with_kato(qid, sqsize, cntlid, cid, kato)
+    }
+
+    pub fn connect_with_kato(
+        &mut self,
+        qid: u16,
+        sqsize: u16,
+        cntlid: u16,
+        cid: u16,
+        kato: u32,
+    ) -> u16 {
         let mut cmd: ConnectCommand = FromZeros::new_zeroed();
         cmd.opcode = spec::admin_opcode::FABRICS;
         cmd.fctype = fctype::CONNECT;
         cmd.cid.set(cid);
         cmd.qid.set(qid);
         cmd.sqsize.set(sqsize - 1);
-        cmd.kato.set(if qid == 0 { 60_000 } else { 0 });
+        cmd.kato.set(kato);
         cmd.dptr.length.set(1024);
         cmd.dptr.sgl_type = spec::sgl::TYPE_DATA_BLOCK_OFFSET;
         let mut data = ConnectData::zeroed();
