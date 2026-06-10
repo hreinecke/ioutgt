@@ -270,6 +270,9 @@ name = "ioutgt-backend"
 version = "0.1.0"
 dependencies = [
  "ioutgt-core",
+ "ioutgt-uring",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

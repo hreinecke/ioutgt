@@ -183,6 +183,28 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>) {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 
+    // Backend ops in flight reference slot memory: wait for executing
+    // slots to finish before aborting tasks and freeing the queue.
+    let mut waited = 0u32;
+    while queue.executing() > 0 && waited < 10_000 {
+        match ops::sleep(Duration::from_millis(2)) {
+            Ok(sleep) => {
+                let _ = sleep.await;
+            }
+            Err(_) => break,
+        }
+        waited += 2;
+    }
+    if queue.executing() > 0 {
+        // A wedged backend op: leak the queue rather than free memory
+        // the kernel may still write to.
+        warn!(
+            qid = conn.qid,
+            executing = queue.executing(),
+            "teardown timeout; leaking queue"
+        );
+        std::mem::forget(Rc::clone(&queue));
+    }
     for task in &tasks {
         task.abort();
     }
