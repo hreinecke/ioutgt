@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+slab = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
