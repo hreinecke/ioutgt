@@ -1,0 +1,18 @@
+{
+  "listen": "0.0.0.0:4420",
+  "io_threads": 2,
+  "header_digest": true,
+  "data_digest": true,
+  "pin_threads": false,
+  "control_socket": "/tmp/ioutgt.sock",
+  "subsystems": [
+    {
+      "nqn": "nqn.2026-06.io.ioutgt:test",
+      "serial": "IOUTGT0001",
+      "namespaces": [
+        { "nsid": 1, "backend": { "type": "memory", "size_mb": 64 } },
+        { "nsid": 2, "backend": { "type": "null", "size_mb": 1024 } }
+      ]
+    }
+  ]
+}

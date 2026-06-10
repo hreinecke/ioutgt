@@ -26,10 +26,28 @@ file)
 *) echo "unknown IOUTGT_BACKEND"; exit 1 ;;
 esac
 
+CTL_SOCK="$TOP/target/ioutgt-interop.sock"
+MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
+mkdir -p "$MARKER_DIR"
+rm -f "$MARKER_DIR/ioutgt_want_ns2"
+
 "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
-    "${BACKEND_ARGS[@]}" >"$LOG" 2>&1 &
+    --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" >"$LOG" 2>&1 &
 TARGET_PID=$!
-trap 'kill $TARGET_PID 2>/dev/null || true' EXIT
+
+# Hot-add watcher: the guest drops a marker when it wants nsid 2 added
+# while it stays connected (the M7 AEN test).
+(
+    while [ ! -f "$MARKER_DIR/ioutgt_want_ns2" ]; do
+        sleep 0.5
+        kill -0 $TARGET_PID 2>/dev/null || exit 0
+    done
+    "$TOP/target/release/ioutgt" ctl --socket "$CTL_SOCK" \
+        '{"op":"ADD_NAMESPACE","nsid":2,"backend":{"type":"memory","size_mb":32}}' ||
+        echo "ctl hot-add failed" >>"$LOG"
+) &
+WATCHER_PID=$!
+trap 'kill $TARGET_PID $WATCHER_PID 2>/dev/null || true' EXIT
 
 # Wait for the listener.
 for _ in $(seq 50); do

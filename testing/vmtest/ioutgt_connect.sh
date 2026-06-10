@@ -125,6 +125,52 @@ ioutgt_run_m5() {
     vt_pass "ioutgt M5 fio data-integrity matrix"
 }
 
+# M7: while connected, ask the host side (via 9p marker) to hot-add
+# nsid 2; the AEN must make this kernel create the namespace device
+# without any reconnect.
+ioutgt_run_m7() {
+    vt_log "runtime namespace add (AEN) test"
+    nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" --nr-io-queues=2 ||
+        vt_die "connect for m7 failed"
+    local ctrl="" i
+    for i in $(seq 50); do
+        for c in /sys/class/nvme/nvme*; do
+            [ -e "$c/subsysnqn" ] || continue
+            if [ "$(cat "$c/subsysnqn")" = "$NQN" ]; then
+                ctrl=$(basename "$c")
+                break
+            fi
+        done
+        [ -n "$ctrl" ] && break
+        sleep 0.2
+    done
+    [ -n "$ctrl" ] || vt_die "controller for $NQN not found"
+    vt_log "controller $ctrl; requesting hot-add from host side"
+
+    : > "${VMTEST_DATA_DIR:?}/tmp/ioutgt_want_ns2"
+
+    local have=0
+    for i in $(seq 60); do
+        have=$(ls "/sys/class/nvme/$ctrl/" 2>/dev/null | grep -c "^${ctrl}n[0-9]")
+        [ "$have" -ge 2 ] && break
+        sleep 0.5
+    done
+    if [ "$have" -lt 2 ]; then
+        dmesg | tail -20
+        vt_die "second namespace did not appear after AEN"
+    fi
+    vt_log "namespace 2 appeared without reconnect"
+
+    # Sanity IO on the hot-added namespace.
+    dd if=/dev/urandom "of=/dev/${ctrl}n2" bs=4k count=4 oflag=direct status=none ||
+        vt_die "write to hot-added namespace failed"
+    dd "if=/dev/${ctrl}n2" of=/dev/null bs=4k count=4 iflag=direct status=none ||
+        vt_die "read from hot-added namespace failed"
+
+    nvme disconnect -n "$NQN" >/dev/null || vt_die "m7 disconnect failed"
+    vt_pass "ioutgt M7 runtime namespace add via AEN"
+}
+
 # Guest console output can be lossy under load; persist the verdict
 # through the 9p-shared data dir so the host can assert on it.
 ioutgt_mark() {
@@ -138,4 +184,6 @@ ioutgt_run_all() {
     ioutgt_mark "PASS m4"
     ioutgt_run_m5
     ioutgt_mark "PASS m5"
+    ioutgt_run_m7
+    ioutgt_mark "PASS m7"
 }

@@ -10,11 +10,13 @@ authors.workspace = true
 
 [dependencies]
 ioutgt-backend = { workspace = true }
+ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
 ioutgt-nvme = { workspace = true }
 ioutgt-tcp = { workspace = true }
 ioutgt-uring = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 core_affinity = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
 tracing = { workspace = true }

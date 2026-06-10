@@ -4,14 +4,19 @@
 //! Exposed as a library so integration tests can start a full target
 //! in-process on an ephemeral port.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, mpsc};
 
-use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend};
+use ioutgt_backend::AnyBackend;
+use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, SubsystemConfig};
+use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::controller::Registry;
+use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_tcp::connection::{QueueConn, run_queue};
 use ioutgt_tcp::handshake::{accept_handshake, read_connect};
@@ -19,8 +24,9 @@ use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{info, warn};
 
-/// Target configuration (grows a JSON schema in the control-plane
-/// milestone).
+/// Target configuration. Built from CLI flags, a JSON file
+/// ([`TargetConfig::from_file`]), or [`TargetConfig::single_memory`] in
+/// tests.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
 pub struct TargetConfig {
@@ -31,39 +37,47 @@ pub struct TargetConfig {
     pub allow_ddgst: bool,
     /// Pin queue threads to cores (sequential map; disable in tests).
     pub pin_threads: bool,
-    /// NVM subsystem NQN served on this port.
-    pub subsys_nqn: String,
-    /// Memory/null namespace size in MiB.
-    pub mem_size_mb: u64,
-    /// Namespace backend.
-    pub backend: BackendSpec,
+    /// Unix socket path for the runtime control API.
+    pub control_socket: Option<std::path::PathBuf>,
+    /// Subsystems served on this port.
+    pub subsystems: Vec<SubsystemConfig>,
 }
 
-/// Which backend serves namespace 1 (the JSON config schema replaces
-/// this in the control-plane milestone).
-#[derive(Debug, Clone, Default)]
-pub enum BackendSpec {
-    /// RAM-backed (tests, bring-up).
-    #[default]
-    Memory,
-    /// Discard writes, zero reads (protocol-overhead measurement).
-    Null,
-    /// O_DIRECT file or block device at this path.
-    File(std::path::PathBuf),
-}
-
-impl Default for TargetConfig {
-    fn default() -> Self {
+impl TargetConfig {
+    /// One subsystem, one memory namespace — the test/bring-up shape.
+    pub fn single_memory(nqn: &str, size_mb: u64) -> TargetConfig {
         TargetConfig {
             listen: "0.0.0.0:4420".parse().expect("static addr"),
             io_threads: 2,
             allow_hdgst: true,
             allow_ddgst: true,
             pin_threads: false,
-            subsys_nqn: "nqn.2026-06.io.ioutgt:test".into(),
-            mem_size_mb: 64,
-            backend: BackendSpec::Memory,
+            control_socket: None,
+            subsystems: vec![SubsystemConfig {
+                nqn: nqn.into(),
+                serial: "IOUTGT0001".into(),
+                model: "ioutgt".into(),
+                allow_any_host: true,
+                namespaces: vec![NamespaceConfig {
+                    nsid: 1,
+                    backend: BackendConfig::Memory { size_mb },
+                }],
+            }],
         }
+    }
+
+    /// Load and validate a JSON config file.
+    pub fn from_file(path: &std::path::Path) -> io::Result<TargetConfig> {
+        let file = FileConfig::load(path).map_err(io::Error::other)?;
+        Ok(TargetConfig {
+            listen: file.listen.parse().expect("validated"),
+            io_threads: file.io_threads,
+            allow_hdgst: file.header_digest,
+            allow_ddgst: file.data_digest,
+            pin_threads: file.pin_threads,
+            control_socket: file.control_socket,
+            subsystems: file.subsystems,
+        })
     }
 }
 
@@ -72,8 +86,83 @@ const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
 
 type Conn = QueueConn<AnyBackend>;
 
-fn spawn_queue_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<Conn>> {
+/// Messages to the admin queue thread.
+enum AdminMsg {
+    Conn(Conn),
+    /// A namespace changed: nudge every live controller's AERs.
+    NsChanged,
+}
+
+/// IO queue threads receive connections only.
+fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<Conn>> {
     let (tx, mut rx): (MailboxSender<Conn>, Mailbox<Conn>) = mailbox()?;
+    spawn_pinned(name.clone(), core_id, move || {
+        run_queue_thread(name, move |spawner| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(conn) => {
+                        spawner(conn);
+                    }
+                    Err(err) => {
+                        warn!("io mailbox failed: {err}");
+                        return;
+                    }
+                }
+            }
+        })
+    })?;
+    Ok(tx)
+}
+
+/// The admin thread additionally tracks live controllers for AER nudges.
+fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
+    let (tx, mut rx): (MailboxSender<AdminMsg>, Mailbox<AdminMsg>) = mailbox()?;
+    spawn_pinned(name.clone(), None, move || {
+        let rt = match QueueRuntime::new(RingConfig::default()) {
+            Ok(rt) => rt,
+            Err(err) => {
+                warn!(thread = %name, "queue runtime failed: {err}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            loop {
+                match rx.recv().await {
+                    Ok(AdminMsg::Conn(conn)) => {
+                        let live = Rc::clone(&live);
+                        tokio::task::spawn_local(async move {
+                            run_queue(conn, |ctx| {
+                                live.borrow_mut().push(Rc::downgrade(ctx));
+                            })
+                            .await;
+                        });
+                    }
+                    Ok(AdminMsg::NsChanged) => {
+                        live.borrow_mut().retain(|weak| {
+                            weak.upgrade().is_some_and(|ctx| {
+                                ctx.fire_ns_changed();
+                                true
+                            })
+                        });
+                    }
+                    Err(err) => {
+                        warn!("admin mailbox failed: {err}");
+                        return;
+                    }
+                }
+            }
+        });
+    })?;
+    Ok(tx)
+}
+
+fn spawn_pinned(
+    name: String,
+    core_id: Option<usize>,
+    body: impl FnOnce() + Send + 'static,
+) -> io::Result<()> {
     std::thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
@@ -86,78 +175,73 @@ fn spawn_queue_thread(name: String, core_id: Option<usize>) -> io::Result<Mailbo
                     warn!(thread = %name, core, "could not pin thread");
                 }
             }
-            let rt = match QueueRuntime::new(RingConfig::default()) {
-                Ok(rt) => rt,
-                Err(err) => {
-                    warn!(thread = %name, "queue runtime failed: {err}");
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(conn) => {
-                            tokio::task::spawn_local(run_queue(conn));
-                        }
-                        Err(err) => {
-                            warn!(thread = %name, "mailbox failed: {err}");
-                            return;
-                        }
-                    }
-                }
-            });
+            body();
         })?;
-    Ok(tx)
+    Ok(())
 }
 
-/// Build the port snapshot: one NVM subsystem, one namespace.
+/// Run a queue-thread runtime whose main future receives a spawner for
+/// connections.
+fn run_queue_thread<F, Fut>(name: String, main: F)
+where
+    F: FnOnce(fn(Conn)) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    fn spawner(conn: Conn) {
+        tokio::task::spawn_local(run_queue(conn, |_| {}));
+    }
+    let rt = match QueueRuntime::new(RingConfig::default()) {
+        Ok(rt) => rt,
+        Err(err) => {
+            warn!(thread = %name, "queue runtime failed: {err}");
+            return;
+        }
+    };
+    rt.block_on(main(spawner));
+}
+
+/// Build the port snapshot from the configured subsystems.
 fn build_port(config: &TargetConfig) -> io::Result<Arc<PortConfig<AnyBackend>>> {
-    // 512B blocks: the most interop-tested format.
-    let block_shift = 9;
-    let backend = Arc::new(match &config.backend {
-        BackendSpec::Memory => {
-            AnyBackend::Memory(MemoryBackend::new(config.mem_size_mb << 20, block_shift))
+    let mut subsystems = BTreeMap::new();
+    for spec in &config.subsystems {
+        let mut namespaces = BTreeMap::new();
+        for ns in &spec.namespaces {
+            let backend = build_backend(&ns.backend).map_err(io::Error::other)?;
+            let mut uuid = [0u8; 16];
+            uuid[..4].copy_from_slice(&ns.nsid.to_be_bytes());
+            uuid[8] = 0x80;
+            namespaces.insert(
+                ns.nsid,
+                Arc::new(Namespace {
+                    nsid: ns.nsid,
+                    backend: Arc::new(backend),
+                    uuid,
+                }),
+            );
         }
-        BackendSpec::Null => {
-            AnyBackend::Null(NullBackend::new(config.mem_size_mb << 20, block_shift))
-        }
-        BackendSpec::File(path) => {
-            let file = FileBackend::open(path, block_shift)?;
-            if !file.is_direct() {
-                warn!(?path, "O_DIRECT unavailable; using buffered IO");
-            }
-            AnyBackend::File(file)
-        }
-    });
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&0x696F_7574_6774_0001u64.to_be_bytes()); // "ioutgt"
-    uuid[8] = 0x80;
-    let namespace = Arc::new(Namespace {
-        nsid: 1,
-        backend,
-        uuid,
-    });
-    let subsystem = Arc::new(Subsystem {
-        nqn: config.subsys_nqn.clone(),
-        serial: "IOUTGT0001".into(),
-        model: "ioutgt".into(),
-        namespaces: BTreeMap::from([(1u32, namespace)]),
-        max_qid: u16::try_from(config.io_threads.max(1)).unwrap_or(1),
-        allow_any_host: true,
-    });
+        let subsystem = Arc::new(Subsystem::new(
+            spec.nqn.clone(),
+            spec.serial.clone(),
+            spec.model.clone(),
+            u16::try_from(config.io_threads.max(1)).unwrap_or(1),
+            spec.allow_any_host,
+            namespaces,
+        ));
+        subsystems.insert(spec.nqn.clone(), subsystem);
+    }
     Ok(Arc::new(PortConfig {
         traddr: config.listen.ip().to_string(),
         trsvcid: config.listen.port().to_string(),
-        subsystems: BTreeMap::from([(config.subsys_nqn.clone(), subsystem)]),
+        subsystems,
     }))
 }
 
 /// Start every thread of a target; returns the bound address (for
 /// ephemeral-port tests). Runs until the process exits.
 pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
-    let admin_tx = spawn_queue_thread("ioutgt-admin".into(), None)?;
+    let admin_tx = spawn_admin_thread("ioutgt-admin".into())?;
     let io_txs: Vec<MailboxSender<Conn>> = (0..config.io_threads)
-        .map(|i| spawn_queue_thread(format!("ioutgt-io{i}"), config.pin_threads.then_some(i + 1)))
+        .map(|i| spawn_io_thread(format!("ioutgt-io{i}"), config.pin_threads.then_some(i + 1)))
         .collect::<io::Result<_>>()?;
 
     // The control thread reports the bound address back synchronously.
@@ -185,7 +269,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
 
 async fn control_loop(
     config: TargetConfig,
-    admin_tx: MailboxSender<Conn>,
+    admin_tx: MailboxSender<AdminMsg>,
     io_txs: Vec<MailboxSender<Conn>>,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
@@ -197,6 +281,28 @@ async fn control_loop(
             return;
         }
     };
+
+    // Runtime control API.
+    if let Some(path) = &config.control_socket {
+        let _ = std::fs::remove_file(path);
+        match tokio::net::UnixListener::bind(path) {
+            Ok(listener) => {
+                let nudge_tx = admin_tx.clone();
+                let state = Arc::new(CtlState {
+                    port: Arc::clone(&port),
+                    registry: Arc::clone(&registry),
+                    notify_ns_changed: Box::new(move || nudge_tx.send(AdminMsg::NsChanged)),
+                });
+                info!(path = %path.display(), "control socket listening");
+                tokio::task::spawn_local(ioutgt_control::server::serve(listener, state));
+            }
+            Err(err) => {
+                let _ = addr_tx.send(Err(err));
+                return;
+            }
+        }
+    }
+
     let listener = match tokio::net::TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -249,7 +355,7 @@ async fn setup_connection(
     mut stream: tokio::net::TcpStream,
     allow_hdgst: bool,
     allow_ddgst: bool,
-    admin_tx: &MailboxSender<Conn>,
+    admin_tx: &MailboxSender<AdminMsg>,
     io_txs: &[MailboxSender<Conn>],
     port: Arc<PortConfig<AnyBackend>>,
     registry: Arc<Registry>,
@@ -275,7 +381,7 @@ async fn setup_connection(
     let sqhd_disabled = connect.cattr & CONNECT_DISABLE_SQFLOW != 0;
 
     let std_stream = stream.into_std()?;
-    let conn = QueueConn {
+    let conn = Conn {
         fd: OwnedFd::from(std_stream),
         hdr_digest: negotiated.hdr_digest,
         data_digest: negotiated.data_digest,
@@ -289,7 +395,7 @@ async fn setup_connection(
         registry,
     };
     if qid == 0 {
-        admin_tx.send(conn);
+        admin_tx.send(AdminMsg::Conn(conn));
     } else if io_txs.is_empty() {
         return Err(io::Error::other("no IO threads"));
     } else {
