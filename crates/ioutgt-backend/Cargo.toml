@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+ioutgt-core = { workspace = true }
 
 [lints]
 workspace = true
