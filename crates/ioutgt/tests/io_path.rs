@@ -173,6 +173,7 @@ fn run_io_flow(hdgst: bool, ddgst: bool) {
         pin_threads: false,
         subsys_nqn: NQN.into(),
         mem_size_mb: 16,
+        backend: ioutgt::BackendSpec::Memory,
     })
     .expect("target start");
 

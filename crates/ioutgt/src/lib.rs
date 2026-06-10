@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, mpsc};
 
-use ioutgt_backend::{AnyBackend, MemoryBackend};
+use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend};
 use ioutgt_core::controller::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_tcp::connection::{QueueConn, run_queue};
@@ -33,9 +33,23 @@ pub struct TargetConfig {
     pub pin_threads: bool,
     /// NVM subsystem NQN served on this port.
     pub subsys_nqn: String,
-    /// Memory-backend namespace size in MiB (the M4 bring-up backend;
-    /// file/block backends arrive next milestone).
+    /// Memory/null namespace size in MiB.
     pub mem_size_mb: u64,
+    /// Namespace backend.
+    pub backend: BackendSpec,
+}
+
+/// Which backend serves namespace 1 (the JSON config schema replaces
+/// this in the control-plane milestone).
+#[derive(Debug, Clone, Default)]
+pub enum BackendSpec {
+    /// RAM-backed (tests, bring-up).
+    #[default]
+    Memory,
+    /// Discard writes, zero reads (protocol-overhead measurement).
+    Null,
+    /// O_DIRECT file or block device at this path.
+    File(std::path::PathBuf),
 }
 
 impl Default for TargetConfig {
@@ -48,6 +62,7 @@ impl Default for TargetConfig {
             pin_threads: false,
             subsys_nqn: "nqn.2026-06.io.ioutgt:test".into(),
             mem_size_mb: 64,
+            backend: BackendSpec::Memory,
         }
     }
 }
@@ -95,12 +110,25 @@ fn spawn_queue_thread(name: String, core_id: Option<usize>) -> io::Result<Mailbo
     Ok(tx)
 }
 
-/// Build the port snapshot: one NVM subsystem with a memory namespace.
-fn build_port(config: &TargetConfig) -> Arc<PortConfig<AnyBackend>> {
-    let backend = Arc::new(AnyBackend::Memory(MemoryBackend::new(
-        config.mem_size_mb << 20,
-        9, // 512B blocks: the most interop-tested format
-    )));
+/// Build the port snapshot: one NVM subsystem, one namespace.
+fn build_port(config: &TargetConfig) -> io::Result<Arc<PortConfig<AnyBackend>>> {
+    // 512B blocks: the most interop-tested format.
+    let block_shift = 9;
+    let backend = Arc::new(match &config.backend {
+        BackendSpec::Memory => {
+            AnyBackend::Memory(MemoryBackend::new(config.mem_size_mb << 20, block_shift))
+        }
+        BackendSpec::Null => {
+            AnyBackend::Null(NullBackend::new(config.mem_size_mb << 20, block_shift))
+        }
+        BackendSpec::File(path) => {
+            let file = FileBackend::open(path, block_shift)?;
+            if !file.is_direct() {
+                warn!(?path, "O_DIRECT unavailable; using buffered IO");
+            }
+            AnyBackend::File(file)
+        }
+    });
     let mut uuid = [0u8; 16];
     uuid[..8].copy_from_slice(&0x696F_7574_6774_0001u64.to_be_bytes()); // "ioutgt"
     uuid[8] = 0x80;
@@ -117,11 +145,11 @@ fn build_port(config: &TargetConfig) -> Arc<PortConfig<AnyBackend>> {
         max_qid: u16::try_from(config.io_threads.max(1)).unwrap_or(1),
         allow_any_host: true,
     });
-    Arc::new(PortConfig {
+    Ok(Arc::new(PortConfig {
         traddr: config.listen.ip().to_string(),
         trsvcid: config.listen.port().to_string(),
         subsystems: BTreeMap::from([(config.subsys_nqn.clone(), subsystem)]),
-    })
+    }))
 }
 
 /// Start every thread of a target; returns the bound address (for
@@ -162,7 +190,13 @@ async fn control_loop(
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
     let registry = Registry::new();
-    let port = build_port(&config);
+    let port = match build_port(&config) {
+        Ok(port) => port,
+        Err(err) => {
+            let _ = addr_tx.send(Err(err));
+            return;
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(err) => {

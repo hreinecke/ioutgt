@@ -32,6 +32,10 @@ struct Args {
     /// Memory-backend namespace size in MiB.
     #[arg(long, default_value_t = 64)]
     mem_size_mb: u64,
+
+    /// Namespace backend: memory, null, or a file/blockdev path.
+    #[arg(long, default_value = "memory")]
+    backend: String,
 }
 
 fn main() -> std::io::Result<()> {
@@ -50,6 +54,11 @@ fn main() -> std::io::Result<()> {
         pin_threads: args.pin,
         subsys_nqn: args.subsys_nqn,
         mem_size_mb: args.mem_size_mb,
+        backend: match args.backend.as_str() {
+            "memory" => ioutgt::BackendSpec::Memory,
+            "null" => ioutgt::BackendSpec::Null,
+            path => ioutgt::BackendSpec::File(path.into()),
+        },
     };
     let addr = ioutgt::spawn_target(config)?;
     eprintln!("ioutgt listening on {addr}");
