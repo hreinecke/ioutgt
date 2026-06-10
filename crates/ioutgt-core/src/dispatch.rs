@@ -65,7 +65,9 @@ pub struct AdminState<B> {
 pub struct IoState<B> {
     /// Set once the IO-queue Connect validates against the registry.
     pub cntlid: Cell<u16>,
-    pub subsys: RefCell<Option<Arc<Subsystem<B>>>>,
+    /// Write-once at Connect: readable without a borrow guard, so slot
+    /// tasks can hold `&Subsystem` across backend awaits safely.
+    pub subsys: std::cell::OnceCell<Arc<Subsystem<B>>>,
 }
 
 impl<B: Backend> ConnCtx<B> {
@@ -109,7 +111,7 @@ impl<B: Backend> ConnCtx<B> {
             connect_data,
             role: Role::Io(IoState {
                 cntlid: Cell::new(0),
-                subsys: RefCell::new(None),
+                subsys: std::cell::OnceCell::new(),
             }),
         })
     }
@@ -177,9 +179,6 @@ pub async fn execute<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, sqe: &Sqe) -> O
             }
             crate::admin::execute(ctx, admin, tag, sqe).await
         }
-        Role::Io(_) => {
-            // IO commands land with the IO milestone.
-            Outcome::status(ctx.cqe(0, sqe.cid.get(), status::INVALID_OPCODE | status::DNR))
-        }
+        Role::Io(io) => crate::io::execute(ctx, io, tag, sqe).await,
     }
 }

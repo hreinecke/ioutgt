@@ -116,6 +116,21 @@ pub struct Completion {
     pub data_len: u32,
 }
 
+/// One unit of work for the transport's send path. R2Ts originate from
+/// the receive path (solicit write data) but must serialize with
+/// responses on the wire, so they travel through the same queue.
+#[derive(Debug, Clone, Copy)]
+#[allow(missing_docs)]
+pub enum SendWork {
+    Response(Completion),
+    R2t {
+        tag: u16,
+        cid: u16,
+        offset: u32,
+        length: u32,
+    },
+}
+
 /// The per-queue state shared by recv path, slot tasks, and send path
 /// (single thread; shared via `Rc`).
 #[allow(missing_docs)]
@@ -128,7 +143,7 @@ pub struct QueueCore {
     sqhd: Cell<u16>,
     /// Host requested SQ flow control disabled (Connect cattr bit).
     pub sqhd_disabled: bool,
-    completions: RefCell<VecDeque<Completion>>,
+    send_work: RefCell<VecDeque<SendWork>>,
     send_waker: Cell<Option<Waker>>,
 }
 
@@ -146,7 +161,7 @@ impl QueueCore {
             free_tags: RefCell::new(free_tags),
             sqhd: Cell::new(0),
             sqhd_disabled,
-            completions: RefCell::new(VecDeque::with_capacity(usize::from(sqsize))),
+            send_work: RefCell::new(VecDeque::with_capacity(usize::from(sqsize) * 2)),
             send_waker: Cell::new(None),
         })
     }
@@ -214,19 +229,33 @@ impl QueueCore {
         let slot = self.slot(tag);
         debug_assert_eq!(slot.state.get(), SlotState::Executing);
         slot.state.set(SlotState::Responding);
-        self.completions
-            .borrow_mut()
-            .push_back(Completion { tag, cqe, data_len });
+        self.push_send_work(SendWork::Response(Completion { tag, cqe, data_len }));
+    }
+
+    /// Queue an R2T soliciting write data for `tag` (recv path side;
+    /// the slot stays `Receiving`).
+    pub fn solicit(&self, tag: u16, cid: u16, offset: u32, length: u32) {
+        debug_assert_eq!(self.slot(tag).state.get(), SlotState::Receiving);
+        self.push_send_work(SendWork::R2t {
+            tag,
+            cid,
+            offset,
+            length,
+        });
+    }
+
+    fn push_send_work(&self, work: SendWork) {
+        self.send_work.borrow_mut().push_back(work);
         if let Some(waker) = self.send_waker.take() {
             waker.wake();
         }
     }
 
-    /// Await the next completion (send path side).
-    pub async fn next_completion(self: &Rc<QueueCore>) -> Completion {
+    /// Await the next send-path work item.
+    pub async fn next_send_work(self: &Rc<QueueCore>) -> SendWork {
         std::future::poll_fn(|cx| {
-            if let Some(completion) = self.completions.borrow_mut().pop_front() {
-                return Poll::Ready(completion);
+            if let Some(work) = self.send_work.borrow_mut().pop_front() {
+                return Poll::Ready(work);
             }
             self.send_waker.set(Some(cx.waker().clone()));
             Poll::Pending

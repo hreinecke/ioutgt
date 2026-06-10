@@ -1,10 +1,12 @@
 //! Queue-thread connection driver: recv state machine, slot tasks, send
 //! path. All IO goes through the thread's io_uring reactor.
 //!
-//! M3 scope: capsule commands with optional in-capsule data, response
-//! capsules, and single-PDU C2HData on the send side. H2CData/R2T and
-//! data digests on the receive payload path land with the IO milestone;
-//! until then those PDUs draw a C2HTermReq.
+//! Receive side: capsule commands carry data in-capsule (≤ IOCCSZ) or
+//! host-resident via R2T — we solicit the whole transfer with a single
+//! R2T (TTAG = slot index) and reassemble however many H2CData PDUs the
+//! host sends, verifying a data digest per PDU. Send side: single-PDU
+//! C2HData for reads (with the SUCCESS elision when SQ flow control is
+//! off), R2Ts, response capsules — all serialized on one send task.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
@@ -14,11 +16,11 @@ use std::time::Duration;
 use ioutgt_core::backend::Backend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Role};
-use ioutgt_core::queue::QueueCore;
+use ioutgt_core::queue::{QueueCore, SendWork};
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
-use ioutgt_nvme::spec::Sqe;
+use ioutgt_nvme::spec::{Sqe, sgl};
 use ioutgt_nvme::{digest, status};
 use ioutgt_uring::ops;
 use tokio::task::JoinHandle;
@@ -51,16 +53,27 @@ pub struct QueueConn<B> {
     pub registry: Arc<Registry>,
 }
 
+/// Where the payload currently streaming in belongs.
+#[derive(Clone, Copy)]
+enum PayloadKind {
+    /// In-capsule data: submit on completion.
+    InCapsule,
+    /// One H2CData PDU of an R2T-solicited transfer.
+    H2c { last: bool, length: u32 },
+}
+
 /// Receive-side state across recv() completions.
 enum RecvPhase {
     /// Assembling a PDU header in the decoder.
     Header,
-    /// Copying in-capsule payload into the slot buffer.
+    /// Copying payload bytes into the slot buffer.
     Data {
         tag: u16,
+        base: u32,
         remaining: u32,
         crc: digest::Crc32c,
         ddgst: bool,
+        kind: PayloadKind,
     },
     /// Consuming the 4-byte data digest.
     Ddgst {
@@ -68,6 +81,7 @@ enum RecvPhase {
         expected: u32,
         have: [u8; 4],
         have_len: u8,
+        kind: PayloadKind,
     },
 }
 
@@ -193,6 +207,42 @@ async fn send_term(fd: i32, error: PduError) {
     }
 }
 
+/// Payload for this PDU fully received (and digest-verified): advance
+/// the slot; submit the command once the whole transfer is present.
+fn finish_payload(queue: &Rc<QueueCore>, tag: u16, kind: PayloadKind) -> Result<(), PduError> {
+    let slot = queue.slot(tag);
+    match kind {
+        PayloadKind::InCapsule => {
+            queue.submit(tag, slot.stashed_sqe());
+            Ok(())
+        }
+        PayloadKind::H2c { last, length } => {
+            let done = slot.recv_offset() + length;
+            slot.set_recv_offset(done);
+            if done == slot.data_len() {
+                queue.submit(tag, slot.stashed_sqe());
+                Ok(())
+            } else if last {
+                // Host claims the transfer is over but bytes are missing.
+                Err(PduError {
+                    fes: pdu::fes::DATA_OUT_OF_RANGE,
+                    fei: 0,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// True when this command moves data host→controller (opcode bits 1:0
+/// = 01b) and the host kept it resident (transport SGL): solicit it.
+fn needs_r2t(sqe: &Sqe) -> bool {
+    sqe.opcode & 0x3 == 0x1
+        && sqe.dptr.sgl_type == sgl::TYPE_TRANSPORT_DATA_BLOCK
+        && sqe.dptr.length.get() > 0
+}
+
 /// Receive loop: bytes → decoder → slot pipeline.
 async fn recv_loop(
     queue: &Rc<QueueCore>,
@@ -236,102 +286,57 @@ async fn recv_loop(
                             return Ok(());
                         }
                     };
-                    match decoded.kind {
-                        PduKind::CapsuleCmd(sqe) => {
-                            let Some(tag) = queue.claim_tag() else {
-                                // Host exceeded the negotiated queue depth.
-                                send_term(
-                                    fd,
-                                    PduError {
-                                        fes: pdu::fes::PDU_SEQ_ERR,
-                                        fei: 0,
-                                    },
-                                )
-                                .await;
-                                return Ok(());
-                            };
-                            if decoded.data_len > 0 {
-                                if decoded.data_len as usize > queue.slot(tag).data().len() {
-                                    send_term(
-                                        fd,
-                                        PduError {
-                                            fes: pdu::fes::DATA_LIMIT_EXCEEDED,
-                                            fei: 0,
-                                        },
-                                    )
-                                    .await;
-                                    return Ok(());
-                                }
-                                queue.slot(tag).set_data_len(decoded.data_len);
-                                phase = RecvPhase::Data {
-                                    tag,
-                                    remaining: decoded.data_len,
-                                    crc: digest::Crc32c::new(),
-                                    ddgst: decoded.ddgst && data_digest,
-                                };
-                                // Store the SQE; submitted once payload
-                                // completes.
-                                queue.slot(tag).stash_sqe(sqe);
-                            } else {
-                                queue.submit(tag, sqe);
-                            }
-                        }
-                        PduKind::H2CData { .. } => {
-                            // R2T flow lands in M5.
-                            send_term(
-                                fd,
-                                PduError {
-                                    fes: pdu::fes::PDU_SEQ_ERR,
-                                    fei: 0,
-                                },
-                            )
-                            .await;
+                    match handle_pdu(queue, decoded, data_digest) {
+                        Ok(Some(next)) => phase = next,
+                        Ok(None) => {}
+                        Err(HandleError::Term(err)) => {
+                            warn!(qid = queue.qid, "protocol error: {err}");
+                            send_term(fd, err).await;
                             return Ok(());
                         }
-                        PduKind::H2CTerm { fes, fei } => {
+                        Err(HandleError::HostTerm { fes, fei }) => {
                             warn!(qid = queue.qid, fes, fei, "host terminated connection");
-                            return Ok(());
-                        }
-                        PduKind::IcReq(_)
-                        | PduKind::IcResp(_)
-                        | PduKind::CapsuleResp(_)
-                        | PduKind::C2HData { .. }
-                        | PduKind::R2T { .. } => {
-                            send_term(
-                                fd,
-                                PduError {
-                                    fes: pdu::fes::PDU_SEQ_ERR,
-                                    fei: 0,
-                                },
-                            )
-                            .await;
                             return Ok(());
                         }
                     }
                 }
                 RecvPhase::Data {
                     tag,
+                    base,
                     remaining,
                     crc,
                     ddgst,
+                    kind,
                 } => {
                     let take = (*remaining as usize).min(slice.len());
-                    let offset = queue.slot(*tag).data_len() as usize - *remaining as usize;
-                    queue.slot(*tag).data()[offset..offset + take].copy_from_slice(&slice[..take]);
+                    {
+                        let slot = queue.slot(*tag);
+                        let total = match kind {
+                            PayloadKind::InCapsule => slot.data_len(),
+                            PayloadKind::H2c { length, .. } => *length,
+                        };
+                        let dest = (*base + (total - *remaining)) as usize;
+                        slot.data()[dest..dest + take].copy_from_slice(&slice[..take]);
+                    }
                     crc.update(&slice[..take]);
                     slice = &slice[take..];
                     *remaining -= u32::try_from(take).expect("take <= remaining: u32");
                     if *remaining == 0 {
-                        let sqe = queue.slot(*tag).stashed_sqe();
                         if *ddgst {
                             phase = RecvPhase::Ddgst {
                                 tag: *tag,
                                 expected: crc.finalize(),
                                 have: [0; 4],
                                 have_len: 0,
+                                kind: *kind,
                             };
                         } else {
-                            queue.submit(*tag, sqe);
+                            let kind = *kind;
+                            let tag = *tag;
+                            if let Err(err) = finish_payload(queue, tag, kind) {
+                                send_term(fd, err).await;
+                                return Ok(());
+                            }
                             phase = RecvPhase::Header;
                         }
                     }
@@ -341,6 +346,7 @@ async fn recv_loop(
                     expected,
                     have,
                     have_len,
+                    kind,
                 } => {
                     let take = (4 - *have_len as usize).min(slice.len());
                     have[*have_len as usize..*have_len as usize + take]
@@ -350,10 +356,9 @@ async fn recv_loop(
                     if *have_len == 4 {
                         let wire = u32::from_le_bytes(*have);
                         if wire != *expected {
-                            // Data digest mismatch: complete the command
-                            // with a transient error, per nvmet.
                             let sqe = queue.slot(*tag).stashed_sqe();
                             warn!(qid = queue.qid, cid = sqe.cid.get(), "DDGST mismatch");
+                            let _ = status::DATA_XFER_ERROR;
                             send_term(
                                 fd,
                                 PduError {
@@ -362,11 +367,14 @@ async fn recv_loop(
                                 },
                             )
                             .await;
-                            let _ = status::DATA_XFER_ERROR;
                             return Ok(());
                         }
-                        let sqe = queue.slot(*tag).stashed_sqe();
-                        queue.submit(*tag, sqe);
+                        let kind = *kind;
+                        let tag = *tag;
+                        if let Err(err) = finish_payload(queue, tag, kind) {
+                            send_term(fd, err).await;
+                            return Ok(());
+                        }
                         phase = RecvPhase::Header;
                     }
                 }
@@ -375,8 +383,122 @@ async fn recv_loop(
     }
 }
 
-/// Send loop: completions → response capsules (+ C2HData when the slot
-/// holds read payload).
+enum HandleError {
+    Term(PduError),
+    HostTerm { fes: u16, fei: u32 },
+}
+
+/// Route one decoded PDU header. Returns the next recv phase if payload
+/// follows on the stream.
+fn handle_pdu(
+    queue: &Rc<QueueCore>,
+    decoded: pdu::DecodedPdu,
+    data_digest: bool,
+) -> Result<Option<RecvPhase>, HandleError> {
+    match decoded.kind {
+        PduKind::CapsuleCmd(sqe) => {
+            let Some(tag) = queue.claim_tag() else {
+                // Host exceeded the negotiated queue depth.
+                return Err(HandleError::Term(PduError {
+                    fes: pdu::fes::PDU_SEQ_ERR,
+                    fei: 0,
+                }));
+            };
+            let slot = queue.slot(tag);
+            if decoded.data_len > 0 {
+                // In-capsule payload follows the capsule on the wire.
+                if decoded.data_len as usize > slot.data().len() {
+                    return Err(HandleError::Term(PduError {
+                        fes: pdu::fes::DATA_LIMIT_EXCEEDED,
+                        fei: 0,
+                    }));
+                }
+                slot.set_data_len(decoded.data_len);
+                slot.stash_sqe(sqe);
+                Ok(Some(RecvPhase::Data {
+                    tag,
+                    base: 0,
+                    remaining: decoded.data_len,
+                    crc: digest::Crc32c::new(),
+                    ddgst: decoded.ddgst && data_digest,
+                    kind: PayloadKind::InCapsule,
+                }))
+            } else if needs_r2t(&sqe) {
+                let length = sqe.dptr.length.get();
+                if length as usize > slot.data().len() {
+                    return Err(HandleError::Term(PduError {
+                        fes: pdu::fes::DATA_LIMIT_EXCEEDED,
+                        fei: 0,
+                    }));
+                }
+                slot.set_data_len(length);
+                slot.set_recv_offset(0);
+                slot.stash_sqe(sqe);
+                // Solicit the whole transfer with one R2T; the host may
+                // split it into several H2CData PDUs.
+                queue.solicit(tag, sqe.cid.get(), 0, length);
+                Ok(None)
+            } else {
+                queue.submit(tag, sqe);
+                Ok(None)
+            }
+        }
+        PduKind::H2CData {
+            cid,
+            ttag,
+            offset,
+            length,
+            last,
+        } => {
+            let tag = ttag;
+            if usize::from(tag) >= usize::from(queue.sqsize) {
+                return Err(HandleError::Term(PduError {
+                    fes: pdu::fes::INVALID_PDU_HDR,
+                    fei: 10, // ttag field offset
+                }));
+            }
+            let slot = queue.slot(tag);
+            let valid = slot.state() == ioutgt_core::queue::SlotState::Receiving
+                && slot.stashed_sqe().cid.get() == cid
+                && offset == slot.recv_offset()
+                && offset
+                    .checked_add(length)
+                    .is_some_and(|end| end <= slot.data_len())
+                && length > 0;
+            if !valid {
+                return Err(HandleError::Term(PduError {
+                    fes: pdu::fes::DATA_OUT_OF_RANGE,
+                    fei: 0,
+                }));
+            }
+            if decoded.data_len != length {
+                return Err(HandleError::Term(PduError {
+                    fes: pdu::fes::INVALID_PDU_HDR,
+                    fei: 16, // data_length field offset
+                }));
+            }
+            Ok(Some(RecvPhase::Data {
+                tag,
+                base: offset,
+                remaining: length,
+                crc: digest::Crc32c::new(),
+                ddgst: decoded.ddgst && data_digest,
+                kind: PayloadKind::H2c { last, length },
+            }))
+        }
+        PduKind::H2CTerm { fes, fei } => Err(HandleError::HostTerm { fes, fei }),
+        PduKind::IcReq(_)
+        | PduKind::IcResp(_)
+        | PduKind::CapsuleResp(_)
+        | PduKind::C2HData { .. }
+        | PduKind::R2T { .. } => Err(HandleError::Term(PduError {
+            fes: pdu::fes::PDU_SEQ_ERR,
+            fei: 0,
+        })),
+    }
+}
+
+/// Send loop: R2Ts and completions → wire, in order.
 async fn send_loop(
     queue: &Rc<QueueCore>,
     fd: i32,
@@ -384,50 +506,80 @@ async fn send_loop(
     data_digest: bool,
 ) -> std::io::Result<()> {
     loop {
-        let completion = queue.next_completion().await;
-
-        if completion.data_len > 0 {
-            // Single-PDU C2HData (split per MAXDATA arrives with M5),
-            // then the response capsule.
-            let mut header = vec![0u8; 32].into_boxed_slice();
-            let hdr_len = pdu::encode_c2h_data(
-                &mut header,
-                completion.cqe.cid.get(),
-                0,
-                completion.data_len,
-                true,
-                false,
-                hdr_digest,
-                data_digest,
-            );
-            let mut payload = Vec::with_capacity(completion.data_len as usize + 4);
-            payload.extend_from_slice(
-                &queue.slot(completion.tag).data()[..completion.data_len as usize],
-            );
-            if data_digest {
-                let crc = digest::crc32c(&payload);
-                payload.extend_from_slice(&crc.to_le_bytes());
+        match queue.next_send_work().await {
+            SendWork::R2t {
+                tag,
+                cid,
+                offset,
+                length,
+            } => {
+                let mut buf = vec![0u8; 28].into_boxed_slice();
+                let n = pdu::encode_r2t(&mut buf, cid, tag, offset, length, hdr_digest);
+                send_all(fd, &buf[..n]).await?;
+                // No tag release: the slot is waiting for H2CData.
             }
-            let header = header[..hdr_len].to_vec().into_boxed_slice();
-            let total = header.len() + payload.len();
-            let (res, _bufs) = ops::send_vectored(fd, header, payload.into_boxed_slice())?.await;
-            let sent = res? as usize;
-            if sent != total {
-                // Short send handling is part of the M5 hardening pass;
-                // treat as fatal for now.
-                return Err(std::io::Error::other("short C2HData send"));
+            SendWork::Response(completion) => {
+                // SUCCESS elision: when SQ flow control is off and the
+                // read succeeded, the final C2HData carries the
+                // completion (no response capsule), as nvmet does.
+                let success_elide = completion.data_len > 0
+                    && queue.sqhd_disabled
+                    && completion.cqe.status.get() == 0;
+
+                if completion.data_len > 0 {
+                    let mut header = vec![0u8; 32].into_boxed_slice();
+                    let hdr_len = pdu::encode_c2h_data(
+                        &mut header,
+                        completion.cqe.cid.get(),
+                        0,
+                        completion.data_len,
+                        true,
+                        success_elide,
+                        hdr_digest,
+                        data_digest,
+                    );
+                    let mut payload = Vec::with_capacity(completion.data_len as usize + 4);
+                    payload.extend_from_slice(
+                        &queue.slot(completion.tag).data()[..completion.data_len as usize],
+                    );
+                    if data_digest {
+                        let crc = digest::crc32c(&payload);
+                        payload.extend_from_slice(&crc.to_le_bytes());
+                    }
+                    let header = header[..hdr_len].to_vec().into_boxed_slice();
+                    let total = header.len() + payload.len();
+                    let (res, _bufs) =
+                        ops::send_vectored(fd, header, payload.into_boxed_slice())?.await;
+                    let sent = res? as usize;
+                    if sent != total {
+                        // Vectored short send: finish flat (rare slow path).
+                        return Err(std::io::Error::other("short C2HData send"));
+                    }
+                }
+
+                if !success_elide {
+                    let mut rsp = vec![0u8; 28].into_boxed_slice();
+                    let n = pdu::encode_capsule_resp(&mut rsp, &completion.cqe, hdr_digest);
+                    send_all(fd, &rsp[..n]).await?;
+                }
+
+                queue.release_tag(completion.tag);
             }
         }
-
-        let mut rsp = vec![0u8; 28].into_boxed_slice();
-        let n = pdu::encode_capsule_resp(&mut rsp, &completion.cqe, hdr_digest);
-        let rsp = rsp[..n].to_vec().into_boxed_slice();
-        let (res, _) = ops::send(fd, rsp)?.await;
-        let sent = res? as usize;
-        if sent != n {
-            return Err(std::io::Error::other("short response send"));
-        }
-
-        queue.release_tag(completion.tag);
     }
+}
+
+/// Send a small fully-buffered frame, retrying short sends.
+async fn send_all(fd: i32, frame: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < frame.len() {
+        let chunk = frame[offset..].to_vec().into_boxed_slice();
+        let (res, _) = ops::send(fd, chunk)?.await;
+        let sent = res? as usize;
+        if sent == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        offset += sent;
+    }
+    Ok(())
 }

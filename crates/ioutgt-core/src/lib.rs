@@ -15,6 +15,7 @@ pub mod backend;
 pub mod controller;
 pub mod dispatch;
 pub mod fabrics_exec;
+pub mod io;
 pub mod queue;
 pub mod subsystem;
 
