@@ -19,6 +19,8 @@ use std::task::{Poll, Waker};
 
 use ioutgt_nvme::spec::{Cqe, Sqe};
 
+use crate::buf::AlignedBuf;
+
 /// Slot lifecycle. Transitions are all same-thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
@@ -42,8 +44,9 @@ pub struct CmdSlot {
     /// Slot task doorbell.
     waker: Cell<Option<Waker>>,
     /// Data buffer: write payload in, read payload out. Sized at queue
-    /// creation (admin: 8 KiB; IO: MDTS).
-    data: RefCell<Box<[u8]>>,
+    /// creation (admin: 8 KiB; IO: MDTS); 4K-aligned for O_DIRECT
+    /// backends.
+    data: RefCell<AlignedBuf>,
     /// Valid bytes in `data` (received payload or response data).
     data_len: Cell<u32>,
     /// Reassembly cursor for multi-PDU H2C transfers.
@@ -57,7 +60,7 @@ impl CmdSlot {
             state: Cell::new(SlotState::Free),
             sqe: Cell::new(Sqe::zeroed()),
             waker: Cell::new(None),
-            data: RefCell::new(vec![0u8; buf_size].into_boxed_slice()),
+            data: RefCell::new(AlignedBuf::zeroed(buf_size)),
             data_len: Cell::new(0),
             recv_offset: Cell::new(0),
         }
@@ -71,8 +74,9 @@ impl CmdSlot {
         self.sqe.get()
     }
 
-    /// Borrow the slot data buffer (short-lived: one copy in/out).
-    pub fn data(&self) -> std::cell::RefMut<'_, Box<[u8]>> {
+    /// Borrow the slot data buffer (short-lived: one copy in/out, or
+    /// held across a backend await while the slot is `Executing`).
+    pub fn data(&self) -> std::cell::RefMut<'_, AlignedBuf> {
         self.data.borrow_mut()
     }
 
@@ -145,6 +149,10 @@ pub struct QueueCore {
     pub sqhd_disabled: bool,
     send_work: RefCell<VecDeque<SendWork>>,
     send_waker: Cell<Option<Waker>>,
+    /// Slots currently inside dispatch (possibly awaiting a backend op
+    /// that references slot memory). Teardown drains this to zero
+    /// before freeing the slots.
+    executing: Cell<u16>,
 }
 
 impl QueueCore {
@@ -163,6 +171,7 @@ impl QueueCore {
             sqhd_disabled,
             send_work: RefCell::new(VecDeque::with_capacity(usize::from(sqsize) * 2)),
             send_waker: Cell::new(None),
+            executing: Cell::new(0),
         })
     }
 
@@ -202,6 +211,7 @@ impl QueueCore {
             match slot.state.get() {
                 SlotState::Ready => {
                     slot.state.set(SlotState::Executing);
+                    self.executing.set(self.executing.get() + 1);
                     Poll::Ready(slot.sqe.get())
                 }
                 _ => {
@@ -229,6 +239,7 @@ impl QueueCore {
         let slot = self.slot(tag);
         debug_assert_eq!(slot.state.get(), SlotState::Executing);
         slot.state.set(SlotState::Responding);
+        self.executing.set(self.executing.get() - 1);
         self.push_send_work(SendWork::Response(Completion { tag, cqe, data_len }));
     }
 
@@ -272,6 +283,12 @@ impl QueueCore {
         self.free_tags.borrow_mut().push(tag);
     }
 
+    /// Slots currently executing a command (teardown gate: their
+    /// backend ops may reference slot memory).
+    pub fn executing(&self) -> u16 {
+        self.executing.get()
+    }
+
     /// All slots free — used by teardown drains and leak assertions.
     pub fn idle(&self) -> bool {
         self.free_tags.borrow().len() == usize::from(self.sqsize)
@@ -302,13 +319,21 @@ mod tests {
         assert!(q.claim_tag().is_none());
         assert!(!q.idle());
 
-        // Walk one slot through the full lifecycle.
+        // Walk one slot through the full lifecycle, including the
+        // await_command transition (polled manually; it is Ready).
         let tag = tags[0];
         q.submit(tag, Sqe::zeroed());
         assert_eq!(q.slot(tag).state(), SlotState::Ready);
-        // (await_command exercised in the async test below)
-        q.slot(tag).state.set(SlotState::Executing);
+        {
+            let fut = q.await_command(tag);
+            let mut fut = std::pin::pin!(fut);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(fut.as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(q.executing(), 1);
         q.complete(tag, Cqe::new(0, 0, 1, 7, 0), 0);
+        assert_eq!(q.executing(), 0);
         assert_eq!(q.slot(tag).state(), SlotState::Responding);
         q.release_tag(tag);
         assert_eq!(q.slot(tag).state(), SlotState::Free);

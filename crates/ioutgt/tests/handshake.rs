@@ -19,6 +19,7 @@ fn start_target() -> std::net::SocketAddr {
         pin_threads: false,
         subsys_nqn: "nqn.2026-06.io.ioutgt:test".into(),
         mem_size_mb: 16,
+        backend: ioutgt::BackendSpec::Memory,
     })
     .expect("target start")
 }

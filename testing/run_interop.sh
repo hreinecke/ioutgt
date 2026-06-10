@@ -13,8 +13,21 @@ LOG="$TOP/target/ioutgt-interop.log"
 
 cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt
 
+# IOUTGT_BACKEND=memory (default) | null | file
+BACKEND_ARGS=()
+case "${IOUTGT_BACKEND:-memory}" in
+memory) BACKEND_ARGS=(--backend memory) ;;
+null) BACKEND_ARGS=(--backend null) ;;
+file)
+    BACKING="$TOP/target/ioutgt-backing.img"
+    truncate -s "${IOUTGT_FILE_MB:-256}M" "$BACKING"
+    BACKEND_ARGS=(--backend "$BACKING")
+    ;;
+*) echo "unknown IOUTGT_BACKEND"; exit 1 ;;
+esac
+
 "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
-    >"$LOG" 2>&1 &
+    "${BACKEND_ARGS[@]}" >"$LOG" 2>&1 &
 TARGET_PID=$!
 trap 'kill $TARGET_PID 2>/dev/null || true' EXIT
 

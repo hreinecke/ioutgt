@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod backend;
+pub mod buf;
 pub mod controller;
 pub mod dispatch;
 pub mod fabrics_exec;

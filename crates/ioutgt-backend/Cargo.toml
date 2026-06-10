@@ -10,6 +10,11 @@ authors.workspace = true
 
 [dependencies]
 ioutgt-core = { workspace = true }
+ioutgt-uring = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
