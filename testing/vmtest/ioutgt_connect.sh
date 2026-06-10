@@ -59,6 +59,43 @@ ioutgt_connect_cycle() {
     vt_log "disconnect ok"
 }
 
+# Connect, run fio --verify on the namespace, disconnect.
+# Args: extra nvme connect flags.
+ioutgt_fio_verify() {
+    vt_log "fio verify cycle (connect flags: $*)"
+    nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" --nr-io-queues=2 "$@" ||
+        vt_die "nvme connect for fio failed"
+    local dev="" i
+    for i in $(seq 100); do
+        dev=$(nvme list 2>/dev/null | awk -v nqn="$NQN" '$1 ~ /\/dev\/nvme/ {print $1}' | tail -1)
+        [ -n "$dev" ] && [ -b "$dev" ] && break
+        sleep 0.2
+    done
+    [ -n "$dev" ] || { dmesg | tail -30; vt_die "namespace device missing"; }
+    vt_log "fio target: $dev"
+
+    fio --name=v4k --filename="$dev" --rw=randwrite --bs=4k --size=16M \
+        --verify=crc32c --verify_fatal=1 --direct=1 --ioengine=libaio \
+        --iodepth=32 --output-format=terse >/dev/null ||
+        vt_die "fio 4k verify failed"
+    vt_log "fio 4k randwrite verify ok"
+
+    fio --name=v128k --filename="$dev" --rw=write --bs=128k --size=32M \
+        --verify=crc32c --verify_fatal=1 --direct=1 --ioengine=libaio \
+        --iodepth=8 --output-format=terse >/dev/null ||
+        vt_die "fio 128k verify failed"
+    vt_log "fio 128k write verify ok"
+
+    fio --name=vmix --filename="$dev" --rw=randrw --rwmixread=70 --bs=4k \
+        --size=16M --runtime=20 --time_based --verify=crc32c \
+        --verify_fatal=1 --direct=1 --ioengine=libaio --iodepth=32 \
+        --output-format=terse >/dev/null ||
+        vt_die "fio mixed verify failed"
+    vt_log "fio 70/30 randrw verify ok"
+
+    nvme disconnect -n "$NQN" >/dev/null || vt_die "disconnect after fio failed"
+}
+
 ioutgt_reconnect_soak() {
     local n="${1:-100}" i
     vt_log "reconnect soak: $n cycles"
@@ -78,4 +115,27 @@ ioutgt_run_m4() {
     ioutgt_connect_cycle --nr-io-queues=2 --hdr-digest --data-digest
     ioutgt_reconnect_soak "${IOUTGT_SOAK_CYCLES:-100}"
     vt_pass "ioutgt M4 discover/connect matrix"
+}
+
+ioutgt_run_m5() {
+    vt_require_cmd fio
+    ioutgt_discover
+    ioutgt_fio_verify
+    ioutgt_fio_verify --hdr-digest --data-digest
+    vt_pass "ioutgt M5 fio data-integrity matrix"
+}
+
+# Guest console output can be lossy under load; persist the verdict
+# through the 9p-shared data dir so the host can assert on it.
+ioutgt_mark() {
+    [ -n "${VMTEST_DATA_DIR:-}" ] && mkdir -p "$VMTEST_DATA_DIR/tmp" &&
+        echo "$*" >> "$VMTEST_DATA_DIR/tmp/ioutgt_result" || true
+}
+
+ioutgt_run_all() {
+    : > "${VMTEST_DATA_DIR:-/tmp}/tmp/ioutgt_result" 2>/dev/null || true
+    ioutgt_run_m4
+    ioutgt_mark "PASS m4"
+    ioutgt_run_m5
+    ioutgt_mark "PASS m5"
 }
