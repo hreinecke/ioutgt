@@ -28,26 +28,48 @@ esac
 
 CTL_SOCK="$TOP/target/ioutgt-interop.sock"
 MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
+PID_FILE="$TOP/target/ioutgt-interop.pid"
 mkdir -p "$MARKER_DIR"
-rm -f "$MARKER_DIR/ioutgt_want_ns2"
+rm -f "$MARKER_DIR/ioutgt_want_ns2" "$MARKER_DIR/ioutgt_want_kill" \
+    "$MARKER_DIR/ioutgt_kill_enabled" "$MARKER_DIR/ioutgt_soak_only"
+# IOUTGT_SOAK_ONLY=N: reconnect-leak mode — the guest only runs N
+# connect/disconnect cycles, and we assert the target RSS stays flat.
+[ -n "${IOUTGT_SOAK_ONLY:-}" ] && echo "$IOUTGT_SOAK_ONLY" > "$MARKER_DIR/ioutgt_soak_only"
 
-"$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
-    --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" >"$LOG" 2>&1 &
-TARGET_PID=$!
+start_target() {
+    "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
+        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" >>"$LOG" 2>&1 &
+    echo $! >"$PID_FILE"
+}
+start_target
+TARGET_PID=$(cat "$PID_FILE")
 
-# Hot-add watcher: the guest drops a marker when it wants nsid 2 added
-# while it stays connected (the M7 AEN test).
+# Opt-in for the guest's kill/recovery test.
+[ "${IOUTGT_ENABLE_KILL:-0}" = "1" ] && : > "$MARKER_DIR/ioutgt_kill_enabled"
+
+# Watcher: serves guest-driven events — M7 hot-add and M8 kill/restart.
 (
-    while [ ! -f "$MARKER_DIR/ioutgt_want_ns2" ]; do
+    while :; do
         sleep 0.5
-        kill -0 $TARGET_PID 2>/dev/null || exit 0
+        if [ -f "$MARKER_DIR/ioutgt_want_ns2" ]; then
+            rm -f "$MARKER_DIR/ioutgt_want_ns2"
+            "$TOP/target/release/ioutgt" ctl --socket "$CTL_SOCK" \
+                '{"op":"ADD_NAMESPACE","nsid":2,"backend":{"type":"memory","size_mb":32}}' ||
+                echo "ctl hot-add failed" >>"$LOG"
+        fi
+        if [ -f "$MARKER_DIR/ioutgt_want_kill" ]; then
+            rm -f "$MARKER_DIR/ioutgt_want_kill"
+            echo "watcher: kill -9 target" >>"$LOG"
+            kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
+            sleep 2
+            start_target
+            echo "watcher: target restarted (pid $(cat "$PID_FILE"))" >>"$LOG"
+        fi
+        kill -0 "$(cat "$PID_FILE")" 2>/dev/null || exit 0
     done
-    "$TOP/target/release/ioutgt" ctl --socket "$CTL_SOCK" \
-        '{"op":"ADD_NAMESPACE","nsid":2,"backend":{"type":"memory","size_mb":32}}' ||
-        echo "ctl hot-add failed" >>"$LOG"
 ) &
 WATCHER_PID=$!
-trap 'kill $TARGET_PID $WATCHER_PID 2>/dev/null || true' EXIT
+trap 'kill $(cat "$PID_FILE" 2>/dev/null) $WATCHER_PID 2>/dev/null || true' EXIT
 
 # Wait for the listener.
 for _ in $(seq 50); do
@@ -62,6 +84,15 @@ set +e
 RC=$?
 set -e
 
+FINAL_PID=$(cat "$PID_FILE" 2>/dev/null)
+if [ -n "$FINAL_PID" ] && [ -r "/proc/$FINAL_PID/status" ]; then
+    RSS_KB=$(awk '/VmRSS/{print $2}' "/proc/$FINAL_PID/status")
+    echo "--- target RSS after run: $RSS_KB kB ---"
+    if [ -n "${IOUTGT_SOAK_ONLY:-}" ] && [ "$RSS_KB" -gt 32768 ]; then
+        echo "FAIL: RSS not flat after reconnect soak ($RSS_KB kB > 32 MB)"
+        RC=1
+    fi
+fi
 echo "--- target log ---"
 tail -50 "$LOG"
 exit $RC
