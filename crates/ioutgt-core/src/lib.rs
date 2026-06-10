@@ -27,3 +27,6 @@ pub const MAX_QUEUE_ENTRIES: u16 = 1024;
 
 /// In-capsule data we advertise via IOCCSZ (16 KiB, nvmet's default).
 pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
+
+/// AEC bit: namespace-attribute-changed notices.
+pub const AEN_CFG_NS_ATTR: u32 = 1 << 8;

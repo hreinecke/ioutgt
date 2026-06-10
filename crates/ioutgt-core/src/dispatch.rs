@@ -16,7 +16,7 @@ use ioutgt_nvme::status;
 use crate::backend::Backend;
 use crate::controller::{RegisterState, Registry};
 use crate::queue::QueueCore;
-use crate::subsystem::{PortConfig, Subsystem};
+use crate::subsystem::{NsCache, PortConfig, Subsystem};
 
 /// Per-connection dispatch context (single-threaded, shared by the
 /// connection's tasks via `Rc`).
@@ -58,6 +58,9 @@ pub struct AdminState<B> {
     pub aer_wakers: RefCell<Vec<std::task::Waker>>,
     /// Async event configuration (Set Features AEC).
     pub aec: Cell<u32>,
+    /// Namespace inventory changed since the host last read the
+    /// Changed-NS log page.
+    pub ns_changed: Cell<bool>,
 }
 
 /// IO-queue state.
@@ -68,6 +71,8 @@ pub struct IoState<B> {
     /// Write-once at Connect: readable without a borrow guard, so slot
     /// tasks can hold `&Subsystem` across backend awaits safely.
     pub subsys: std::cell::OnceCell<Arc<Subsystem<B>>>,
+    /// Generation-validated namespace-table cache (hot path).
+    pub ns_cache: NsCache<B>,
 }
 
 impl<B: Backend> ConnCtx<B> {
@@ -92,7 +97,10 @@ impl<B: Backend> ConnCtx<B> {
                 last_heard: Cell::new(std::time::Instant::now()),
                 events: RefCell::new(std::collections::VecDeque::new()),
                 aer_wakers: RefCell::new(Vec::new()),
-                aec: Cell::new(0),
+                // Optional notices enabled until the host programs AEC
+                // (nvmet behaves the same).
+                aec: Cell::new(crate::AEN_CFG_NS_ATTR),
+                ns_changed: Cell::new(false),
             }),
         })
     }
@@ -112,6 +120,7 @@ impl<B: Backend> ConnCtx<B> {
             role: Role::Io(IoState {
                 cntlid: Cell::new(0),
                 subsys: std::cell::OnceCell::new(),
+                ns_cache: NsCache::default(),
             }),
         })
     }
@@ -133,6 +142,24 @@ impl<B: Backend> ConnCtx<B> {
             cid,
             status_code,
         )
+    }
+
+    /// Namespace inventory changed: complete one parked AER with the
+    /// NS_ATTR notice (if the host enabled it) so the host rescans.
+    pub fn fire_ns_changed(&self) {
+        let Role::Admin(admin) = &self.role else {
+            return;
+        };
+        admin.ns_changed.set(true);
+        if admin.aec.get() & crate::AEN_CFG_NS_ATTR == 0 {
+            return;
+        }
+        // AER result DW0: type Notice (2) | info NS_ATTR_CHANGED (0) <<8
+        // | Changed-NS log page (0x04) <<16.
+        admin.events.borrow_mut().push_back(0x0004_0002);
+        for waker in admin.aer_wakers.borrow_mut().drain(..) {
+            waker.wake();
+        }
     }
 }
 
