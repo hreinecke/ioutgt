@@ -1,0 +1,14 @@
+[package]
+name = "ioutgt-tcp"
+description = "NVMe/TCP transport: ICReq handshake, PDU recv/send state machines, digests, R2T"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

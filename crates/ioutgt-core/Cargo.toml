@@ -1,0 +1,14 @@
+[package]
+name = "ioutgt-core"
+description = "Transport-independent NVMe target core: subsystems, controllers, namespaces, queues, command dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

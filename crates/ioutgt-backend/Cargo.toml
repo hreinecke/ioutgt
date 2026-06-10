@@ -1,0 +1,14 @@
+[package]
+name = "ioutgt-backend"
+description = "Storage backends: null, memory, file (O_DIRECT), block device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

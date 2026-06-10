@@ -1,0 +1,14 @@
+[package]
+name = "ioutgt-uring"
+description = "Per-thread io_uring reactor and op futures integrated with a Tokio current-thread runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

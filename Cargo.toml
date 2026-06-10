@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ioutgt-uring",
+    "crates/ioutgt-nvme",
+    "crates/ioutgt-core",
+    "crates/ioutgt-tcp",
+    "crates/ioutgt-backend",
+    "crates/ioutgt-control",
+    "crates/ioutgt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ming1/ioutgt"
+authors = ["Ming Lei <tom.leiming@gmail.com>"]
+
+[workspace.dependencies]
+# intra-workspace
+ioutgt-uring = { path = "crates/ioutgt-uring" }
+ioutgt-nvme = { path = "crates/ioutgt-nvme" }
+ioutgt-core = { path = "crates/ioutgt-core" }
+ioutgt-tcp = { path = "crates/ioutgt-tcp" }
+ioutgt-backend = { path = "crates/ioutgt-backend" }
+ioutgt-control = { path = "crates/ioutgt-control" }
+
+# external
+io-uring = "0.7"
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+slab = "0.4"
+zerocopy = { version = "0.8", features = ["derive"] }
+crc32c = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+core_affinity = "0.8"
+tokio = { version = "1", default-features = false }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+cast_possible_truncation = "warn"
+must_use_candidate = "allow"
+
+# Performance-sensitive project: keep debug info in release builds for
+# perf/flamegraph work; thin LTO is close to fat LTO here at a fraction
+# of the link time.
+[profile.release]
+lto = "thin"
+debug = true
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

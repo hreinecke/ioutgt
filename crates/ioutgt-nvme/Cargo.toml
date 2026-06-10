@@ -1,0 +1,14 @@
+[package]
+name = "ioutgt-nvme"
+description = "Sans-io NVMe and NVMe/TCP protocol types, PDU codec, and digests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
