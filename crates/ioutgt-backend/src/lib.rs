@@ -7,9 +7,11 @@
 //! `ioutgt-core` with: dispatch stays monomorphized (no per-IO boxing)
 //! while namespaces stay heterogeneous.
 
+mod file;
 mod memory;
 mod null;
 
+pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
 
@@ -21,6 +23,8 @@ pub enum AnyBackend {
     Null(NullBackend),
     /// See [`MemoryBackend`].
     Memory(MemoryBackend),
+    /// See [`FileBackend`] (regular files and block devices).
+    File(FileBackend),
 }
 
 impl Backend for AnyBackend {
@@ -28,6 +32,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.block_shift(),
             AnyBackend::Memory(b) => b.block_shift(),
+            AnyBackend::File(b) => b.block_shift(),
         }
     }
 
@@ -35,6 +40,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.nr_blocks(),
             AnyBackend::Memory(b) => b.nr_blocks(),
+            AnyBackend::File(b) => b.nr_blocks(),
         }
     }
 
@@ -42,6 +48,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.read(slba, buf).await,
             AnyBackend::Memory(b) => b.read(slba, buf).await,
+            AnyBackend::File(b) => b.read(slba, buf).await,
         }
     }
 
@@ -49,6 +56,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.write(slba, buf).await,
             AnyBackend::Memory(b) => b.write(slba, buf).await,
+            AnyBackend::File(b) => b.write(slba, buf).await,
         }
     }
 
@@ -56,6 +64,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.flush().await,
             AnyBackend::Memory(b) => b.flush().await,
+            AnyBackend::File(b) => b.flush().await,
         }
     }
 
@@ -63,6 +72,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.discard(ranges).await,
             AnyBackend::Memory(b) => b.discard(ranges).await,
+            AnyBackend::File(b) => b.discard(ranges).await,
         }
     }
 
@@ -70,6 +80,7 @@ impl Backend for AnyBackend {
         match self {
             AnyBackend::Null(b) => b.write_zeroes(range).await,
             AnyBackend::Memory(b) => b.write_zeroes(range).await,
+            AnyBackend::File(b) => b.write_zeroes(range).await,
         }
     }
 }
