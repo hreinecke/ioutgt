@@ -53,7 +53,7 @@ ioutgt_run_affinity() {
 
     local log=/tmp/ioutgt-affinity.log
     RUST_LOG=info "$bin" --listen 127.0.0.1:14420 --io-threads "$io_threads" \
-        --pin >"$log.raw" 2>&1 &
+        --pin --control-socket /tmp/ioutgt-affinity.sock >"$log.raw" 2>&1 &
     local pid=$!
     vt_atexit "kill $pid 2>/dev/null || true"
 
@@ -134,5 +134,40 @@ want: $(tr '\n' ' ' <<<"$want")"
         [ "${node_threads[n]}" -ge 1 ] || vt_die "node $n got no IO thread"
     done
 
-    vt_pass "affinity: $io_threads threads node-pure over $nodes nodes, all CPUs covered"
+    # End-to-end: `ioutgt list` must report each queue's live affinity
+    # exactly as /proc sees it. Controllers exist only while a host is
+    # connected, so connect over loopback.
+    modprobe nvme-tcp 2>/dev/null || true
+    nvme connect -t tcp -a 127.0.0.1 -s 14420 -n nqn.2026-06.io.ioutgt:test \
+        --nr-io-queues "$io_threads" || vt_die "nvme connect failed"
+    vt_atexit "nvme disconnect -n nqn.2026-06.io.ioutgt:test >/dev/null 2>&1 || true"
+    sleep 1
+
+    local listing
+    listing=$("$bin" list --socket /tmp/ioutgt-affinity.sock) ||
+        vt_die "ioutgt list failed"
+    vt_log "$listing"
+    local entry qid tid cpus allowed checked=0
+    while read -r entry; do
+        [ -n "$entry" ] || continue
+        qid=${entry%%:*}
+        tid=$(sed -n 's/.*@\([0-9]*\) cpus.*/\1/p' <<<"$entry")
+        cpus=$(sed -n 's/.*cpus \(.*\)$/\1/p' <<<"$entry")
+        [ -n "$tid" ] && [ -n "$cpus" ] || vt_die "unparsable queue entry: $entry"
+        if [ "$qid" -eq 0 ]; then
+            [ "$cpus" = "*" ] || vt_die "admin queue cpus '$cpus', expected *"
+        else
+            allowed=$(awk '/Cpus_allowed_list/{print $2}' "/proc/$pid/task/$tid/status")
+            [ "$cpus" = "$allowed" ] ||
+                vt_die "qid $qid tid $tid: list says '$cpus', /proc says '$allowed'"
+            [[ "$cpus" =~ ^[0-9]+$ ]] ||
+                vt_die "qid $qid: expected one pinned cpu, got '$cpus'"
+        fi
+        checked=$((checked + 1))
+    done < <(sed -n 's/^  queues: //p' <<<"$listing" | tr '|' '\n' |
+        sed 's/^ *//;s/ *$//')
+    [ "$checked" -eq $((io_threads + 1)) ] ||
+        vt_die "listing showed $checked queues, expected $((io_threads + 1))"
+
+    vt_pass "affinity: $io_threads threads node-pure over $nodes nodes, all CPUs covered, list affinity verified"
 }

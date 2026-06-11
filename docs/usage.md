@@ -82,9 +82,10 @@ The protocol is plain newline-delimited JSON, so `nc -U` works too.
 
 `LIST_CONTROLLER` reports each live controller's cntlid, subsystem and
 host NQNs, granted KATO, installed queues — including the queue depth
-and the kernel tid of the serving queue thread (`top -H` /
-`perf -t` friendly) — plus the target pid and the namespaces visible
-through the controller. The response also carries the port's
+the kernel tid of the serving queue thread (`top -H` / `perf -t`
+friendly), and its live CPU affinity (`*` = unpinned; with `--pin`
+each IO queue shows its `group_cpus_evenly` CPU) — plus the target
+pid and the namespaces visible through the controller. The response also carries the port's
 discoverable inventory (listen address, subsystems, namespaces), which
 `ioutgt list` prints before the controller list — so an idle target
 shows what hosts would discover rather than only `no controllers`.
