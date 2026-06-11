@@ -74,6 +74,14 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
   enabled (same trap as NS_ATTR on IO controllers). One coherent work
   item; becomes load-bearing once runtime subsystem add or multi-port
   lands.
+- **Wildcard-traddr fixup in discovery log entries**: a target bound to
+  `0.0.0.0` (the default `--listen`) advertises `0.0.0.0` verbatim as
+  traddr, which `nvme connect-all` would try to dial. nvmet substitutes
+  the connection's actual local address via the `disc_traddr` transport
+  callback (`nvmet_tcp_disc_port_addr`); ioutgt should do the same —
+  use the accepted socket's local address when the configured traddr is
+  a wildcard. The entry's hardcoded `adrfam = IPv4` should be derived
+  from the same address while at it.
 - Host ACLs (per-subsystem allowed-host lists) in config + control
   API.
 - **Multiple ports**: one process currently serves one listen address
