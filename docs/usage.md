@@ -20,7 +20,7 @@ ioutgt --config target.json
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
 | `--pin` | off | Pin queue threads to sequential cores |
-| `--control-socket <path>` | `/tmp/ioutgt.sock` | Runtime control API socket (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
+| `--control-socket <path>` | `$XDG_RUNTIME_DIR/ioutgt.sock`, else `/tmp/ioutgt.sock` | Runtime control API socket, created mode 0600 (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
 `RUST_LOG=debug ioutgt …`, or per-module
@@ -65,13 +65,13 @@ socket; the response prints on stdout and the exit code reflects
 `"ok"`.
 
 ```sh
-ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"LIST_NAMESPACE"}'
-ioutgt ctl --socket /tmp/ioutgt.sock \
+ioutgt ctl '{"op":"LIST_NAMESPACE"}'
+ioutgt ctl \
     '{"op":"ADD_NAMESPACE","nsid":4,"backend":{"type":"memory","size_mb":32}}'
-ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"REMOVE_NAMESPACE","nsid":4}'
-ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"GET_STATS"}'
-ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"LIST_CONTROLLER"}'
-ioutgt list --socket /tmp/ioutgt.sock           # human-readable form
+ioutgt ctl '{"op":"REMOVE_NAMESPACE","nsid":4}'
+ioutgt ctl '{"op":"GET_STATS"}'
+ioutgt ctl '{"op":"LIST_CONTROLLER"}'
+ioutgt list                                     # human-readable form
 ```
 
 Operations: `ADD_NAMESPACE`, `REMOVE_NAMESPACE`, `LIST_NAMESPACE`,

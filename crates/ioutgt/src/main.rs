@@ -44,24 +44,31 @@ struct Args {
     backend: String,
 
     /// Unix socket path for the runtime control API.
-    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+    #[arg(long, default_value_os_t = default_control_socket())]
     control_socket: std::path::PathBuf,
 
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-/// Control-socket path shared as the default by the target and every
-/// ctl-style subcommand, so out of the box the clients dial the socket
-/// the server actually binds.
-const DEFAULT_CONTROL_SOCKET: &str = "/tmp/ioutgt.sock";
+/// Default control-socket path, shared by the target and every
+/// ctl-style subcommand so out of the box the clients dial the socket
+/// the server actually binds: `$XDG_RUNTIME_DIR/ioutgt.sock` (a
+/// per-user 0700 directory — no squatting, no cross-user access),
+/// falling back to `/tmp/ioutgt.sock` where XDG_RUNTIME_DIR is unset.
+fn default_control_socket() -> std::path::PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::Path::new(&dir).join("ioutgt.sock"),
+        _ => std::path::PathBuf::from("/tmp/ioutgt.sock"),
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Send one JSON request to a running target's control socket.
     Ctl {
         /// Control socket path.
-        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+        #[arg(long, default_value_os_t = default_control_socket())]
         socket: std::path::PathBuf,
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
@@ -71,7 +78,7 @@ enum Command {
     #[command(alias = "list-ctrl")]
     List {
         /// Control socket path.
-        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+        #[arg(long, default_value_os_t = default_control_socket())]
         socket: std::path::PathBuf,
     },
 }
@@ -122,9 +129,9 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "pid {}", data["pid"]);
-    // Discoverable inventory (configured port + subsystems), shown in
+    // Discoverable inventory (bound ports + subsystems), shown in
     // every state; skipped silently if the server predates it.
-    if let Some(port) = data["port"].as_object() {
+    for port in data["ports"].as_array().into_iter().flatten() {
         let _ = writeln!(
             out,
             "port {}:{}",
@@ -178,7 +185,7 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|q| format!("{}:{}@{}", q["qid"], q["sqsize"], q["tid"]))
+            .map(|q| format!("{}:{}@{}", q["qid"], q["depth"], q["tid"]))
             .collect::<Vec<_>>()
             .join(" ");
         let _ = writeln!(out, "  queues: {queues}");
@@ -269,7 +276,7 @@ mod tests {
     fn render_ctrl_list_formats_controllers() {
         let data = serde_json::json!({
             "pid": 4242,
-            "port": sample_port(),
+            "ports": [sample_port()],
             "controllers": [{
                 "cntlid": 1,
                 "subsysnqn": "nqn.2026-06.io.ioutgt:test",
@@ -277,8 +284,8 @@ mod tests {
                 "discovery": false,
                 "kato_ms": 60000,
                 "queues": [
-                    {"qid": 0, "sqsize": 32, "tid": 100},
-                    {"qid": 1, "sqsize": 64, "tid": 101},
+                    {"qid": 0, "depth": 32, "tid": 100},
+                    {"qid": 1, "depth": 64, "tid": 101},
                 ],
                 "namespaces": [{"nsid": 1, "blocks": 32768, "block_shift": 9}],
             }],
@@ -297,7 +304,7 @@ mod tests {
 
     #[test]
     fn render_ctrl_list_empty() {
-        let data = serde_json::json!({ "pid": 4242, "port": sample_port(), "controllers": [] });
+        let data = serde_json::json!({ "pid": 4242, "ports": [sample_port()], "controllers": [] });
         assert_eq!(
             super::render_ctrl_list(&data),
             format!("pid 4242\n{PORT_HEADER}no controllers\n")
@@ -308,14 +315,14 @@ mod tests {
     fn render_ctrl_list_gib_sizes() {
         let data = serde_json::json!({
             "pid": 1,
-            "port": {
+            "ports": [{
                 "traddr": "::", "trsvcid": "14420",
                 "subsystems": [{
                     "nqn": "nqn.x",
                     // 2 GiB in 4096B blocks.
                     "namespaces": [{"nsid": 7, "blocks": 524288, "block_shift": 12}],
                 }],
-            },
+            }],
             "controllers": [],
         });
         let out = super::render_ctrl_list(&data);
@@ -339,7 +346,7 @@ mod tests {
                 "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
                 "discovery": true,
                 "kato_ms": 120000,
-                "queues": [{"qid": 0, "sqsize": 32, "tid": 100}],
+                "queues": [{"qid": 0, "depth": 32, "tid": 100}],
                 "namespaces": [],
             }],
         });

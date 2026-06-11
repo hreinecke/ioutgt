@@ -207,7 +207,10 @@ where
 }
 
 /// Build the port snapshot from the configured subsystems.
-fn build_port(config: &TargetConfig) -> io::Result<Arc<PortConfig<AnyBackend>>> {
+/// `bound` is the listener's actual local address, so ephemeral ports
+/// (`--listen …:0`) report the real port in discovery log entries and
+/// LIST_CONTROLLER, not the configured 0.
+fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortConfig<AnyBackend>>> {
     let mut subsystems = BTreeMap::new();
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
@@ -236,8 +239,8 @@ fn build_port(config: &TargetConfig) -> io::Result<Arc<PortConfig<AnyBackend>>> 
         subsystems.insert(spec.nqn.clone(), subsystem);
     }
     Ok(Arc::new(PortConfig {
-        traddr: config.listen.ip().to_string(),
-        trsvcid: config.listen.port().to_string(),
+        traddr: bound.ip().to_string(),
+        trsvcid: bound.port().to_string(),
         subsystems,
     }))
 }
@@ -280,7 +283,21 @@ async fn control_loop(
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
     let registry = Registry::new();
-    let port = match build_port(&config) {
+
+    // Bind before building the port so the model carries the actual
+    // bound address (ephemeral ports resolve to the real one).
+    let listener = match tokio::net::TcpListener::bind(config.listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            let _ = addr_tx.send(Err(err));
+            return;
+        }
+    };
+    let local = listener
+        .local_addr()
+        .expect("bound listener has an address");
+
+    let port = match build_port(&config, local) {
         Ok(port) => port,
         Err(err) => {
             let _ = addr_tx.send(Err(err));
@@ -293,6 +310,17 @@ async fn control_loop(
         let _ = std::fs::remove_file(path);
         match tokio::net::UnixListener::bind(path) {
             Ok(listener) => {
+                // The API mutates served storage (ADD/REMOVE_NAMESPACE):
+                // owner-only. Prefer a private dir (the CLI defaults to
+                // $XDG_RUNTIME_DIR) over world-writable /tmp, where a
+                // pre-bound squatter could still intercept first.
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    let _ = addr_tx.send(Err(err));
+                    return;
+                }
                 let nudge_tx = admin_tx.clone();
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),
@@ -309,16 +337,6 @@ async fn control_loop(
         }
     }
 
-    let listener = match tokio::net::TcpListener::bind(config.listen).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            let _ = addr_tx.send(Err(err));
-            return;
-        }
-    };
-    let local = listener
-        .local_addr()
-        .expect("bound listener has an address");
     let _ = addr_tx.send(Ok(local));
     info!(%local, "ioutgt listening");
 
