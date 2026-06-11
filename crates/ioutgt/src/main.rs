@@ -44,19 +44,24 @@ struct Args {
     backend: String,
 
     /// Unix socket path for the runtime control API.
-    #[arg(long)]
-    control_socket: Option<std::path::PathBuf>,
+    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+    control_socket: std::path::PathBuf,
 
     #[command(subcommand)]
     command: Option<Command>,
 }
+
+/// Control-socket path shared as the default by the target and every
+/// ctl-style subcommand, so out of the box the clients dial the socket
+/// the server actually binds.
+const DEFAULT_CONTROL_SOCKET: &str = "/tmp/ioutgt.sock";
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Send one JSON request to a running target's control socket.
     Ctl {
         /// Control socket path.
-        #[arg(long, default_value = "/tmp/ioutgt.sock")]
+        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
         socket: std::path::PathBuf,
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
@@ -65,7 +70,7 @@ enum Command {
     /// namespaces).
     ListCtrl {
         /// Control socket path.
-        #[arg(long, default_value = "/tmp/ioutgt.sock")]
+        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
         socket: std::path::PathBuf,
     },
 }
@@ -190,7 +195,7 @@ fn main() -> std::io::Result<()> {
             config.allow_hdgst = !args.no_hdgst;
             config.allow_ddgst = !args.no_ddgst;
             config.pin_threads = args.pin;
-            config.control_socket = args.control_socket;
+            config.control_socket = Some(args.control_socket);
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {
                     size_mb: args.mem_size_mb,

@@ -20,7 +20,7 @@ ioutgt --config target.json
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
 | `--pin` | off | Pin queue threads to sequential cores |
-| `--control-socket <path>` | — | Enable the runtime control API on this Unix socket |
+| `--control-socket <path>` | `/tmp/ioutgt.sock` | Runtime control API socket (same default as the `ctl`/`list-ctrl` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
 `RUST_LOG=debug ioutgt …`, or per-module
