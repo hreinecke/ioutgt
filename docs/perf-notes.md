@@ -69,17 +69,24 @@ binaries (baseline = the commit immediately before the gather
 rewire). loadgen does not negotiate digests, so the digest-on
 config is covered functionally by the interop fio matrix only.
 
-| config | 4K IOPS | 4K CPU µs/IOP | 128K BW | 128K CPU µs/IOP | 128K p50 |
+| config | 4K IOPS (repeat mean, range) | 4K CPU µs/IOP | 128K BW¹ | 128K CPU µs/IOP | 128K p50 |
 |---|---|---|---|---|---|
-| staging | 445K / repeat mean 392K | 6.1–6.9 | 7.73 GiB/s | 55.9 | 1938 µs |
-| gather | 408K / repeat mean 378K | 6.7–7.2 | **9.47 GiB/s (+22%)** | **44.0 (−21%)** | **1559 µs** |
+| staging | 392K (382–403K) | 6.1–6.9 | 7.73 GiB/s | 55.9 | 1938 µs |
+| gather | 378K (355–405K) | 6.7–7.2 | **9.47 GiB/s (+22%)** | **44.0 (−21%)** | **1559 µs** |
+
+¹ BW is loadgen's own figure (over its measured elapsed, ~9.8 s),
+so it does not exactly cross-check against ops ÷ 10 s; the +22%
+relative claim holds either way. The very first single-shot pair
+(staging 445K, gather 408K) sat above both repeat ranges — a
+quiet-period artifact, excluded from the table.
 
 128K reads are an unambiguous win: +22% bandwidth, −21% CPU per
-IOP, p50 −20%. 4K reads show a possible ~0–4% IOPS deficit with
-heavily overlapping run distributions (staging repeat range
-382–403K, gather 355–405K; CPU ticks identical within 2%) on a
-non-quiesced machine — the per-response iovec count (3 entries vs
-staging's 1 contiguous stream) is the suspected mechanism if real.
+IOP, p50 −20%. 4K reads show a possible ~0–4% IOPS deficit
+(repeat means 392K vs 378K = −3.6%) with heavily overlapping run
+distributions and CPU ticks identical within 2%, on a
+non-quiesced machine — below the rig's resolution. The
+per-response iovec count (3 entries vs staging's 1 contiguous
+stream) is the suspected mechanism if real.
 If a quiet rig confirms it, the candidate fix is inlining payloads
 below a threshold (≤ ~8K) into the arena so small-IO batches
 collapse back to one contiguous iovec — i.e. staging as the *small*

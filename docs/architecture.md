@@ -223,7 +223,8 @@ while malformed or out-of-place PDUs produce C2HTermReq and close.
 **send_loop** blocks on `next_send_work()` (`None` after
 `close_send()` at teardown), then greedily drains
 `try_next_send_work()`, staging R2Ts, C2HData headers, digests, and
-response capsules into a small per-connection arena (sqsize × 64 B)
+response capsules into a small per-connection arena (sqsize × 64 B,
+min 4 KiB)
 while read payloads are referenced **in place** from slot buffers;
 the batch ships as one gather `ops::sendmsg_raw` (byte-contiguous
 arena chunks merge, so a payload-free batch is a single iovec
