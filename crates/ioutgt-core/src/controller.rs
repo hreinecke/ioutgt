@@ -88,9 +88,9 @@ impl RegisterState {
 
 /// One installed queue's identity (recorded at Connect time, on the
 /// owning queue thread).
-#[derive(Debug, Clone)]
-#[allow(missing_docs)] // qid/sqsize/tid are self-describing
+#[derive(Debug, Clone, Copy)]
 pub struct QueueInfo {
+    /// Queue id (0 = admin, 1..=max_qid = IO).
     pub qid: u16,
     /// Queue depth in entries (wire sqsize + 1).
     pub sqsize: u16,
@@ -175,7 +175,7 @@ impl Registry {
                         hostnqn: hostnqn.to_owned(),
                         max_qid,
                         kato_ms,
-                        queues: vec![admin_queue.clone()],
+                        queues: vec![admin_queue],
                     });
                     true
                 }
@@ -353,7 +353,27 @@ mod tests {
         assert_eq!(snap[0].kato_ms, 5000);
         let qids: Vec<u16> = snap[0].queues.iter().map(|q| q.qid).collect();
         assert_eq!(qids, vec![0, 1]);
-        assert!(snap[0].queues.iter().all(|q| q.tid > 0));
+        // Single-threaded test and qi() records current_tid(), so every
+        // queue must carry exactly this thread's tid.
+        assert!(snap[0].queues.iter().all(|q| q.tid == current_tid()));
         assert!(!snap[0].is_discovery());
+    }
+
+    #[test]
+    fn snapshot_sorts_by_cntlid() {
+        let registry = Registry::new();
+        let mut ids: Vec<u16> = (0..3)
+            .map(|_| {
+                registry
+                    .allocate("nqn.test", "nqn.host", 4, 60_000, qi(0))
+                    .unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        // HashMap iteration order is random; snapshot() must still come
+        // back sorted ascending by cntlid.
+        let snap_ids: Vec<u16> = registry.snapshot().iter().map(|e| e.cntlid).collect();
+        assert_eq!(snap_ids, ids);
+        assert!(snap_ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

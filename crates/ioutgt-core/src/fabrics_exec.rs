@@ -19,6 +19,17 @@ pub fn nqn_str(raw: &[u8]) -> &str {
     std::str::from_utf8(&raw[..end]).unwrap_or("").trim_end()
 }
 
+/// This queue's identity for the registry. Connect executes on the
+/// owning queue thread, so the tid recorded here is the thread serving
+/// this queue.
+fn queue_info<B: Backend>(ctx: &ConnCtx<B>) -> QueueInfo {
+    QueueInfo {
+        qid: ctx.queue.qid,
+        sqsize: ctx.queue.sqsize,
+        tid: current_tid(),
+    }
+}
+
 /// Route one fabrics command (Connect / Property Get / Property Set).
 pub fn execute<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, sqe: &Sqe) -> Outcome {
     let _ = tag;
@@ -105,16 +116,9 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             } else {
                 cmd.kato.get()
             };
-            // Connect executes on the owning queue thread, so the tid
-            // recorded here is the thread serving this queue.
-            let admin_queue = QueueInfo {
-                qid: ctx.queue.qid,
-                sqsize: ctx.queue.sqsize,
-                tid: current_tid(),
-            };
             let Some(cntlid) =
                 ctx.registry
-                    .allocate(subsysnqn, hostnqn, max_qid, kato, admin_queue)
+                    .allocate(subsysnqn, hostnqn, max_qid, kato, queue_info(ctx))
             else {
                 return Outcome::status(ctx.cqe(0, cid, status::CONNECT_CTRL_BUSY | status::DNR));
             };
@@ -133,15 +137,13 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                 ));
             }
             let cntlid = data.cntlid.get();
-            let queue = QueueInfo {
-                qid: ctx.queue.qid,
-                sqsize: ctx.queue.sqsize,
-                tid: current_tid(),
-            };
-            match ctx.registry.install_io_queue(cntlid, hostnqn, queue) {
+            match ctx
+                .registry
+                .install_io_queue(cntlid, hostnqn, queue_info(ctx))
+            {
                 Ok(entry) => {
                     io.cntlid.set(cntlid);
-                    if entry.subsys_nqn != fabrics::DISCOVERY_NQN {
+                    if !entry.is_discovery() {
                         if let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn) {
                             let _ = io.subsys.set(Arc::clone(subsys));
                         }
