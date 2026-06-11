@@ -116,6 +116,8 @@ pub fn current_cpus() -> String {
     // SAFETY: a zeroed cpu_set_t is a valid value for the call to
     // overwrite; sched_getaffinity writes within size_of::<cpu_set_t>().
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: pid 0 = calling thread; the buffer is a real cpu_set_t
+    // and the size passed matches it.
     let rc =
         unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
     if rc != 0 {
@@ -123,6 +125,7 @@ pub fn current_cpus() -> String {
     }
     // SAFETY: `set` was initialized by sched_getaffinity above.
     let count = unsafe { libc::CPU_COUNT(&set) };
+    // SAFETY: sysconf has no preconditions.
     let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if online > 0 && i64::from(count) >= online {
         return "*".to_owned();
