@@ -12,6 +12,16 @@ two IO threads. This file orders what comes next.
   `ENOBUFS` → single-shot fallback): removes the recv re-arm SQE and
   the owned-buffer round trip per batch. The `RecvSource` seam in the
   transport was designed for exactly this swap.
+- **Direct-to-slot payload recv** (avoid the recv_loop memcpy): once
+  a PDU header places the payload (`RecvPhase::Data`), issue bounded
+  recvs straight into the slot buffer at the reassembly offset
+  instead of bouncing through the recv buffer — removes the
+  write-side userspace copy in the §4.2 data-copy budget. Costs one
+  recv op per payload (vs amortized batch) and the DDGST
+  accumulation loses its copy-time pass; in tension with multishot
+  recv + provided buffers (kernel picks the buffer there), so
+  evaluate as the alternative recv strategy, CPU-per-IOP on large
+  writes.
 - **Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED`** for
   the O_DIRECT backend: removes per-op page pinning; evaluate by
   CPU-per-IOP on ext4, not loopback IOPS.
