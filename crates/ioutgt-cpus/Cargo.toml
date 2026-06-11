@@ -1,0 +1,17 @@
+[package]
+name = "ioutgt-cpus"
+description = "Userspace port of the kernel's group_cpus_evenly() CPU grouping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

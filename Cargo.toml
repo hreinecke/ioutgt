@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ioutgt-uring",
     "crates/ioutgt-nvme",
+    "crates/ioutgt-cpus",
     "crates/ioutgt-core",
     "crates/ioutgt-tcp",
     "crates/ioutgt-backend",
@@ -22,6 +23,7 @@ authors = ["Ming Lei <tom.leiming@gmail.com>"]
 # intra-workspace
 ioutgt-uring = { path = "crates/ioutgt-uring" }
 ioutgt-nvme = { path = "crates/ioutgt-nvme" }
+ioutgt-cpus = { path = "crates/ioutgt-cpus" }
 ioutgt-core = { path = "crates/ioutgt-core" }
 ioutgt-tcp = { path = "crates/ioutgt-tcp" }
 ioutgt-backend = { path = "crates/ioutgt-backend" }

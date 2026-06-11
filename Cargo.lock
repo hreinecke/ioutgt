@@ -257,6 +257,7 @@ dependencies = [
  "ioutgt-backend",
  "ioutgt-control",
  "ioutgt-core",
+ "ioutgt-cpus",
  "ioutgt-nvme",
  "ioutgt-tcp",
  "ioutgt-uring",
@@ -296,6 +297,13 @@ dependencies = [
  "ioutgt-nvme",
  "tracing",
  "zerocopy",
+]
+
+[[package]]
+name = "ioutgt-cpus"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
