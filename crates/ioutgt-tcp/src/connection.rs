@@ -590,7 +590,10 @@ async fn send_loop(
     loop {
         let first = match carry.take() {
             Some(work) => work,
-            None => queue.next_send_work().await,
+            None => match queue.next_send_work().await {
+                Some(work) => work,
+                None => return Ok(()), // close_send(): teardown
+            },
         };
         let mut buf = staging.take().expect("staged");
         let mut offset = 0usize;

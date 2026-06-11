@@ -149,6 +149,10 @@ pub struct QueueCore {
     pub sqhd_disabled: bool,
     send_work: RefCell<VecDeque<SendWork>>,
     send_waker: Cell<Option<Waker>>,
+    /// Teardown: `next_send_work` yields `None` once set (and the
+    /// pending list is drained), letting the send task exit before
+    /// the queue's slot memory is freed.
+    send_closed: Cell<bool>,
     /// Slots currently inside dispatch (possibly awaiting a backend op
     /// that references slot memory). Teardown drains this to zero
     /// before freeing the slots.
@@ -171,6 +175,7 @@ impl QueueCore {
             sqhd_disabled,
             send_work: RefCell::new(VecDeque::with_capacity(usize::from(sqsize) * 2)),
             send_waker: Cell::new(None),
+            send_closed: Cell::new(false),
             executing: Cell::new(0),
         })
     }
@@ -284,16 +289,31 @@ impl QueueCore {
         self.send_work.borrow_mut().pop_front()
     }
 
-    /// Await the next send-path work item.
-    pub async fn next_send_work(self: &Rc<QueueCore>) -> SendWork {
+    /// Await the next send-path work item; `None` after [`close_send`]
+    /// (pending work is delivered first).
+    pub async fn next_send_work(self: &Rc<QueueCore>) -> Option<SendWork> {
         std::future::poll_fn(|cx| {
             if let Some(work) = self.send_work.borrow_mut().pop_front() {
-                return Poll::Ready(work);
+                return Poll::Ready(Some(work));
+            }
+            if self.send_closed.get() {
+                return Poll::Ready(None);
             }
             self.send_waker.set(Some(cx.waker().clone()));
             Poll::Pending
         })
         .await
+    }
+
+    /// Wake the send loop into orderly exit: `next_send_work` yields
+    /// queued work first, then `None`. Called at connection teardown
+    /// so the gather send's slot references drain before the queue is
+    /// freed.
+    pub fn close_send(&self) {
+        self.send_closed.set(true);
+        if let Some(waker) = self.send_waker.take() {
+            waker.wake();
+        }
     }
 
     /// Return a tag to the freelist once its response is fully sent
@@ -367,5 +387,27 @@ mod tests {
         let q = QueueCore::new(1, 8, 64, true);
         assert_eq!(q.advance_sqhd(), 0);
         assert_eq!(q.advance_sqhd(), 0);
+    }
+
+    #[test]
+    fn close_send_drains_then_ends() {
+        let queue = QueueCore::new(0, 4, 512, false);
+        // solicit() debug-asserts Receiving state: claim properly.
+        let tag = queue.claim_tag().unwrap();
+        queue.solicit(tag, 42, 0, 512);
+        queue.close_send();
+        // Pending work is still delivered after close...
+        assert!(matches!(
+            queue.try_next_send_work(),
+            Some(SendWork::R2t { .. })
+        ));
+        // ...then the closed flag surfaces as Ready(None), not Pending.
+        let mut fut = std::pin::pin!(queue.next_send_work());
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            std::future::Future::poll(fut.as_mut(), &mut cx),
+            Poll::Ready(None)
+        ));
     }
 }
