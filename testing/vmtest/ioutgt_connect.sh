@@ -8,7 +8,8 @@
 set -eu
 
 ADDR="${IOUTGT_ADDR:-10.0.2.2}"
-PORT="${IOUTGT_PORT:-4420}"
+# The host runner publishes its port through the 9p-shared marker.
+PORT="${IOUTGT_PORT:-$(cat "${VMTEST_DATA_DIR:-/nonexistent}/tmp/ioutgt_port" 2>/dev/null || echo 4420)}"
 NQN="${IOUTGT_NQN:-nqn.2026-06.io.ioutgt:test}"
 
 vt_require_module nvme_tcp

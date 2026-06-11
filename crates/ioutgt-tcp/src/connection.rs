@@ -529,88 +529,127 @@ fn handle_pdu(
     }
 }
 
-/// Send loop: R2Ts and completions → wire, in order.
+/// Send loop: drain ALL pending completions/R2Ts into one staging
+/// buffer and ship them as a single send op.
+///
+/// Independent send SQEs on one socket carry no ordering guarantee, so
+/// pipelining ops is not an option; batching into one op is — and it
+/// fixes the worst sleep pattern this design can exhibit: with
+/// one-op-per-response, the thread parks (one io_uring_enter round
+/// trip) for every response even when dozens are queued. One park per
+/// batch instead of one per IO.
 async fn send_loop(
     queue: &Rc<QueueCore>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
 ) -> std::io::Result<()> {
+    let slot_capacity = queue.slot(0).data().len();
+    // Room for several full responses; a single one always fits.
+    let staging_size = (slot_capacity + 256).max(512 * 1024);
+    let mut staging: Option<Box<[u8]>> = Some(vec![0u8; staging_size].into_boxed_slice());
+    let mut done_tags: Vec<u16> = Vec::with_capacity(usize::from(queue.sqsize));
+    let mut carry: Option<SendWork> = None;
+
     loop {
-        match queue.next_send_work().await {
-            SendWork::R2t {
-                tag,
-                cid,
-                offset,
-                length,
-            } => {
-                let mut buf = vec![0u8; 28].into_boxed_slice();
-                let n = pdu::encode_r2t(&mut buf, cid, tag, offset, length, hdr_digest);
-                send_all(fd, &buf[..n]).await?;
-                // No tag release: the slot is waiting for H2CData.
+        let first = match carry.take() {
+            Some(work) => work,
+            None => queue.next_send_work().await,
+        };
+        let mut buf = staging.take().expect("staged");
+        let mut offset = 0usize;
+        done_tags.clear();
+        let mut work = Some(first);
+        while let Some(item) = work {
+            let worst_case = match &item {
+                SendWork::R2t { .. } => 28,
+                SendWork::Response(completion) => 64 + completion.data_len as usize + 4,
+            };
+            if offset + worst_case > buf.len() {
+                carry = Some(item); // flush first, encode next round
+                break;
             }
-            SendWork::Response(completion) => {
-                // SUCCESS elision: when SQ flow control is off and the
-                // read succeeded, the final C2HData carries the
-                // completion (no response capsule), as nvmet does.
-                let success_elide = completion.data_len > 0
-                    && queue.sqhd_disabled
-                    && completion.cqe.status.get() == 0;
-
-                if completion.data_len > 0 {
-                    let mut header = vec![0u8; 32].into_boxed_slice();
-                    let hdr_len = pdu::encode_c2h_data(
-                        &mut header,
-                        completion.cqe.cid.get(),
-                        0,
-                        completion.data_len,
-                        true,
-                        success_elide,
-                        hdr_digest,
-                        data_digest,
-                    );
-                    let mut payload = Vec::with_capacity(completion.data_len as usize + 4);
-                    payload.extend_from_slice(
-                        &queue.slot(completion.tag).data()[..completion.data_len as usize],
-                    );
-                    if data_digest {
-                        let crc = digest::crc32c(&payload);
-                        payload.extend_from_slice(&crc.to_le_bytes());
-                    }
-                    let header = header[..hdr_len].to_vec().into_boxed_slice();
-                    let total = header.len() + payload.len();
-                    let (res, _bufs) =
-                        ops::send_vectored(fd, header, payload.into_boxed_slice())?.await;
-                    let sent = res? as usize;
-                    if sent != total {
-                        // Vectored short send: finish flat (rare slow path).
-                        return Err(std::io::Error::other("short C2HData send"));
-                    }
-                }
-
-                if !success_elide {
-                    let mut rsp = vec![0u8; 28].into_boxed_slice();
-                    let n = pdu::encode_capsule_resp(&mut rsp, &completion.cqe, hdr_digest);
-                    send_all(fd, &rsp[..n]).await?;
-                }
-
-                queue.release_tag(completion.tag);
+            offset += encode_send_work(queue, &mut buf[offset..], &item, hdr_digest, data_digest);
+            if let SendWork::Response(completion) = item {
+                done_tags.push(completion.tag);
             }
+            work = queue.try_next_send_work();
+        }
+
+        let len = u32::try_from(offset).expect("staging < 4G");
+        let (res, returned) = ops::send_partial(fd, buf, len)?.await;
+        staging = Some(returned);
+        let mut sent = res? as usize;
+        // Short send: finish the remainder before anything else may hit
+        // the wire (ordering).
+        while sent < offset {
+            let mut tail = staging.take().expect("staged");
+            let remaining = offset - sent;
+            tail.copy_within(sent..offset, 0);
+            let (res, returned) =
+                ops::send_partial(fd, tail, u32::try_from(remaining).expect("fits"))?.await;
+            staging = Some(returned);
+            let n = res? as usize;
+            if n == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            offset = remaining;
+            sent = n;
+        }
+        for tag in done_tags.drain(..) {
+            queue.release_tag(tag);
         }
     }
 }
 
-/// Send a small fully-buffered frame, retrying short sends.
-async fn send_all(fd: i32, frame: &[u8]) -> std::io::Result<()> {
-    let mut offset = 0;
-    while offset < frame.len() {
-        let chunk = frame[offset..].to_vec().into_boxed_slice();
-        let (res, _) = ops::send(fd, chunk)?.await;
-        let sent = res? as usize;
-        if sent == 0 {
-            return Err(std::io::ErrorKind::WriteZero.into());
+/// Encode one work item at `out[0..]`; returns bytes written.
+fn encode_send_work(
+    queue: &Rc<QueueCore>,
+    out: &mut [u8],
+    work: &SendWork,
+    hdr_digest: bool,
+    data_digest: bool,
+) -> usize {
+    match *work {
+        SendWork::R2t {
+            tag,
+            cid,
+            offset,
+            length,
+        } => pdu::encode_r2t(out, cid, tag, offset, length, hdr_digest),
+        SendWork::Response(completion) => {
+            let mut offset = 0usize;
+            let success_elide =
+                completion.data_len > 0 && queue.sqhd_disabled && completion.cqe.status.get() == 0;
+            if completion.data_len > 0 {
+                let data_len = completion.data_len as usize;
+                let hdr_len = pdu::encode_c2h_data(
+                    &mut out[offset..],
+                    completion.cqe.cid.get(),
+                    0,
+                    completion.data_len,
+                    true,
+                    success_elide,
+                    hdr_digest,
+                    data_digest,
+                );
+                offset += hdr_len;
+                {
+                    let slot_data = queue.slot(completion.tag).data();
+                    out[offset..offset + data_len].copy_from_slice(&slot_data[..data_len]);
+                }
+                if data_digest {
+                    let crc = digest::crc32c(&out[offset..offset + data_len]);
+                    out[offset + data_len..offset + data_len + 4]
+                        .copy_from_slice(&crc.to_le_bytes());
+                    offset += 4;
+                }
+                offset += data_len;
+            }
+            if !success_elide {
+                offset += pdu::encode_capsule_resp(&mut out[offset..], &completion.cqe, hdr_digest);
+            }
+            offset
         }
-        offset += sent;
     }
-    Ok(())
 }

@@ -262,6 +262,11 @@ impl QueueCore {
         }
     }
 
+    /// Non-blocking pop of send work (batching: drain without parking).
+    pub fn try_next_send_work(&self) -> Option<SendWork> {
+        self.send_work.borrow_mut().pop_front()
+    }
+
     /// Await the next send-path work item.
     pub async fn next_send_work(self: &Rc<QueueCore>) -> SendWork {
         std::future::poll_fn(|cx| {

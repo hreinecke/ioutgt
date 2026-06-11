@@ -80,9 +80,11 @@ impl MsgResources {
 
 /// Per-op slab entry. Owns everything the kernel may still look at.
 pub(crate) struct OpEntry {
-    /// CQEs reaped but not yet consumed by the future (multishot may
-    /// buffer several).
-    pub(crate) results: VecDeque<CqeResult>,
+    /// First pending CQE, inline: single-shot ops (the vast majority)
+    /// complete without touching the heap-backed overflow queue.
+    pub(crate) first: Option<CqeResult>,
+    /// Overflow for multishot bursts only.
+    pub(crate) overflow: VecDeque<CqeResult>,
     pub(crate) waker: Option<Waker>,
     /// Terminal CQE seen (single-shot completion, or multishot CQE
     /// without `IORING_CQE_F_MORE`). No further CQEs will arrive.
@@ -96,12 +98,29 @@ pub(crate) struct OpEntry {
 impl OpEntry {
     pub(crate) fn new(resources: Resources) -> Self {
         OpEntry {
-            results: VecDeque::new(),
+            first: None,
+            overflow: VecDeque::new(),
             waker: None,
             terminated: false,
             orphaned: false,
             resources,
         }
+    }
+
+    pub(crate) fn push_result(&mut self, result: CqeResult) {
+        if self.first.is_none() && self.overflow.is_empty() {
+            self.first = Some(result);
+        } else {
+            self.overflow.push_back(result);
+        }
+    }
+
+    pub(crate) fn pop_result(&mut self) -> Option<CqeResult> {
+        self.first.take().or_else(|| self.overflow.pop_front())
+    }
+
+    pub(crate) fn has_result(&self) -> bool {
+        self.first.is_some() || !self.overflow.is_empty()
     }
 }
 
@@ -137,14 +156,14 @@ impl Op {
         assert!(!self.done, "op polled after completion");
         let mut slab = self.reactor.slab_mut();
         let entry = slab.get_mut(self.key).expect("op entry vanished");
-        if entry.results.is_empty() {
+        if !entry.has_result() {
             entry.waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
         debug_assert!(entry.terminated, "single-shot op got non-terminal CQE");
         let mut entry = slab.remove(self.key);
         self.done = true;
-        let result = entry.results.pop_front().expect("checked non-empty");
+        let result = entry.pop_result().expect("checked non-empty");
         Poll::Ready((result, entry.resources))
     }
 }
@@ -186,8 +205,8 @@ impl MultiOp {
         }
         let mut slab = self.reactor.slab_mut();
         let entry = slab.get_mut(self.key).expect("op entry vanished");
-        if let Some(result) = entry.results.pop_front() {
-            if entry.terminated && entry.results.is_empty() {
+        if let Some(result) = entry.pop_result() {
+            if entry.terminated && !entry.has_result() {
                 slab.remove(self.key);
                 self.done = true;
             }

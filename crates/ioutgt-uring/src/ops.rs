@@ -101,6 +101,28 @@ pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> io::Result<BufOp> {
     Ok(BufOp { op })
 }
 
+/// Send the first `len` bytes of an owned buffer (the whole buffer
+/// stays alive in the reactor and is handed back) — the reusable
+/// staging-buffer primitive.
+pub fn send_partial(fd: RawFd, buf: Box<[u8]>, len: u32) -> io::Result<BufOp> {
+    if len as usize > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "len exceeds buffer",
+        ));
+    }
+    let ptr = buf.as_ptr();
+    let op = Op::submit(
+        |key| {
+            opcode::Send::new(types::Fd(fd), ptr, len)
+                .build()
+                .user_data(key)
+        },
+        Resources::Buffer(buf),
+    )?;
+    Ok(BufOp { op })
+}
+
 /// Send an owned buffer on a socket.
 pub fn send(fd: RawFd, buf: Box<[u8]>) -> io::Result<BufOp> {
     let len = buf_len(&buf)?;
@@ -128,6 +150,36 @@ impl Future for SendVectored {
         let (result, resources) = ready!(self.op.poll_single(cx));
         Poll::Ready((result.io(), resources.into_msg().bufs))
     }
+}
+
+/// Vectored send of the first `hlen` bytes of `header` then `plen`
+/// bytes of `payload` in one SENDMSG; both buffers come back whole.
+pub fn send_vectored_partial(
+    fd: RawFd,
+    header: Box<[u8]>,
+    hlen: usize,
+    payload: Box<[u8]>,
+    plen: usize,
+) -> io::Result<SendVectored> {
+    if hlen > header.len() || plen > payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "len exceeds buffer",
+        ));
+    }
+    let mut msg = MsgResources::new_send(header, payload);
+    msg.iovecs[0].iov_len = hlen;
+    msg.iovecs[1].iov_len = plen;
+    let msghdr_ptr: *const libc::msghdr = &msg.msghdr;
+    let op = Op::submit(
+        |key| {
+            opcode::SendMsg::new(types::Fd(fd), msghdr_ptr)
+                .build()
+                .user_data(key)
+        },
+        Resources::Msg(msg),
+    )?;
+    Ok(SendVectored { op })
 }
 
 /// Vectored send of `header` then `payload` in a single SENDMSG — the

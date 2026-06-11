@@ -8,7 +8,9 @@ TOP="$(cd "$(dirname "$0")/.." && pwd)"
 VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
 VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
 TEST_NAME="${1:-ioutgt_nvme_tcp}"
-PORT="${IOUTGT_PORT:-4420}"
+# Dedicated port: 4420 is the canonical NVMe port and may be owned by
+# other targets on a dev box (kernel nvmet, etc.).
+PORT="${IOUTGT_PORT:-14420}"
 LOG="$TOP/target/ioutgt-interop.log"
 
 cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt
@@ -32,6 +34,10 @@ PID_FILE="$TOP/target/ioutgt-interop.pid"
 mkdir -p "$MARKER_DIR"
 rm -f "$MARKER_DIR/ioutgt_want_ns2" "$MARKER_DIR/ioutgt_want_kill" \
     "$MARKER_DIR/ioutgt_kill_enabled" "$MARKER_DIR/ioutgt_soak_only"
+# Tell the guest which port we serve on (env does not cross into the VM).
+echo "$PORT" > "$MARKER_DIR/ioutgt_port"
+# Fresh log: the startup gate below greps it for the listener line.
+: > "$LOG"
 # IOUTGT_SOAK_ONLY=N: reconnect-leak mode — the guest only runs N
 # connect/disconnect cycles, and we assert the target RSS stays flat.
 [ -n "${IOUTGT_SOAK_ONLY:-}" ] && echo "$IOUTGT_SOAK_ONLY" > "$MARKER_DIR/ioutgt_soak_only"

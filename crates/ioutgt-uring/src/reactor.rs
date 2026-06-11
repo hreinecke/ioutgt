@@ -249,7 +249,7 @@ impl Reactor {
                 }
                 continue;
             }
-            entry.results.push_back(result);
+            entry.push_result(result);
             if let Some(waker) = entry.waker.take() {
                 waker.wake();
                 woken += 1;
