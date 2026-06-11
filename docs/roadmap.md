@@ -66,8 +66,18 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 - RAE semantics on log pages; real SMART/error-log content; discovery
   genctr maintenance; Get Log Page offset support beyond discovery.
 - Host ACLs (per-subsystem allowed-host lists) in config + control
-  API; multiple ports; TLS (kTLS or userspace) for NVMe/TCP secure
-  channels.
+  API.
+- **Multiple ports**: one process currently serves one listen address
+  (`spawn_target()` binds a single listener; nvmet allows N ports with
+  subsystems linked into each). The model is already port-shaped —
+  `PortConfig` carries traddr/trsvcid plus its own subsystem map — so
+  the work is assembly and config: a `ports` array in the JSON schema
+  (each with listen address, digest policy, subsystem list), one accept
+  loop per port on the control thread routing into the *shared* queue
+  threads, per-port discovery log pages, and port identity in
+  `GET_STATS`. Queue threads and the registry need no changes;
+  controllers are already keyed by (subsystem, host), not by port.
+- TLS (kTLS or userspace) for NVMe/TCP secure channels.
 - bdev discard/write-zeroes via `IORING_OP_URING_CMD`
   (BLKDISCARD-equivalent) once a root test rig exists; NVMe
   passthrough backend over uring-cmd to a host controller.
