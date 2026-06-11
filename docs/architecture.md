@@ -205,27 +205,54 @@ run_queue(QueueConn)                                   [ioutgt-tcp]
                 │                        │                       │   [uring]
 ```
 
-**Data copies.** The slot buffer (preallocated per tag: 8 KiB admin,
-128 KiB = MDTS io) is the single rendezvous for payload bytes, and the
-design accepts exactly one userspace memcpy per direction around it:
+**recv_loop** is a resumable state machine across `ops::recv`
+completions (one reused 64 KiB recv buffer, passed by value through
+each op per the reactor's ownership rule). `Header` feeds bytes to
+`PduDecoder` [nvme]; a decoded CapsuleCmd claims a tag and either
+expects in-capsule payload next on the stream, or — for a
+host-resident write (transport SGL) — `solicit()`s the whole transfer
+with a single R2T (TTAG = slot index) and returns to `Header` until
+the H2CData PDUs arrive. `Data` memcpys payload from the recv buffer
+into the slot buffer at the PDU's data offset plus reassembly
+progress, resuming across recvs; the command is `submit()`ed only
+once the full transfer is present. `Ddgst` collects the trailing
+4-byte digest; a mismatch fails just that command
+(`DATA_XFER_ERROR|DNR`, as nvmet does) and keeps the connection,
+while malformed or out-of-place PDUs produce C2HTermReq and close.
 
-- **Host write (H2C)**: kernel → 64 KiB recv buffer (`ops::recv`);
-  recv loop memcpys recv buffer → slot buffer (`RecvPhase::Data`),
-  reassembling in-capsule data or any number of H2CData PDUs at
-  `base + offset`; the backend then gets `&slot.data()[..len]`
-  borrowed directly — the file backend issues `write_at` on that
-  pointer, zero further copies.
+**send_loop** blocks on `next_send_work()`, then greedily drains
+`try_next_send_work()`, encoding R2Ts, C2HData (header + payload),
+and response capsules into one staging buffer until the next item
+might not fit; the batch ships as a single `ops::send_partial`,
+re-issued on short send so nothing else can interleave on the wire.
+With SQ flow control off, a successful read elides the response
+capsule (SUCCESS bit in C2HData). Slots are `release_tag()`ed only
+after the whole batch send completes.
+
+**Data copies.** The slot buffer (preallocated per tag: 8 KiB admin,
+128 KiB = MDTS io) is the single rendezvous for payload bytes; the
+phase-1 transport (§9) costs one userspace memcpy per direction
+around it:
+
+- **Host write (H2C)**: kernel → recv buffer (`ops::recv`); recv
+  loop memcpys recv buffer → slot buffer (`RecvPhase::Data`); the
+  backend then gets `&slot.data()[..len]` borrowed directly — the
+  file backend issues `write_at` on that pointer, zero further
+  copies.
 - **Host read (C2H)**: the file backend `read_at`s straight into the
   slot buffer; send loop memcpys slot buffer → staging buffer
-  (`encode_send_work`), then one `ops::send_partial` → kernel.
+  (`encode_send_work`), then `ops::send_partial` → kernel.
 
 The write-side copy is what lets one flat, MDTS-sized buffer absorb
-arbitrarily fragmented TCP segments, so backends never see scatter;
-the read-side copy is the price of batching many responses into one
-ordered send op. Both copies are fused with CRC32C when data digests
-are negotiated — the bytes are walked once, never twice. `release_tag`
-runs only after the staged bytes are fully on the wire, so a slot
-buffer is never recycled while the send path still reads from it.
+arbitrarily fragmented TCP segments and H2CData splits, so backends
+never see scatter; the read-side copy is the price of the batched
+ordered send (and is slated to go away under phase-2 `SEND_ZC`, §9).
+CRC32C is computed alongside each copy while the bytes are cache-hot,
+never as a separate cold pass over the full payload — the recv side
+always accumulates, with digest negotiation gating only verification
+and emission. And since a response's bytes are copied out to staging
+at encode time, the batch-completion `release_tag` above reclaims
+slots strictly after the send path is done reading them.
 
 ### 4.3 One IO command end to end
 
@@ -333,7 +360,7 @@ The transport boundary is a pair of abstractions so phase-2 optimizations
 and future transports slot in without touching protocol logic:
 
 - `RecvSource` — yields borrowed byte chunks to the codec. Phase 1: plain
-  single-shot `RECV` into a per-connection ring buffer. Phase 2: multishot
+  single-shot `RECV` into a per-connection recv buffer. Phase 2: multishot
   recv with a provided-buffer ring. (RECV_ZC requires NIC header-data
   split; deferred to real-NIC benchmarking.)
 - Send side — queue tasks emit `SendItem { header, payload }` onto the
@@ -399,7 +426,7 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → ring buffer → copy into slot buffer | batch-drain into recycled staging, one SEND per batch | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
+| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot buffer | batch-drain into recycled staging, one SEND per batch | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
 | Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | SEND_ZC, slot reuse gated on notification CQE | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 
