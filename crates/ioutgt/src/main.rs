@@ -66,9 +66,10 @@ enum Command {
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
     },
-    /// List live controllers on a running target (queues, threads,
-    /// namespaces).
-    ListCtrl {
+    /// List the target: port inventory plus live controllers
+    /// (queues, threads, namespaces).
+    #[command(alias = "list-ctrl")]
+    List {
         /// Control socket path.
         #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
         socket: std::path::PathBuf,
@@ -103,8 +104,8 @@ fn ctl(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `ioutgt list-ctrl`: render LIST_CONTROLLER output for humans.
-fn list_ctrl(socket: &std::path::Path) -> std::io::Result<()> {
+/// `ioutgt list`: render the target's inventory and live controllers.
+fn list_target(socket: &std::path::Path) -> std::io::Result<()> {
     let raw = ctl_request(socket, r#"{"op":"LIST_CONTROLLER"}"#)?;
     let response = serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -212,7 +213,7 @@ fn main() -> std::io::Result<()> {
     if let Some(command) = &args.command {
         match command {
             Command::Ctl { socket, request } => return ctl(socket, request),
-            Command::ListCtrl { socket } => return list_ctrl(socket),
+            Command::List { socket } => return list_target(socket),
         }
     }
 
@@ -308,7 +309,7 @@ mod tests {
         let data = serde_json::json!({
             "pid": 1,
             "port": {
-                "traddr": "::", "trsvcid": "4420",
+                "traddr": "::", "trsvcid": "14420",
                 "subsystems": [{
                     "nqn": "nqn.x",
                     // 2 GiB in 4096B blocks.
@@ -318,7 +319,7 @@ mod tests {
             "controllers": [],
         });
         let out = super::render_ctrl_list(&data);
-        assert!(out.contains("port :::4420\n"), "{out}");
+        assert!(out.contains("port :::14420\n"), "{out}");
         assert!(out.contains("ns 7: 2 GiB (4096B blocks)\n"), "{out}");
     }
 
