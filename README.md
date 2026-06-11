@@ -34,12 +34,17 @@ implementations behind the same core.
 
 ## Documentation
 
+- [`docs/usage.md`](docs/usage.md) — command line, config file, control
+  API, host connection, test harnesses.
 - [`docs/architecture.md`](docs/architecture.md) — the architecture
   specification (thread model, reactor, command-slot lifecycle, PDU flows).
 - [`docs/nvmet-comparison.md`](docs/nvmet-comparison.md) — subsystem-by-
   subsystem comparison with the Linux kernel NVMe target.
+- [`docs/perf-notes.md`](docs/perf-notes.md) — measured optimization log.
+- [`docs/roadmap.md`](docs/roadmap.md) — what's next (RDMA/NBD/iSCSI,
+  remaining perf work, deferred nvmet benchmark).
 - [`docs/benchmark-plan.md`](docs/benchmark-plan.md) — benchmark methodology
-  vs kernel nvmet.
+  vs kernel nvmet (execution deferred).
 
 ## Requirements
 

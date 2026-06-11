@@ -1,8 +1,11 @@
 # Benchmark plan
 
-Status: skeleton; methodology fixed before M9 so optimization steps are
-measured against a stable baseline. Results land in
-`docs/benchmark-report.md` at M10.
+Status: **execution deferred** (by decision, 2026-06). The methodology
+below stands; internal A/B numbers from the M9 pass live in
+`docs/perf-notes.md`. When picked up again, prerequisites are: root on
+the host (nvmet configfs, loop devices), a quiet machine, and ideally a
+real NIC pair for the zero-copy items. Results will land in
+`docs/benchmark-report.md`.
 
 ## Systems under test
 1. **ioutgt** (this project), null / memory / file / block backends.
