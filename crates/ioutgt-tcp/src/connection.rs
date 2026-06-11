@@ -188,17 +188,18 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         }));
     }
 
-    // Send path.
-    {
+    // Send path. Held separately: teardown must join it (the gather
+    // send references slot buffers) before freeing the queue.
+    let send_task = {
         let queue = Rc::clone(&queue);
         let hdr_digest = conn.hdr_digest;
         let data_digest = conn.data_digest;
-        tasks.push(tokio::task::spawn_local(async move {
+        tokio::task::spawn_local(async move {
             if let Err(err) = send_loop(&queue, fd, hdr_digest, data_digest).await {
                 debug!(qid = queue.qid, "send loop ended: {err}");
             }
-        }));
-    }
+        })
+    };
 
     // The Connect command was consumed on the control thread; run it
     // through the normal slot pipeline as this queue's first command.
@@ -226,24 +227,49 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         }
         waited += 2;
     }
-    if queue.executing() > 0 {
+    // Stop the send task and wait for any in-flight send op before
+    // anything it references is freed. shutdown() unwedges a send
+    // parked on a full socket buffer; close_send() unparks an idle
+    // send loop.
+    queue.close_send();
+    // SAFETY: fd is valid for the connection's lifetime; shutdown only
+    // signals, never frees.
+    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    // Own budget: the executing drain may have spent all of `waited`,
+    // and the send task needs at least one poll cycle to observe
+    // close_send/shutdown.
+    let mut send_waited = 0u32;
+    while !send_task.is_finished() && send_waited < 10_000 {
+        match ops::sleep(Duration::from_millis(2)) {
+            Ok(sleep) => {
+                let _ = sleep.await;
+            }
+            Err(_) => break,
+        }
+        send_waited += 2;
+    }
+    if queue.executing() > 0 || !send_task.is_finished() {
         // A wedged backend op: leak the queue AND the slot tasks rather
         // than free memory the kernel may still write to. A suspended
         // backend future can own a private buffer (e.g. the write-zeroes
         // fallback chunk) referenced by an in-flight raw kernel op;
         // aborting the task would drop and free that buffer mid-DMA.
         // Leaking the tasks keeps every such future — and its buffer —
-        // alive for the process's remaining lifetime.
+        // alive for the process's remaining lifetime. The same applies
+        // to the send task: its in-flight gather op references slot
+        // buffers and the batch arena.
         warn!(
             qid = conn.qid,
             executing = queue.executing(),
             "teardown timeout; leaking queue and tasks"
         );
         std::mem::forget(Rc::clone(&queue));
+        std::mem::forget(send_task);
         for task in tasks {
             std::mem::forget(task);
         }
     } else {
+        send_task.abort();
         for task in &tasks {
             task.abort();
         }
