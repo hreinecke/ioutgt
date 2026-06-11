@@ -57,6 +57,46 @@ fn socketpair_echo() {
 }
 
 #[test]
+fn sendmsg_raw_gathers_three_chunks() {
+    let (client, server) = UnixStream::pair().unwrap();
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+
+    rt.block_on(async move {
+        let a = b"hdr:".to_vec();
+        let b = b"payload-".to_vec();
+        let c = b"trailer".to_vec();
+        let iovs = [
+            libc::iovec {
+                iov_base: a.as_ptr().cast_mut().cast(),
+                iov_len: a.len(),
+            },
+            libc::iovec {
+                iov_base: b.as_ptr().cast_mut().cast(),
+                iov_len: b.len(),
+            },
+            libc::iovec {
+                iov_base: c.as_ptr().cast_mut().cast(),
+                iov_len: c.len(),
+            },
+        ];
+        // SAFETY: a zeroed msghdr is a valid value; iov fields set below.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = iovs.as_ptr().cast_mut();
+        msg.msg_iovlen = iovs.len();
+        let total = a.len() + b.len() + c.len();
+
+        // SAFETY: msg, iovs, and the three buffers outlive the await.
+        let op = unsafe { ops::sendmsg_raw(client.as_raw_fd(), &raw const msg) }.unwrap();
+        assert_eq!(op.await.unwrap() as usize, total);
+
+        let buf = vec![0u8; total].into_boxed_slice();
+        let (res, buf) = ops::recv(server.as_raw_fd(), buf).unwrap().await;
+        assert_eq!(res.unwrap() as usize, total);
+        assert_eq!(&buf[..], b"hdr:payload-trailer");
+    });
+}
+
+#[test]
 fn vectored_send_reassembles() {
     let (client, server) = UnixStream::pair().unwrap();
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();

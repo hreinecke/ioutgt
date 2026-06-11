@@ -370,6 +370,26 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp>
     Ok(RawOp { op })
 }
 
+/// Vectored send described by a caller-managed `msghdr` — the batched
+/// gather-send primitive (header arena + slot-payload iovecs).
+///
+/// # Safety
+///
+/// `msg`, its iovec array, and every buffer the iovecs reference must
+/// remain valid (reads only) until this op's terminal CQE has been
+/// reaped — same contract as [`recv_raw`].
+pub unsafe fn sendmsg_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<RawOp> {
+    let op = Op::submit(
+        |key| {
+            opcode::SendMsg::new(types::Fd(fd), msg)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+    )?;
+    Ok(RawOp { op })
+}
+
 /// Positional read into caller-managed memory.
 ///
 /// # Safety
