@@ -263,8 +263,25 @@ fn handle(state: &CtlState, request: Request) -> Response {
                     })
                 })
                 .collect();
+            // Discoverable inventory: what the discovery log would
+            // advertise, reported even with no controller connected.
+            let port_subsystems: Vec<_> = state
+                .port
+                .subsystems
+                .values()
+                .map(|subsys| {
+                    let namespaces: Vec<_> =
+                        subsys.snapshot().values().map(|ns| ns_json(ns)).collect();
+                    json!({ "nqn": subsys.nqn, "namespaces": namespaces })
+                })
+                .collect();
             Response::ok(Some(json!({
                 "pid": std::process::id(),
+                "port": {
+                    "traddr": state.port.traddr,
+                    "trsvcid": state.port.trsvcid,
+                    "subsystems": port_subsystems,
+                },
                 "controllers": controllers,
             })))
         }
