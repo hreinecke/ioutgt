@@ -108,7 +108,11 @@ through the test VM is not a useful target benchmark.
 
 ```sh
 cargo test --workspace            # unit + in-process integration suites
-testing/run_interop.sh            # full VM interop: discover/connect/fio
+                                  #   (incl. io_verify: concurrent mixed-size
+                                  #    data-integrity torture on both write paths)
+testing/run_interop.sh            # full VM interop: discover/connect, fio
+                                  #   --verify matrix, mkfs/mount/fstrim/fsck
+testing/run_interop.sh ioutgt_fio # ONLY the fio data-integrity verify stage
                                   #   IOUTGT_BACKEND=file|null|memory
                                   #   IOUTGT_ENABLE_KILL=1  (kill/recovery test)
                                   #   IOUTGT_SOAK_ONLY=N    (reconnect-leak gate)

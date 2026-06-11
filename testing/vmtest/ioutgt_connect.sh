@@ -94,6 +94,15 @@ ioutgt_fio_verify() {
         vt_die "fio mixed verify failed"
     vt_log "fio 70/30 randrw verify ok"
 
+    # Mixed block sizes spanning both write paths (512B..16K in-capsule,
+    # >16K via R2T) with per-block crc32c verification.
+    fio --name=vbs --filename="$dev" --rw=randwrite \
+        --bssplit=512/10:4k/40:16k/20:64k/20:128k/10 --size=24M \
+        --verify=crc32c --verify_fatal=1 --direct=1 --ioengine=libaio \
+        --iodepth=16 --output-format=terse >/dev/null ||
+        vt_die "fio mixed-blocksize verify failed"
+    vt_log "fio mixed-blocksize verify ok"
+
     nvme disconnect -n "$NQN" >/dev/null || vt_die "disconnect after fio failed"
 }
 
@@ -219,6 +228,63 @@ ioutgt_run_m8() {
     vt_pass "ioutgt M8 target-kill recovery"
 }
 
+# Filesystem end-to-end: mkfs.ext4 + mount + checksummed file IO +
+# fstrim (exercises DSM discard) + fsck. This drives flush ordering,
+# sub-block RMW patterns, page-cache writeback, and discard through a
+# real filesystem rather than raw block IO.
+ioutgt_run_fs() {
+    vt_require_cmd mkfs.ext4
+    vt_require_cmd fsck.ext4
+    vt_log "filesystem test: mkfs/mount/verify/fstrim/fsck"
+    nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" --nr-io-queues=2 ||
+        vt_die "connect for fs test failed"
+    local ctrl="" dev="" i c
+    for i in $(seq 100); do
+        for c in /sys/class/nvme/nvme*; do
+            [ -e "$c/subsysnqn" ] || continue
+            [ "$(cat "$c/subsysnqn")" = "$NQN" ] && ctrl=$(basename "$c") && break
+        done
+        dev="/dev/${ctrl}n1"
+        [ -n "$ctrl" ] && [ -b "$dev" ] && break
+        sleep 0.2
+    done
+    [ -n "$ctrl" ] && [ -b "$dev" ] || vt_die "device missing for fs test"
+
+    mkfs.ext4 -F -q "$dev" || vt_die "mkfs.ext4 failed"
+
+    local mnt sums
+    mnt=$(mktemp -d)
+    mount "$dev" "$mnt" || vt_die "mount failed"
+
+    # Checksummed payload: mixed file sizes, then sync to push real IO.
+    for i in 1 2 3 4 5 6; do
+        dd if=/dev/urandom of="$mnt/file.$i" bs=64k count=$((i * 8)) \
+            status=none || vt_die "file write failed"
+    done
+    (cd "$mnt" && sha256sum file.* > SHA256SUMS) || vt_die "checksum failed"
+    sync
+
+    # Unmount and check on-disk consistency cold.
+    umount "$mnt" || vt_die "umount failed"
+    fsck.ext4 -f -n "$dev" >/dev/null || vt_die "fsck found errors after write phase"
+
+    # Remount, verify every checksum survived the round trip.
+    mount "$dev" "$mnt" || vt_die "remount failed"
+    (cd "$mnt" && sha256sum -c SHA256SUMS --quiet) || vt_die "data verification failed"
+    vt_log "checksums verified after remount"
+
+    # Delete + fstrim: drives DSM deallocate end to end.
+    rm -f "$mnt"/file.*
+    sync
+    fstrim -v "$mnt" || vt_die "fstrim failed (DSM discard path)"
+
+    umount "$mnt" || vt_die "final umount failed"
+    fsck.ext4 -f -n "$dev" >/dev/null || vt_die "fsck found errors after fstrim"
+    rmdir "$mnt"
+    nvme disconnect -n "$NQN" >/dev/null || vt_die "fs test disconnect failed"
+    vt_pass "ioutgt filesystem mkfs/mount/verify/fstrim/fsck"
+}
+
 # Guest console output can be lossy under load; persist the verdict
 # through the 9p-shared data dir so the host can assert on it.
 ioutgt_mark() {
@@ -245,6 +311,8 @@ ioutgt_run_all() {
     ioutgt_mark "PASS m5"
     ioutgt_run_m7
     ioutgt_mark "PASS m7"
+    ioutgt_run_fs
+    ioutgt_mark "PASS fs"
     ioutgt_run_m8
     [ -f "${VMTEST_DATA_DIR:?}/tmp/ioutgt_kill_enabled" ] && ioutgt_mark "PASS m8"
     true
