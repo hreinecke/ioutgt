@@ -44,24 +44,31 @@ struct Args {
     backend: String,
 
     /// Unix socket path for the runtime control API.
-    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+    #[arg(long, default_value_os_t = default_control_socket())]
     control_socket: std::path::PathBuf,
 
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-/// Control-socket path shared as the default by the target and every
-/// ctl-style subcommand, so out of the box the clients dial the socket
-/// the server actually binds.
-const DEFAULT_CONTROL_SOCKET: &str = "/tmp/ioutgt.sock";
+/// Default control-socket path, shared by the target and every
+/// ctl-style subcommand so out of the box the clients dial the socket
+/// the server actually binds: `$XDG_RUNTIME_DIR/ioutgt.sock` (a
+/// per-user 0700 directory — no squatting, no cross-user access),
+/// falling back to `/tmp/ioutgt.sock` where XDG_RUNTIME_DIR is unset.
+fn default_control_socket() -> std::path::PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::Path::new(&dir).join("ioutgt.sock"),
+        _ => std::path::PathBuf::from("/tmp/ioutgt.sock"),
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Send one JSON request to a running target's control socket.
     Ctl {
         /// Control socket path.
-        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+        #[arg(long, default_value_os_t = default_control_socket())]
         socket: std::path::PathBuf,
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
@@ -71,7 +78,7 @@ enum Command {
     #[command(alias = "list-ctrl")]
     List {
         /// Control socket path.
-        #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
+        #[arg(long, default_value_os_t = default_control_socket())]
         socket: std::path::PathBuf,
     },
 }

@@ -293,6 +293,17 @@ async fn control_loop(
         let _ = std::fs::remove_file(path);
         match tokio::net::UnixListener::bind(path) {
             Ok(listener) => {
+                // The API mutates served storage (ADD/REMOVE_NAMESPACE):
+                // owner-only. Prefer a private dir (the CLI defaults to
+                // $XDG_RUNTIME_DIR) over world-writable /tmp, where a
+                // pre-bound squatter could still intercept first.
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    let _ = addr_tx.send(Err(err));
+                    return;
+                }
                 let nudge_tx = admin_tx.clone();
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),
