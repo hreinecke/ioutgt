@@ -12,16 +12,22 @@ two IO threads. This file orders what comes next.
   `ENOBUFS` → single-shot fallback): removes the recv re-arm SQE and
   the owned-buffer round trip per batch. The `RecvSource` seam in the
   transport was designed for exactly this swap.
-- **Direct-to-slot payload recv** (avoid the recv_loop memcpy): once
-  a PDU header places the payload (`RecvPhase::Data`), issue bounded
-  recvs straight into the slot buffer at the reassembly offset
-  instead of bouncing through the recv buffer — removes the
-  write-side userspace copy in the §4.2 data-copy budget. Costs one
-  recv op per payload (vs amortized batch) and the DDGST
-  accumulation loses its copy-time pass; in tension with multishot
-  recv + provided buffers (kernel picks the buffer there), so
-  evaluate as the alternative recv strategy, CPU-per-IOP on large
-  writes.
+- **Direct-to-slot payload recv** (shrink the recv_loop memcpy —
+  what nvmet does after the header): once a PDU header places the
+  payload (`RecvPhase::Data`), recv the not-yet-arrived tail of
+  large R2T transfers straight into the slot buffer at the
+  reassembly offset (`ops::recv_raw` exists for exactly this). The
+  already-buffered prefix and in-capsule payloads still copy; full
+  elimination would need header-bounded recvs at ≥2 ops/command,
+  forfeiting cross-command batching. Costs: one or more bounded
+  recvs per H2CData PDU (`MSG_WAITALL` to cap), DDGST loses its
+  copy-time accumulation (separate pass over the slot), teardown
+  must drain *receiving* slots too (raw-op contract: slot memory
+  valid until terminal CQE), and §6's `RecvSource` chunk model gets
+  a payload-bypass variant. Irreconcilable with multishot recv +
+  provided buffers (kernel picks the buffer there) — a third recv
+  strategy, measured by CPU-per-IOP on large writes
+  (architecture.md §4.2 documents the copy budget).
 - **Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED`** for
   the O_DIRECT backend: removes per-op page pinning; evaluate by
   CPU-per-IOP on ext4, not loopback IOPS.
