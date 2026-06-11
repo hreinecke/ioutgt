@@ -155,6 +155,15 @@ pub fn build_backend(config: &BackendConfig) -> Result<AnyBackend, String> {
     })
 }
 
+/// Namespace JSON body shared by `LIST_NAMESPACE` and `LIST_CONTROLLER`.
+fn ns_json(ns: &Namespace<AnyBackend>) -> serde_json::Value {
+    json!({
+        "nsid": ns.nsid,
+        "blocks": ns.backend.nr_blocks(),
+        "block_shift": ns.backend.block_shift(),
+    })
+}
+
 fn handle(state: &CtlState, request: Request) -> Response {
     match request {
         Request::AddNamespace {
@@ -206,16 +215,7 @@ fn handle(state: &CtlState, request: Request) -> Response {
                 Err(response) => return response,
             };
             let table = subsys.snapshot();
-            let list: Vec<_> = table
-                .values()
-                .map(|ns| {
-                    json!({
-                        "nsid": ns.nsid,
-                        "blocks": ns.backend.nr_blocks(),
-                        "block_shift": ns.backend.block_shift(),
-                    })
-                })
-                .collect();
+            let list: Vec<_> = table.values().map(|ns| ns_json(ns)).collect();
             Response::ok(Some(json!({ "namespaces": list })))
         }
         Request::GetStats => {
@@ -245,19 +245,7 @@ fn handle(state: &CtlState, request: Request) -> Response {
                     let namespaces: Vec<_> = state
                         .port
                         .subsystem(&entry.subsys_nqn)
-                        .map(|subsys| {
-                            subsys
-                                .snapshot()
-                                .values()
-                                .map(|ns| {
-                                    json!({
-                                        "nsid": ns.nsid,
-                                        "blocks": ns.backend.nr_blocks(),
-                                        "block_shift": ns.backend.block_shift(),
-                                    })
-                                })
-                                .collect()
-                        })
+                        .map(|subsys| subsys.snapshot().values().map(|ns| ns_json(ns)).collect())
                         .unwrap_or_default();
                     let queues: Vec<_> = entry
                         .queues

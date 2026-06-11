@@ -210,6 +210,7 @@ fn list_controller_reports_queues_and_namespaces() {
     for _ in 0..50 {
         let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
         if resp["data"]["controllers"].as_array().unwrap().is_empty() {
+            let _ = std::fs::remove_file(&socket);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
