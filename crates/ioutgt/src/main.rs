@@ -121,6 +121,37 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "pid {}", data["pid"]);
+    // Discoverable inventory (configured port + subsystems), shown in
+    // every state; skipped silently if the server predates it.
+    if let Some(port) = data["port"].as_object() {
+        let _ = writeln!(
+            out,
+            "port {}:{}",
+            port["traddr"].as_str().unwrap_or("?"),
+            port["trsvcid"].as_str().unwrap_or("?")
+        );
+        for subsys in port["subsystems"].as_array().into_iter().flatten() {
+            let _ = writeln!(out, "  subsystem {}", subsys["nqn"].as_str().unwrap_or("?"));
+            for ns in subsys["namespaces"].as_array().into_iter().flatten() {
+                let blocks = ns["blocks"].as_u64().unwrap_or(0);
+                let shift = u32::try_from(ns["block_shift"].as_u64().unwrap_or(0).min(63))
+                    .expect("bounded by min(63)");
+                let bytes = blocks << shift;
+                const GIB: u64 = 1 << 30;
+                let size = if bytes > 0 && bytes % GIB == 0 {
+                    format!("{} GiB", bytes / GIB)
+                } else {
+                    format!("{} MiB", bytes >> 20)
+                };
+                let _ = writeln!(
+                    out,
+                    "    ns {}: {size} ({}B blocks)",
+                    ns["nsid"],
+                    1u64 << shift
+                );
+            }
+        }
+    }
     let controllers = data["controllers"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
@@ -218,10 +249,26 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn sample_port() -> serde_json::Value {
+        serde_json::json!({
+            "traddr": "0.0.0.0",
+            "trsvcid": "14420",
+            "subsystems": [{
+                "nqn": "nqn.2026-06.io.ioutgt:test",
+                "namespaces": [{"nsid": 1, "blocks": 131072, "block_shift": 9}],
+            }],
+        })
+    }
+
+    const PORT_HEADER: &str = "port 0.0.0.0:14420\n\
+         \x20 subsystem nqn.2026-06.io.ioutgt:test\n\
+         \x20   ns 1: 64 MiB (512B blocks)\n";
+
     #[test]
     fn render_ctrl_list_formats_controllers() {
         let data = serde_json::json!({
             "pid": 4242,
+            "port": sample_port(),
             "controllers": [{
                 "cntlid": 1,
                 "subsysnqn": "nqn.2026-06.io.ioutgt:test",
@@ -236,19 +283,47 @@ mod tests {
             }],
         });
         let out = super::render_ctrl_list(&data);
-        assert_eq!(
-            out,
-            "pid 4242\n\
+        let expected = format!(
+            "pid 4242\n{PORT_HEADER}\
              controller 1: nqn.2026-06.io.ioutgt:test\n\
              \x20 host:   nqn.2014-08.org.nvmexpress:uuid:abc\n\
              \x20 kato:   60000 ms\n\
              \x20 queues: 0:32@100 1:64@101\n\
              \x20 ns:     1\n"
         );
+        assert_eq!(out, expected);
     }
 
     #[test]
     fn render_ctrl_list_empty() {
+        let data = serde_json::json!({ "pid": 4242, "port": sample_port(), "controllers": [] });
+        assert_eq!(
+            super::render_ctrl_list(&data),
+            format!("pid 4242\n{PORT_HEADER}no controllers\n")
+        );
+    }
+
+    #[test]
+    fn render_ctrl_list_gib_sizes() {
+        let data = serde_json::json!({
+            "pid": 1,
+            "port": {
+                "traddr": "::", "trsvcid": "4420",
+                "subsystems": [{
+                    "nqn": "nqn.x",
+                    // 2 GiB in 4096B blocks.
+                    "namespaces": [{"nsid": 7, "blocks": 524288, "block_shift": 12}],
+                }],
+            },
+            "controllers": [],
+        });
+        let out = super::render_ctrl_list(&data);
+        assert!(out.contains("port :::4420\n"), "{out}");
+        assert!(out.contains("ns 7: 2 GiB (4096B blocks)\n"), "{out}");
+    }
+
+    #[test]
+    fn render_ctrl_list_without_port_section() {
         let data = serde_json::json!({ "pid": 4242, "controllers": [] });
         assert_eq!(super::render_ctrl_list(&data), "pid 4242\nno controllers\n");
     }
