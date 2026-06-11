@@ -1,6 +1,7 @@
 # ioutgt Architecture Specification
 
-Status: living document — Phase 1 deliverable, updated as milestones land.
+Status: as-built specification (M0–M9 part 1). The milestone table at
+the end records what shipped; `docs/roadmap.md` holds what's next.
 
 ## 1. Mission and goals
 
@@ -140,6 +141,12 @@ send (per command, items on an ordered queue-local send list):
 - **Errors**: malformed PDUs produce C2HTermReq with the spec'd FES codes,
   never a panic or silent close; backend errors map via an errno→NVMe-SC
   table copied from nvmet semantics.
+- **Send batching (M9)**: the send task drains the entire
+  completion/R2T queue into one staging buffer and ships a single send
+  op — send SQEs on one socket have no ordering guarantee, so batching
+  (not op pipelining) is how the per-response park cycle was removed
+  (one `io_uring_enter` per batch in each direction; 4.2× on 4K reads,
+  see `docs/perf-notes.md`).
 
 The transport boundary is a pair of abstractions so phase-2 optimizations
 and future transports slot in without touching protocol logic:
@@ -167,9 +174,18 @@ Controller (cntlid) ── created by fabrics Connect on the admin queue
       via Set Features NUM_QUEUES)
 ```
 
-Queue teardown is the userspace analogue of nvmet's `percpu_ref`: a
-queue-local inflight counter plus a drain future — single-threaded, so no
-atomics.
+Queue teardown is the userspace analogue of nvmet's `percpu_ref`: an
+executing-slot counter drained before slot memory is freed (backend ops
+may still be DMAing into it), preceded by failing parked AERs
+(`ConnCtx::close`, the analog of `nvmet_async_events_failall` — its
+omission was a measurable per-disconnect leak), with a deliberate
+leak-on-wedge instead of a use-after-free if a backend never returns.
+
+The namespace table is versioned for runtime add/remove: an `Arc`
+snapshot behind a generation counter; IO queues revalidate with one
+atomic load per command and refresh only when the control plane changed
+something. Changes fire the NS_ATTR async event (note: Identify must
+advertise OAES.NS_ATTR or Linux hosts never enable the notice).
 
 Admin command surface (interop-minimal, values per nvmet): Identify CNS
 0x00/0x01/0x02/0x03, Get/Set Features (NUM_QUEUES, KATO, async event
@@ -202,7 +218,7 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1 (correctness) | single-shot RECV → ring buffer → copy into slot buffer | vectored SENDMSG (header + payload in one op) | READ/WRITE, O_DIRECT |
+| Phase 1+M9 (current) | single-shot RECV → ring buffer → copy into slot buffer | batch-drain into recycled staging, one SEND per batch | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
 | Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | SEND_ZC, slot reuse gated on notification CQE | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 
@@ -250,19 +266,19 @@ single-node).
 
 ## 12. Milestones
 
-| # | Deliverable | Exit criterion |
-|---|-------------|----------------|
-| M0 | workspace + this document | build + clippy clean |
-| M1 | `ioutgt-uring` reactor | stress/ASAN green; echo ≤ 0.1 syscalls/op |
-| M2 | `ioutgt-nvme` codec | parses real nvmet capture at any fragmentation |
-| M3 | core model + handshake | ICResp accepted by Linux host |
-| M4 | fabrics + admin | **nvme discover + connect from VM succeed** |
-| M5 | IO path (R2T, digests) | fio --verify clean from VM |
-| M6 | file/block backends | fio verify on file + loop device |
-| M7 | control plane + JSON config | runtime ns add visible without reconnect |
-| M8 | hardening + fuzz | suite green; 1 h soak; RSS flat over 1000 reconnects |
-| M9 | performance pass | measured wins, each isolated |
-| M10 | benchmark vs nvmet + docs | report + comparison + roadmap complete |
+| # | Deliverable | Status |
+|---|-------------|--------|
+| M0 | workspace + this document | done |
+| M1 | `ioutgt-uring` reactor | done — 11 tests, ASAN-clean, echo 0.065 syscalls/op |
+| M2 | `ioutgt-nvme` codec | done — 1-byte fragmentation torture green |
+| M3 | core model + handshake | done — end-to-end pipeline test |
+| M4 | fabrics + admin | done — **nvme discover/connect from VM**, digest matrix |
+| M5 | IO path (R2T, digests) | done — VM fio --verify clean, both digest modes |
+| M6 | file/block backend | done — O_DIRECT on ext4 VM-verified (loop dev needs root: deferred) |
+| M7 | control plane + JSON config | done — hot-add visible to connected host via AEN |
+| M8 | hardening + fuzz | done — abuse suite, kill-recovery, RSS-gated soak, workspace ASAN |
+| M9 | performance pass | part 1 done — batched send 4.2×; rest in roadmap |
+| M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
 
 ## 13. Risks
 

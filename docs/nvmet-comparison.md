@@ -1,43 +1,259 @@
 # ioutgt vs Linux kernel nvmet — design comparison
 
-Status: skeleton; each section is completed when the corresponding ioutgt
-subsystem lands (final pass at M10). Format per subsystem: Linux design /
-ioutgt design / differences / benefits / risks.
-
 Reference sources: `drivers/nvme/target/{core.c,tcp.c,fabrics-cmd.c,
-admin-cmd.c,discovery.c,io-cmd-bdev.c,io-cmd-file.c,nvmet.h}`.
+admin-cmd.c,discovery.c,io-cmd-bdev.c,io-cmd-file.c,nvmet.h}` (studied
+at the start of the project and mirrored where interop depends on it).
+Format per the project specification: for each subsystem — Linux
+design, ioutgt design, differences, benefits, risks.
+
+Status: complete as of M9 part 1. Benchmark-backed claims are limited
+to ioutgt-internal A/B measurements (`docs/perf-notes.md`); the
+head-to-head against nvmet is deferred (`docs/benchmark-plan.md`).
+
+---
 
 ## 1. Command lifecycle and request tracking
-- Linux: `nvmet_req` embedded in transport command; `percpu_ref` per SQ;
-  sqhd via cmpxchg; lock-free llist for responses.
-- ioutgt: preallocated `CmdSlot` array, persistent task per tag,
-  single-threaded queue ownership (no atomics at all). *(details at M3)*
 
-## 2. TCP transport
-- Linux: softirq → `io_work` on bound CPU, budgeted recv/send loops,
-  kernel_sendpage/recvmsg.
-- ioutgt: io_uring reactor on a pinned thread, identical PDU state
-  machines, batched ring submission. *(details at M5)*
+**Linux.** `struct nvmet_req` embedded in a transport command
+(`nvmet_tcp_cmd`), preallocated per queue at install time
+(`nvmet_tcp_alloc_cmds`, one per SQ entry). Lifecycle:
+`nvmet_req_init → req->execute() → nvmet_req_complete`, with a
+`percpu_ref` per SQ guarding teardown, `cmpxchg`-based sqhd
+accounting, and a lock-free `llist` carrying completions from
+executor context to the send side.
 
-## 3. Fabrics connect / controller model
-*(at M4)*
+**ioutgt.** Preallocated `CmdSlot` array sized by the negotiated
+sqsize, plus **one persistent async task per tag** that loops
+await-command → dispatch → complete. The TCP transfer tag *is* the
+slot index; the host CID is stored and echoed, so no CID lookup
+structure exists anywhere. Slot doorbells are same-thread
+`Cell<Option<Waker>>`; sqhd is a plain `Cell<u16>`; completions ride a
+queue-local `VecDeque`. Teardown uses an executing-slot counter and a
+drain loop instead of percpu_ref.
 
-## 4. Admin command surface
-*(at M4)*
+**Differences.** nvmet expresses per-command state as an explicit
+state machine driven from work-queue context; ioutgt expresses it as
+suspended stack frames. nvmet's atomics (percpu_ref, cmpxchg sqhd,
+llist) exist because executor and transport contexts can run on
+different CPUs; ioutgt pins the whole queue to one thread, so the
+same invariants hold with zero atomics.
 
-## 5. Discovery
-*(at M4)*
+**Benefits.** The data path reads as straight-line async Rust — the
+R2T flow, AER parking, and backend waits are all just `.await`s.
+Bounded concurrency makes the steady state allocation-free without a
+request mempool. Cancellation correctness is centralized in one place
+(the reactor's orphan protocol) rather than scattered per state.
 
-## 6. IO backends
-- Linux: bio submission (`io-cmd-bdev.c`) / kiocb + workqueue
-  (`io-cmd-file.c`).
-- ioutgt: ring READ/WRITE on the queue thread, O_DIRECT. *(details at M6)*
+**Risks.** A suspended task is opaque compared to an inspectable state
+enum: nvmet can dump `cmd->state` for every command; ioutgt currently
+infers stuck commands from slot-state counters only. Per-tag tasks
+cost ~0.5 KiB each of future state (negligible at NVMe depths, but
+real). Hidden wake-ordering bugs are subtler than missed `queue_work`
+calls — this is why M1 stress-tested the reactor before anything was
+built on it.
 
-## 7. Threading and locking
-*(at M5/M9, with measurements)*
+## 2. TCP transport: receive and send
 
-## 8. What ioutgt deliberately does differently
-- Task-per-tag async instead of state-machine callbacks.
-- No CID lookup structure (TTAG = slot index).
-- Userspace: no softirq sharing, explicit core ownership.
-*(expanded at M10 with benchmark evidence)*
+**Linux.** Socket callbacks schedule `io_work` on a CPU chosen from
+the queue index; `io_work` runs budgeted recv/send loops
+(`NVMET_TCP_RECV_BUDGET`/`SEND_BUDGET` 8, total budget 64) using
+`kernel_recvmsg`/`sendpage`. Recv states {PDU, DATA, DDGST}; send
+states {DATA_PDU, DATA, R2T, DDGST, RESPONSE} walked one command at a
+time. MAXH2CDATA 16 MiB, inline data 16 KiB, CRC32C digests optional.
+
+**ioutgt.** Identical wire-state machines (deliberately), but driven
+by io_uring completions on a pinned thread. Receive: one in-flight
+recv into a 64 KiB connection buffer feeding the sans-io header
+decoder; payloads are copied straight into slot buffers with
+incremental CRC32C. Send: the loop drains *all* pending
+completions/R2Ts into one staging buffer and ships a single send op —
+ordering on the socket is preserved by construction, and the queue
+thread parks once per batch instead of once per response (the M9
+finding: the naive one-op-per-response loop cost a full
+park/`io_uring_enter` cycle per IO and capped a connection at ~85K
+4K IOPS; batching took it to 202K single-connection, 506K at four).
+
+**Differences.** nvmet's budget loop and ioutgt's batch drain solve
+the same problem (amortize wakeups, bound latency injection) from
+opposite directions: nvmet caps how much it does per wakeup, ioutgt
+caps how often it sleeps. nvmet can `sendpage` slot pages zero-copy;
+ioutgt phase 1 memcpys payloads into staging (one copy, amortized
+into the batch encoder; SEND_ZC with notification-gated reuse is the
+roadmap item that removes it).
+
+**Benefits.** Submission batching is automatic (SQEs accumulate while
+tasks run; one `io_uring_enter` flushes the lot — measured 0.065
+syscalls/op on the echo fixture). No softirq sharing: the thread's
+cycles are entirely its own.
+
+**Risks.** The staging copy costs memory bandwidth at 128K sizes
+(measured: still +8% over the allocating variant, but nvmet's
+sendpage path avoids it entirely). DDGST failure currently terminates
+the connection, where nvmet fails only the affected command with
+`NVME_SC_DATA_XFER_ERROR` and keeps the connection — stricter than
+needed, noted for the hardening backlog.
+
+## 3. Fabrics connect and controller model
+
+**Linux.** Connect allocates `nvmet_ctrl` (cntlid from an IDA),
+validates subsysnqn/hostnqn ACLs, installs queues with sqsize
+validation against MQES; property get/set implement the register
+surface (CAP/VS/CC/CSTS) with the enable/shutdown state machine;
+keep-alive is a delayed work item firing fatal error on expiry.
+
+**ioutgt.** The control thread performs the ICReq handshake and reads
+the first (Connect) capsule on plain Tokio sockets — the qid decides
+which queue thread receives the socket; the Connect command then
+replays through the normal slot pipeline as the queue's first
+command. Controllers live and die with their admin-queue connection;
+a mutex-guarded registry (control-plane rate only) maps cntlid →
+identity for IO-queue Connect validation. Register state machine and
+CAP values mirror nvmet (MQES 0-based, CQR, TO=15s). Keep-alive is a
+ring-timer watchdog that closes the socket past 2×KATO+grace.
+
+**Differences.** nvmet routes raw connections to whatever CPU the
+socket callback lands on and learns the qid later; ioutgt pays one
+control-thread hop to learn the qid first, so admin queues never
+occupy IO threads and qid→core mapping is deterministic (lining up
+with the host's per-CPU queue placement).
+
+**Benefits.** Deterministic placement; the handshake (control-plane
+rate) keeps queue threads free of accept/negotiation states entirely.
+
+**Risks.** The control thread is a connect-rate serialization point —
+irrelevant for storage workloads (hundreds of connections), but a
+difference from nvmet's fully distributed accept. Host ACLs
+(`allow_any_host = false` paths) are not yet enforced beyond a flag
+check.
+
+## 4. Admin commands, discovery, async events
+
+**Linux.** Identify/features/log pages in `admin-cmd.c` with
+carefully chosen values (sqes/cqes 0x66/0x44, IOCCSZ from inline
+size, KAS); discovery subsystem in `discovery.c`; AER pool of 4 with
+`nvmet_async_events_failall` on teardown; changed-NS log with RAE
+semantics.
+
+**ioutgt.** The same command surface with values copied where the
+host depends on them — including two found-the-hard-way fields:
+**OAES must advertise NS_ATTR** (the host masks its AEC against OAES;
+without it, namespace-change notices are never enabled) and subnqn
+must be NUL-terminated rather than space-padded. AERs park as
+unresolved futures inside their slot tasks; namespace changes
+complete one with the NS_ATTR notice; teardown fails parked AERs
+(`ConnCtx::close`, the analog of `nvmet_async_events_failall`) — the
+omission of which was a 389 KB-per-disconnect leak caught by the M8
+RSS gate. Changed-NS log reports the 0xFFFFFFFF sentinel and clears
+on read (RAE is not yet honored).
+
+**Differences/Risks.** Log pages are minimal (zeroed error/SMART/FW);
+RAE handling, SMART data, and multi-page error logs are future work.
+Discovery log windowing (LPO) is implemented; generation-counter
+churn protection is simplistic (static genctr).
+
+## 5. IO backends
+
+**Linux.** Two backends with different kernel machinery: `io-cmd-bdev`
+builds bios onto the block layer; `io-cmd-file` uses kiocbs with a
+buffered-IO fallback workqueue. Status mapping from blk_status_t;
+ONCS advertises DSM/Write Zeroes.
+
+**ioutgt.** One trait (`Backend`, async fn, monomorphized via an enum
+— no per-IO boxing), four implementations: null, memory (sharded 2 MiB
+lazily-allocated chunks), and one file/bdev backend — in userspace the
+two collapse to "open O_DIRECT, probe geometry differently"
+(st_size vs BLKGETSIZE64), with buffered fallback where O_DIRECT is
+refused. Discard is punch-hole on files (hint semantics) and a no-op
+on bdevs until uring-cmd lands; write-zeroes falls back
+ZERO_RANGE → PUNCH_HOLE → zero-chunk writes. Slot buffers are
+4 KiB-aligned for O_DIRECT, and teardown waits for executing slots
+(the kernel may be DMAing into slot memory) with a deliberate
+leak-on-wedge instead of a use-after-free.
+
+**Differences.** nvmet submits bios that the block layer may split
+and parallelize; ioutgt issues one ring op per command region
+(resuming short transfers). nvmet's FUA maps to REQ_FUA; ioutgt
+flushes after the write — correct but one round trip more expensive.
+
+**Risks.** No metadata/PI, no zoned support, bdev
+discard/write-zeroes lack the ioctl/uring-cmd path, and the bdev side
+has only been exercised through the file-backend code path plus
+geometry probing (loop-device runs need root — deferred with the
+benchmark work).
+
+## 6. Threading and synchronization
+
+**Linux.** Work-queue execution with queue→CPU binding by index;
+correctness across contexts via percpu_ref, cmpxchg, llist; file IO
+hops through a second workqueue.
+
+**ioutgt.** One OS thread per NVMe queue: Tokio current-thread
+runtime, `LocalSet`, one `SINGLE_ISSUER | DEFER_TASKRUN` ring, no
+Tokio IO/time drivers. `io_uring_enter` *is* the park primitive.
+Cross-thread input exists only as eventfd-doorbell mailboxes; the
+namespace table is the one shared read-mostly structure, versioned
+behind a generation counter so the per-command cost is a single
+atomic load. Everything else on the data path is `Cell`/`RefCell`.
+
+**Benefits.** The "no locks on the hot path" claim is checkable by
+construction (`!Send` types make violations compile errors). CPU
+accounting is exact: a queue's cycles are its thread's cycles.
+
+**Risks.** A blocking backend op stalls every queue on that thread
+(nvmet's workqueues would just grow); the wedge path leaks by design
+rather than stalls forever, but a slow disk degrades all connections
+sharing the thread. The DEFER_TASKRUN park integration is the
+project's most safety-critical code and carries a 100 ms backstop
+against missed-wakeup bugs.
+
+## 7. Configuration and control plane
+
+**Linux.** configfs: mkdir/echo per subsystem/namespace/port; runtime
+namespace enable/disable fires AENs; nvmetcli wraps it.
+
+**ioutgt.** One JSON file creates the whole target (validated before
+any thread spawns); a Unix-socket JSON API (ADD/REMOVE/LIST_NAMESPACE,
+GET_STATS) mutates the versioned namespace table at runtime and
+nudges controllers' AERs — verified end-to-end: a connected Linux
+host saw the hot-added namespace appear without reconnecting.
+
+**Differences/Risks.** Far smaller surface than configfs (no port
+management at runtime, no host ACL objects, no passthru). GET_STATS
+lacks per-queue IO counters until the deferred stats work lands.
+
+## 8. Error handling and teardown
+
+**Linux.** Per-command status mapping; transport-fatal errors raise
+CSTS.CFS or tear the queue down; `nvmet_ctrl_fatal_error` on KA
+expiry; release paths quiesce via percpu_ref kill+drain.
+
+**ioutgt.** Malformed PDUs draw C2HTermReq with spec FES codes (8
+abuse tests assert both the code and that the target stays healthy);
+KA expiry closes the connection and reaps the controller; teardown
+is close() (fail AERs) → drain executing slots → abort tasks →
+registry removal, with the reactor reclaiming orphaned ops on their
+terminal CQEs. The whole workspace runs clean under AddressSanitizer.
+
+**Risks.** Termination is used in a few places where nvmet degrades
+more gracefully (DDGST mismatch, queue-depth overrun); a hostile or
+buggy host gets disconnected rather than per-command errors. Defensible
+for a v1, but the gentler responses are catalogued in the roadmap.
+
+---
+
+## What ioutgt deliberately does differently — summary
+
+1. **Task-per-tag instead of state machines** — NVMe's bounded CID
+   space turns "async task per request" from an anti-pattern into a
+   preallocation strategy; this is the project's central bet and the
+   main readability win over both nvmet and SPDK.
+2. **No CID lookup anywhere** — TTAG = slot index; the CID is data,
+   not a key.
+3. **Park-driven batching instead of budget loops** — submission and
+   completion batching fall out of the runtime-idle hook; the send
+   side completes the picture by draining per batch (one syscall
+   amortized over the whole burst in each direction).
+4. **One backend implementation where the kernel needs two** —
+   userspace O_DIRECT erases most of the bdev/file split.
+5. **Generation-cached namespace tables instead of RCU** — the same
+   read-mostly semantics with one atomic load, no RCU machinery.
