@@ -93,6 +93,8 @@ pub struct ControllerEntry {
     pub cntlid: u16,
     pub subsys_nqn: String,
     pub hostnqn: String,
+    /// Highest IO qid this controller may install (offered queue count).
+    pub max_qid: u16,
     /// IO queues installed so far (Connect-time duplicate detection).
     pub installed_qids: Vec<u16>,
 }
@@ -121,8 +123,9 @@ impl Registry {
         })
     }
 
-    /// Allocate a cntlid for a new controller (admin Connect).
-    pub fn allocate(&self, subsys_nqn: &str, hostnqn: &str) -> Option<u16> {
+    /// Allocate a cntlid for a new controller (admin Connect). `max_qid`
+    /// is the highest IO queue id the controller may later install.
+    pub fn allocate(&self, subsys_nqn: &str, hostnqn: &str, max_qid: u16) -> Option<u16> {
         let mut inner = self.inner.lock().expect("registry poisoned");
         // Linear scan for a free id: controller counts are tiny.
         let start = inner.next_cntlid.max(1);
@@ -134,6 +137,7 @@ impl Registry {
                         cntlid,
                         subsys_nqn: subsys_nqn.to_owned(),
                         hostnqn: hostnqn.to_owned(),
+                        max_qid,
                         installed_qids: vec![0],
                     });
                     true
@@ -162,6 +166,13 @@ impl Registry {
             .ok_or(IoConnectError::UnknownController)?;
         if entry.hostnqn != hostnqn {
             return Err(IoConnectError::HostMismatch);
+        }
+        // qid 0 is the admin queue; IO qids must be 1..=max_qid (the
+        // count granted via Set Features NUM_QUEUES). Rejecting out-of-
+        // range qids bounds installed_qids and prevents a host creating
+        // more queues than advertised.
+        if qid == 0 || qid > entry.max_qid {
+            return Err(IoConnectError::InvalidQid);
         }
         if entry.installed_qids.contains(&qid) {
             return Err(IoConnectError::QueueExists);
@@ -200,6 +211,7 @@ pub enum IoConnectError {
     UnknownController,
     HostMismatch,
     QueueExists,
+    InvalidQid,
 }
 
 #[cfg(test)]
@@ -233,8 +245,8 @@ mod tests {
     #[test]
     fn registry_allocates_unique_cntlids() {
         let registry = Registry::new();
-        let a = registry.allocate("nqn.test", "nqn.host").unwrap();
-        let b = registry.allocate("nqn.test", "nqn.host").unwrap();
+        let a = registry.allocate("nqn.test", "nqn.host", 4).unwrap();
+        let b = registry.allocate("nqn.test", "nqn.host", 4).unwrap();
         assert_ne!(a, b);
         assert!(a >= 1 && b >= 1);
 
@@ -253,6 +265,15 @@ mod tests {
         assert_eq!(
             registry.install_io_queue(a, "nqn.other", 2).unwrap_err(),
             IoConnectError::HostMismatch
+        );
+        // qid 0 and qid > max_qid are rejected.
+        assert_eq!(
+            registry.install_io_queue(a, "nqn.host", 0).unwrap_err(),
+            IoConnectError::InvalidQid
+        );
+        assert_eq!(
+            registry.install_io_queue(a, "nqn.host", 5).unwrap_err(),
+            IoConnectError::InvalidQid
         );
         registry.remove(a).unwrap();
         assert_eq!(registry.len(), 1);

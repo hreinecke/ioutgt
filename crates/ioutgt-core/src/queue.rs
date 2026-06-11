@@ -243,6 +243,23 @@ impl QueueCore {
         self.push_send_work(SendWork::Response(Completion { tag, cqe, data_len }));
     }
 
+    /// Fail a command still in the receive phase (payload/digest) without
+    /// dispatching it — e.g. a data-digest mismatch, where executing the
+    /// write would persist corrupt data. The slot task never saw this
+    /// command (it is still parked in `await_command`), so `executing`
+    /// is deliberately untouched: the same task will serve the next
+    /// command that claims this tag.
+    pub fn complete_receiving(&self, tag: u16, cqe: Cqe) {
+        let slot = self.slot(tag);
+        debug_assert_eq!(slot.state.get(), SlotState::Receiving);
+        slot.state.set(SlotState::Responding);
+        self.push_send_work(SendWork::Response(Completion {
+            tag,
+            cqe,
+            data_len: 0,
+        }));
+    }
+
     /// Queue an R2T soliciting write data for `tag` (recv path side;
     /// the slot stays `Receiving`).
     pub fn solicit(&self, tag: u16, cid: u16, offset: u32, length: u32) {

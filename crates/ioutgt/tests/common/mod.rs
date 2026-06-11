@@ -151,6 +151,39 @@ impl Client {
         assert_eq!(cqe.status.get() >> 1, status::SUCCESS, "connect qid {qid}");
         u16::try_from(cqe.result.get() & 0xFFFF).unwrap()
     }
+
+    /// Property Set CC and return the (unshifted) status code.
+    pub fn set_property_cc(&mut self, value: u32, cid: u16) -> u16 {
+        use ioutgt_nvme::fabrics::{PropertyCommand, fctype as fct, prop};
+        let mut cmd: PropertyCommand = FromZeros::new_zeroed();
+        cmd.opcode = spec::admin_opcode::FABRICS;
+        cmd.fctype = fct::PROPERTY_SET;
+        cmd.cid.set(cid);
+        cmd.offset.set(prop::CC);
+        cmd.value.set(u64::from(value));
+        let sqe = spec::Sqe::read_from_bytes(cmd.as_bytes()).unwrap();
+        self.send_capsule(&sqe, &[]);
+        self.recv_response().status.get() >> 1
+    }
+}
+
+/// Build a Connect SQE + data capsule (for hand-driven Connect tests).
+pub fn connect_sqe(qid: u16, sqsize: u16, cntlid: u16, cid: u16) -> (spec::Sqe, ConnectData) {
+    let mut cmd: ConnectCommand = FromZeros::new_zeroed();
+    cmd.opcode = spec::admin_opcode::FABRICS;
+    cmd.fctype = fctype::CONNECT;
+    cmd.cid.set(cid);
+    cmd.qid.set(qid);
+    cmd.sqsize.set(sqsize - 1);
+    cmd.kato.set(if qid == 0 { 60_000 } else { 0 });
+    cmd.dptr.length.set(1024);
+    cmd.dptr.sgl_type = spec::sgl::TYPE_DATA_BLOCK_OFFSET;
+    let mut data = ConnectData::zeroed();
+    data.cntlid.set(cntlid);
+    data.subsysnqn[..NQN.len()].copy_from_slice(NQN.as_bytes());
+    data.hostnqn[..HOSTNQN.len()].copy_from_slice(HOSTNQN.as_bytes());
+    let sqe = spec::Sqe::read_from_bytes(cmd.as_bytes()).unwrap();
+    (sqe, data)
 }
 
 pub fn rw_sqe(

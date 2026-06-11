@@ -51,6 +51,18 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
 
     match &ctx.role {
         Role::Admin(admin) => {
+            // One Connect per queue: a second Connect on an already-bound
+            // admin queue would mint and leak another cntlid and silently
+            // overwrite the controller's identity (the connect_data is
+            // fixed at queue setup, so it would also ignore the new
+            // capsule). Reject, as nvmet does.
+            if admin.cntlid.get() != 0 {
+                return Outcome::status(ctx.cqe(
+                    0,
+                    cid,
+                    status::CONNECT_INVALID_PARAM | status::DNR,
+                ));
+            }
             // Resolve the subsystem: the well-known discovery NQN or a
             // configured NVM subsystem.
             let discovery = subsysnqn == fabrics::DISCOVERY_NQN;
@@ -83,7 +95,10 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                     status::CONNECT_INVALID_PARAM | status::DNR,
                 ));
             }
-            let Some(cntlid) = ctx.registry.allocate(subsysnqn, hostnqn) else {
+            // IO queues the controller may install: the subsystem's
+            // offered count (discovery controllers get none).
+            let max_qid = admin.subsys.borrow().as_ref().map_or(0, |s| s.max_qid);
+            let Some(cntlid) = ctx.registry.allocate(subsysnqn, hostnqn, max_qid) else {
                 return Outcome::status(ctx.cqe(0, cid, status::CONNECT_CTRL_BUSY | status::DNR));
             };
             admin.cntlid.set(cntlid);
@@ -99,6 +114,14 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             Outcome::status(ctx.cqe(u32::from(cntlid), cid, status::SUCCESS))
         }
         Role::Io(io) => {
+            if io.cntlid.get() != 0 {
+                // Already connected: reject a duplicate Connect.
+                return Outcome::status(ctx.cqe(
+                    0,
+                    cid,
+                    status::CONNECT_INVALID_PARAM | status::DNR,
+                ));
+            }
             let cntlid = data.cntlid.get();
             match ctx
                 .registry
@@ -159,6 +182,12 @@ fn property<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe, fct: u8) -> Outcome {
     let value = cmd.value.get();
     match offset {
         prop::CC => {
+            // CC writes are only valid after Connect has bound the
+            // controller; enabling an unbound controller (cntlid 0,
+            // no subsystem) violates the fabrics enable sequence.
+            if admin.cntlid.get() == 0 {
+                return Outcome::status(ctx.cqe(0, cid, status::INVALID_FIELD | status::DNR));
+            }
             #[allow(clippy::cast_possible_truncation)]
             let effect = admin.regs.borrow_mut().write_cc(value as u32);
             match effect {

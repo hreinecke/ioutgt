@@ -8,9 +8,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use common::{Client, NQN, pattern, rw_sqe};
+use common::{Client, NQN, connect_sqe, pattern, rw_sqe};
 use ioutgt_nvme::pdu::{self, PduDecoder, PduKind};
 use ioutgt_nvme::{digest, spec, status};
+use zerocopy::IntoBytes;
 
 fn start_target() -> std::net::SocketAddr {
     let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
@@ -126,7 +127,7 @@ fn wrong_offset_h2cdata_terminates() {
 }
 
 #[test]
-fn ddgst_mismatch_terminates() {
+fn ddgst_mismatch_fails_command_keeps_connection() {
     let addr = start_target();
     let mut admin = Client::handshake(addr, true, true);
     let cntlid = admin.connect(0, 32, 0xFFFF, 1);
@@ -144,7 +145,24 @@ fn ddgst_mismatch_terminates() {
     let bad_crc = digest::crc32c(&payload) ^ 0xFFFF_FFFF;
     frame.extend_from_slice(&bad_crc.to_le_bytes());
     io.stream().write_all(&frame).unwrap();
-    expect_term_then_close(io.stream(), Some(pdu::fes::HDR_DIGEST_ERR));
+
+    // The command fails with DATA_XFER_ERROR; the connection stays up,
+    // as nvmet does (there is no NVMe/TCP data-digest-error FES).
+    let cqe = io.recv_response();
+    assert_eq!(cqe.cid.get(), 5);
+    assert_eq!(
+        cqe.status.get() >> 1,
+        status::DATA_XFER_ERROR | status::DNR,
+        "data digest error status"
+    );
+    // The same connection keeps serving: a clean write/read round-trips.
+    let data = pattern(4096, 9);
+    io.send_capsule(&rw_sqe(spec::io_opcode::WRITE, 6, 0, 7, 4096, false), &data);
+    assert_eq!(io.recv_response().status.get() >> 1, status::SUCCESS);
+    io.send_capsule(&rw_sqe(spec::io_opcode::READ, 7, 0, 7, 4096, true), &[]);
+    let (_, got) = io.recv_pdu();
+    assert_eq!(got, data, "connection still healthy after digest error");
+    let _ = io.recv_response();
     assert_target_alive(addr);
 }
 
@@ -186,6 +204,61 @@ fn mid_r2t_disconnect_recovers() {
     }
     std::thread::sleep(Duration::from_millis(200));
     assert_target_alive(addr);
+}
+
+#[test]
+fn second_connect_on_admin_queue_rejected() {
+    // A second Connect on an already-bound admin queue must be rejected
+    // (not mint and leak another cntlid). The connection stays usable.
+    let addr = start_target();
+    let mut admin = Client::handshake(addr, false, false);
+    let cntlid = admin.connect(0, 32, 0xFFFF, 1);
+    assert!(cntlid >= 1);
+
+    // Re-send Connect through the normal command path; expect a
+    // non-success status, connection alive.
+    let (sqe, data) = connect_sqe(0, 32, 0xFFFF, 0x55);
+    admin.send_capsule(&sqe, data.as_bytes());
+    let cqe = admin.recv_response();
+    assert_eq!(cqe.cid.get(), 0x55);
+    assert_ne!(
+        cqe.status.get() >> 1,
+        status::SUCCESS,
+        "duplicate connect must fail"
+    );
+    // The original controller still works: enable + identify succeed.
+    admin.enable_controller(0x56);
+    let id = admin.identify(spec::cns::CONTROLLER, 0, 0x57);
+    assert_eq!(id.len(), 4096);
+}
+
+#[test]
+fn cc_enable_before_connect_rejected() {
+    // The only way to reach the dispatcher with cntlid 0 and the queue
+    // still alive is a structurally-valid Connect that fails logically
+    // (unknown subsystem): the connection stays up, no controller bound.
+    // A Property Set CC then must be rejected (no enabling a cntlid-0
+    // controller).
+    let addr = start_target();
+    let mut client = Client::handshake(addr, false, false);
+    let (sqe, mut data) = connect_sqe(0, 32, 0xFFFF, 1);
+    data.subsysnqn = [0u8; 256];
+    let bogus = b"nqn.2026-06.io.ioutgt:does-not-exist";
+    data.subsysnqn[..bogus.len()].copy_from_slice(bogus);
+    client.send_capsule(&sqe, data.as_bytes());
+    let cqe = client.recv_response();
+    assert_ne!(
+        cqe.status.get() >> 1,
+        status::SUCCESS,
+        "connect to unknown subsys must fail"
+    );
+    // Controller never bound; CC.EN must be rejected.
+    let status_code = client.set_property_cc(0x10, 2);
+    assert_ne!(
+        status_code,
+        status::SUCCESS,
+        "CC.EN before connect must fail"
+    );
 }
 
 #[test]

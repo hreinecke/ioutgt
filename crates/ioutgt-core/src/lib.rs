@@ -23,7 +23,13 @@ pub mod subsystem;
 pub use backend::{Backend, BackendError, LbaRange};
 
 /// Largest queue we accept (CAP.MQES advertises this minus one).
-pub const MAX_QUEUE_ENTRIES: u16 = 1024;
+///
+/// Each slot preallocates a data buffer (128 KiB on IO queues), so this
+/// directly bounds per-queue memory: 256 entries → ≤ 32 MiB per IO
+/// queue. The host sizes its queues to `min(desired, MQES + 1)`;
+/// Connect requests beyond this are rejected (a hostile host ignores
+/// the advertised MQES, so the limit is enforced, not just advertised).
+pub const MAX_QUEUE_ENTRIES: u16 = 256;
 
 /// In-capsule data we advertise via IOCCSZ (16 KiB, nvmet's default).
 pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
