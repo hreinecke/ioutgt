@@ -193,6 +193,11 @@ fn list_controller_reports_queues_and_namespaces() {
     let admin_tid = queues[0]["tid"].as_i64().unwrap();
     let io_tid = queues[1]["tid"].as_i64().unwrap();
     assert!(admin_tid > 0 && io_tid > 0);
+    // Live affinity recorded at Connect; both queues are unpinned
+    // in-process, so the values are identical non-empty cpulists.
+    let admin_cpus = queues[0]["cpus"].as_str().unwrap();
+    assert!(!admin_cpus.is_empty(), "{resp}");
+    assert_eq!(queues[0]["cpus"], queues[1]["cpus"], "{resp}");
     assert_ne!(
         admin_tid, io_tid,
         "admin and IO queues on different threads"

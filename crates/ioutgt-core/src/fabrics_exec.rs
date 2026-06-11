@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::backend::Backend;
-use crate::controller::{CcEffect, QueueInfo, current_tid};
+use crate::controller::{CcEffect, QueueInfo, current_cpus, current_tid};
 use crate::dispatch::{ConnCtx, Outcome, Role};
 
 /// NUL/space-trimmed string from a fixed NQN field.
@@ -27,6 +27,7 @@ fn queue_info<B: Backend>(ctx: &ConnCtx<B>) -> QueueInfo {
         qid: ctx.queue.qid,
         sqsize: ctx.queue.sqsize,
         tid: current_tid(),
+        cpus: current_cpus(),
     }
 }
 

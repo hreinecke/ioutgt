@@ -88,7 +88,7 @@ impl RegisterState {
 
 /// One installed queue's identity (recorded at Connect time, on the
 /// owning queue thread).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct QueueInfo {
     /// Queue id (0 = admin, 1..=max_qid = IO).
     pub qid: u16,
@@ -98,12 +98,69 @@ pub struct QueueInfo {
     /// Meaningful only while the controller lives: the entry is reaped
     /// with its admin connection, before any tid could be reused.
     pub tid: i32,
+    /// The serving thread's CPU affinity at Connect time: kernel
+    /// cpulist ("3", "0-3,8"), or "*" when the mask covers every
+    /// online CPU (unpinned).
+    pub cpus: String,
 }
 
 /// Kernel thread id of the calling thread.
 pub fn current_tid() -> i32 {
     // SAFETY: gettid has no preconditions and cannot fail.
     unsafe { libc::gettid() }
+}
+
+/// Current thread's CPU affinity as a kernel cpulist ("3", "0-3,8"),
+/// "*" when the mask covers every online CPU, "?" if the query fails.
+pub fn current_cpus() -> String {
+    // SAFETY: a zeroed cpu_set_t is a valid value for the call to
+    // overwrite; sched_getaffinity writes within size_of::<cpu_set_t>().
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: pid 0 = calling thread; the buffer is a real cpu_set_t
+    // and the size passed matches it.
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if rc != 0 {
+        return "?".to_owned();
+    }
+    // SAFETY: `set` was initialized by sched_getaffinity above.
+    let count = unsafe { libc::CPU_COUNT(&set) };
+    // SAFETY: sysconf has no preconditions.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if online > 0 && i64::from(count) >= online {
+        return "*".to_owned();
+    }
+    fn flush(out: &mut String, run: (usize, usize)) {
+        use std::fmt::Write;
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let _ = if run.0 == run.1 {
+            write!(out, "{}", run.0)
+        } else {
+            write!(out, "{}-{}", run.0, run.1)
+        };
+    }
+    let mut out = String::new();
+    let mut run: Option<(usize, usize)> = None;
+    #[allow(clippy::cast_sign_loss)] // CPU_SETSIZE is a positive constant
+    for cpu in 0..(libc::CPU_SETSIZE as usize) {
+        // SAFETY: cpu < CPU_SETSIZE bounds the bit lookup.
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            run = match run {
+                Some((start, end)) if end + 1 == cpu => Some((start, cpu)),
+                Some(prev) => {
+                    flush(&mut out, prev);
+                    Some((cpu, cpu))
+                }
+                None => Some((cpu, cpu)),
+            };
+        }
+    }
+    if let Some(prev) = run {
+        flush(&mut out, prev);
+    }
+    out
 }
 
 /// A live controller's routing info, visible to all threads.
@@ -177,7 +234,7 @@ impl Registry {
                         hostnqn: hostnqn.to_owned(),
                         max_qid,
                         kato_ms,
-                        queues: vec![admin_queue],
+                        queues: vec![admin_queue.clone()],
                     });
                     true
                 }
@@ -296,6 +353,7 @@ mod tests {
             qid,
             sqsize: 32,
             tid: current_tid(),
+            cpus: current_cpus(),
         }
     }
 
@@ -382,6 +440,10 @@ mod tests {
         // Single-threaded test and qi() records current_tid(), so every
         // queue must carry exactly this thread's tid.
         assert!(snap[0].queues.iter().all(|q| q.tid == current_tid()));
+        // Affinity is recorded the same way; single-threaded test, so
+        // every queue carries this thread's (non-empty) cpulist.
+        assert!(snap[0].queues.iter().all(|q| q.cpus == current_cpus()));
+        assert!(!snap[0].queues[0].cpus.is_empty());
         assert!(!snap[0].is_discovery());
     }
 

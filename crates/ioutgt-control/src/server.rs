@@ -250,7 +250,10 @@ fn handle(state: &CtlState, request: Request) -> Response {
                     let queues: Vec<_> = entry
                         .queues
                         .iter()
-                        .map(|q| json!({ "qid": q.qid, "depth": q.sqsize, "tid": q.tid }))
+                        .map(|q| {
+                            json!({ "qid": q.qid, "depth": q.sqsize, "tid": q.tid,
+                                    "cpus": q.cpus })
+                        })
                         .collect();
                     json!({
                         "cntlid": entry.cntlid,

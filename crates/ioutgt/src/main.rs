@@ -185,9 +185,17 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|q| format!("{}:{}@{}", q["qid"], q["depth"], q["tid"]))
+            .map(|q| {
+                format!(
+                    "{}:{}@{} cpus {}",
+                    q["qid"],
+                    q["depth"],
+                    q["tid"],
+                    q["cpus"].as_str().unwrap_or("?")
+                )
+            })
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" | ");
         let _ = writeln!(out, "  queues: {queues}");
         let nsids = c["namespaces"]
             .as_array()
@@ -284,8 +292,8 @@ mod tests {
                 "discovery": false,
                 "kato_ms": 60000,
                 "queues": [
-                    {"qid": 0, "depth": 32, "tid": 100},
-                    {"qid": 1, "depth": 64, "tid": 101},
+                    {"qid": 0, "depth": 32, "tid": 100, "cpus": "*"},
+                    {"qid": 1, "depth": 64, "tid": 101, "cpus": "3"},
                 ],
                 "namespaces": [{"nsid": 1, "blocks": 32768, "block_shift": 9}],
             }],
@@ -296,7 +304,7 @@ mod tests {
              controller 1: nqn.2026-06.io.ioutgt:test\n\
              \x20 host:   nqn.2014-08.org.nvmexpress:uuid:abc\n\
              \x20 kato:   60000 ms\n\
-             \x20 queues: 0:32@100 1:64@101\n\
+             \x20 queues: 0:32@100 cpus * | 1:64@101 cpus 3\n\
              \x20 ns:     1\n"
         );
         assert_eq!(out, expected);
@@ -346,7 +354,7 @@ mod tests {
                 "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
                 "discovery": true,
                 "kato_ms": 120000,
-                "queues": [{"qid": 0, "depth": 32, "tid": 100}],
+                "queues": [{"qid": 0, "depth": 32, "tid": 100, "cpus": "*"}],
                 "namespaces": [],
             }],
         });
@@ -357,7 +365,7 @@ mod tests {
              controller 2 (discovery): nqn.2014-08.org.nvmexpress.discovery\n\
              \x20 host:   nqn.2014-08.org.nvmexpress:uuid:abc\n\
              \x20 kato:   120000 ms\n\
-             \x20 queues: 0:32@100\n\
+             \x20 queues: 0:32@100 cpus *\n\
              \x20 ns:     -\n"
         );
     }
