@@ -60,7 +60,8 @@ Controller Process
 │
 ├── Admin Queue Thread         pinned; own ring; admin queues of all ctrls
 │
-└── IO Queue Threads 0..N-1    pinned to core i; own ring; own memory;
+└── IO Queue Threads 0..N-1    pinned, one CPU from group_cpus_evenly
+                               group i (§11); own ring; own memory;
                                own command slots; own send/recv machines
 ```
 
@@ -82,11 +83,16 @@ mailbox sender is the only exported handle.
 
 ## 4. Crate map and cross-crate call flow
 
-The workspace is seven crates forming a strict dependency DAG — every
-crate depends only on layers below it, and the two leaves are deliberately
-opposite in character: `ioutgt-nvme` is **sans-IO** (pure bytes ↔ structs,
-no sockets, no async, fuzzable in isolation) and `ioutgt-uring` is **pure
-IO** (op futures and the reactor, zero protocol knowledge).
+The workspace is eight crates forming a strict dependency DAG — every
+crate depends only on layers below it, and the main two leaves are
+deliberately opposite in character: `ioutgt-nvme` is **sans-IO** (pure
+bytes ↔ structs, no sockets, no async, fuzzable in isolation) and
+`ioutgt-uring` is **pure IO** (op futures and the reactor, zero protocol
+knowledge). A third small leaf, `ioutgt-cpus`, is a userspace port of
+the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`): the grouping
+algorithm is pure (driven by a `CpuTopology` value, synthetic in tests),
+with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
+`ioutgt` binary uses it (§11).
 
 ```text
   app       ┌──────────────────────────────────────────────────────┐
@@ -116,18 +122,20 @@ IO** (op futures and the reactor, zero protocol knowledge).
 
 | Crate | Role | Depends on (workspace) |
 |-------|------|------------------------|
-| `ioutgt` | binary + assembly | all six |
+| `ioutgt` | binary + assembly | all seven |
 | `ioutgt-control` | config + UDS control plane | core, backend |
 | `ioutgt-tcp` | NVMe/TCP transport | core, nvme, uring |
 | `ioutgt-backend` | storage backends | core, uring |
 | `ioutgt-core` | NVMe model + dispatch | nvme |
 | `ioutgt-nvme` | sans-IO codec | — |
 | `ioutgt-uring` | reactor + op futures | — |
+| `ioutgt-cpus` | userspace `group_cpus_evenly()` | — |
 
 ### 4.1 Assembly: what `spawn_target()` wires up
 
 `main()` parses the config and hands everything to `spawn_target()`
-(`crates/ioutgt/src/lib.rs`), which is the only place all six crates meet:
+(`crates/ioutgt/src/lib.rs`), which is the only place all seven crates
+meet:
 
 ```text
 spawn_target(config)                                   [ioutgt]
@@ -391,12 +399,20 @@ allocated once at queue install and registered with the ring in phase 2.
 
 ## 11. CPU affinity and NUMA
 
-Queue threads pin to explicit cores (config map; default: sequential).
-Deterministic qid→core mapping lines the Linux host's per-CPU queues up
-with target cores. Slot arrays and buffers are allocated on the owning
-thread (first-touch locality); the allocation hooks take a NUMA node hint
-so multi-node placement needs no API change (development machine is
-single-node).
+With `pin_threads`, IO queue thread placement uses `ioutgt-cpus`, a
+userspace port of the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`):
+all possible CPUs are grouped evenly per NUMA / cluster / SMT locality
+(present CPUs spread first, groups apportioned to nodes by CPU-count
+ratio, cluster-aligned when possible, SMT-sibling-first fill — the same
+spread managed IRQs and therefore host-side nvme queues get), one group
+per IO thread, and each thread is pinned to its group's first online
+CPU. A group with no online CPU (or sysfs failure) leaves that thread
+unpinned with a warning; the admin thread is never pinned. Combined with
+the deterministic qid→thread routing `(n-1) % N`, this lines the host's
+per-CPU queues up with topology-aware target cores. Slot arrays and
+buffers are allocated on the owning thread (first-touch locality); the
+allocation hooks take a NUMA node hint so multi-node placement needs no
+API change (development machine is single-node).
 
 ## 12. Testing strategy
 

@@ -12,6 +12,7 @@ authors.workspace = true
 ioutgt-backend = { workspace = true }
 ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
+ioutgt-cpus = { workspace = true }
 ioutgt-nvme = { workspace = true }
 ioutgt-tcp = { workspace = true }
 ioutgt-uring = { workspace = true }
