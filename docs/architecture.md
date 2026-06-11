@@ -205,6 +205,28 @@ run_queue(QueueConn)                                   [ioutgt-tcp]
                 │                        │                       │   [uring]
 ```
 
+**Data copies.** The slot buffer (preallocated per tag: 8 KiB admin,
+128 KiB = MDTS io) is the single rendezvous for payload bytes, and the
+design accepts exactly one userspace memcpy per direction around it:
+
+- **Host write (H2C)**: kernel → 64 KiB recv buffer (`ops::recv`);
+  recv loop memcpys recv buffer → slot buffer (`RecvPhase::Data`),
+  reassembling in-capsule data or any number of H2CData PDUs at
+  `base + offset`; the backend then gets `&slot.data()[..len]`
+  borrowed directly — the file backend issues `write_at` on that
+  pointer, zero further copies.
+- **Host read (C2H)**: the file backend `read_at`s straight into the
+  slot buffer; send loop memcpys slot buffer → staging buffer
+  (`encode_send_work`), then one `ops::send_partial` → kernel.
+
+The write-side copy is what lets one flat, MDTS-sized buffer absorb
+arbitrarily fragmented TCP segments, so backends never see scatter;
+the read-side copy is the price of batching many responses into one
+ordered send op. Both copies are fused with CRC32C when data digests
+are negotiated — the bytes are walked once, never twice. `release_tag`
+runs only after the staged bytes are fully on the wire, so a slot
+buffer is never recycled while the send path still reads from it.
+
 ### 4.3 One IO command end to end
 
 A host `Read` crosses every crate boundary exactly once per hop:
