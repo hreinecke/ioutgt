@@ -55,14 +55,46 @@ anything else touches the wire.
   interop/bench harness uses 14420 (published to the VM guest through
   the 9p marker).
 
+## Gather send: staging buffer removed (2026-06-11)
+
+Design: `docs/superpowers/specs/2026-06-11-gather-send-design.md`.
+send_loop's slot → staging payload memcpy replaced by one SENDMSG
+gather per batch (headers/digests in a small arena, payload iovecs
+pointing into slot buffers). Wire bytes identical (golden tests +
+full interop matrix including the digest leg).
+
+Rig for this A/B: memory backend, 4 IO threads, loadgen
+`--conns 4 --qd 32 --rw randread`, loopback, same machine both
+binaries (baseline = the commit immediately before the gather
+rewire). loadgen does not negotiate digests, so the digest-on
+config is covered functionally by the interop fio matrix only.
+
+| config | 4K IOPS | 4K CPU µs/IOP | 128K BW | 128K CPU µs/IOP | 128K p50 |
+|---|---|---|---|---|---|
+| staging | 445K / repeat mean 392K | 6.1–6.9 | 7.73 GiB/s | 55.9 | 1938 µs |
+| gather | 408K / repeat mean 378K | 6.7–7.2 | **9.47 GiB/s (+22%)** | **44.0 (−21%)** | **1559 µs** |
+
+128K reads are an unambiguous win: +22% bandwidth, −21% CPU per
+IOP, p50 −20%. 4K reads show a possible ~0–4% IOPS deficit with
+heavily overlapping run distributions (staging repeat range
+382–403K, gather 355–405K; CPU ticks identical within 2%) on a
+non-quiesced machine — the per-response iovec count (3 entries vs
+staging's 1 contiguous stream) is the suspected mechanism if real.
+If a quiet rig confirms it, the candidate fix is inlining payloads
+below a threshold (≤ ~8K) into the arena so small-IO batches
+collapse back to one contiguous iovec — i.e. staging as the *small*
+case of gather, not a separate path.
+
 ## Next steps (in measured-isolation order)
 
-1. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
+1. Quiet-rig 4K re-measure of gather vs staging; threshold-inline
+   small payloads into the arena if the deficit is real.
+2. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
    fallback): saves the recv re-arm SQE and the recv-buffer round trip.
-2. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
+3. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
    file backend: removes per-op page pinning; measure CPU/IOP on
    O_DIRECT ext4.
-3. `SEND_ZC`: loopback falls back to copying (REPORT_USAGE confirms),
-   so this needs a real NIC to evaluate honestly; the notif-gated
-   buffer-reuse design is sketched in the architecture doc.
-4. Recv/send budget sweeps; per-queue stats counters for GET_STATS.
+4. `SEND_ZC`: loopback falls back to copying (REPORT_USAGE confirms),
+   so this needs a real NIC to evaluate honestly; rides the same
+   gather iovecs with notification-gated slot reuse.
+5. Recv/send budget sweeps; per-queue stats counters for GET_STATS.

@@ -101,28 +101,6 @@ pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> io::Result<BufOp> {
     Ok(BufOp { op })
 }
 
-/// Send the first `len` bytes of an owned buffer (the whole buffer
-/// stays alive in the reactor and is handed back) — the reusable
-/// staging-buffer primitive.
-pub fn send_partial(fd: RawFd, buf: Box<[u8]>, len: u32) -> io::Result<BufOp> {
-    if len as usize > buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "len exceeds buffer",
-        ));
-    }
-    let ptr = buf.as_ptr();
-    let op = Op::submit(
-        |key| {
-            opcode::Send::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::Buffer(buf),
-    )?;
-    Ok(BufOp { op })
-}
-
 /// Send an owned buffer on a socket.
 pub fn send(fd: RawFd, buf: Box<[u8]>) -> io::Result<BufOp> {
     let len = buf_len(&buf)?;
