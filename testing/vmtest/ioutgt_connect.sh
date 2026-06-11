@@ -207,23 +207,47 @@ ioutgt_run_m8() {
     done
     [ -n "$ctrl" ] && [ -b "$dev" ] || vt_die "device missing for m8"
 
-    # No verify: the memory backend forgets on restart by design; this
-    # tests transport recovery, not durability.
+    # Background IO across the kill. No verify (the memory backend
+    # forgets on restart by design). continue_on_error=all: whether the
+    # host driver masks every in-flight command across a hard kill -9 is
+    # timing-dependent (it may fail some with DNR during the chaotic
+    # reconnect window) — that is a host-driver property, not a target
+    # correctness property. What the target must guarantee is that it
+    # *recovers* and serves correct IO again, which the post-recovery
+    # write+read+verify below asserts deterministically.
     fio --name=killio --filename="$dev" --rw=randwrite --bs=4k \
         --runtime=45 --time_based --direct=1 --ioengine=libaio \
-        --iodepth=16 --output-format=terse >/tmp/fio-m8.out 2>&1 &
+        --iodepth=16 --continue_on_error=all \
+        --output-format=terse >/tmp/fio-m8.out 2>&1 &
     local fio_pid=$!
     sleep 3
     vt_log "requesting target kill"
     : > "$VMTEST_DATA_DIR/tmp/ioutgt_want_kill"
+    wait "$fio_pid" || true # errors during the outage are expected/tolerated
 
-    wait "$fio_pid" || { cat /tmp/fio-m8.out; vt_die "fio failed across target restart"; }
-    # terse field 5 of the write section carries error count via exit
-    # code already; belt-and-braces: no 'err=' in non-terse output.
-    dmesg | grep -q "nvme nvme.*reconnect" ||
-        vt_log "note: no explicit reconnect line in dmesg (driver may log differently)"
-    dd "if=$dev" of=/dev/null bs=4k count=8 iflag=direct status=none ||
+    # The controller must reconnect (the host logs it).
+    local i reconnected=0
+    for i in $(seq 60); do
+        if dmesg | grep -q "Successfully reconnected"; then
+            reconnected=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$reconnected" = 1 ] || { dmesg | tail -20; vt_die "host did not reconnect"; }
+    vt_log "controller reconnected after restart"
+
+    # Deterministic recovery check: write a known pattern to the fresh
+    # target and read it back. If the target came back wrong, this fails.
+    local tmp
+    tmp=$(mktemp)
+    dd if=/dev/urandom of="$tmp" bs=4k count=64 status=none
+    dd "if=$tmp" "of=$dev" bs=4k count=64 oflag=direct status=none ||
+        vt_die "write after recovery failed"
+    dd "if=$dev" of="$tmp.back" bs=4k count=64 iflag=direct status=none ||
         vt_die "read after recovery failed"
+    cmp "$tmp" "$tmp.back" || vt_die "data mismatch after recovery"
+    rm -f "$tmp" "$tmp.back"
     nvme disconnect -n "$NQN" >/dev/null || vt_die "m8 disconnect failed"
     vt_pass "ioutgt M8 target-kill recovery"
 }
