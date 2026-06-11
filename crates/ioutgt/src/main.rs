@@ -247,4 +247,30 @@ mod tests {
         let data = serde_json::json!({ "pid": 4242, "controllers": [] });
         assert_eq!(super::render_ctrl_list(&data), "pid 4242\nno controllers\n");
     }
+
+    #[test]
+    fn render_ctrl_list_discovery() {
+        let data = serde_json::json!({
+            "pid": 4242,
+            "controllers": [{
+                "cntlid": 2,
+                "subsysnqn": "nqn.2014-08.org.nvmexpress.discovery",
+                "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
+                "discovery": true,
+                "kato_ms": 120000,
+                "queues": [{"qid": 0, "sqsize": 32, "tid": 100}],
+                "namespaces": [],
+            }],
+        });
+        let out = super::render_ctrl_list(&data);
+        assert_eq!(
+            out,
+            "pid 4242\n\
+             controller 2 (discovery): nqn.2014-08.org.nvmexpress.discovery\n\
+             \x20 host:   nqn.2014-08.org.nvmexpress:uuid:abc\n\
+             \x20 kato:   120000 ms\n\
+             \x20 queues: 0:32@100\n\
+             \x20 ns:     -\n"
+        );
+    }
 }

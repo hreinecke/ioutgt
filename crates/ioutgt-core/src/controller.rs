@@ -298,6 +298,30 @@ mod tests {
     }
 
     #[test]
+    fn discovery_entries_flagged() {
+        let registry = Registry::new();
+        registry
+            .allocate(
+                ioutgt_nvme::fabrics::DISCOVERY_NQN,
+                "nqn.host",
+                0,
+                120_000,
+                qi(0),
+            )
+            .unwrap();
+        let snap = registry.snapshot();
+        assert!(snap[0].is_discovery());
+        assert_eq!(snap[0].kato_ms, 120_000);
+        // max_qid 0: any IO-queue Connect must be rejected.
+        assert_eq!(
+            registry
+                .install_io_queue(snap[0].cntlid, "nqn.host", qi(1))
+                .unwrap_err(),
+            IoConnectError::InvalidQid
+        );
+    }
+
+    #[test]
     fn registry_allocates_unique_cntlids() {
         let registry = Registry::new();
         let a = registry
