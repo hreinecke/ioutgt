@@ -20,7 +20,7 @@ ioutgt --config target.json
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
 | `--pin` | off | Pin queue threads to sequential cores |
-| `--control-socket <path>` | `/tmp/ioutgt.sock` | Runtime control API socket (same default as the `ctl`/`list-ctrl` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
+| `--control-socket <path>` | `/tmp/ioutgt.sock` | Runtime control API socket (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
 `RUST_LOG=debug ioutgt …`, or per-module
@@ -71,7 +71,7 @@ ioutgt ctl --socket /tmp/ioutgt.sock \
 ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"REMOVE_NAMESPACE","nsid":4}'
 ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"GET_STATS"}'
 ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"LIST_CONTROLLER"}'
-ioutgt list-ctrl --socket /tmp/ioutgt.sock      # human-readable form
+ioutgt list --socket /tmp/ioutgt.sock           # human-readable form
 ```
 
 Operations: `ADD_NAMESPACE`, `REMOVE_NAMESPACE`, `LIST_NAMESPACE`,
@@ -84,8 +84,11 @@ The protocol is plain newline-delimited JSON, so `nc -U` works too.
 host NQNs, granted KATO, installed queues — including the queue depth
 and the kernel tid of the serving queue thread (`top -H` /
 `perf -t` friendly) — plus the target pid and the namespaces visible
-through the controller. `ioutgt list-ctrl` renders the same data as
-text.
+through the controller. The response also carries the port's
+discoverable inventory (listen address, subsystems, namespaces), which
+`ioutgt list` prints before the controller list — so an idle target
+shows what hosts would discover rather than only `no controllers`.
+(`list-ctrl` remains as an alias for `list`.)
 
 ## Connecting a Linux host
 
