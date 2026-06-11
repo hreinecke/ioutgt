@@ -185,7 +185,7 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|q| format!("{}:{}@{}", q["qid"], q["sqsize"], q["tid"]))
+            .map(|q| format!("{}:{}@{}", q["qid"], q["depth"], q["tid"]))
             .collect::<Vec<_>>()
             .join(" ");
         let _ = writeln!(out, "  queues: {queues}");
@@ -284,8 +284,8 @@ mod tests {
                 "discovery": false,
                 "kato_ms": 60000,
                 "queues": [
-                    {"qid": 0, "sqsize": 32, "tid": 100},
-                    {"qid": 1, "sqsize": 64, "tid": 101},
+                    {"qid": 0, "depth": 32, "tid": 100},
+                    {"qid": 1, "depth": 64, "tid": 101},
                 ],
                 "namespaces": [{"nsid": 1, "blocks": 32768, "block_shift": 9}],
             }],
@@ -346,7 +346,7 @@ mod tests {
                 "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
                 "discovery": true,
                 "kato_ms": 120000,
-                "queues": [{"qid": 0, "sqsize": 32, "tid": 100}],
+                "queues": [{"qid": 0, "depth": 32, "tid": 100}],
                 "namespaces": [],
             }],
         });

@@ -95,6 +95,8 @@ pub struct QueueInfo {
     /// Queue depth in entries (wire sqsize + 1).
     pub sqsize: u16,
     /// Kernel thread id of the queue thread serving this queue.
+    /// Meaningful only while the controller lives: the entry is reaped
+    /// with its admin connection, before any tid could be reused.
     pub tid: i32,
 }
 

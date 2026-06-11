@@ -187,9 +187,9 @@ fn list_controller_reports_queues_and_namespaces() {
     let queues = c["queues"].as_array().unwrap();
     assert_eq!(queues.len(), 2, "{resp}");
     assert_eq!(queues[0]["qid"], 0);
-    assert_eq!(queues[0]["sqsize"], 32);
+    assert_eq!(queues[0]["depth"], 32);
     assert_eq!(queues[1]["qid"], 1);
-    assert_eq!(queues[1]["sqsize"], 64);
+    assert_eq!(queues[1]["depth"], 64);
     let admin_tid = queues[0]["tid"].as_i64().unwrap();
     let io_tid = queues[1]["tid"].as_i64().unwrap();
     assert!(admin_tid > 0 && io_tid > 0);
