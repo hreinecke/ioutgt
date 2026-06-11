@@ -69,8 +69,9 @@ from the fabrics Connect command (the first capsule), so blind round-robin
 of raw connections would put admin queues on IO threads. Handshake traffic
 is control-plane rate; doing it on plain Tokio sockets costs nothing where
 it matters and keeps queue threads free of accept/handshake states. After
-parsing Connect, the control thread passes the raw fd plus the parsed
-`ConnectInfo` and negotiated digest flags to the target thread's mailbox.
+parsing Connect, the control thread packs the socket, the parsed Connect
+capsule, and the negotiated digest flags into a `QueueConn` and sends it
+to the target thread's mailbox.
 The queue thread then owns the socket exclusively for the connection's
 lifetime.
 
@@ -79,7 +80,157 @@ mailbox (MPSC queue + eventfd doorbell, watched by a persistent multishot
 read on the ring). Queue-thread handles are deliberately not `Send`; the
 mailbox sender is the only exported handle.
 
-## 4. Reactor: io_uring under Tokio current-thread
+## 4. Crate map and cross-crate call flow
+
+The workspace is seven crates forming a strict dependency DAG — every
+crate depends only on layers below it, and the two leaves are deliberately
+opposite in character: `ioutgt-nvme` is **sans-IO** (pure bytes ↔ structs,
+no sockets, no async, fuzzable in isolation) and `ioutgt-uring` is **pure
+IO** (op futures and the reactor, zero protocol knowledge).
+
+```text
+  app       ┌──────────────────────────────────────────────────────┐
+            │ ioutgt — binary; loads TargetConfig, spawn_target()  │
+            │ spawns all threads, owns the TCP accept loop         │
+            └──────────────────────────────────────────────────────┘
+  frontends ┌─────────────────────────┐  ┌─────────────────────────┐
+            │ ioutgt-control          │  │ ioutgt-tcp              │
+            │ JSON config schema,     │  │ ICReq handshake, recv/  │
+            │ UDS control server      │  │ send loops, slot tasks  │
+            └─────────────────────────┘  └─────────────────────────┘
+  storage   ┌──────────────────────────────────────────────────────┐
+            │ ioutgt-backend — AnyBackend: Null / Memory / File    │
+            └──────────────────────────────────────────────────────┘
+  model     ┌──────────────────────────────────────────────────────┐
+            │ ioutgt-core — Port/Subsystem/Namespace, Registry,    │
+            │ QueueCore command slots, dispatch (fabrics/admin/io),│
+            │ Backend trait definition                             │
+            └──────────────────────────────────────────────────────┘
+  leaves    ┌─────────────────────────┐  ┌─────────────────────────┐
+            │ ioutgt-nvme             │  │ ioutgt-uring            │
+            │ sans-IO NVMe(-oF) codec │  │ io_uring reactor, op    │
+            │ Sqe/Cqe, PDUs, CRC32C   │  │ futures, mailbox,       │
+            │                         │  │ QueueRuntime            │
+            └─────────────────────────┘  └─────────────────────────┘
+```
+
+| Crate | Role | Depends on (workspace) |
+|-------|------|------------------------|
+| `ioutgt` | binary + assembly | all six |
+| `ioutgt-control` | config + UDS control plane | core, backend |
+| `ioutgt-tcp` | NVMe/TCP transport | core, nvme, uring |
+| `ioutgt-backend` | storage backends | core, uring |
+| `ioutgt-core` | NVMe model + dispatch | nvme |
+| `ioutgt-nvme` | sans-IO codec | — |
+| `ioutgt-uring` | reactor + op futures | — |
+
+### 4.1 Assembly: what `spawn_target()` wires up
+
+`main()` parses the config and hands everything to `spawn_target()`
+(`crates/ioutgt/src/lib.rs`), which is the only place all six crates meet:
+
+```text
+spawn_target(config)                                   [ioutgt]
+  ├─ spawn_admin_thread() ─┐  each queue thread:
+  ├─ spawn_io_thread() × N ┤   QueueRuntime::new()     [ioutgt-uring]
+  │                        │   mailbox()               [ioutgt-uring]
+  │                        └─  block_on: loop { conn = mailbox.recv()
+  │                               → spawn run_queue(conn) }   [ioutgt-tcp]
+  └─ control thread (plain Tokio): control_loop()
+       ├─ Registry::new()                              [ioutgt-core]
+       ├─ build_port(): per namespace
+       │    build_backend() → AnyBackend               [ioutgt-control → -backend]
+       │    Namespace / Subsystem::new() / PortConfig  [ioutgt-core]
+       ├─ server::serve(UnixListener, CtlState)        [ioutgt-control]
+       │    └─ notify_ns_changed ──► admin mailbox ──► ctx.fire_ns_changed()
+       │       (UDS ADD/REMOVE_NAMESPACE → AER NS_CHANGED on live ctrls)
+       └─ TCP accept loop → setup_connection() per socket
+            ├─ accept_handshake()  ICReq/ICResp        [ioutgt-tcp]
+            ├─ read_connect()      first capsule       [ioutgt-tcp]
+            └─ MailboxSender::send(QueueConn)          [ioutgt-uring mailbox]
+                 qid 0 → admin thread, qid n → io thread[(n-1) % N]
+```
+
+The mailbox (`ioutgt-uring::mailbox`) is the only cross-thread channel: an
+MPSC queue plus eventfd doorbell that the queue thread watches with a
+persistent ring read, so handing off a connection never touches the queue
+thread's hot path.
+
+### 4.2 Queue thread: who calls whom inside `run_queue()`
+
+`run_queue()` (`ioutgt-tcp/src/connection.rs`) is the per-connection
+orchestrator. It builds the core-side state, then spawns the task set whose
+**only rendezvous is `QueueCore`** — the recv loop, slot tasks, and send
+loop never call each other directly:
+
+```text
+run_queue(QueueConn)                                   [ioutgt-tcp]
+  ├─ QueueCore::new(qid, sqsize, slot_buf, …)          [ioutgt-core]
+  ├─ ConnCtx::new_admin() / new_io()                   [ioutgt-core]
+  ├─ spawn_local × sqsize  ── slot tasks ("task per tag"):
+  │     loop { sqe = queue.await_command(tag)          [core]
+  │            out = dispatch::execute(ctx, tag, &sqe) [core → backend]
+  │            queue.complete(tag, out.cqe, out.len) } [core]
+  ├─ spawn_local send_loop(queue, fd)                  [tcp]
+  ├─ spawn_local keep-alive watchdog (admin only)      [tcp → uring ops::sleep]
+  └─ recv_loop(queue, fd)        (runs as the task body)
+```
+
+```text
+            recv_loop                 QueueCore              send_loop
+            (ioutgt-tcp)            (ioutgt-core)           (ioutgt-tcp)
+                │                        │                       │
+  ops::recv ──► │  PduDecoder [nvme]     │                       │
+                │  claim_tag() ────────► │                       │
+                │  solicit() R2T ──────► │ ─── SendWork::R2t ──► │ encode_r2t [nvme]
+                │  submit(tag, sqe) ───► │                       │
+                │                        │ wakes slot task `tag` │
+                │                        │  dispatch::execute()  │
+                │                        │   └ Backend::read/    │
+                │                        │     write [backend    │
+                │                        │     → uring read_at/  │
+                │                        │       write_at]       │
+                │                        │  complete(tag, cqe) ─►│ next_send_work()
+                │                        │                       │ encode_c2h_data /
+                │                        │                       │ response [nvme]
+                │                        │ ◄── release_tag() ─── │ ops::send_partial
+                │                        │                       │   [uring]
+```
+
+### 4.3 One IO command end to end
+
+A host `Read` crosses every crate boundary exactly once per hop:
+
+1. **Accept + handshake** (control thread): `setup_connection()` calls
+   `accept_handshake()` then `read_connect()` [tcp]; the parsed
+   `ConnectCommand` [nvme] yields the qid; a `QueueConn` is mailed to the
+   owning queue thread [uring mailbox].
+2. **Install**: `run_queue()` [tcp] builds `QueueCore` + `ConnCtx` [core]
+   and spawns the slot tasks; the stashed Connect SQE is the first
+   `claim_tag()`/`submit()`.
+3. **Receive**: `recv_loop` [tcp] awaits `ops::recv` [uring], feeds bytes
+   to `PduDecoder` [nvme], claims a tag and `submit()`s the SQE [core].
+   Writes larger than the inline limit first `solicit()` an R2T (TTAG =
+   slot index) and reassemble H2CData into the slot buffer.
+4. **Dispatch**: the woken slot task calls `dispatch::execute()` [core],
+   which routes fabrics/admin/io; `io::execute` resolves the namespace via
+   the generation-checked `NsCache` and awaits `Backend::read()`
+   [backend], which issues `ops::read_at` on the same thread's ring
+   [uring].
+5. **Respond**: `complete()` [core] queues a `SendWork`; `send_loop` [tcp]
+   drains the whole send list, encodes C2HData/response PDUs [nvme] into
+   the staging buffer, ships one `ops::send_partial` [uring], then
+   `release_tag()` returns the slot to the freelist.
+
+Boundary summary: **bin→tcp** is two handshake calls; **bin/tcp→uring** is
+op futures + mailbox; **tcp→core** is the `QueueCore` slot API plus
+`dispatch::execute`; **core→backend** is the `Backend` trait behind
+`Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
+add/remove + the NS-changed nudge; **core/tcp→nvme** is types and
+encode/decode only — the codec never does IO, and the reactor never sees
+a PDU.
+
+## 5. Reactor: io_uring under Tokio current-thread
 
 Each queue thread runs `tokio::runtime::Builder::new_current_thread()` with
 a `LocalSet`, with **no** Tokio IO driver or timer enabled. A thread-local
@@ -115,7 +266,7 @@ preallocated slots; maintenance mode) and a **fully custom executor**
 `select!`/`JoinHandle`/ecosystem for free — only the wait primitive needs
 replacing).
 
-## 5. NVMe/TCP transport
+## 6. NVMe/TCP transport
 
 State machines mirror `drivers/nvme/target/tcp.c`:
 
@@ -159,7 +310,7 @@ and future transports slot in without touching protocol logic:
   ordered send list; the per-connection sender chooses vectored `SENDMSG`
   (phase 1) or `SEND_ZC` with notification-gated slot reuse (phase 2).
 
-## 6. Core model
+## 7. Core model
 
 ```text
 Port ──┬── Subsystem (NQN) ──┬── Namespace (nsid → Backend)
@@ -194,7 +345,7 @@ Property Get/Set (CAP/VS/CC/CSTS), fabrics Connect. IO commands: Read,
 Write, Flush, then Write Zeroes and DSM-deallocate advertised via ONCS once
 backend support lands.
 
-## 7. Backend trait
+## 8. Backend trait
 
 ```rust
 trait Backend {
@@ -214,7 +365,7 @@ bdev). Disk ops are issued on the owning queue thread's own ring. IOPOLL is
 not used: a polled ring cannot carry socket ops, and a second per-thread
 IOPOLL ring is a measured-later roadmap item.
 
-## 8. Buffer strategy: staged, measured
+## 9. Buffer strategy: staged, measured
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
@@ -225,7 +376,7 @@ IOPOLL ring is a measured-later roadmap item.
 Slot data buffers: 128 KiB (= MDTS) on IO queues, 8 KiB on admin queues,
 allocated once at queue install and registered with the ring in phase 2.
 
-## 9. Control plane and configuration
+## 10. Control plane and configuration
 
 - Unix domain socket, newline-delimited JSON: `ADD_NAMESPACE`,
   `REMOVE_NAMESPACE`, `LIST_NAMESPACE`, `GET_STATS`. Stats are aggregated
@@ -237,7 +388,7 @@ allocated once at queue install and registered with the ring in phase 2.
 - Runtime namespace changes propagate via mailboxes and fire AER
   NS_CHANGED so connected hosts rescan without reconnect.
 
-## 10. CPU affinity and NUMA
+## 11. CPU affinity and NUMA
 
 Queue threads pin to explicit cores (config map; default: sequential).
 Deterministic qid→core mapping lines the Linux host's per-CPU queues up
@@ -246,7 +397,7 @@ thread (first-touch locality); the allocation hooks take a NUMA node hint
 so multi-node placement needs no API change (development machine is
 single-node).
 
-## 11. Testing strategy
+## 12. Testing strategy
 
 1. **Unit**: per crate; PDU codec tested against byte fixtures captured
    from a real kernel-host ↔ kernel-nvmet loopback session (tcpdump), and
@@ -264,7 +415,7 @@ single-node).
    against ioutgt and an identically-configured kernel nvmet, with perf
    flamegraphs both sides. See `docs/benchmark-plan.md`.
 
-## 12. Milestones
+## 13. Milestones
 
 | # | Deliverable | Status |
 |---|-------------|--------|
@@ -280,7 +431,7 @@ single-node).
 | M9 | performance pass | part 1 done — batched send 4.2×; rest in roadmap |
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
 
-## 13. Risks
+## 14. Risks
 
 | Risk | Mitigation |
 |------|-----------|
