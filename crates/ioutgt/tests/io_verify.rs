@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation)] // test indices bounded by SIZES/BLOCK constants
+
 //! Data-integrity torture: concurrent connections, mixed transfer
 //! sizes across both write paths (in-capsule and R2T), interleaved
 //! ownership stripes, full read-back verification with per-LBA
