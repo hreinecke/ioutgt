@@ -18,7 +18,7 @@ use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
-use ioutgt_tcp::connection::{QueueConn, run_queue};
+use ioutgt_tcp::connection::{ConnPermit, QueueConn, run_queue};
 use ioutgt_tcp::handshake::{accept_handshake, read_connect};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -83,6 +83,11 @@ impl TargetConfig {
 
 /// Connect CATTR bit 2: host requests SQ flow control disabled.
 const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
+
+/// Maximum concurrent connections accepted. Bounds total preallocated
+/// queue memory; a host that exceeds it is rejected at accept. (Deeper
+/// mitigation — lazy slot-buffer allocation — is in the roadmap.)
+const MAX_CONNECTIONS: usize = 256;
 
 type Conn = QueueConn<AnyBackend>;
 
@@ -317,6 +322,8 @@ async fn control_loop(
     let _ = addr_tx.send(Ok(local));
     info!(%local, "ioutgt listening");
 
+    // Bounds total preallocated queue memory across all queue threads.
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -325,6 +332,13 @@ async fn control_loop(
                 continue;
             }
         };
+        let count = active.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count > MAX_CONNECTIONS {
+            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(%peer, "connection limit {MAX_CONNECTIONS} reached; rejecting");
+            continue; // stream drops here, closing the connection
+        }
+        let permit = ConnPermit::new(Arc::clone(&active));
         let admin_tx = admin_tx.clone();
         let io_txs = io_txs.clone();
         let allow_hdgst = config.allow_hdgst;
@@ -340,6 +354,7 @@ async fn control_loop(
                 &io_txs,
                 port,
                 registry,
+                permit,
             )
             .await
             {
@@ -360,6 +375,7 @@ async fn setup_connection(
     io_txs: &[MailboxSender<Conn>],
     port: Arc<PortConfig<AnyBackend>>,
     registry: Arc<Registry>,
+    permit: ConnPermit,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let negotiated = accept_handshake(
@@ -373,7 +389,10 @@ async fn setup_connection(
     let connect = first.connect();
     let qid = connect.qid.get();
     let entries = connect.sqsize.get() as u32 + 1;
-    if !(2..=1024).contains(&entries) {
+    // Enforce the advertised queue-size limit (CAP.MQES + 1): each slot
+    // preallocates a data buffer, so an oversized queue is a memory
+    // amplification vector a hostile host could exploit by ignoring MQES.
+    if !(2..=u32::from(ioutgt_core::MAX_QUEUE_ENTRIES)).contains(&entries) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "sqsize out of range",
@@ -394,6 +413,7 @@ async fn setup_connection(
         connect_data: first.data,
         port,
         registry,
+        permit,
     };
     if qid == 0 {
         admin_tx.send(AdminMsg::Conn(conn));

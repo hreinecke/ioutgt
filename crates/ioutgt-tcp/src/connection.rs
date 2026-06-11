@@ -20,7 +20,7 @@ use ioutgt_core::queue::{QueueCore, SendWork};
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
-use ioutgt_nvme::spec::{Sqe, sgl};
+use ioutgt_nvme::spec::{Cqe, Sqe, sgl};
 use ioutgt_nvme::{digest, status};
 use ioutgt_uring::ops;
 use tokio::task::JoinHandle;
@@ -30,6 +30,26 @@ use tracing::{debug, info, warn};
 pub const ADMIN_SLOT_BUF: usize = 8 * 1024;
 /// IO-queue slot buffers: MDTS.
 pub const IO_SLOT_BUF: usize = 128 * 1024;
+
+/// RAII guard for the active-connection counter: the count is
+/// incremented by the acceptor before the permit is built, and
+/// decremented here when the connection's `run_queue` returns. This is
+/// how the control thread bounds concurrent connections (and thus total
+/// preallocated queue memory) across queue threads.
+pub struct ConnPermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnPermit {
+    /// Wrap an already-incremented counter; drop decrements it.
+    pub fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        ConnPermit(counter)
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Everything a queue thread receives to run one connection.
 #[allow(missing_docs)]
@@ -51,6 +71,8 @@ pub struct QueueConn<B> {
     pub port: Arc<PortConfig<B>>,
     /// Cross-thread controller registry.
     pub registry: Arc<Registry>,
+    /// Active-connection accounting; dropped when this connection ends.
+    pub permit: ConnPermit,
 }
 
 /// Where the payload currently streaming in belongs.
@@ -205,17 +227,26 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         waited += 2;
     }
     if queue.executing() > 0 {
-        // A wedged backend op: leak the queue rather than free memory
-        // the kernel may still write to.
+        // A wedged backend op: leak the queue AND the slot tasks rather
+        // than free memory the kernel may still write to. A suspended
+        // backend future can own a private buffer (e.g. the write-zeroes
+        // fallback chunk) referenced by an in-flight raw kernel op;
+        // aborting the task would drop and free that buffer mid-DMA.
+        // Leaking the tasks keeps every such future — and its buffer —
+        // alive for the process's remaining lifetime.
         warn!(
             qid = conn.qid,
             executing = queue.executing(),
-            "teardown timeout; leaking queue"
+            "teardown timeout; leaking queue and tasks"
         );
         std::mem::forget(Rc::clone(&queue));
-    }
-    for task in &tasks {
-        task.abort();
+        for task in tasks {
+            std::mem::forget(task);
+        }
+    } else {
+        for task in &tasks {
+            task.abort();
+        }
     }
     // Tear down the controller when its admin queue dies.
     if let Role::Admin(admin) = &ctx.role {
@@ -387,18 +418,23 @@ async fn recv_loop(
                     if *have_len == 4 {
                         let wire = u32::from_le_bytes(*have);
                         if wire != *expected {
-                            let sqe = queue.slot(*tag).stashed_sqe();
-                            warn!(qid = queue.qid, cid = sqe.cid.get(), "DDGST mismatch");
-                            let _ = status::DATA_XFER_ERROR;
-                            send_term(
-                                fd,
-                                PduError {
-                                    fes: pdu::fes::HDR_DIGEST_ERR,
-                                    fei: 0,
-                                },
-                            )
-                            .await;
-                            return Ok(());
+                            // There is no NVMe/TCP "data digest error" FES;
+                            // nvmet completes the offending command with
+                            // NVME_SC_DATA_XFER_ERROR and keeps the
+                            // connection. Executing the write is skipped so
+                            // corrupt data never reaches the backend.
+                            let cid = queue.slot(*tag).stashed_sqe().cid.get();
+                            warn!(qid = queue.qid, cid, "DDGST mismatch; failing command");
+                            let cqe = Cqe::new(
+                                0,
+                                queue.advance_sqhd(),
+                                queue.qid,
+                                cid,
+                                status::DATA_XFER_ERROR | status::DNR,
+                            );
+                            queue.complete_receiving(*tag, cqe);
+                            phase = RecvPhase::Header;
+                            continue;
                         }
                         let kind = *kind;
                         let tag = *tag;

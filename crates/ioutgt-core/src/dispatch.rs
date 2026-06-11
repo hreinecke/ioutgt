@@ -172,8 +172,16 @@ impl<B: Backend> ConnCtx<B> {
             return;
         }
         // AER result DW0: type Notice (2) | info NS_ATTR_CHANGED (0) <<8
-        // | Changed-NS log page (0x04) <<16.
-        admin.events.borrow_mut().push_back(0x0004_0002);
+        // | Changed-NS log page (0x04) <<16. A single pending NS_ATTR
+        // notice suffices (the host rescans everything on read), so
+        // coalesce rather than letting the queue grow unbounded when no
+        // AER is posted.
+        const NS_ATTR_NOTICE: u32 = 0x0004_0002;
+        let mut events = admin.events.borrow_mut();
+        if !events.contains(&NS_ATTR_NOTICE) {
+            events.push_back(NS_ATTR_NOTICE);
+        }
+        drop(events);
         for waker in admin.aer_wakers.borrow_mut().drain(..) {
             waker.wake();
         }
