@@ -241,12 +241,23 @@ around it:
   copies.
 - **Host read (C2H)**: the file backend `read_at`s straight into the
   slot buffer; send loop memcpys slot buffer → staging buffer
-  (`encode_send_work`), then `ops::send_partial` → kernel.
+  (`encode_send_work`), then `ops::send_partial` → kernel. A short
+  send `copy_within`s the unsent remainder to the front of staging
+  and re-issues — exceptional, and self-throttled: the full socket
+  buffer that caused it is the same backpressure that keeps it rare.
 
 The write-side copy is what lets one flat, MDTS-sized buffer absorb
 arbitrarily fragmented TCP segments and H2CData splits, so backends
 never see scatter; the read-side copy is the price of the batched
-ordered send (and is slated to go away under phase-2 `SEND_ZC`, §9).
+ordered send (and is slated to go away under phase-2 `SEND_ZC`, §9 —
+the easier of the two to remove, since a send's source is known at
+submit time while a payload's slot is unknown until its header
+parses). The budget is the transport's: the memory backend adds one
+chunk copy per direction, null adds none, and the file backend adds
+none (O_DIRECT DMAs against the slot pages). Everything else on the
+path is O(1) per command — PDU header assembly in the decoder
+(headers can straddle recvs), the 64-byte SQE stash, and
+header/digest encoding into staging.
 CRC32C is computed alongside each copy while the bytes are cache-hot,
 never as a separate cold pass over the full payload — the recv side
 always accumulates, with digest negotiation gating only verification
