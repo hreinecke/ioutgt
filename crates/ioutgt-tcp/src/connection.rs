@@ -591,25 +591,191 @@ fn handle_pdu(
     }
 }
 
-/// Send loop: drain ALL pending completions/R2Ts into one staging
-/// buffer and ship them as a single send op.
+/// Worst-case arena bytes per staged item: C2HData header (24+4
+/// HDGST) + DDGST trailer (4) + response capsule (24+4).
+const ARENA_PER_ITEM: usize = 64;
+/// Worst-case iovec entries per staged item (header, payload, digest,
+/// capsule). Adjacent arena chunks merge; this is the unmerged bound.
+const IOVS_PER_ITEM: usize = 4;
+/// Kernel cap on msg_iovlen.
+const UIO_MAXIOV: usize = libc::UIO_MAXIOV as usize;
+
+/// One batch's gather state: headers and digests packed into a small
+/// arena, payloads referenced in place from slot buffers. Exactly one
+/// batch is in flight at a time; `reset()` recycles everything. All
+/// memory is preallocated at queue install.
+struct SendBatch {
+    arena: Box<[u8]>,
+    arena_used: usize,
+    iovs: Vec<libc::iovec>,
+    /// Hard entry cap (≤ UIO_MAXIOV). `Vec::with_capacity` may
+    /// over-allocate, so the fit check must not use `capacity()`.
+    iov_cap: usize,
+    /// First entry not yet fully sent (short-send resume point).
+    live: usize,
+    msghdr: Box<libc::msghdr>,
+}
+
+impl SendBatch {
+    fn new(sqsize: u16) -> SendBatch {
+        let n = usize::from(sqsize);
+        let iov_cap = (n * IOVS_PER_ITEM + IOVS_PER_ITEM).min(UIO_MAXIOV);
+        SendBatch {
+            arena: vec![0u8; (n * ARENA_PER_ITEM).max(4096)].into_boxed_slice(),
+            arena_used: 0,
+            iovs: Vec::with_capacity(iov_cap),
+            iov_cap,
+            live: 0,
+            // SAFETY: a zeroed msghdr is a valid value; msg_iov[len]
+            // are set in msghdr() before every submit.
+            msghdr: Box::new(unsafe { std::mem::zeroed() }),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.arena_used = 0;
+        self.iovs.clear();
+        self.live = 0;
+    }
+
+    /// Headroom for one more worst-case item?
+    fn fits(&self) -> bool {
+        self.arena_used + ARENA_PER_ITEM <= self.arena.len()
+            && self.iovs.len() + IOVS_PER_ITEM <= self.iov_cap
+    }
+
+    /// Unused arena to encode the next header piece into.
+    fn arena_tail(&mut self) -> &mut [u8] {
+        &mut self.arena[self.arena_used..]
+    }
+
+    /// Publish `len` bytes just written at the arena tail.
+    fn push_arena(&mut self, len: usize) {
+        let start = self.arena_used;
+        self.arena_used += len;
+        let ptr = self.arena[start..].as_ptr();
+        self.push_raw(ptr, len);
+    }
+
+    /// Append a wire chunk; merges with the previous entry when
+    /// byte-contiguous (consecutive arena pieces collapse, so pure
+    /// header batches degenerate to a single entry).
+    fn push_raw(&mut self, ptr: *const u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.iovs.last_mut() {
+            // SAFETY: one-past-the-end pointer, used only for equality.
+            let end = unsafe { last.iov_base.cast::<u8>().add(last.iov_len) };
+            if std::ptr::eq(end, ptr) {
+                last.iov_len += len;
+                return;
+            }
+        }
+        self.iovs.push(libc::iovec {
+            iov_base: ptr.cast_mut().cast(),
+            iov_len: len,
+        });
+    }
+
+    /// msghdr describing the unsent suffix; call before each submit.
+    fn msghdr(&mut self) -> *const libc::msghdr {
+        self.msghdr.msg_iov = self.iovs[self.live..].as_mut_ptr();
+        self.msghdr.msg_iovlen = self.iovs.len() - self.live;
+        &raw const *self.msghdr
+    }
+
+    /// Consume `sent` bytes; true when the whole batch hit the socket.
+    fn advance(&mut self, sent: usize) -> bool {
+        advance_iovecs(&mut self.iovs, &mut self.live, sent)
+    }
+}
+
+/// Skip fully-sent entries, bump the partial one in place. Returns
+/// true when `sent` consumed everything from `live` onward.
+fn advance_iovecs(iovs: &mut [libc::iovec], live: &mut usize, mut sent: usize) -> bool {
+    while *live < iovs.len() {
+        let e = &mut iovs[*live];
+        if sent < e.iov_len {
+            // SAFETY: stays within the entry's own chunk.
+            e.iov_base = unsafe { e.iov_base.cast::<u8>().add(sent).cast() };
+            e.iov_len -= sent;
+            return false;
+        }
+        sent -= e.iov_len;
+        *live += 1;
+    }
+    true
+}
+
+/// Stage one work item: header pieces into the arena (sans-IO encoders
+/// unchanged), payload referenced in place from the slot buffer, DDGST
+/// computed over the slot and trailed in the arena.
+fn stage_send_work(
+    queue: &Rc<QueueCore>,
+    batch: &mut SendBatch,
+    work: &SendWork,
+    hdr_digest: bool,
+    data_digest: bool,
+) {
+    match *work {
+        SendWork::R2t {
+            tag,
+            cid,
+            offset,
+            length,
+        } => {
+            let n = pdu::encode_r2t(batch.arena_tail(), cid, tag, offset, length, hdr_digest);
+            batch.push_arena(n);
+        }
+        SendWork::Response(completion) => {
+            let success_elide =
+                completion.data_len > 0 && queue.sqhd_disabled && completion.cqe.status.get() == 0;
+            if completion.data_len > 0 {
+                let data_len = completion.data_len as usize;
+                let n = pdu::encode_c2h_data(
+                    batch.arena_tail(),
+                    completion.cqe.cid.get(),
+                    0,
+                    completion.data_len,
+                    true,
+                    success_elide,
+                    hdr_digest,
+                    data_digest,
+                );
+                batch.push_arena(n);
+                let slot_data = queue.slot(completion.tag).data();
+                // The payload rides in place: the slot stays claimed
+                // until release_tag after the batch send completes.
+                batch.push_raw(slot_data.as_ptr(), data_len);
+                if data_digest {
+                    let crc = digest::crc32c(&slot_data[..data_len]);
+                    batch.arena_tail()[..4].copy_from_slice(&crc.to_le_bytes());
+                    batch.push_arena(4);
+                }
+            }
+            if !success_elide {
+                let n = pdu::encode_capsule_resp(batch.arena_tail(), &completion.cqe, hdr_digest);
+                batch.push_arena(n);
+            }
+        }
+    }
+}
+
+/// Send loop: drain ALL pending completions/R2Ts into one iovec
+/// gather list and ship it as a single SENDMSG.
 ///
 /// Independent send SQEs on one socket carry no ordering guarantee, so
-/// pipelining ops is not an option; batching into one op is — and it
-/// fixes the worst sleep pattern this design can exhibit: with
-/// one-op-per-response, the thread parks (one io_uring_enter round
-/// trip) for every response even when dozens are queued. One park per
-/// batch instead of one per IO.
+/// pipelining ops is not an option; one op per batch is — and gather
+/// keeps that while the payload entries point straight into slot
+/// buffers (no staging copy). One park per batch, zero payload memcpy.
 async fn send_loop(
     queue: &Rc<QueueCore>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
 ) -> std::io::Result<()> {
-    let slot_capacity = queue.slot(0).data().len();
-    // Room for several full responses; a single one always fits.
-    let staging_size = (slot_capacity + 256).max(512 * 1024);
-    let mut staging: Option<Box<[u8]>> = Some(vec![0u8; staging_size].into_boxed_slice());
+    let mut batch = SendBatch::new(queue.sqsize);
     let mut done_tags: Vec<u16> = Vec::with_capacity(usize::from(queue.sqsize));
     let mut carry: Option<SendWork> = None;
 
@@ -621,45 +787,37 @@ async fn send_loop(
                 None => return Ok(()), // close_send(): teardown
             },
         };
-        let mut buf = staging.take().expect("staged");
-        let mut offset = 0usize;
+        batch.reset();
         done_tags.clear();
         let mut work = Some(first);
         while let Some(item) = work {
-            let worst_case = match &item {
-                SendWork::R2t { .. } => 28,
-                SendWork::Response(completion) => 64 + completion.data_len as usize + 4,
-            };
-            if offset + worst_case > buf.len() {
-                carry = Some(item); // flush first, encode next round
+            if !batch.fits() {
+                carry = Some(item); // flush first, stage next round
                 break;
             }
-            offset += encode_send_work(queue, &mut buf[offset..], &item, hdr_digest, data_digest);
+            stage_send_work(queue, &mut batch, &item, hdr_digest, data_digest);
             if let SendWork::Response(completion) = item {
                 done_tags.push(completion.tag);
             }
             work = queue.try_next_send_work();
         }
 
-        let len = u32::try_from(offset).expect("staging < 4G");
-        let (res, returned) = ops::send_partial(fd, buf, len)?.await;
-        staging = Some(returned);
-        let mut sent = res? as usize;
-        // Short send: finish the remainder before anything else may hit
-        // the wire (ordering).
-        while sent < offset {
-            let mut tail = staging.take().expect("staged");
-            let remaining = offset - sent;
-            tail.copy_within(sent..offset, 0);
-            let (res, returned) =
-                ops::send_partial(fd, tail, u32::try_from(remaining).expect("fits"))?.await;
-            staging = Some(returned);
-            let n = res? as usize;
+        // Ship; on short send advance the iovecs and re-issue so
+        // nothing else can interleave on the wire (ordering).
+        loop {
+            // SAFETY: the msghdr, iovec array, arena, and referenced
+            // slot buffers all outlive the await — the batch is owned
+            // by this task, slots release only after the batch
+            // completes, and run_queue joins this task (or leaks the
+            // queue) before freeing anything.
+            let op = unsafe { ops::sendmsg_raw(fd, batch.msghdr()) }?;
+            let n = op.await? as usize;
             if n == 0 {
                 return Err(std::io::ErrorKind::WriteZero.into());
             }
-            offset = remaining;
-            sent = n;
+            if batch.advance(n) {
+                break;
+            }
         }
         for tag in done_tags.drain(..) {
             queue.release_tag(tag);
@@ -667,54 +825,133 @@ async fn send_loop(
     }
 }
 
-/// Encode one work item at `out[0..]`; returns bytes written.
-fn encode_send_work(
-    queue: &Rc<QueueCore>,
-    out: &mut [u8],
-    work: &SendWork,
-    hdr_digest: bool,
-    data_digest: bool,
-) -> usize {
-    match *work {
-        SendWork::R2t {
-            tag,
-            cid,
-            offset,
-            length,
-        } => pdu::encode_r2t(out, cid, tag, offset, length, hdr_digest),
-        SendWork::Response(completion) => {
-            let mut offset = 0usize;
-            let success_elide =
-                completion.data_len > 0 && queue.sqhd_disabled && completion.cqe.status.get() == 0;
-            if completion.data_len > 0 {
-                let data_len = completion.data_len as usize;
-                let hdr_len = pdu::encode_c2h_data(
-                    &mut out[offset..],
-                    completion.cqe.cid.get(),
-                    0,
-                    completion.data_len,
-                    true,
-                    success_elide,
-                    hdr_digest,
-                    data_digest,
-                );
-                offset += hdr_len;
-                {
-                    let slot_data = queue.slot(completion.tag).data();
-                    out[offset..offset + data_len].copy_from_slice(&slot_data[..data_len]);
-                }
-                if data_digest {
-                    let crc = digest::crc32c(&out[offset..offset + data_len]);
-                    out[offset + data_len..offset + data_len + 4]
-                        .copy_from_slice(&crc.to_le_bytes());
-                    offset += 4;
-                }
-                offset += data_len;
-            }
-            if !success_elide {
-                offset += pdu::encode_capsule_resp(&mut out[offset..], &completion.cqe, hdr_digest);
-            }
-            offset
+#[cfg(test)]
+mod gather_tests {
+    use ioutgt_core::queue::Completion;
+
+    use super::*;
+
+    /// Linearize a batch's iovecs (what the kernel would put on the wire).
+    fn gather(batch: &SendBatch) -> Vec<u8> {
+        let mut out = Vec::new();
+        for e in &batch.iovs {
+            // SAFETY: entries reference the batch arena and slot
+            // buffers owned by the test, sized by construction.
+            let s = unsafe { std::slice::from_raw_parts(e.iov_base.cast::<u8>(), e.iov_len) };
+            out.extend_from_slice(s);
         }
+        out
+    }
+
+    #[test]
+    fn batch_matches_linear_encoding() {
+        let queue = QueueCore::new(1, 4, 4096, false);
+        #[allow(clippy::cast_possible_truncation)]
+        let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        queue.slot(2).data()[..1000].copy_from_slice(&payload);
+
+        let mut batch = SendBatch::new(queue.sqsize);
+        let cqe = Cqe::new(0, 1, 1, 7, 0);
+        let items = [
+            SendWork::R2t {
+                tag: 3,
+                cid: 9,
+                offset: 0,
+                length: 4096,
+            },
+            SendWork::Response(Completion {
+                tag: 2,
+                cqe,
+                data_len: 1000,
+            }),
+        ];
+        for item in &items {
+            assert!(batch.fits());
+            stage_send_work(&queue, &mut batch, item, true, true);
+        }
+
+        // Reference: the same PDUs encoded linearly (the old staging
+        // layout): R2T | C2HData hdr | payload | DDGST | resp capsule.
+        let mut expect = vec![0u8; 8192];
+        let mut off = pdu::encode_r2t(&mut expect, 9, 3, 0, 4096, true);
+        off += pdu::encode_c2h_data(&mut expect[off..], 7, 0, 1000, true, false, true, true);
+        expect[off..off + 1000].copy_from_slice(&payload);
+        off += 1000;
+        let crc = digest::crc32c(&payload);
+        expect[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+        off += 4;
+        off += pdu::encode_capsule_resp(&mut expect[off..], &cqe, true);
+        expect.truncate(off);
+
+        assert_eq!(gather(&batch), expect);
+        // Arena-contiguous chunks merge: [R2T+C2H hdr][payload][DDGST+capsule].
+        assert_eq!(batch.iovs.len(), 3);
+    }
+
+    #[test]
+    fn batch_elides_and_merges_without_digests() {
+        // sqhd_disabled queue: a successful read elides the response
+        // capsule; digests off exercises the bare-header layout.
+        let queue = QueueCore::new(1, 4, 4096, true);
+        let payload = [0xa5u8; 512];
+        queue.slot(1).data()[..512].copy_from_slice(&payload);
+
+        let mut batch = SendBatch::new(queue.sqsize);
+        let read_cqe = Cqe::new(0, 1, 1, 5, 0);
+        let flush_cqe = Cqe::new(0, 2, 1, 6, 0);
+        let items = [
+            // Elided: C2HData header + payload, no capsule.
+            SendWork::Response(Completion {
+                tag: 1,
+                cqe: read_cqe,
+                data_len: 512,
+            }),
+            // Data-less response: capsule only.
+            SendWork::Response(Completion {
+                tag: 3,
+                cqe: flush_cqe,
+                data_len: 0,
+            }),
+        ];
+        for item in &items {
+            assert!(batch.fits());
+            stage_send_work(&queue, &mut batch, item, false, false);
+        }
+
+        let mut expect = vec![0u8; 4096];
+        let mut off = pdu::encode_c2h_data(&mut expect, 5, 0, 512, true, true, false, false);
+        expect[off..off + 512].copy_from_slice(&payload);
+        off += 512;
+        off += pdu::encode_capsule_resp(&mut expect[off..], &flush_cqe, false);
+        expect.truncate(off);
+
+        assert_eq!(gather(&batch), expect);
+        // [C2H hdr][payload][capsule]: capsule can't merge across the
+        // slot-payload entry.
+        assert_eq!(batch.iovs.len(), 3);
+    }
+
+    #[test]
+    fn advance_iovecs_walks_short_sends() {
+        let a = [1u8, 2, 3, 4];
+        let b = [5u8, 6, 7];
+        let mut iovs = vec![
+            libc::iovec {
+                iov_base: a.as_ptr().cast_mut().cast(),
+                iov_len: 4,
+            },
+            libc::iovec {
+                iov_base: b.as_ptr().cast_mut().cast(),
+                iov_len: 3,
+            },
+        ];
+        let mut live = 0;
+        assert!(!advance_iovecs(&mut iovs, &mut live, 5)); // all of a + 1 byte of b
+        assert_eq!(live, 1);
+        assert_eq!(iovs[1].iov_len, 2);
+        assert!(!advance_iovecs(&mut iovs, &mut live, 1));
+        assert_eq!(iovs[1].iov_len, 1);
+        assert!(advance_iovecs(&mut iovs, &mut live, 1));
+        assert_eq!(live, 2);
     }
 }
