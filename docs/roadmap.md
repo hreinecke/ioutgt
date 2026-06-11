@@ -63,8 +63,17 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 - Gentler error responses where nvmet degrades per-command instead of
   terminating: DDGST mismatch → `DATA_XFER_ERROR` on the command;
   queue-depth overrun handling.
-- RAE semantics on log pages; real SMART/error-log content; discovery
-  genctr maintenance; Get Log Page offset support beyond discovery.
+- RAE semantics on log pages; real SMART/error-log content; Get Log
+  Page offset support beyond discovery.
+- **Persistent discovery controllers**: discovery genctr maintenance
+  (bump on subsystem add/remove instead of the hardcoded 1), the
+  DISC_CHANGE AEN fired to connected discovery controllers on topology
+  changes (nvmet: `nvmet_port_disc_changed`), and OAES advertising
+  DISC_CHANGE instead of NS_ATTR on discovery controllers — the host
+  masks its AEC against OAES, so without the bit the notice is never
+  enabled (same trap as NS_ATTR on IO controllers). One coherent work
+  item; becomes load-bearing once runtime subsystem add or multi-port
+  lands.
 - Host ACLs (per-subsystem allowed-host lists) in config + control
   API.
 - **Multiple ports**: one process currently serves one listen address
