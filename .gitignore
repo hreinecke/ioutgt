@@ -6,3 +6,4 @@ flamegraph*.svg
 /bench/results/
 /.codegraph/
 *.swp
+*~
