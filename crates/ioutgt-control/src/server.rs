@@ -275,13 +275,15 @@ fn handle(state: &CtlState, request: Request) -> Response {
                     json!({ "nqn": subsys.nqn, "namespaces": namespaces })
                 })
                 .collect();
+            // An array from day one: multi-port is on the roadmap and
+            // the wire shape shouldn't need a breaking rename then.
             Response::ok(Some(json!({
                 "pid": std::process::id(),
-                "port": {
+                "ports": [{
                     "traddr": state.port.traddr,
                     "trsvcid": state.port.trsvcid,
                     "subsystems": port_subsystems,
-                },
+                }],
                 "controllers": controllers,
             })))
         }

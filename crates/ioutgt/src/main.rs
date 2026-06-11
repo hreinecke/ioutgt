@@ -129,9 +129,9 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "pid {}", data["pid"]);
-    // Discoverable inventory (configured port + subsystems), shown in
+    // Discoverable inventory (bound ports + subsystems), shown in
     // every state; skipped silently if the server predates it.
-    if let Some(port) = data["port"].as_object() {
+    for port in data["ports"].as_array().into_iter().flatten() {
         let _ = writeln!(
             out,
             "port {}:{}",
@@ -276,7 +276,7 @@ mod tests {
     fn render_ctrl_list_formats_controllers() {
         let data = serde_json::json!({
             "pid": 4242,
-            "port": sample_port(),
+            "ports": [sample_port()],
             "controllers": [{
                 "cntlid": 1,
                 "subsysnqn": "nqn.2026-06.io.ioutgt:test",
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn render_ctrl_list_empty() {
-        let data = serde_json::json!({ "pid": 4242, "port": sample_port(), "controllers": [] });
+        let data = serde_json::json!({ "pid": 4242, "ports": [sample_port()], "controllers": [] });
         assert_eq!(
             super::render_ctrl_list(&data),
             format!("pid 4242\n{PORT_HEADER}no controllers\n")
@@ -315,14 +315,14 @@ mod tests {
     fn render_ctrl_list_gib_sizes() {
         let data = serde_json::json!({
             "pid": 1,
-            "port": {
+            "ports": [{
                 "traddr": "::", "trsvcid": "14420",
                 "subsystems": [{
                     "nqn": "nqn.x",
                     // 2 GiB in 4096B blocks.
                     "namespaces": [{"nsid": 7, "blocks": 524288, "block_shift": 12}],
                 }],
-            },
+            }],
             "controllers": [],
         });
         let out = super::render_ctrl_list(&data);

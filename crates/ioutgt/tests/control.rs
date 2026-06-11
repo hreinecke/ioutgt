@@ -159,12 +159,12 @@ fn list_controller_reports_queues_and_namespaces() {
     assert!(resp["data"]["controllers"].as_array().unwrap().is_empty());
 
     // Discoverable inventory is reported before any host connects.
-    // traddr/trsvcid are the *configured* listen address ("…:0" here);
-    // bound-address fixup is the roadmapped wildcard-traddr item.
-    let port = &resp["data"]["port"];
-    assert_eq!(port["traddr"], "127.0.0.1", "{resp}");
-    assert_eq!(port["trsvcid"], "0", "{resp}");
-    let subsystems = port["subsystems"].as_array().unwrap();
+    // trsvcid is the *bound* port (the target listens on :0 here).
+    let ports = resp["data"]["ports"].as_array().unwrap();
+    assert_eq!(ports.len(), 1, "{resp}");
+    assert_eq!(ports[0]["traddr"], "127.0.0.1", "{resp}");
+    assert_eq!(ports[0]["trsvcid"], addr.port().to_string(), "{resp}");
+    let subsystems = ports[0]["subsystems"].as_array().unwrap();
     assert_eq!(subsystems.len(), 1);
     assert_eq!(subsystems[0]["nqn"], NQN);
     assert_eq!(subsystems[0]["namespaces"][0]["nsid"], 1);
@@ -200,7 +200,7 @@ fn list_controller_reports_queues_and_namespaces() {
     assert_eq!(c["namespaces"].as_array().unwrap().len(), 1);
     assert_eq!(c["namespaces"][0]["nsid"], 1);
     // Port section is present in the connected state too.
-    assert_eq!(resp["data"]["port"]["subsystems"][0]["nqn"], NQN);
+    assert_eq!(resp["data"]["ports"][0]["subsystems"][0]["nqn"], NQN);
 
     // Hot-added namespace appears on the next listing.
     let resp = ctl(
