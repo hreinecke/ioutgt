@@ -379,8 +379,9 @@ allocated once at queue install and registered with the ring in phase 2.
 ## 10. Control plane and configuration
 
 - Unix domain socket, newline-delimited JSON: `ADD_NAMESPACE`,
-  `REMOVE_NAMESPACE`, `LIST_NAMESPACE`, `GET_STATS`. Stats are aggregated
-  by querying each queue thread's mailbox — no shared counters.
+  `REMOVE_NAMESPACE`, `LIST_NAMESPACE`, `LIST_CONTROLLER`, `GET_STATS`.
+  Stats are aggregated by querying each queue thread's mailbox — no
+  shared counters.
 - The target is fully constructible from a JSON config file: subsystems,
   namespaces (backend type + path + nsid), listen address, thread/affinity
   map, digest policy, inline data size. Validation produces line-precise

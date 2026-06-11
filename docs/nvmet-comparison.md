@@ -213,7 +213,8 @@ namespace enable/disable fires AENs; nvmetcli wraps it.
 
 **ioutgt.** One JSON file creates the whole target (validated before
 any thread spawns); a Unix-socket JSON API (ADD/REMOVE/LIST_NAMESPACE,
-GET_STATS) mutates the versioned namespace table at runtime and
+LIST_CONTROLLER, GET_STATS) mutates the versioned namespace table at
+runtime and
 nudges controllers' AERs — verified end-to-end: a connected Linux
 host saw the hot-added namespace appear without reconnecting.
 
