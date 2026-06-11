@@ -61,26 +61,97 @@ enum Command {
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
     },
+    /// List live controllers on a running target (queues, threads,
+    /// namespaces).
+    ListCtrl {
+        /// Control socket path.
+        #[arg(long, default_value = "/tmp/ioutgt.sock")]
+        socket: std::path::PathBuf,
+    },
+}
+
+fn ctl_request(socket: &std::path::Path, request: &str) -> std::io::Result<serde_json::Value> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let mut response = String::new();
+    BufReader::new(&stream).read_line(&mut response)?;
+    serde_json::from_str(&response)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 fn ctl(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
     // Validate locally for a friendlier error than the server echo.
     serde_json::from_str::<serde_json::Value>(request)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut response = String::new();
-    BufReader::new(&stream).read_line(&mut response)?;
-    print!("{response}");
-    let ok = serde_json::from_str::<serde_json::Value>(&response)
-        .ok()
-        .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false);
-    if !ok {
+    let response = ctl_request(socket, request)?;
+    println!("{response}");
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn list_ctrl(socket: &std::path::Path) -> std::io::Result<()> {
+    let response = ctl_request(socket, r#"{"op":"LIST_CONTROLLER"}"#)?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        eprintln!("{response}");
+        std::process::exit(1);
+    }
+    print!("{}", render_ctrl_list(&response["data"]));
+    Ok(())
+}
+
+/// One block per controller; NQNs are too long for fixed columns.
+fn render_ctrl_list(data: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "pid {}", data["pid"]);
+    let controllers = data["controllers"].as_array().cloned().unwrap_or_default();
+    if controllers.is_empty() {
+        out.push_str("no controllers\n");
+        return out;
+    }
+    for c in &controllers {
+        let kind = if c["discovery"] == true {
+            " (discovery)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "controller {}{kind}: {}",
+            c["cntlid"],
+            c["subsysnqn"].as_str().unwrap_or("?")
+        );
+        let _ = writeln!(out, "  host:   {}", c["hostnqn"].as_str().unwrap_or("?"));
+        let _ = writeln!(out, "  kato:   {} ms", c["kato_ms"]);
+        let queues = c["queues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|q| format!("{}:{}@{}", q["qid"], q["sqsize"], q["tid"]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(out, "  queues: {queues}");
+        let nsids = c["namespaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|ns| ns["nsid"].to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "  ns:     {}",
+            if nsids.is_empty() {
+                "-".to_owned()
+            } else {
+                nsids
+            }
+        );
+    }
+    out
 }
 
 fn main() -> std::io::Result<()> {
@@ -91,8 +162,11 @@ fn main() -> std::io::Result<()> {
         .init();
 
     let args = Args::parse();
-    if let Some(Command::Ctl { socket, request }) = &args.command {
-        return ctl(socket, request);
+    if let Some(command) = &args.command {
+        match command {
+            Command::Ctl { socket, request } => return ctl(socket, request),
+            Command::ListCtrl { socket } => return list_ctrl(socket),
+        }
     }
 
     let config = match &args.config {
@@ -123,5 +197,43 @@ fn main() -> std::io::Result<()> {
     // The target runs on its own threads; park the main thread.
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn render_ctrl_list_formats_controllers() {
+        let data = serde_json::json!({
+            "pid": 4242,
+            "controllers": [{
+                "cntlid": 1,
+                "subsysnqn": "nqn.2026-06.io.ioutgt:test",
+                "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
+                "discovery": false,
+                "kato_ms": 60000,
+                "queues": [
+                    {"qid": 0, "sqsize": 32, "tid": 100},
+                    {"qid": 1, "sqsize": 64, "tid": 101},
+                ],
+                "namespaces": [{"nsid": 1, "blocks": 32768, "block_shift": 9}],
+            }],
+        });
+        let out = super::render_ctrl_list(&data);
+        assert_eq!(
+            out,
+            "pid 4242\n\
+             controller 1: nqn.2026-06.io.ioutgt:test\n\
+             \x20 host:   nqn.2014-08.org.nvmexpress:uuid:abc\n\
+             \x20 kato:   60000 ms\n\
+             \x20 queues: 0:32@100 1:64@101\n\
+             \x20 ns:     1\n"
+        );
+    }
+
+    #[test]
+    fn render_ctrl_list_empty() {
+        let data = serde_json::json!({ "pid": 4242, "controllers": [] });
+        assert_eq!(super::render_ctrl_list(&data), "pid 4242\nno controllers\n");
     }
 }
