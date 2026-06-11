@@ -223,8 +223,10 @@ while malformed or out-of-place PDUs produce C2HTermReq and close.
 **send_loop** blocks on `next_send_work()`, then greedily drains
 `try_next_send_work()`, encoding R2Ts, C2HData (header + payload),
 and response capsules into one staging buffer until the next item
-might not fit; the batch ships as a single `ops::send_partial`,
-re-issued on short send so nothing else can interleave on the wire.
+might not fit; the batch ships as a single `ops::send_partial`. A
+short send `copy_within`s the unsent remainder to the front of
+staging and re-issues, so nothing else can interleave on the wire
+(frequency depends on batch size vs socket buffer; unmeasured).
 With SQ flow control off, a successful read elides the response
 capsule (SUCCESS bit in C2HData). Slots are `release_tag()`ed only
 after the whole batch send completes.
@@ -241,10 +243,8 @@ around it:
   copies.
 - **Host read (C2H)**: the file backend `read_at`s straight into the
   slot buffer; send loop memcpys slot buffer → staging buffer
-  (`encode_send_work`), then `ops::send_partial` → kernel. A short
-  send `copy_within`s the unsent remainder to the front of staging
-  and re-issues — exceptional, and self-throttled: the full socket
-  buffer that caused it is the same backpressure that keeps it rare.
+  (`encode_send_work`), then `ops::send_partial` → kernel — plus a
+  payload-sized `copy_within` on short send (see above).
 
 The write-side copy is what lets one flat, MDTS-sized buffer absorb
 arbitrarily fragmented TCP segments and H2CData splits, so backends
@@ -253,11 +253,16 @@ ordered send (and is slated to go away under phase-2 `SEND_ZC`, §9 —
 the easier of the two to remove, since a send's source is known at
 submit time while a payload's slot is unknown until its header
 parses). The budget is the transport's: the memory backend adds one
-chunk copy per direction, null adds none, and the file backend adds
-none (O_DIRECT DMAs against the slot pages). Everything else on the
-path is O(1) per command — PDU header assembly in the decoder
-(headers can straddle recvs), the 64-byte SQE stash, and
-header/digest encoding into staging.
+payload copy per direction (chunk-wise across its 2 MiB chunks),
+null adds none (reads memset the slot — visible when measuring
+protocol overhead with it), and the file backend adds none — when
+the open gets O_DIRECT the device DMAs against the slot pages;
+where the filesystem refuses (e.g. tmpfs) it falls back to buffered
+IO and the kernel copies through the page cache
+(`FileBackend::is_direct`). Everything else on the path is bounded
+per PDU — header assembly in the decoder (headers can straddle
+recvs), the 64-byte SQE stash, and header/digest encoding into
+staging.
 CRC32C is computed alongside each copy while the bytes are cache-hot,
 never as a separate cold pass over the full payload — the recv side
 always accumulates, with digest negotiation gating only verification
