@@ -45,6 +45,8 @@ pub enum Request {
     },
     #[serde(rename = "GET_STATS")]
     GetStats,
+    #[serde(rename = "LIST_CONTROLLER")]
+    ListController,
 }
 
 /// Control response (one JSON object per line).
@@ -153,6 +155,15 @@ pub fn build_backend(config: &BackendConfig) -> Result<AnyBackend, String> {
     })
 }
 
+/// Namespace JSON body shared by `LIST_NAMESPACE` and `LIST_CONTROLLER`.
+fn ns_json(ns: &Namespace<AnyBackend>) -> serde_json::Value {
+    json!({
+        "nsid": ns.nsid,
+        "blocks": ns.backend.nr_blocks(),
+        "block_shift": ns.backend.block_shift(),
+    })
+}
+
 fn handle(state: &CtlState, request: Request) -> Response {
     match request {
         Request::AddNamespace {
@@ -204,16 +215,7 @@ fn handle(state: &CtlState, request: Request) -> Response {
                 Err(response) => return response,
             };
             let table = subsys.snapshot();
-            let list: Vec<_> = table
-                .values()
-                .map(|ns| {
-                    json!({
-                        "nsid": ns.nsid,
-                        "blocks": ns.backend.nr_blocks(),
-                        "block_shift": ns.backend.block_shift(),
-                    })
-                })
-                .collect();
+            let list: Vec<_> = table.values().map(|ns| ns_json(ns)).collect();
             Response::ok(Some(json!({ "namespaces": list })))
         }
         Request::GetStats => {
@@ -232,6 +234,38 @@ fn handle(state: &CtlState, request: Request) -> Response {
             Response::ok(Some(json!({
                 "controllers": state.registry.len(),
                 "subsystems": subsystems,
+            })))
+        }
+        Request::ListController => {
+            let controllers: Vec<_> = state
+                .registry
+                .snapshot()
+                .into_iter()
+                .map(|entry| {
+                    let namespaces: Vec<_> = state
+                        .port
+                        .subsystem(&entry.subsys_nqn)
+                        .map(|subsys| subsys.snapshot().values().map(|ns| ns_json(ns)).collect())
+                        .unwrap_or_default();
+                    let queues: Vec<_> = entry
+                        .queues
+                        .iter()
+                        .map(|q| json!({ "qid": q.qid, "sqsize": q.sqsize, "tid": q.tid }))
+                        .collect();
+                    json!({
+                        "cntlid": entry.cntlid,
+                        "subsysnqn": entry.subsys_nqn,
+                        "hostnqn": entry.hostnqn,
+                        "discovery": entry.is_discovery(),
+                        "kato_ms": entry.kato_ms,
+                        "queues": queues,
+                        "namespaces": namespaces,
+                    })
+                })
+                .collect();
+            Response::ok(Some(json!({
+                "pid": std::process::id(),
+                "controllers": controllers,
             })))
         }
     }

@@ -86,6 +86,24 @@ impl RegisterState {
     }
 }
 
+/// One installed queue's identity (recorded at Connect time, on the
+/// owning queue thread).
+#[derive(Debug, Clone, Copy)]
+pub struct QueueInfo {
+    /// Queue id (0 = admin, 1..=max_qid = IO).
+    pub qid: u16,
+    /// Queue depth in entries (wire sqsize + 1).
+    pub sqsize: u16,
+    /// Kernel thread id of the queue thread serving this queue.
+    pub tid: i32,
+}
+
+/// Kernel thread id of the calling thread.
+pub fn current_tid() -> i32 {
+    // SAFETY: gettid has no preconditions and cannot fail.
+    unsafe { libc::gettid() }
+}
+
 /// A live controller's routing info, visible to all threads.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)] // routing record; fields named per NVMe terms
@@ -95,8 +113,18 @@ pub struct ControllerEntry {
     pub hostnqn: String,
     /// Highest IO qid this controller may install (offered queue count).
     pub max_qid: u16,
-    /// IO queues installed so far (Connect-time duplicate detection).
-    pub installed_qids: Vec<u16>,
+    /// Keep-alive timeout granted at Connect (ms).
+    pub kato_ms: u32,
+    /// Installed queues, admin first (Connect-time duplicate detection
+    /// and LIST_CONTROLLER reporting).
+    pub queues: Vec<QueueInfo>,
+}
+
+impl ControllerEntry {
+    /// The controller is bound to the well-known discovery subsystem.
+    pub fn is_discovery(&self) -> bool {
+        self.subsys_nqn == ioutgt_nvme::fabrics::DISCOVERY_NQN
+    }
 }
 
 /// Cross-thread controller registry. Control-plane rate only (Connect /
@@ -112,8 +140,8 @@ struct RegistryInner {
     controllers: HashMap<u16, ControllerEntry>,
 }
 
-#[allow(missing_docs)]
 impl Registry {
+    /// Create a new, empty registry wrapped in an `Arc`.
     pub fn new() -> Arc<Registry> {
         Arc::new(Registry {
             inner: Mutex::new(RegistryInner {
@@ -124,8 +152,16 @@ impl Registry {
     }
 
     /// Allocate a cntlid for a new controller (admin Connect). `max_qid`
-    /// is the highest IO queue id the controller may later install.
-    pub fn allocate(&self, subsys_nqn: &str, hostnqn: &str, max_qid: u16) -> Option<u16> {
+    /// is the highest IO queue id the controller may later install;
+    /// `admin_queue` is the admin queue's identity (qid 0).
+    pub fn allocate(
+        &self,
+        subsys_nqn: &str,
+        hostnqn: &str,
+        max_qid: u16,
+        kato_ms: u32,
+        admin_queue: QueueInfo,
+    ) -> Option<u16> {
         let mut inner = self.inner.lock().expect("registry poisoned");
         // Linear scan for a free id: controller counts are tiny.
         let start = inner.next_cntlid.max(1);
@@ -138,7 +174,8 @@ impl Registry {
                         subsys_nqn: subsys_nqn.to_owned(),
                         hostnqn: hostnqn.to_owned(),
                         max_qid,
-                        installed_qids: vec![0],
+                        kato_ms,
+                        queues: vec![admin_queue],
                     });
                     true
                 }
@@ -157,7 +194,7 @@ impl Registry {
         &self,
         cntlid: u16,
         hostnqn: &str,
-        qid: u16,
+        queue: QueueInfo,
     ) -> Result<ControllerEntry, IoConnectError> {
         let mut inner = self.inner.lock().expect("registry poisoned");
         let entry = inner
@@ -169,15 +206,15 @@ impl Registry {
         }
         // qid 0 is the admin queue; IO qids must be 1..=max_qid (the
         // count granted via Set Features NUM_QUEUES). Rejecting out-of-
-        // range qids bounds installed_qids and prevents a host creating
+        // range qids bounds the queue list and prevents a host creating
         // more queues than advertised.
-        if qid == 0 || qid > entry.max_qid {
+        if queue.qid == 0 || queue.qid > entry.max_qid {
             return Err(IoConnectError::InvalidQid);
         }
-        if entry.installed_qids.contains(&qid) {
+        if entry.queues.iter().any(|q| q.qid == queue.qid) {
             return Err(IoConnectError::QueueExists);
         }
-        entry.installed_qids.push(qid);
+        entry.queues.push(queue);
         Ok(entry.clone())
     }
 
@@ -191,6 +228,7 @@ impl Registry {
             .remove(&cntlid)
     }
 
+    /// Number of live controllers.
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -199,8 +237,17 @@ impl Registry {
             .len()
     }
 
+    /// True when no controllers are registered.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Clone out all live controllers, sorted by cntlid (control API).
+    pub fn snapshot(&self) -> Vec<ControllerEntry> {
+        let inner = self.inner.lock().expect("registry poisoned");
+        let mut entries: Vec<ControllerEntry> = inner.controllers.values().cloned().collect();
+        entries.sort_unstable_by_key(|e| e.cntlid);
+        entries
     }
 }
 
@@ -242,40 +289,115 @@ mod tests {
         assert!(regs.csts() & ioutgt_nvme::fabrics::csts::SHST_COMPLETE != 0);
     }
 
+    fn qi(qid: u16) -> QueueInfo {
+        QueueInfo {
+            qid,
+            sqsize: 32,
+            tid: current_tid(),
+        }
+    }
+
+    #[test]
+    fn discovery_entries_flagged() {
+        let registry = Registry::new();
+        registry
+            .allocate(
+                ioutgt_nvme::fabrics::DISCOVERY_NQN,
+                "nqn.host",
+                0,
+                120_000,
+                qi(0),
+            )
+            .unwrap();
+        let snap = registry.snapshot();
+        assert!(snap[0].is_discovery());
+        assert_eq!(snap[0].kato_ms, 120_000);
+        // max_qid 0: any IO-queue Connect must be rejected.
+        assert_eq!(
+            registry
+                .install_io_queue(snap[0].cntlid, "nqn.host", qi(1))
+                .unwrap_err(),
+            IoConnectError::InvalidQid
+        );
+    }
+
     #[test]
     fn registry_allocates_unique_cntlids() {
         let registry = Registry::new();
-        let a = registry.allocate("nqn.test", "nqn.host", 4).unwrap();
-        let b = registry.allocate("nqn.test", "nqn.host", 4).unwrap();
+        let a = registry
+            .allocate("nqn.test", "nqn.host", 4, 60_000, qi(0))
+            .unwrap();
+        let b = registry
+            .allocate("nqn.test", "nqn.host", 4, 60_000, qi(0))
+            .unwrap();
         assert_ne!(a, b);
         assert!(a >= 1 && b >= 1);
 
         // IO queue install: unknown controller rejected, dup qid rejected.
         assert_eq!(
             registry
-                .install_io_queue(0xBEEF, "nqn.host", 1)
+                .install_io_queue(0xBEEF, "nqn.host", qi(1))
                 .unwrap_err(),
             IoConnectError::UnknownController
         );
-        registry.install_io_queue(a, "nqn.host", 1).unwrap();
+        registry.install_io_queue(a, "nqn.host", qi(1)).unwrap();
         assert_eq!(
-            registry.install_io_queue(a, "nqn.host", 1).unwrap_err(),
+            registry.install_io_queue(a, "nqn.host", qi(1)).unwrap_err(),
             IoConnectError::QueueExists
         );
         assert_eq!(
-            registry.install_io_queue(a, "nqn.other", 2).unwrap_err(),
+            registry
+                .install_io_queue(a, "nqn.other", qi(2))
+                .unwrap_err(),
             IoConnectError::HostMismatch
         );
         // qid 0 and qid > max_qid are rejected.
         assert_eq!(
-            registry.install_io_queue(a, "nqn.host", 0).unwrap_err(),
+            registry.install_io_queue(a, "nqn.host", qi(0)).unwrap_err(),
             IoConnectError::InvalidQid
         );
         assert_eq!(
-            registry.install_io_queue(a, "nqn.host", 5).unwrap_err(),
+            registry.install_io_queue(a, "nqn.host", qi(5)).unwrap_err(),
             IoConnectError::InvalidQid
         );
         registry.remove(a).unwrap();
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_reports_queues_and_kato() {
+        let registry = Registry::new();
+        let a = registry
+            .allocate("nqn.test", "nqn.host", 4, 5000, qi(0))
+            .unwrap();
+        registry.install_io_queue(a, "nqn.host", qi(1)).unwrap();
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].cntlid, a);
+        assert_eq!(snap[0].kato_ms, 5000);
+        let qids: Vec<u16> = snap[0].queues.iter().map(|q| q.qid).collect();
+        assert_eq!(qids, vec![0, 1]);
+        // Single-threaded test and qi() records current_tid(), so every
+        // queue must carry exactly this thread's tid.
+        assert!(snap[0].queues.iter().all(|q| q.tid == current_tid()));
+        assert!(!snap[0].is_discovery());
+    }
+
+    #[test]
+    fn snapshot_sorts_by_cntlid() {
+        let registry = Registry::new();
+        let mut ids: Vec<u16> = (0..3)
+            .map(|_| {
+                registry
+                    .allocate("nqn.test", "nqn.host", 4, 60_000, qi(0))
+                    .unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        // HashMap iteration order is random; snapshot() must still come
+        // back sorted ascending by cntlid.
+        let snap_ids: Vec<u16> = registry.snapshot().iter().map(|e| e.cntlid).collect();
+        assert_eq!(snap_ids, ids);
+        assert!(snap_ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

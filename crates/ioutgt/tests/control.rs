@@ -140,3 +140,80 @@ fn runtime_namespace_add_remove_with_aer() {
 
     let _ = std::fs::remove_file(&socket);
 }
+
+#[test]
+fn list_controller_reports_queues_and_namespaces() {
+    let socket = std::env::temp_dir().join(format!("ioutgt-lsctrl-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+
+    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    config.io_threads = 1;
+    config.control_socket = Some(socket.clone());
+    let addr = ioutgt::spawn_target(config).expect("target start");
+
+    // Empty registry: ok, pid present, no controllers.
+    let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["data"]["pid"], u64::from(std::process::id()));
+    assert!(resp["data"]["controllers"].as_array().unwrap().is_empty());
+
+    // Admin connect (Client::connect uses kato 60s on qid 0) + one IO queue.
+    let mut admin = Client::handshake(addr, false, false);
+    let cntlid = admin.connect(0, 32, 0xFFFF, 1);
+    admin.enable_controller(2);
+    let mut io = Client::handshake(addr, false, false);
+    io.connect(1, 64, cntlid, 1);
+
+    let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
+    let ctrls = resp["data"]["controllers"].as_array().unwrap();
+    assert_eq!(ctrls.len(), 1, "{resp}");
+    let c = &ctrls[0];
+    assert_eq!(c["cntlid"], u64::from(cntlid));
+    assert_eq!(c["subsysnqn"], NQN);
+    assert_eq!(c["discovery"], false);
+    assert_eq!(c["kato_ms"], 60_000);
+    let queues = c["queues"].as_array().unwrap();
+    assert_eq!(queues.len(), 2, "{resp}");
+    assert_eq!(queues[0]["qid"], 0);
+    assert_eq!(queues[0]["sqsize"], 32);
+    assert_eq!(queues[1]["qid"], 1);
+    assert_eq!(queues[1]["sqsize"], 64);
+    let admin_tid = queues[0]["tid"].as_i64().unwrap();
+    let io_tid = queues[1]["tid"].as_i64().unwrap();
+    assert!(admin_tid > 0 && io_tid > 0);
+    assert_ne!(
+        admin_tid, io_tid,
+        "admin and IO queues on different threads"
+    );
+    assert_eq!(c["namespaces"].as_array().unwrap().len(), 1);
+    assert_eq!(c["namespaces"][0]["nsid"], 1);
+
+    // Hot-added namespace appears on the next listing.
+    let resp = ctl(
+        &socket,
+        r#"{"op":"ADD_NAMESPACE","nsid":2,"backend":{"type":"memory","size_mb":8}}"#,
+    );
+    assert_eq!(resp["ok"], true, "{resp}");
+    let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
+    assert_eq!(
+        resp["data"]["controllers"][0]["namespaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Disconnect reaps the entry (teardown is async; poll briefly).
+    drop(io);
+    drop(admin);
+    for _ in 0..50 {
+        let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
+        if resp["data"]["controllers"].as_array().unwrap().is_empty() {
+            let _ = std::fs::remove_file(&socket);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("controller not reaped after disconnect");
+}

@@ -10,13 +10,24 @@ use tracing::{debug, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::backend::Backend;
-use crate::controller::CcEffect;
+use crate::controller::{CcEffect, QueueInfo, current_tid};
 use crate::dispatch::{ConnCtx, Outcome, Role};
 
 /// NUL/space-trimmed string from a fixed NQN field.
 pub fn nqn_str(raw: &[u8]) -> &str {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     std::str::from_utf8(&raw[..end]).unwrap_or("").trim_end()
+}
+
+/// This queue's identity for the registry. Connect executes on the
+/// owning queue thread, so the tid recorded here is the thread serving
+/// this queue.
+fn queue_info<B: Backend>(ctx: &ConnCtx<B>) -> QueueInfo {
+    QueueInfo {
+        qid: ctx.queue.qid,
+        sqsize: ctx.queue.sqsize,
+        tid: current_tid(),
+    }
 }
 
 /// Route one fabrics command (Connect / Property Get / Property Set).
@@ -98,10 +109,6 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             // IO queues the controller may install: the subsystem's
             // offered count (discovery controllers get none).
             let max_qid = admin.subsys.borrow().as_ref().map_or(0, |s| s.max_qid);
-            let Some(cntlid) = ctx.registry.allocate(subsysnqn, hostnqn, max_qid) else {
-                return Outcome::status(ctx.cqe(0, cid, status::CONNECT_CTRL_BUSY | status::DNR));
-            };
-            admin.cntlid.set(cntlid);
             // Discovery controllers default to 120s KATO, others take the
             // host's value.
             let kato = if cmd.kato.get() == 0 && discovery {
@@ -109,6 +116,13 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             } else {
                 cmd.kato.get()
             };
+            let Some(cntlid) =
+                ctx.registry
+                    .allocate(subsysnqn, hostnqn, max_qid, kato, queue_info(ctx))
+            else {
+                return Outcome::status(ctx.cqe(0, cid, status::CONNECT_CTRL_BUSY | status::DNR));
+            };
+            admin.cntlid.set(cntlid);
             admin.kato_ms.set(kato);
             info!(cntlid, subsysnqn, hostnqn, kato, "controller created");
             Outcome::status(ctx.cqe(u32::from(cntlid), cid, status::SUCCESS))
@@ -125,11 +139,11 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             let cntlid = data.cntlid.get();
             match ctx
                 .registry
-                .install_io_queue(cntlid, hostnqn, ctx.queue.qid)
+                .install_io_queue(cntlid, hostnqn, queue_info(ctx))
             {
                 Ok(entry) => {
                     io.cntlid.set(cntlid);
-                    if entry.subsys_nqn != fabrics::DISCOVERY_NQN {
+                    if !entry.is_discovery() {
                         if let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn) {
                             let _ = io.subsys.set(Arc::clone(subsys));
                         }

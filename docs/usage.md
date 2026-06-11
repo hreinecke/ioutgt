@@ -70,13 +70,22 @@ ioutgt ctl --socket /tmp/ioutgt.sock \
     '{"op":"ADD_NAMESPACE","nsid":4,"backend":{"type":"memory","size_mb":32}}'
 ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"REMOVE_NAMESPACE","nsid":4}'
 ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"GET_STATS"}'
+ioutgt ctl --socket /tmp/ioutgt.sock '{"op":"LIST_CONTROLLER"}'
+ioutgt list-ctrl --socket /tmp/ioutgt.sock      # human-readable form
 ```
 
 Operations: `ADD_NAMESPACE`, `REMOVE_NAMESPACE`, `LIST_NAMESPACE`,
-`GET_STATS`. `subsysnqn` is optional while a single subsystem is
-configured. Namespace changes propagate to connected hosts via the
-NS_ATTR_CHANGED async event — hosts rescan without reconnecting. The
-protocol is plain newline-delimited JSON, so `nc -U` works too.
+`LIST_CONTROLLER`, `GET_STATS`. `subsysnqn` is optional while a single
+subsystem is configured. Namespace changes propagate to connected hosts
+via the NS_ATTR_CHANGED async event — hosts rescan without reconnecting.
+The protocol is plain newline-delimited JSON, so `nc -U` works too.
+
+`LIST_CONTROLLER` reports each live controller's cntlid, subsystem and
+host NQNs, granted KATO, installed queues — including the queue depth
+and the kernel tid of the serving queue thread (`top -H` /
+`perf -t` friendly) — plus the target pid and the namespaces visible
+through the controller. `ioutgt list-ctrl` renders the same data as
+text.
 
 ## Connecting a Linux host
 

@@ -294,6 +294,7 @@ name = "ioutgt-core"
 version = "0.1.0"
 dependencies = [
  "ioutgt-nvme",
+ "libc",
  "tracing",
  "zerocopy",
 ]
