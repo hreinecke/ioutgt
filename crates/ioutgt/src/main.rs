@@ -70,32 +70,41 @@ enum Command {
     },
 }
 
-fn ctl_request(socket: &std::path::Path, request: &str) -> std::io::Result<serde_json::Value> {
+/// Send one request line over the control socket; return the raw
+/// response line (trailing newline stripped).
+fn ctl_request(socket: &std::path::Path, request: &str) -> std::io::Result<String> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     stream.write_all(request.as_bytes())?;
     stream.write_all(b"\n")?;
     let mut response = String::new();
     BufReader::new(&stream).read_line(&mut response)?;
-    serde_json::from_str(&response)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    response.truncate(response.trim_end().len());
+    Ok(response)
 }
 
+/// `ioutgt ctl`: forward one JSON request verbatim, echo the raw
+/// response line, exit 1 unless the server said `"ok": true`.
 fn ctl(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
     // Validate locally for a friendlier error than the server echo.
     serde_json::from_str::<serde_json::Value>(request)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let response = ctl_request(socket, request)?;
     println!("{response}");
-    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+    let parsed = serde_json::from_str::<serde_json::Value>(&response)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if parsed.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         std::process::exit(1);
     }
     Ok(())
 }
 
+/// `ioutgt list-ctrl`: render LIST_CONTROLLER output for humans.
 fn list_ctrl(socket: &std::path::Path) -> std::io::Result<()> {
-    let response = ctl_request(socket, r#"{"op":"LIST_CONTROLLER"}"#)?;
+    let raw = ctl_request(socket, r#"{"op":"LIST_CONTROLLER"}"#)?;
+    let response = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        eprintln!("{response}");
+        eprintln!("{raw}");
         std::process::exit(1);
     }
     print!("{}", render_ctrl_list(&response["data"]));
@@ -107,12 +116,14 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "pid {}", data["pid"]);
-    let controllers = data["controllers"].as_array().cloned().unwrap_or_default();
+    let controllers = data["controllers"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     if controllers.is_empty() {
         out.push_str("no controllers\n");
         return out;
     }
-    for c in &controllers {
+    for c in controllers {
         let kind = if c["discovery"] == true {
             " (discovery)"
         } else {
