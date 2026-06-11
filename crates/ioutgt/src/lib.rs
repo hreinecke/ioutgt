@@ -18,6 +18,7 @@ use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
+use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
 use ioutgt_tcp::connection::{ConnPermit, QueueConn, run_queue};
 use ioutgt_tcp::handshake::{accept_handshake, read_connect};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
@@ -35,7 +36,8 @@ pub struct TargetConfig {
     pub io_threads: usize,
     pub allow_hdgst: bool,
     pub allow_ddgst: bool,
-    /// Pin queue threads to cores (sequential map; disable in tests).
+    /// Pin each IO queue thread to one CPU of its `group_cpus_evenly`
+    /// group (disable in tests).
     pub pin_threads: bool,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
@@ -164,6 +166,44 @@ fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
     Ok(tx)
 }
 
+/// Pick the CPU each IO queue thread is pinned to: group all CPUs
+/// evenly per NUMA/cluster/SMT locality (the kernel `group_cpus_evenly`
+/// spread, i.e. what nvme-tcp queues see on the host side), one group
+/// per IO thread, then select the group's first online CPU.
+fn io_thread_cpus(io_threads: usize) -> Vec<Option<usize>> {
+    let topo = match CpuTopology::from_sysfs() {
+        Ok(topo) => topo,
+        Err(err) => {
+            warn!("cpu topology unavailable, io threads not pinned: {err}");
+            return vec![None; io_threads];
+        }
+    };
+    let groups = group_cpus_evenly(io_threads, &topo);
+    (0..io_threads)
+        .map(|i| {
+            // groups can run out when io_threads > possible CPUs; a
+            // group of only-offline CPUs yields no pinnable CPU.
+            let group = groups.get(i);
+            let cpu = group.and_then(|g| g.and(&topo.online).first());
+            match (cpu, group) {
+                (Some(cpu), Some(group)) => {
+                    info!(thread = i, cpus = %group, cpu, "io queue affinity");
+                }
+                (None, Some(group)) => {
+                    warn!(thread = i, cpus = %group, "no online cpu in group, thread not pinned");
+                }
+                (_, None) => {
+                    warn!(
+                        thread = i,
+                        "more io threads than possible cpus, thread not pinned"
+                    );
+                }
+            }
+            cpu
+        })
+        .collect()
+}
+
 fn spawn_pinned(
     name: String,
     core_id: Option<usize>,
@@ -246,8 +286,13 @@ fn build_port(config: &TargetConfig) -> io::Result<Arc<PortConfig<AnyBackend>>> 
 /// ephemeral-port tests). Runs until the process exits.
 pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
     let admin_tx = spawn_admin_thread("ioutgt-admin".into())?;
+    let io_cpus = if config.pin_threads {
+        io_thread_cpus(config.io_threads)
+    } else {
+        vec![None; config.io_threads]
+    };
     let io_txs: Vec<MailboxSender<Conn>> = (0..config.io_threads)
-        .map(|i| spawn_io_thread(format!("ioutgt-io{i}"), config.pin_threads.then_some(i + 1)))
+        .map(|i| spawn_io_thread(format!("ioutgt-io{i}"), io_cpus[i]))
         .collect::<io::Result<_>>()?;
 
     // The control thread reports the bound address back synchronously.

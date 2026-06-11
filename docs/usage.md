@@ -19,7 +19,7 @@ ioutgt --config target.json
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
-| `--pin` | off | Pin queue threads to sequential cores |
+| `--pin` | off | Pin each IO thread to one CPU of its `group_cpus_evenly` group (NUMA/cluster/SMT-aware) |
 | `--control-socket <path>` | — | Enable the runtime control API on this Unix socket |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
