@@ -21,8 +21,9 @@ pub struct FileConfig {
     /// Allow data-digest negotiation.
     #[serde(default = "default_true")]
     pub data_digest: bool,
-    /// Pin queue threads to cores.
-    #[serde(default)]
+    /// Topology-aware IO thread pinning (default on, like the CLI;
+    /// set false to opt out).
+    #[serde(default = "default_true")]
     pub pin_threads: bool,
     /// Unix socket path for the runtime control API.
     #[serde(default)]

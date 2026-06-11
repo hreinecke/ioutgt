@@ -32,7 +32,7 @@ profile keeps `debug = true` for perf/flamegraph work.
 ```sh
 testing/run_interop.sh            # full matrix: discover/connect, fio --verify, fs stage
 testing/run_interop.sh ioutgt_fio # only the fio data-integrity stage
-testing/run_affinity.sh           # multi-NUMA guest: --pin group_cpus_evenly placement
+testing/run_affinity.sh           # multi-NUMA guest: group_cpus_evenly placement (default-on)
 ```
 
 Requires the external vmtest harness (`~/git/utils/vmtest`, config

@@ -19,7 +19,7 @@ ioutgt --config target.json
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
-| `--pin` | off | Pin each IO thread to one CPU of its `group_cpus_evenly` group (NUMA/cluster/SMT-aware) |
+| `--no-pin` | pinning on | Disable topology-aware IO-thread pinning (each IO thread pins to one CPU of its `group_cpus_evenly` group — NUMA/cluster/SMT-aware) |
 | `--control-socket <path>` | `$XDG_RUNTIME_DIR/ioutgt.sock`, else `/tmp/ioutgt.sock` | Runtime control API socket, created mode 0600 (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
@@ -37,7 +37,6 @@ The well-known discovery subsystem is always served; `nvme discover
   "io_threads": 2,
   "header_digest": true,
   "data_digest": true,
-  "pin_threads": false,
   "control_socket": "/tmp/ioutgt.sock",
   "subsystems": [
     {
@@ -83,7 +82,7 @@ The protocol is plain newline-delimited JSON, so `nc -U` works too.
 `LIST_CONTROLLER` reports each live controller's cntlid, subsystem and
 host NQNs, granted KATO, installed queues — including the queue depth
 the kernel tid of the serving queue thread (`top -H` / `perf -t`
-friendly), and its live CPU affinity (`*` = unpinned; with `--pin`
+friendly), and its live CPU affinity (`*` = unpinned, e.g. with `--no-pin`; by default
 each IO queue shows its `group_cpus_evenly` CPU) — plus the target
 pid and the namespaces visible through the controller. The response also carries the port's
 discoverable inventory (listen address, subsystems, namespaces), which

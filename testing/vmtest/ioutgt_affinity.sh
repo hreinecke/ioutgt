@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# Guest-side CPU-affinity test: run ioutgt --pin inside a multi-NUMA
+# Guest-side CPU-affinity test: run ioutgt (pinning is default-on)
 # guest (vmtest.conf: VMTEST_NUMA_NODES > 1) and verify the userspace
 # group_cpus_evenly placement against the guest's /sys topology:
 #   - one affinity group per IO thread, each group inside ONE NUMA node
@@ -53,7 +53,7 @@ ioutgt_run_affinity() {
 
     local log=/tmp/ioutgt-affinity.log
     RUST_LOG=info "$bin" --listen 127.0.0.1:14420 --io-threads "$io_threads" \
-        --pin --control-socket /tmp/ioutgt-affinity.sock >"$log.raw" 2>&1 &
+        --control-socket /tmp/ioutgt-affinity.sock >"$log.raw" 2>&1 &
     local pid=$!
     vt_atexit "kill $pid 2>/dev/null || true"
 

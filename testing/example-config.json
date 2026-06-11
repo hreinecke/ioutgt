@@ -3,7 +3,6 @@
   "io_threads": 2,
   "header_digest": true,
   "data_digest": true,
-  "pin_threads": false,
   "control_socket": "/tmp/ioutgt.sock",
   "subsystems": [
     {

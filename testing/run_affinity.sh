@@ -1,7 +1,7 @@
 #!/bin/bash
 # Host-side affinity test runner: build ioutgt, then boot the vmtest VM
 # — multi-NUMA per vmtest.conf (VMTEST_NUMA_NODES, currently 4) — where
-# the guest runs the target with --pin and verifies the userspace
+# the guest runs the target (pinning default-on) and verifies the userspace
 # group_cpus_evenly placement against its /sys topology.
 # Usage: testing/run_affinity.sh
 set -eu

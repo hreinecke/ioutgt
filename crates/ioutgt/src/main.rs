@@ -27,9 +27,9 @@ struct Args {
     #[arg(long)]
     no_ddgst: bool,
 
-    /// Pin queue threads to cores.
+    /// Disable topology-aware IO thread pinning (on by default).
     #[arg(long)]
-    pin: bool,
+    no_pin: bool,
 
     /// NVM subsystem NQN.
     #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
@@ -241,7 +241,7 @@ fn main() -> std::io::Result<()> {
             config.io_threads = args.io_threads;
             config.allow_hdgst = !args.no_hdgst;
             config.allow_ddgst = !args.no_ddgst;
-            config.pin_threads = args.pin;
+            config.pin_threads = !args.no_pin;
             config.control_socket = Some(args.control_socket);
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {

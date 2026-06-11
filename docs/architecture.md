@@ -399,8 +399,9 @@ allocated once at queue install and registered with the ring in phase 2.
 
 ## 11. CPU affinity and NUMA
 
-With `pin_threads`, IO queue thread placement uses `ioutgt-cpus`, a
-userspace port of the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`):
+By default (`pin_threads` on; opt out with `--no-pin` or
+`"pin_threads": false`), IO queue thread placement uses `ioutgt-cpus`,
+a userspace port of the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`):
 all possible CPUs are grouped evenly per NUMA / cluster / SMT locality
 (present CPUs spread first, groups apportioned to nodes by CPU-count
 ratio, cluster-aligned when possible, SMT-sibling-first fill — the same
