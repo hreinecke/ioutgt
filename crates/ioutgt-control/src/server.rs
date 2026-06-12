@@ -77,6 +77,10 @@ impl Response {
     }
 }
 
+/// Fires one queue thread's stats request (a mailbox send); the
+/// thread's JSON reply lands on the provided sender.
+pub type StatsSource = Box<dyn Fn(tokio::sync::oneshot::Sender<serde_json::Value>) + Send + Sync>;
+
 /// Shared state the API operates on.
 pub struct CtlState {
     pub port: Arc<PortConfig<AnyBackend>>,
@@ -84,6 +88,9 @@ pub struct CtlState {
     /// Invoked after any namespace change: routes an AER nudge to the
     /// admin queue thread.
     pub notify_ns_changed: Box<dyn Fn() + Send + Sync>,
+    /// One per queue thread (admin first, then io threads), for
+    /// GET_STATS aggregation.
+    pub stats_sources: Vec<StatsSource>,
 }
 
 /// Serve the control API until the listener fails. Spawn on the control
@@ -106,7 +113,7 @@ pub async fn serve(listener: tokio::net::UnixListener, state: Arc<CtlState>) {
                     continue;
                 }
                 let response = match serde_json::from_str::<Request>(&line) {
-                    Ok(request) => handle(&state, request),
+                    Ok(request) => handle(&state, request).await,
                     Err(err) => Response::err(format!("bad request: {err}")),
                 };
                 let mut out = serde_json::to_string(&response).expect("serializable");
@@ -164,7 +171,7 @@ fn ns_json(ns: &Namespace<AnyBackend>) -> serde_json::Value {
     })
 }
 
-fn handle(state: &CtlState, request: Request) -> Response {
+async fn handle(state: &CtlState, request: Request) -> Response {
     match request {
         Request::AddNamespace {
             subsysnqn,
@@ -230,10 +237,23 @@ fn handle(state: &CtlState, request: Request) -> Response {
                     })
                 })
                 .collect();
-            // Per-queue IO counters land with the performance milestone.
+            // Per-queue/per-thread counters: ask each queue thread to
+            // snapshot its own Cell counters (mailbox round trip).
+            let mut threads = Vec::with_capacity(state.stats_sources.len());
+            for source in &state.stats_sources {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                source(tx);
+                // A wedged queue thread must not hang the control API.
+                let reply = tokio::time::timeout(std::time::Duration::from_millis(500), rx).await;
+                threads.push(match reply {
+                    Ok(Ok(value)) => value,
+                    _ => json!({ "error": "thread unresponsive" }),
+                });
+            }
             Response::ok(Some(json!({
                 "controllers": state.registry.len(),
                 "subsystems": subsystems,
+                "threads": threads,
             })))
         }
         Request::ListController => {

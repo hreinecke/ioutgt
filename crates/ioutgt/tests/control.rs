@@ -131,6 +131,13 @@ fn runtime_namespace_add_remove_with_aer() {
     let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
     assert_eq!(resp["ok"], true);
     assert_eq!(resp["data"]["controllers"], 1);
+    // Every queue thread (admin + io) reports its ring counters.
+    let threads = resp["data"]["threads"].as_array().expect("threads array");
+    assert!(!threads.is_empty(), "{resp}");
+    for thread in threads {
+        assert!(thread["ring"]["sqes"].is_u64(), "thread reply: {thread}");
+        assert!(thread["tid"].as_i64().unwrap_or(0) > 0, "{thread}");
+    }
 
     // Bad requests are rejected, connection stays usable.
     let resp = ctl(&socket, r#"{"op":"REMOVE_NAMESPACE","nsid":42}"#);
@@ -234,4 +241,115 @@ fn list_controller_reports_queues_and_namespaces() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!("controller not reaped after disconnect");
+}
+
+/// The per-queue counters in GET_STATS track real IO exactly, and a
+/// torn-down queue's counts fold into the thread's retired totals.
+#[test]
+fn get_stats_counts_ios_and_folds_retired() {
+    let socket = std::env::temp_dir().join(format!("ioutgt-stat-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+
+    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    config.io_threads = 1;
+    config.control_socket = Some(socket.clone());
+    let addr = ioutgt::spawn_target(config).expect("target start");
+
+    let mut admin = Client::handshake(addr, false, false);
+    let cntlid = admin.connect(0, 32, 0xFFFF, 1);
+    admin.enable_controller(2);
+    let mut io = Client::handshake(addr, false, false);
+    io.connect(1, 32, cntlid, 1);
+
+    const BS: u32 = 4096;
+    let data = pattern(BS as usize, 0x37);
+    for i in 0..4u16 {
+        let sqe = rw_sqe(
+            spec::io_opcode::WRITE,
+            10 + i,
+            u64::from(i) * 8,
+            7,
+            BS,
+            false,
+        );
+        io.send_capsule(&sqe, &data);
+        assert_eq!(io.recv_response().status.get() >> 1, status::SUCCESS);
+    }
+    for i in 0..3u16 {
+        let sqe = rw_sqe(spec::io_opcode::READ, 20 + i, u64::from(i) * 8, 7, BS, true);
+        io.send_capsule(&sqe, &[]);
+        let (decoded, payload) = io.recv_pdu();
+        assert!(matches!(decoded.kind, PduKind::C2HData { .. }));
+        assert_eq!(payload, data, "readback {i}");
+        let _ = io.recv_response();
+    }
+
+    let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
+    assert_eq!(resp["ok"], true, "{resp}");
+    let threads = resp["data"]["threads"].as_array().expect("threads");
+    let find_queue = |threads: &[serde_json::Value], qid: u64| -> Option<serde_json::Value> {
+        threads.iter().find_map(|t| {
+            t["queues"]
+                .as_array()?
+                .iter()
+                .find(|q| {
+                    q["cntlid"].as_u64() == Some(u64::from(cntlid))
+                        && q["qid"].as_u64() == Some(qid)
+                })
+                .cloned()
+        })
+    };
+    let q = find_queue(threads, 1).expect("io queue in stats");
+    assert_eq!(q["write_cmds"], 4, "{q}");
+    assert_eq!(q["read_cmds"], 3, "{q}");
+    assert_eq!(q["write_bytes"], 4 * u64::from(BS), "{q}");
+    assert_eq!(q["read_bytes"], 3 * u64::from(BS), "{q}");
+    assert_eq!(q["errors"], 0, "{q}");
+    // The queue's own fabrics Connect is an "other" command.
+    assert!(q["other_cmds"].as_u64().unwrap() >= 1, "{q}");
+    // Admin queue counters exist too (Connect/enable/keep-alive land
+    // in other_cmds), and the serving thread's ring did real work.
+    let aq = find_queue(threads, 0).expect("admin queue in stats");
+    assert!(aq["other_cmds"].as_u64().unwrap() >= 2, "{aq}");
+    let io_thread = threads
+        .iter()
+        .find(|t| {
+            t["queues"]
+                .as_array()
+                .is_some_and(|qs| qs.iter().any(|q| q["qid"].as_u64() == Some(1)))
+        })
+        .expect("thread serving qid 1");
+    assert!(
+        io_thread["ring"]["sqes"].as_u64().unwrap() > 0,
+        "{io_thread}"
+    );
+    assert!(
+        io_thread["ring"]["enters"].as_u64().unwrap() > 0,
+        "{io_thread}"
+    );
+
+    // Teardown folds the final counts into retired totals (monotonic).
+    drop(io);
+    drop(admin);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
+        let retired_writes: u64 = resp["data"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["retired"]["write_cmds"].as_u64())
+            .sum();
+        if retired_writes >= 4 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retired fold timed out: {resp}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = std::fs::remove_file(&socket);
 }

@@ -34,5 +34,12 @@ mod runtime;
 
 pub use cqe::CqeResult;
 pub use probe::{Features, probe};
-pub use reactor::{Reactor, RingConfig};
+pub use reactor::{Reactor, ReactorStats, RingConfig};
 pub use runtime::QueueRuntime;
+
+/// Lifetime ring counters of the current thread's reactor.
+///
+/// Errors if the thread has no live [`QueueRuntime`].
+pub fn reactor_stats() -> std::io::Result<ReactorStats> {
+    Ok(reactor::Reactor::current()?.stats())
+}

@@ -1,6 +1,6 @@
 //! The per-thread reactor: ring ownership, op slab, park/reap loop.
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::io;
 use std::rc::Rc;
 
@@ -17,6 +17,40 @@ thread_local! {
 /// Backstop wait inside the park loop: bounds the damage of any missed
 /// wakeup to 100 ms without ever being the *intended* wake mechanism.
 const PARK_SAFETY_NS: u32 = 100_000_000;
+
+/// Lifetime ring counters for one queue thread. A snapshot of the
+/// owning thread's `Cell` counters; obtainable only on that thread
+/// (via [`crate::reactor_stats`] or [`Reactor::stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReactorStats {
+    /// `io_uring_enter` syscalls (parks + SQ-full flushes + teardown
+    /// waits).
+    pub enters: u64,
+    /// Park-hook waits (`submit_and_wait` from `on_thread_park`); a
+    /// subset of `enters`.
+    pub parks: u64,
+    /// SQEs pushed to the submission ring.
+    pub sqes: u64,
+    /// CQEs reaped from the completion ring.
+    pub cqes: u64,
+}
+
+/// The live counters behind [`ReactorStats`]: plain `Cell`s, written
+/// only by the owning thread — no atomics on the IO path.
+#[derive(Default)]
+struct StatCells {
+    enters: Cell<u64>,
+    parks: Cell<u64>,
+    sqes: Cell<u64>,
+    cqes: Cell<u64>,
+}
+
+impl StatCells {
+    #[inline]
+    fn bump(cell: &Cell<u64>) {
+        cell.set(cell.get() + 1);
+    }
+}
 
 /// Ring geometry for one queue thread.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +81,7 @@ pub struct Reactor {
     // frees the buffers those ops reference.
     ring: RefCell<IoUring>,
     slab: RefCell<Slab<OpEntry>>,
+    stats: StatCells,
 }
 
 impl Reactor {
@@ -69,6 +104,7 @@ impl Reactor {
             let reactor = Rc::new(Reactor {
                 ring: RefCell::new(ring),
                 slab: RefCell::new(Slab::with_capacity(config.cq_entries as usize)),
+                stats: StatCells::default(),
             });
             *current = Some(Rc::clone(&reactor));
             Ok(reactor)
@@ -108,6 +144,16 @@ impl Reactor {
         self.slab_ref().len()
     }
 
+    /// Snapshot the lifetime ring counters (owning thread only).
+    pub fn stats(&self) -> ReactorStats {
+        ReactorStats {
+            enters: self.stats.enters.get(),
+            parks: self.stats.parks.get(),
+            sqes: self.stats.sqes.get(),
+            cqes: self.stats.cqes.get(),
+        }
+    }
+
     /// Reserve a slab entry, build the SQE with its key as `user_data`,
     /// and push it to the SQ ring (flushing with a submit syscall only if
     /// the ring is full).
@@ -138,17 +184,21 @@ impl Reactor {
         // memory for raw ops), which outlives the op by construction.
         unsafe {
             if ring.submission().push(sqe).is_ok() {
+                StatCells::bump(&self.stats.sqes);
                 return Ok(());
             }
         }
         // SQ full: flush to the kernel and retry once.
+        StatCells::bump(&self.stats.enters);
         ring.submit()?;
         // SAFETY: as above.
         unsafe {
             ring.submission()
                 .push(sqe)
-                .map_err(|_| io::Error::other("SQ ring full after flush"))
+                .map_err(|_| io::Error::other("SQ ring full after flush"))?;
         }
+        StatCells::bump(&self.stats.sqes);
+        Ok(())
     }
 
     /// Mark an op whose future was dropped. The entry (and its resources)
@@ -195,6 +245,8 @@ impl Reactor {
             }
             let timeout = types::Timespec::new().nsec(PARK_SAFETY_NS);
             let args = types::SubmitArgs::new().timespec(&timeout);
+            StatCells::bump(&self.stats.parks);
+            StatCells::bump(&self.stats.enters);
             let res = self
                 .ring
                 .borrow_mut()
@@ -224,6 +276,7 @@ impl Reactor {
         completion.sync();
         let mut woken = 0;
         for cqe in &mut completion {
+            StatCells::bump(&self.stats.cqes);
             let key = cqe.user_data();
             if key == IGNORE_USER_DATA {
                 continue;
@@ -295,6 +348,7 @@ impl Drop for Reactor {
             }
             let timeout = types::Timespec::new().nsec(10_000_000);
             let args = types::SubmitArgs::new().timespec(&timeout);
+            StatCells::bump(&self.stats.enters);
             let _ = self
                 .ring
                 .borrow_mut()
