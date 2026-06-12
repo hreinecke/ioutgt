@@ -92,24 +92,29 @@ shows what hosts would discover rather than only `no controllers`.
 
 ## Counters: `ioutgt stat`
 
-`GET_STATS` carries a `threads` array: one entry per queue thread with
-its ring counters (`enters` = `io_uring_enter` syscalls, `parks`,
-`sqes`, `cqes`) and per-queue IO counters (read/write/flush/other
-commands, read/write bytes, errors — IO-path failures only, admin and
-fabrics rejections are not counted — keyed by cntlid+qid; correlate
-with `LIST_CONTROLLER` for tid/cpus). Counts from disconnected queues
-fold into the thread's monotonic `retired` totals. Counters are plain
-per-thread `Cell`s snapshotted via a mailbox round trip — the IO path
-pays no atomics or locks for them, and a wedged thread degrades to an
-`"error": "thread unresponsive"` entry after 500 ms rather than
-hanging the API.
+`GET_STATS` carries a `controller_info` array (which controller —
+subsystem and host NQN — each cntlid below belongs to) and a `threads`
+array: one entry per queue thread with its ring counters (`enters` =
+`io_uring_enter` syscalls, `parks`, `sqes`, `cqes`) and per-queue IO
+counters (read/write/flush/other commands, read/write bytes, errors —
+IO-path failures only, admin and fabrics rejections are not counted —
+keyed by cntlid+qid; correlate with `LIST_CONTROLLER` for tid/cpus).
+Counts from disconnected queues fold into the thread's monotonic
+`retired` totals. Counters are plain per-thread `Cell`s snapshotted
+via a mailbox round trip — the IO path pays no atomics or locks for
+them, and a wedged thread degrades to an `"error": "thread
+unresponsive"` entry after 500 ms rather than hanging the API.
+`{"op":"GET_STATS","clear":true}` zeros every counter (queues, retired,
+ring) after the snapshot — the reply still carries the final totals.
 
 ```sh
 ioutgt stat            # lifetime totals
 ioutgt stat -i 2       # per-second rates every 2 s (iostat-style)
+ioutgt stat --clear    # print the final totals, then zero everything
 ```
 
 ```text
+controller 1: nqn.2026-06.io.ioutgt:test  host nqn.2014-08.org.nvmexpress:uuid:abc…
 ioutgt-io0  tid 12345  enters/s 8124  parks/s 8011  sqes/s 540210  cqes/s 540231
   cntlid 1 qid 1   read 250310/s (977.8 MiB/s)  write 0/s (0.0 MiB/s)  flush 0/s  other 0/s  err 0/s
 ```

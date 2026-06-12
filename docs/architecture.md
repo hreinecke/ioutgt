@@ -481,8 +481,9 @@ allocated once at queue install and registered with the ring in phase 2.
   plain `Cell`s written only by the owning thread; GET_STATS sends a
   oneshot-reply message through the mailbox and each thread snapshots
   its own cells (500 ms timeout per thread, so a wedged backend can't
-  hang the control API). `ioutgt stat` renders them, `-i N` for
-  iostat-style rates computed client-side.
+  hang the control API), and on `clear` zeros them after the snapshot.
+  `ioutgt stat` renders them under a controller-identity header, `-i N`
+  for iostat-style rates computed client-side, `--clear` to reset.
 - The target is fully constructible from a JSON config file: subsystems,
   namespaces (backend type + path + nsid), listen address, thread/affinity
   map, digest policy, inline data size. Validation produces line-precise

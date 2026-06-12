@@ -154,6 +154,15 @@ impl Reactor {
         }
     }
 
+    /// Zero the ring counters (owning thread only) — the stats-clear
+    /// path; in-flight ops keep counting from zero.
+    pub fn reset_stats(&self) {
+        self.stats.enters.set(0);
+        self.stats.parks.set(0);
+        self.stats.sqes.set(0);
+        self.stats.cqes.set(0);
+    }
+
     /// Reserve a slab entry, build the SQE with its key as `user_data`,
     /// and push it to the SQ ring (flushing with a submit syscall only if
     /// the ring is full).

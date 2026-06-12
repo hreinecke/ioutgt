@@ -43,3 +43,11 @@ pub use runtime::QueueRuntime;
 pub fn reactor_stats() -> std::io::Result<ReactorStats> {
     Ok(reactor::Reactor::current()?.stats())
 }
+
+/// Zero the current thread's ring counters (the stats-clear path).
+///
+/// Errors if the thread has no live [`QueueRuntime`].
+pub fn reset_reactor_stats() -> std::io::Result<()> {
+    reactor::Reactor::current()?.reset_stats();
+    Ok(())
+}

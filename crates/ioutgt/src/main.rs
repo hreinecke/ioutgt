@@ -89,6 +89,9 @@ enum Command {
         /// Repeat every N seconds, printing per-interval rates.
         #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..))]
         interval: Option<u64>,
+        /// Zero all counters after printing this (final) snapshot.
+        #[arg(long, conflicts_with = "interval")]
+        clear: bool,
     },
 }
 
@@ -135,10 +138,20 @@ fn list_target(socket: &std::path::Path) -> std::io::Result<()> {
 
 /// `ioutgt stat`: one snapshot, or `-i N` for iostat-style rates
 /// (client-side deltas of the monotonic counters — the target never
-/// computes rates).
-fn stat_target(socket: &std::path::Path, interval: Option<u64>) -> std::io::Result<()> {
+/// computes rates). `--clear` prints the final totals and zeros every
+/// counter target-side.
+fn stat_target(
+    socket: &std::path::Path,
+    interval: Option<u64>,
+    clear: bool,
+) -> std::io::Result<()> {
+    let request = if clear {
+        r#"{"op":"GET_STATS","clear":true}"#
+    } else {
+        r#"{"op":"GET_STATS"}"#
+    };
     let fetch = || -> std::io::Result<serde_json::Value> {
-        let raw = ctl_request(socket, r#"{"op":"GET_STATS"}"#)?;
+        let raw = ctl_request(socket, request)?;
         let v: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -242,6 +255,22 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
     };
 
     let mut out = String::new();
+    // Identity first: which controller/subsystem/host each cntlid in
+    // the per-queue rows below belongs to.
+    for c in data["controller_info"].as_array().into_iter().flatten() {
+        let kind = if c["discovery"] == true {
+            " (discovery)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "controller {}{kind}: {}  host {}",
+            c["cntlid"],
+            c["subsysnqn"].as_str().unwrap_or("?"),
+            c["hostnqn"].as_str().unwrap_or("?"),
+        );
+    }
     for thread in data["threads"].as_array().into_iter().flatten() {
         if let Some(err) = thread["error"].as_str() {
             let _ = writeln!(
@@ -433,7 +462,11 @@ fn main() -> std::io::Result<()> {
         match command {
             Command::Ctl { socket, request } => return ctl(socket, request),
             Command::List { socket } => return list_target(socket),
-            Command::Stat { socket, interval } => return stat_target(socket, *interval),
+            Command::Stat {
+                socket,
+                interval,
+                clear,
+            } => return stat_target(socket, *interval, *clear),
         }
     }
 
@@ -576,7 +609,16 @@ mod tests {
     }
 
     fn stat_sample() -> serde_json::Value {
-        serde_json::json!({ "threads": [{
+        serde_json::json!({
+        "controller_info": [
+            { "cntlid": 1, "subsysnqn": "nqn.2026-06.io.ioutgt:test",
+              "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
+              "discovery": false },
+            { "cntlid": 2, "subsysnqn": "nqn.2014-08.org.nvmexpress.discovery",
+              "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:abc",
+              "discovery": true },
+        ],
+        "threads": [{
             "name": "ioutgt-io0", "tid": 42,
             "ring": { "enters": 100, "parks": 90, "sqes": 5000, "cqes": 5000 },
             "queues": [{ "cntlid": 1, "qid": 1,
@@ -591,6 +633,16 @@ mod tests {
     #[test]
     fn render_stat_totals() {
         let out = super::render_stat(&stat_sample(), None);
+        // Controller identity first, so the cntlid rows are readable.
+        assert!(
+            out.starts_with("controller 1: nqn.2026-06.io.ioutgt:test"),
+            "{out}"
+        );
+        assert!(
+            out.contains("host nqn.2014-08.org.nvmexpress:uuid:abc"),
+            "{out}"
+        );
+        assert!(out.contains("controller 2 (discovery):"), "{out}");
         assert!(out.contains("ioutgt-io0"), "{out}");
         assert!(out.contains("tid 42"), "{out}");
         assert!(out.contains("5000"), "sqes visible: {out}");

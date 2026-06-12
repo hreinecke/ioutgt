@@ -101,7 +101,7 @@ type StatsRequest = tokio::sync::oneshot::Sender<serde_json::Value>;
 /// Messages to an IO queue thread.
 enum IoMsg {
     Conn(Conn),
-    Stats(StatsRequest),
+    Stats { reply: StatsRequest, clear: bool },
 }
 
 /// Messages to the admin queue thread.
@@ -109,7 +109,21 @@ enum AdminMsg {
     Conn(Conn),
     /// A namespace changed: nudge every live controller's AERs.
     NsChanged,
-    Stats(StatsRequest),
+    Stats {
+        reply: StatsRequest,
+        clear: bool,
+    },
+}
+
+/// Zero everything a queue thread counts: every live queue's counters,
+/// the retired accumulator, and the thread's ring counters. Runs on the
+/// owning thread (the only place the `Cell`s may be written).
+fn clear_thread_stats(queues: &[Rc<QueueStats>], retired: &mut QueueStatsSnapshot) {
+    for stats in queues {
+        stats.reset();
+    }
+    *retired = QueueStatsSnapshot::default();
+    let _ = ioutgt_uring::reset_reactor_stats();
 }
 
 /// Fold queues whose connection is gone (this list holds the only
@@ -190,9 +204,13 @@ fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSe
                             .await;
                         });
                     }
-                    Ok(IoMsg::Stats(reply)) => {
+                    Ok(IoMsg::Stats { reply, clear }) => {
                         prune_dead_queues(&queues, &mut retired);
-                        let _ = reply.send(thread_stats_json(&name, &queues.borrow(), &retired));
+                        let queues = queues.borrow();
+                        let _ = reply.send(thread_stats_json(&name, &queues, &retired));
+                        if clear {
+                            clear_thread_stats(&queues, &mut retired);
+                        }
                     }
                     Err(err) => {
                         warn!("io mailbox failed: {err}");
@@ -244,9 +262,13 @@ fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
                             })
                         });
                     }
-                    Ok(AdminMsg::Stats(reply)) => {
+                    Ok(AdminMsg::Stats { reply, clear }) => {
                         prune_dead_queues(&queues, &mut retired);
-                        let _ = reply.send(thread_stats_json(&name, &queues.borrow(), &retired));
+                        let queues = queues.borrow();
+                        let _ = reply.send(thread_stats_json(&name, &queues, &retired));
+                        if clear {
+                            clear_thread_stats(&queues, &mut retired);
+                        }
                     }
                     Err(err) => {
                         warn!("admin mailbox failed: {err}");
@@ -443,12 +465,14 @@ async fn control_loop(
                 let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
                     Vec::with_capacity(1 + io_txs.len());
                 let stats_admin = admin_tx.clone();
-                stats_sources.push(Box::new(move |reply| {
-                    stats_admin.send(AdminMsg::Stats(reply))
+                stats_sources.push(Box::new(move |clear, reply| {
+                    stats_admin.send(AdminMsg::Stats { reply, clear });
                 }));
                 for io_tx in &io_txs {
                     let io_tx = io_tx.clone();
-                    stats_sources.push(Box::new(move |reply| io_tx.send(IoMsg::Stats(reply))));
+                    stats_sources.push(Box::new(move |clear, reply| {
+                        io_tx.send(IoMsg::Stats { reply, clear });
+                    }));
                 }
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),

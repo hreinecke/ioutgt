@@ -329,7 +329,58 @@ fn get_stats_counts_ios_and_folds_retired() {
         "{io_thread}"
     );
 
-    // Teardown folds the final counts into retired totals (monotonic).
+    // The response names the controllers the cntlid rows refer to.
+    let info = resp["data"]["controller_info"]
+        .as_array()
+        .expect("controller_info");
+    assert!(
+        info.iter()
+            .any(|c| c["cntlid"].as_u64() == Some(u64::from(cntlid)) && c["subsysnqn"] == NQN),
+        "{resp}"
+    );
+
+    // clear=true: the clearing request still reports the totals...
+    let resp = ctl(&socket, r#"{"op":"GET_STATS","clear":true}"#);
+    let q = find_queue(resp["data"]["threads"].as_array().unwrap(), 1).expect("io queue");
+    assert_eq!(q["write_cmds"], 4, "clear reports pre-clear totals: {q}");
+    // ...the next snapshot starts from zero with identity preserved...
+    let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
+    let q = find_queue(resp["data"]["threads"].as_array().unwrap(), 1).expect("io queue");
+    assert_eq!(q["write_cmds"], 0, "cleared: {q}");
+    assert_eq!(q["read_bytes"], 0, "cleared: {q}");
+    let cleared_thread = resp["data"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["queues"]
+                .as_array()
+                .is_some_and(|qs| qs.iter().any(|q| q["qid"].as_u64() == Some(1)))
+        })
+        .expect("thread serving qid 1");
+    assert!(
+        cleared_thread["ring"]["sqes"].as_u64().unwrap()
+            < io_thread["ring"]["sqes"].as_u64().unwrap(),
+        "ring counters cleared too: {cleared_thread}"
+    );
+    // ...and counting resumes.
+    for i in 0..2u16 {
+        let sqe = rw_sqe(
+            spec::io_opcode::WRITE,
+            30 + i,
+            u64::from(i) * 8,
+            7,
+            BS,
+            false,
+        );
+        io.send_capsule(&sqe, &data);
+        assert_eq!(io.recv_response().status.get() >> 1, status::SUCCESS);
+    }
+    let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
+    let q = find_queue(resp["data"]["threads"].as_array().unwrap(), 1).expect("io queue");
+    assert_eq!(q["write_cmds"], 2, "counts resume after clear: {q}");
+
+    // Teardown folds the final (post-clear) counts into retired totals.
     drop(io);
     drop(admin);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -341,7 +392,7 @@ fn get_stats_counts_ios_and_folds_retired() {
             .iter()
             .filter_map(|t| t["retired"]["write_cmds"].as_u64())
             .sum();
-        if retired_writes >= 4 {
+        if retired_writes >= 2 {
             break;
         }
         assert!(
