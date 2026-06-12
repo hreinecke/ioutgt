@@ -44,7 +44,12 @@ pub enum Request {
         subsysnqn: Option<String>,
     },
     #[serde(rename = "GET_STATS")]
-    GetStats,
+    GetStats {
+        /// Zero every counter after this snapshot (the reply still
+        /// carries the pre-clear totals).
+        #[serde(default)]
+        clear: bool,
+    },
     #[serde(rename = "LIST_CONTROLLER")]
     ListController,
 }
@@ -78,8 +83,10 @@ impl Response {
 }
 
 /// Fires one queue thread's stats request (a mailbox send); the
-/// thread's JSON reply lands on the provided sender.
-pub type StatsSource = Box<dyn Fn(tokio::sync::oneshot::Sender<serde_json::Value>) + Send + Sync>;
+/// thread's JSON reply lands on the provided sender. The `bool` asks
+/// the thread to zero its counters after the snapshot.
+pub type StatsSource =
+    Box<dyn Fn(bool, tokio::sync::oneshot::Sender<serde_json::Value>) + Send + Sync>;
 
 /// Shared state the API operates on.
 pub struct CtlState {
@@ -225,7 +232,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
             let list: Vec<_> = table.values().map(|ns| ns_json(ns)).collect();
             Response::ok(Some(json!({ "namespaces": list })))
         }
-        Request::GetStats => {
+        Request::GetStats { clear } => {
             let subsystems: Vec<_> = state
                 .port
                 .subsystems
@@ -237,12 +244,28 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                     })
                 })
                 .collect();
+            // Identity for the per-queue rows: which controller (and
+            // subsystem/host) each cntlid belongs to.
+            let controller_info: Vec<_> = state
+                .registry
+                .snapshot()
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "cntlid": entry.cntlid,
+                        "subsysnqn": entry.subsys_nqn,
+                        "hostnqn": entry.hostnqn,
+                        "discovery": entry.is_discovery(),
+                    })
+                })
+                .collect();
             // Per-queue/per-thread counters: ask each queue thread to
-            // snapshot its own Cell counters (mailbox round trip).
+            // snapshot (and on `clear`, then zero) its own Cell
+            // counters — a mailbox round trip per thread.
             let mut threads = Vec::with_capacity(state.stats_sources.len());
             for source in &state.stats_sources {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                source(tx);
+                source(clear, tx);
                 // A wedged queue thread must not hang the control API.
                 let reply = tokio::time::timeout(std::time::Duration::from_millis(500), rx).await;
                 threads.push(match reply {
@@ -252,6 +275,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
             }
             Response::ok(Some(json!({
                 "controllers": state.registry.len(),
+                "controller_info": controller_info,
                 "subsystems": subsystems,
                 "threads": threads,
             })))

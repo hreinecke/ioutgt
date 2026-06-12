@@ -105,6 +105,18 @@ impl QueueStats {
             errors: self.errors.get(),
         }
     }
+
+    /// Zero the counters (owning thread only). Identity (`qid`,
+    /// `cntlid`) is preserved — the queue is still the same queue.
+    pub fn reset(&self) {
+        self.read_cmds.set(0);
+        self.write_cmds.set(0);
+        self.flush_cmds.set(0);
+        self.other_cmds.set(0);
+        self.read_bytes.set(0);
+        self.write_bytes.set(0);
+        self.errors.set(0);
+    }
 }
 
 impl QueueStatsSnapshot {
@@ -534,6 +546,19 @@ mod tests {
         // Identity does not aggregate: the accumulator is "all retired
         // queues", not any one of them.
         assert_eq!((retired.qid, retired.cntlid), (0, 0));
+
+        // Reset zeros the counters but keeps the identity.
+        stats.reset();
+        let snap = stats.snapshot();
+        assert_eq!((snap.qid, snap.cntlid), (3, 7));
+        assert_eq!(
+            snap,
+            QueueStatsSnapshot {
+                qid: 3,
+                cntlid: 7,
+                ..QueueStatsSnapshot::default()
+            }
+        );
     }
 
     #[test]
