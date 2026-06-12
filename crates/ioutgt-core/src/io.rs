@@ -13,9 +13,11 @@ use zerocopy::FromBytes;
 
 use crate::backend::{Backend, BackendError, LbaRange};
 use crate::dispatch::{ConnCtx, IoState, Outcome};
+use crate::queue::stat_add;
 use crate::subsystem::Namespace;
 
 fn err_outcome<B: Backend>(ctx: &Rc<ConnCtx<B>>, cid: u16, code: u16) -> Outcome {
+    stat_add(&ctx.queue.stats.errors, 1);
     Outcome::status(ctx.cqe(0, cid, code))
 }
 
@@ -49,10 +51,20 @@ pub async fn execute<B: Backend>(
     };
 
     match sqe.opcode {
-        io_opcode::FLUSH => map_backend(ctx, cid, ns.backend.flush().await, 0),
-        io_opcode::READ => read(ctx, ns, tag, sqe).await,
-        io_opcode::WRITE => write(ctx, ns, tag, sqe).await,
+        io_opcode::FLUSH => {
+            stat_add(&ctx.queue.stats.flush_cmds, 1);
+            map_backend(ctx, cid, ns.backend.flush().await, 0)
+        }
+        io_opcode::READ => {
+            stat_add(&ctx.queue.stats.read_cmds, 1);
+            read(ctx, ns, tag, sqe).await
+        }
+        io_opcode::WRITE => {
+            stat_add(&ctx.queue.stats.write_cmds, 1);
+            write(ctx, ns, tag, sqe).await
+        }
         io_opcode::WRITE_ZEROES => {
+            stat_add(&ctx.queue.stats.other_cmds, 1);
             let rw = RwCommand::parse(sqe);
             let range = LbaRange {
                 slba: rw.slba,
@@ -60,8 +72,14 @@ pub async fn execute<B: Backend>(
             };
             map_backend(ctx, cid, ns.backend.write_zeroes(range).await, 0)
         }
-        io_opcode::DSM => dsm(ctx, ns, tag, sqe).await,
-        _ => err_outcome(ctx, cid, status::INVALID_OPCODE | status::DNR),
+        io_opcode::DSM => {
+            stat_add(&ctx.queue.stats.other_cmds, 1);
+            dsm(ctx, ns, tag, sqe).await
+        }
+        _ => {
+            stat_add(&ctx.queue.stats.other_cmds, 1);
+            err_outcome(ctx, cid, status::INVALID_OPCODE | status::DNR)
+        }
     }
 }
 
@@ -104,6 +122,9 @@ async fn read<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe
     let mut buf = slot.data();
     let result = ns.backend.read(rw.slba, &mut buf[..len as usize]).await;
     drop(buf);
+    if result.is_ok() {
+        stat_add(&ctx.queue.stats.read_bytes, u64::from(len));
+    }
     map_backend(ctx, cid, result, len)
 }
 
@@ -133,6 +154,9 @@ async fn write<B: Backend>(
         (Ok(()), true) => ns.backend.flush().await,
         (other, _) => other,
     };
+    if result.is_ok() {
+        stat_add(&ctx.queue.stats.write_bytes, u64::from(len));
+    }
     map_backend(ctx, cid, result, 0)
 }
 
