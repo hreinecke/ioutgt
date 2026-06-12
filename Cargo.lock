@@ -261,6 +261,7 @@ dependencies = [
  "ioutgt-nvme",
  "ioutgt-tcp",
  "ioutgt-uring",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

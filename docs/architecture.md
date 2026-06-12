@@ -405,13 +405,14 @@ and future transports slot in without touching protocol logic:
   split; deferred to real-NIC benchmarking.)
 - Send side — queue tasks emit `SendWork` onto the ordered send list;
   the per-connection sender ships vectored `SENDMSG` gather batches
-  (as built). With `--send-zc`, batches carrying ≥ `SEND_ZC_MIN`
-  (16 KiB) payload go out as `SENDMSG_ZC` over the same iovecs:
-  double-buffered batches keep staging through the notification RTT,
-  payload tags release on the notif (capsule-only tags still at the
-  send CQE), and the idle park polls the oldest batch's notifs
-  alongside `next_send_work` so tag release never depends on new work
-  arriving (as built, opt-in).
+  (as built). With `--send-zc`, batches go out as `SENDMSG_ZC` over
+  the same iovecs: double-buffered batches keep staging through the
+  notification RTT, payload tags release on the notif (capsule-only
+  tags still at the send CQE), the idle park polls the oldest batch's
+  notifs alongside `next_send_work` so tag release never depends on
+  new work arriving, and pin-budget failures (per-user
+  `RLIMIT_MEMLOCK`) fall back to the copying SENDMSG per batch (as
+  built, opt-in).
 
 ## 7. Core model
 
@@ -472,7 +473,7 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC for batches ≥ 16 KiB payload, slot reuse gated on the notification CQE (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
+| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC per batch, slot reuse gated on the notification CQE, RLIMIT_MEMLOCK pin failures fall back to copy (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
 | Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | — (SEND_ZC landed opt-in, above) | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 

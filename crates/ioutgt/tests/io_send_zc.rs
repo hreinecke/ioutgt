@@ -14,7 +14,7 @@ use ioutgt_nvme::pdu::PduKind;
 use ioutgt_nvme::{spec, status};
 
 const BLOCK: u64 = 512;
-/// 128 KiB: well past SEND_ZC_MIN (16 KiB), forcing the ZC path.
+/// 128 KiB: a full-size slot payload riding the ZC path.
 const BIG: u32 = 131_072;
 
 fn spawn_zc_target() -> std::net::SocketAddr {

@@ -76,8 +76,8 @@ fn zc_survives_memlock_exhaustion() {
     let cqe = io.recv_response();
     assert_eq!(cqe.status.get() >> 1, status::SUCCESS);
 
-    // Full-depth 128K read bursts: every response batch wants the ZC
-    // path (payload >= SEND_ZC_MIN) and every pin attempt ENOMEMs.
+    // Full-depth 128K read bursts: every response batch takes the ZC
+    // path and every pin attempt ENOMEMs.
     for round in 0..10 {
         for cid in 0..DEPTH {
             let mut sqe = rw_sqe(spec::io_opcode::READ, 100 + cid, 0, nlb0, BIG, true);

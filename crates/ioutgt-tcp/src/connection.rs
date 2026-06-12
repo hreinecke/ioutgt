@@ -360,14 +360,6 @@ fn finish_payload(queue: &Rc<QueueCore>, tag: u16, kind: PayloadKind) -> Result<
 /// their segmentation to the real gate value.
 pub const H2C_DIRECT_MIN: u32 = 16 * 1024;
 
-/// A batch whose staged payload reaches this many bytes ships as
-/// SENDMSG_ZC when `--send-zc` is on; smaller batches keep the
-/// copying SENDMSG — ZC's pin+notif overhead loses on small sends,
-/// and small-batch tags would otherwise wait an RTT for their notif.
-/// `u32::MAX` disables ZC entirely (A/B measurement). Public for the
-/// e2e tests to size payloads against the real gate.
-pub const SEND_ZC_MIN: u32 = 16 * 1024;
-
 /// True when this command moves data host→controller (opcode bits 1:0
 /// = 01b) and the host kept it resident (transport SGL): solicit it.
 fn needs_r2t(sqe: &Sqe) -> bool {
@@ -744,8 +736,6 @@ struct SendBatch {
     /// First entry not yet fully sent (short-send resume point).
     live: usize,
     msghdr: Box<libc::msghdr>,
-    /// Total slot-payload bytes staged (the ZC threshold input).
-    payload_bytes: usize,
     /// Response tags safe to release at the send CQE: capsule-only
     /// responses, whose slot memory the op never references.
     tags_at_cqe: Vec<u16>,
@@ -770,7 +760,6 @@ impl SendBatch {
             // SAFETY: a zeroed msghdr is a valid value; msg_iov[len]
             // are set in msghdr() before every submit.
             msghdr: Box::new(unsafe { std::mem::zeroed() }),
-            payload_bytes: 0,
             tags_at_cqe: Vec::with_capacity(n),
             tags_at_notif: Vec::with_capacity(n),
             pending_notifs: Vec::with_capacity(8),
@@ -781,7 +770,6 @@ impl SendBatch {
         self.arena_used = 0;
         self.iovs.clear();
         self.live = 0;
-        self.payload_bytes = 0;
         self.tags_at_cqe.clear();
         self.tags_at_notif.clear();
         debug_assert!(
@@ -928,7 +916,6 @@ fn stage_and_account(
     stage_send_work(queue, batch, work, hdr_digest, data_digest);
     if let SendWork::Response(completion) = work {
         if completion.data_len > 0 {
-            batch.payload_bytes += completion.data_len as usize;
             batch.tags_at_notif.push(completion.tag);
         } else {
             batch.tags_at_cqe.push(completion.tag);
@@ -1072,8 +1059,8 @@ impl SendState {
 
 /// Send loop: drain ALL pending completions/R2Ts into one iovec
 /// gather list and ship it as a single SENDMSG — or SENDMSG_ZC when
-/// `--send-zc` is on and the batch carries ≥ [`SEND_ZC_MIN`] payload
-/// bytes, gating slot reuse on the zero-copy notification.
+/// `--send-zc` is on, gating slot reuse on the zero-copy
+/// notification (pin-budget failures fall back to the copying path).
 ///
 /// Independent send SQEs on one socket carry no ordering guarantee, so
 /// pipelining ops is not an option; one op per batch is — and gather
@@ -1133,7 +1120,7 @@ async fn send_batches(
             work = queue.try_next_send_work();
         }
 
-        let mut use_zc = send_zc && batch.payload_bytes >= SEND_ZC_MIN as usize;
+        let mut use_zc = send_zc;
         // Ship; on short send advance the iovecs and re-issue so
         // nothing else can interleave on the wire (ordering). The
         // re-issue stays ZC: the batch's pages are pinned regardless.
@@ -1347,12 +1334,10 @@ mod gather_tests {
         for item in &items {
             stage_and_account(&queue, &mut batch, item, false, false);
         }
-        assert_eq!(batch.payload_bytes, 4096);
         assert_eq!(batch.tags_at_notif, vec![1]);
         assert_eq!(batch.tags_at_cqe, vec![2]);
 
         batch.reset();
-        assert_eq!(batch.payload_bytes, 0);
         assert!(batch.tags_at_notif.is_empty() && batch.tags_at_cqe.is_empty());
     }
 

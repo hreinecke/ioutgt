@@ -210,10 +210,15 @@ What the numbers mean on loopback:
   `ulimit -l` (or systemd `LimitMEMLOCK`) is part of any honest
   real-NIC evaluation; with the default limit a large fraction of
   "ZC" traffic is copies plus a failed-pin round trip.
-- 4K@qd32 also rides ZC because the 16 KiB `SEND_ZC_MIN` threshold is
-  per *batch* (32 pending 4K responses ≈ 128K staged payload), not
-  per response — a future sweep knob if small-IO ZC stays a loss on
-  hardware.
+- These runs used the since-removed 16 KiB `SEND_ZC_MIN` per-batch
+  threshold (at qd32 even 4K batches exceeded it, so the numbers
+  carry over); the threshold was dropped the same day for simplicity
+  — every batch ships ZC under `--send-zc`, with the ENOMEM fallback
+  as the only gate. A (noisy, shared-box) spot check after removal
+  showed the expected new cost on the traffic the threshold used to
+  shield: 4K qd1 p50 +≈5 µs (15.8 → 20.4) from per-op pin + notif +
+  second CQE. Re-measure clean alongside the real-NIC evaluation;
+  reintroduce a threshold only if small-IO ZC proves a loss there.
 
 Verdict: keep `--send-zc` experimental/default-off; the honest
 evaluation needs a real NIC **and a raised memlock limit** (roadmap).
