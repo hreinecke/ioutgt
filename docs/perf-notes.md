@@ -55,14 +55,67 @@ anything else touches the wire.
   interop/bench harness uses 14420 (published to the VM guest through
   the 9p marker).
 
+## Gather send: staging buffer removed (2026-06-11)
+
+Design: `docs/superpowers/specs/2026-06-11-gather-send-design.md`.
+send_loop's slot → staging payload memcpy replaced by one SENDMSG
+gather per batch (headers/digests in a small arena, payload iovecs
+pointing into slot buffers). Wire bytes identical (golden tests +
+full interop matrix including the digest leg).
+
+Rig for this A/B: memory backend, 4 IO threads, loadgen
+`--conns 4 --qd 32 --rw randread`, loopback, same machine both
+binaries (baseline = the commit immediately before the gather
+rewire). loadgen does not negotiate digests, so the digest-on
+config is covered functionally by the interop fio matrix only.
+
+| config | 4K IOPS (repeat mean, range) | 4K CPU µs/IOP | 128K BW¹ | 128K CPU µs/IOP | 128K p50 |
+|---|---|---|---|---|---|
+| staging | 392K (382–403K) | 6.1–6.9 | 7.73 GiB/s | 55.9 | 1938 µs |
+| gather | 378K (355–405K) | 6.7–7.2 | **9.47 GiB/s (+22%)** | **44.0 (−21%)** | **1559 µs** |
+
+¹ BW is loadgen's own figure (over its measured elapsed, ~9.8 s),
+so it does not exactly cross-check against ops ÷ 10 s; the +22%
+relative claim holds either way. The very first single-shot pair
+(staging 445K, gather 408K) sat above both repeat ranges — a
+quiet-period artifact, excluded from the table.
+
+Large reads are an unambiguous win: +22% bandwidth, −21% CPU per
+IOP, p50 −20% (confirmed on Ming's rig as a clear sequential-read
+improvement). 4K reads carry a small consistent cost, root-caused
+in a follow-up (2026-06-11, null backend, 2 threads, per-run
+utime/stime split):
+
+- gather *lowers* user CPU per op ~5% — the staging `__memmove`
+  (13.5% of target CPU in perf) is gone — but *raises* kernel CPU
+  per op ~4.6%; kernel is ~85% of the per-op budget, so 4K nets a
+  few percent loss (−3..5% per paired run here; acceptable on
+  Ming's rig).
+- Mechanism confirmed by experiment, not just suspected: a
+  prototype inlining payloads ≤16K into the arena — one contiguous
+  iovec segment, still SENDMSG — restored kernel CPU and IOPS to
+  staging parity while keeping the large-read by-reference win
+  (+13% at 128K qd16×2). The cost is the kernel's multi-segment
+  `ITER_IOVEC` walk (3 segments per small response vs staging's 1
+  contiguous stream), not the SENDMSG opcode itself.
+
+Verdict: keep gather as-is. If small-IO CPU ever matters on a
+workload, the validated fix is threshold-inlining — staging as the
+*small* case of gather, arena sized sqsize × (64 + threshold) ≈ the
+old staging footprint; a one-entry batch could additionally drop to
+plain SEND (`ITER_UBUF`).
+
 ## Next steps (in measured-isolation order)
 
-1. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
+1. Optional: threshold-inline small payloads (validated by the
+   prototype above) if a real workload surfaces the 4K kernel-side
+   cost.
+2. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
    fallback): saves the recv re-arm SQE and the recv-buffer round trip.
-2. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
+3. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
    file backend: removes per-op page pinning; measure CPU/IOP on
    O_DIRECT ext4.
-3. `SEND_ZC`: loopback falls back to copying (REPORT_USAGE confirms),
-   so this needs a real NIC to evaluate honestly; the notif-gated
-   buffer-reuse design is sketched in the architecture doc.
-4. Recv/send budget sweeps; per-queue stats counters for GET_STATS.
+4. `SEND_ZC`: loopback falls back to copying (REPORT_USAGE confirms),
+   so this needs a real NIC to evaluate honestly; rides the same
+   gather iovecs with notification-gated slot reuse.
+5. Recv/send budget sweeps; per-queue stats counters for GET_STATS.

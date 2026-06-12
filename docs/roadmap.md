@@ -31,9 +31,12 @@ two IO threads. This file orders what comes next.
 - **Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED`** for
   the O_DIRECT backend: removes per-op page pinning; evaluate by
   CPU-per-IOP on ext4, not loopback IOPS.
-- **`SEND_ZC` with notification-gated buffer reuse**: eliminates the
-  staging memcpy on reads. Loopback falls back to copying
-  (REPORT_USAGE confirms), so honest evaluation needs a real NIC.
+- **`SEND_ZC` with notification-gated buffer reuse**: removes the
+  kernel user→skb copy, riding the gather send's existing iovecs
+  (the userspace staging copy is already gone); slot reuse gates on
+  the notification CQE instead of the send CQE. Loopback falls back
+  to copying (REPORT_USAGE confirms), so honest evaluation needs a
+  real NIC.
 - **`RECV_ZC` (zcrx)**: requires NIC header-data split + flow
   steering; revisit when 100G hardware is on the bench.
 - Recv/send **budget tuning** (configurable, swept), per-queue
