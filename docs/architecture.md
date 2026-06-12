@@ -1,7 +1,8 @@
 # ioutgt Architecture Specification
 
-Status: as-built specification (M0–M9 part 1). The milestone table at
-the end records what shipped; `docs/roadmap.md` holds what's next.
+Status: as-built specification (M0–M10, plus the post-M10 perf work:
+gather send and direct-to-slot recv). The milestone table at the end
+records what shipped; `docs/roadmap.md` holds what's next.
 
 ## 1. Mission and goals
 
@@ -262,8 +263,9 @@ payloads and prefixes only) and none on the read side:
 
 The write-side copy is what lets one flat, MDTS-sized buffer absorb
 arbitrarily fragmented TCP segments and H2CData splits, so backends
-never see scatter (eliminating it for the unreceived tail of large
-R2T transfers is a roadmap item); the read side's remaining copy is
+never see scatter (the unreceived tail of large R2T transfers no
+longer pays it — the direct-to-slot recv above); the read side's
+remaining copy is
 the kernel's user→skb gather, which phase-2 `SEND_ZC` (§9) removes
 over the same iovecs. The budget is the transport's: the memory
 backend adds one payload copy per direction (chunk-wise across its
@@ -462,7 +464,7 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot buffer | batch-drain into one gather SENDMSG (header arena + slot iovecs) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
+| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
 | Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | SEND_ZC, slot reuse gated on notification CQE | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 
@@ -512,7 +514,9 @@ API change (development machine is single-node).
    target on the host; a vmtest VM (`~/git/utils/vmtest -c
    ~/git/linux-knext/vmtest.conf`) runs `nvme discover`, `nvme connect`,
    `nvme list/id-ctrl/id-ns`, fio `--verify=crc32c`, `nvme disconnect`
-   against `10.0.2.2:4420`, across the digest × queue-count matrix.
+   against `10.0.2.2:14420` (the harness avoids 4420, which is often
+   owned by other targets on a dev box; the port is published to the
+   guest via the 9p marker), across the digest × queue-count matrix.
 4. **Fuzzing**: cargo-fuzz on the PDU decoder.
 5. **Benchmarks**: fio (4K rand R/W, 128K seq R/W, 70/30 mix; QD 1/32/128)
    against ioutgt and an identically-configured kernel nvmet, with perf
@@ -531,7 +535,7 @@ API change (development machine is single-node).
 | M6 | file/block backend | done — O_DIRECT on ext4 VM-verified (loop dev needs root: deferred) |
 | M7 | control plane + JSON config | done — hot-add visible to connected host via AEN |
 | M8 | hardening + fuzz | done — abuse suite, kill-recovery, RSS-gated soak, workspace ASAN |
-| M9 | performance pass | part 1 done — batched send 4.2×; rest in roadmap |
+| M9 | performance pass | part 1 done — batched send 4.2×; post-M10: gather send (+22% 128K read BW), direct-to-slot recv (−44% c/IOP 128K write); rest in roadmap |
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
 
 ## 14. Risks

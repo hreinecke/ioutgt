@@ -6,7 +6,8 @@ at the start of the project and mirrored where interop depends on it).
 Format per the project specification: for each subsystem — Linux
 design, ioutgt design, differences, benefits, risks.
 
-Status: complete as of M9 part 1. Benchmark-backed claims are limited
+Status: current as of the gather-send and direct-to-slot recv work
+(2026-06; §2 reflects both). Benchmark-backed claims are limited
 to ioutgt-internal A/B measurements (`docs/perf-notes.md`); the
 head-to-head against nvmet is deferred (`docs/benchmark-plan.md`).
 
