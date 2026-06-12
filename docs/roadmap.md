@@ -72,8 +72,8 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 ## 4. Protocol/robustness backlog
 
 - Gentler error responses where nvmet degrades per-command instead of
-  terminating: DDGST mismatch → `DATA_XFER_ERROR` on the command;
-  queue-depth overrun handling.
+  terminating: queue-depth overrun handling (DDGST mismatch →
+  `DATA_XFER_ERROR` per command is done).
 - RAE semantics on log pages; real SMART/error-log content; Get Log
   Page offset support beyond discovery.
 - **Persistent discovery controllers**: discovery genctr maintenance

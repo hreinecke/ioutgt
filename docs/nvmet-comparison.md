@@ -243,9 +243,10 @@ registry removal, with the reactor reclaiming orphaned ops on their
 terminal CQEs. The whole workspace runs clean under AddressSanitizer.
 
 **Risks.** Termination is used in a few places where nvmet degrades
-more gracefully (DDGST mismatch, queue-depth overrun); a hostile or
-buggy host gets disconnected rather than per-command errors. Defensible
-for a v1, but the gentler responses are catalogued in the roadmap.
+more gracefully (queue-depth overrun; DDGST mismatch is already
+per-command, §2); a hostile or buggy host gets disconnected rather
+than per-command errors. Defensible for a v1, but the gentler
+responses are catalogued in the roadmap.
 
 ---
 

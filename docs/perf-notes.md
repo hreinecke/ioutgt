@@ -134,6 +134,13 @@ clean bench).
 (off); randwrite (in-capsule, path untouched) 249K/6.1Kc vs 237K/6.3Kc
 — within noise. p50 at 128K ×1 fell ~1110 µs → ~590 µs.
 
+Correctness gates on this branch: workspace + ASAN green, the
+9-test io_direct_recv matrix ×stability runs, and the VM interop
+fio --verify matrix on the FILE backend
+(`IOUTGT_BACKEND=file testing/run_interop.sh ioutgt_fio` →
+`PASS fio-verify`, which includes 128 KiB R2T writes through the
+real kernel host driver — i.e. the direct path end to end).
+
 Instructions/IOP halving says the win is more than the memcpy: the
 copy path also re-arms the 64 KiB buffer recv 2–3× per 128 KiB
 payload (each a wakeup + state-machine pass), where the direct path
