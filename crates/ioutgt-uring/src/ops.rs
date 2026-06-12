@@ -389,6 +389,92 @@ pub unsafe fn sendmsg_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<Raw
     Ok(RawOp { op })
 }
 
+/// `IORING_SEND_ZC_REPORT_USAGE`: ask the notification CQE to report
+/// whether the kernel copied (the loopback fallback). Rides the SQE
+/// ioprio field; the io-uring crate does not re-export the constant.
+const SEND_ZC_REPORT_USAGE: u16 = 8;
+/// Notification-CQE `res` bit set when a "zero-copy" send actually
+/// copied. Bit 31 — notif results are raw flags, never an errno.
+const NOTIF_ZC_COPIED: u32 = 1 << 31;
+
+/// Handle to an in-flight zero-copy vectored send.
+///
+/// ZC sends complete in two CQEs: the send result first (awaited via
+/// [`SendZcOp::sent`]), then a notification once the kernel drops its
+/// last page reference ([`SendZcOp::into_notif`]). The notif handle
+/// must be taken and awaited (or deliberately orphaned) before any
+/// referenced memory is reused.
+pub struct SendZcOp {
+    op: MultiOp,
+}
+
+impl SendZcOp {
+    /// Await the send CQE: bytes accepted into the socket, as
+    /// `sendmsg(2)`. Call exactly once, before [`Self::into_notif`].
+    pub async fn sent(&mut self) -> io::Result<u32> {
+        let result = std::future::poll_fn(|cx| self.op.poll_next(cx))
+            .await
+            .expect("ZC send: result CQE precedes termination");
+        result.io()
+    }
+
+    /// The notification future gating buffer reuse. Take it even on
+    /// the error path: a failed ZC send may still have pinned pages
+    /// (`F_MORE` on the result CQE) and post a notif; if it did not,
+    /// the future resolves immediately.
+    pub fn into_notif(self) -> ZcNotif {
+        ZcNotif { op: self.op }
+    }
+}
+
+/// Future of a ZC send's notification CQE; yields `true` when the
+/// kernel reported the data was copied rather than sent zero-copy
+/// (REPORT_USAGE — always the case on loopback).
+pub struct ZcNotif {
+    op: MultiOp,
+}
+
+impl Future for ZcNotif {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut copied = false;
+        // The notif is the terminal CQE: one Some (the notif itself,
+        // or nothing at all if the errored send never pinned pages),
+        // then None. Raw bit test — bit 31 is not an errno.
+        while let Some(result) = ready!(self.op.poll_next(cx)) {
+            copied = result.result as u32 & NOTIF_ZC_COPIED != 0;
+        }
+        Poll::Ready(copied)
+    }
+}
+
+/// Zero-copy vectored send described by a caller-managed `msghdr`
+/// (`IORING_OP_SENDMSG_ZC`); completes in two CQEs — see [`SendZcOp`].
+/// REPORT_USAGE is always requested.
+///
+/// # Safety
+///
+/// `msg`, its iovec array, and every buffer the iovecs reference must
+/// remain valid (reads only) until this op's **terminal** CQE — the
+/// notification, not the send result. The kernel snapshots the iovec
+/// array at issue, so its *contents* may be rewritten once the send
+/// result has been reaped (short-send resume), but all memory must
+/// stay allocated until the notification is reaped,
+/// [`crate::Reactor::drain`] returns, or queue teardown completes.
+pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<SendZcOp> {
+    let op = MultiOp::submit(
+        |key| {
+            opcode::SendMsgZc::new(types::Fd(fd), msg)
+                .ioprio(SEND_ZC_REPORT_USAGE)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+    )?;
+    Ok(SendZcOp { op })
+}
+
 /// Positional read into caller-managed memory.
 ///
 /// # Safety
