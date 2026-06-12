@@ -31,6 +31,12 @@ struct Args {
     #[arg(long)]
     no_pin: bool,
 
+    /// Zero-copy sends (SENDMSG_ZC), gating buffer reuse on the
+    /// kernel's notification CQE. Experimental: loopback always
+    /// copies; a real NIC is needed for any benefit.
+    #[arg(long)]
+    send_zc: bool,
+
     /// NVM subsystem NQN.
     #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
     subsys_nqn: String,
@@ -480,6 +486,7 @@ fn main() -> std::io::Result<()> {
             config.allow_hdgst = !args.no_hdgst;
             config.allow_ddgst = !args.no_ddgst;
             config.pin_threads = !args.no_pin;
+            config.send_zc = args.send_zc;
             config.control_socket = Some(args.control_socket);
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {

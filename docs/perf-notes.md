@@ -180,3 +180,45 @@ interleaved reps. Baseline median 409.4K IOPS (393.3–415.6K), with
 counters 408.1K (407.6–409.7K), p50 ~172 µs both sides — well inside
 the run-to-run spread. Design:
 `docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+
+## SENDMSG_ZC loopback A/B (2026-06-12)
+
+`--send-zc` (design: `docs/superpowers/specs/2026-06-12-send-zc-design.md`)
+landed opt-in. An earlier table in this section recorded −4%/−61% —
+those runs were **invalid**: queues were silently wedging on ENOMEM
+from ZC pinned-page accounting (see the RLIMIT_MEMLOCK note below;
+fixed the same day, with the field symptom being ~27 s IO hangs under
+`t/io_uring` until the host's 30 s IO timeout reset the controller).
+Corrected loopback A/B, memory backend, 4 IO threads, loadgen conns=4
+qd=32, 10 s runs, default 8 MiB `ulimit -l`:
+
+| Workload | Baseline | --send-zc | Δ |
+|---|---|---|---|
+| 4K randread | 378.3K IOPS, p50 184 µs | 353.3K IOPS, p50 201 µs | −6.6% |
+| 128K read | 10140 MiB/s, p50 1489 µs | 7215 MiB/s, p50 1911 µs | −29% |
+
+What the numbers mean on loopback:
+
+- ZC always degrades to a kernel copy here — REPORT_USAGE confirms
+  `zc_copied == zc_batches` — so the copy is still paid, plus page
+  pinning, a second CQE per op, and notif-gated tag reuse.
+- **RLIMIT_MEMLOCK is the binding constraint**: ZC pins are charged
+  against the per-user memlock limit (8 MiB default), *shared across
+  all connections*; two full-depth 128K batches alone fill it. At
+  this load ~29% of batches hit ENOMEM and fell back to the copying
+  path (`zc_fallbacks` ≈ 4K of ≈ 14K batches per queue). Raising
+  `ulimit -l` (or systemd `LimitMEMLOCK`) is part of any honest
+  real-NIC evaluation; with the default limit a large fraction of
+  "ZC" traffic is copies plus a failed-pin round trip.
+- These runs used the since-removed 16 KiB `SEND_ZC_MIN` per-batch
+  threshold (at qd32 even 4K batches exceeded it, so the numbers
+  carry over); the threshold was dropped the same day for simplicity
+  — every batch ships ZC under `--send-zc`, with the ENOMEM fallback
+  as the only gate. A (noisy, shared-box) spot check after removal
+  showed the expected new cost on the traffic the threshold used to
+  shield: 4K qd1 p50 +≈5 µs (15.8 → 20.4) from per-op pin + notif +
+  second CQE. Re-measure clean alongside the real-NIC evaluation;
+  reintroduce a threshold only if small-IO ZC proves a loss there.
+
+Verdict: keep `--send-zc` experimental/default-off; the honest
+evaluation needs a real NIC **and a raised memlock limit** (roadmap).

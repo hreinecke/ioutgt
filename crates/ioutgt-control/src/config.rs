@@ -25,6 +25,10 @@ pub struct FileConfig {
     /// set false to opt out).
     #[serde(default = "default_true")]
     pub pin_threads: bool,
+    /// Zero-copy sends (SENDMSG_ZC) with notification-gated buffer
+    /// reuse; off by default.
+    #[serde(default)]
+    pub send_zc: bool,
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,

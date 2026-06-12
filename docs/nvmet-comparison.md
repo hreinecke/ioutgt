@@ -82,7 +82,14 @@ single-connection, 506K at four).
 **Differences.** nvmet's budget loop and ioutgt's batch drain solve
 the same problem (amortize wakeups, bound latency injection) from
 opposite directions: nvmet caps how much it does per wakeup, ioutgt
-caps how often it sleeps. Payload copies now match nvmet on both
+caps how often it sleeps. ioutgt additionally offers opt-in
+`SENDMSG_ZC` (`--send-zc`) — nvmet has no zero-copy send. Two
+ZC-mode behavioral divergences: payload slot reuse waits for the
+kernel's notification CQE (≈ the host's ACK), and a host exceeding
+the negotiated queue depth is stalled by TCP backpressure instead of
+receiving a C2HTermReq — the notification races the host's next
+command, making a legitimate command indistinguishable from a depth
+violation at the target. Payload copies now match nvmet on both
 directions' hot paths: reads go by reference via the gather iovecs
 (nvmet: `sendpage`), large write tails land direct (nvmet:
 `recvmsg` into SG); ioutgt still copies in-capsule writes and

@@ -266,8 +266,11 @@ arbitrarily fragmented TCP segments and H2CData splits, so backends
 never see scatter (the unreceived tail of large R2T transfers no
 longer pays it — the direct-to-slot recv above); the read side's
 remaining copy is
-the kernel's user→skb gather, which phase-2 `SEND_ZC` (§9) removes
-over the same iovecs. The budget is the transport's: the memory
+the kernel's user→skb gather, which opt-in `SENDMSG_ZC` (`--send-zc`,
+§9) removes over the same iovecs — slot reuse then gates on the
+kernel's notification CQE instead of the send CQE, and the recv path
+parks on tag exhaustion (`await_tag`) instead of terminating, since
+the notification races the host's next command. The budget is the transport's: the memory
 backend adds one payload copy per direction (chunk-wise across its
 2 MiB chunks), null adds none (reads memset the slot — visible when
 measuring protocol overhead with it), and the file backend adds
@@ -402,8 +405,14 @@ and future transports slot in without touching protocol logic:
   split; deferred to real-NIC benchmarking.)
 - Send side — queue tasks emit `SendWork` onto the ordered send list;
   the per-connection sender ships vectored `SENDMSG` gather batches
-  (as built); `SEND_ZC` with notification-gated slot reuse rides the
-  same iovecs (phase 2).
+  (as built). With `--send-zc`, batches go out as `SENDMSG_ZC` over
+  the same iovecs: double-buffered batches keep staging through the
+  notification RTT, payload tags release on the notif (capsule-only
+  tags still at the send CQE), the idle park polls the oldest batch's
+  notifs alongside `next_send_work` so tag release never depends on
+  new work arriving, and pin-budget failures (per-user
+  `RLIMIT_MEMLOCK`) fall back to the copying SENDMSG per batch (as
+  built, opt-in).
 
 ## 7. Core model
 
@@ -464,8 +473,8 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
-| Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | SEND_ZC, slot reuse gated on notification CQE | READ_FIXED/WRITE_FIXED on registered slot buffers |
+| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC per batch, slot reuse gated on the notification CQE, RLIMIT_MEMLOCK pin failures fall back to copy (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
+| Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | — (SEND_ZC landed opt-in, above) | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 
 Slot data buffers: 128 KiB (= MDTS) on IO queues, 8 KiB on admin queues,
