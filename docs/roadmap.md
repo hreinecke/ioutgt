@@ -74,6 +74,16 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 - Gentler error responses where nvmet degrades per-command instead of
   terminating: queue-depth overrun handling (DDGST mismatch →
   `DATA_XFER_ERROR` per command is done).
+- **IO-queue teardown on controller removal**: admin keep-alive expiry
+  shuts down only the admin socket and drops the registry entry — the
+  controller's IO-queue sockets are never shut down, so an IO queue
+  wedged on a stalling host (recv pending forever) survives its own
+  controller's teardown. Found by adversarial review of the
+  direct-slot-recv merge; pre-existing (a buffered recv wedges
+  identically). Fix shape: controller removal shuts down its installed
+  IO-queue fds — the registry has the qid routing records but holds no
+  fd today, so teardown needs a shutdown handle per installed queue
+  (nvmet analog: `nvmet_ctrl_fatal_error` schedules all queues dead).
 - RAE semantics on log pages; real SMART/error-log content; Get Log
   Page offset support beyond discovery.
 - **Persistent discovery controllers**: discovery genctr maintenance
