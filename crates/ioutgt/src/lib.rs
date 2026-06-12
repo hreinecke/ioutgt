@@ -438,10 +438,20 @@ async fn control_loop(
                     return;
                 }
                 let nudge_tx = admin_tx.clone();
+                let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
+                    Vec::with_capacity(1 + io_txs.len());
+                let stats_admin = admin_tx.clone();
+                stats_sources
+                    .push(Box::new(move |reply| stats_admin.send(AdminMsg::Stats(reply))));
+                for io_tx in &io_txs {
+                    let io_tx = io_tx.clone();
+                    stats_sources.push(Box::new(move |reply| io_tx.send(IoMsg::Stats(reply))));
+                }
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),
                     registry: Arc::clone(&registry),
                     notify_ns_changed: Box::new(move || nudge_tx.send(AdminMsg::NsChanged)),
+                    stats_sources,
                 });
                 info!(path = %path.display(), "control socket listening");
                 tokio::task::spawn_local(ioutgt_control::server::serve(listener, state));

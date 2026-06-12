@@ -131,6 +131,13 @@ fn runtime_namespace_add_remove_with_aer() {
     let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
     assert_eq!(resp["ok"], true);
     assert_eq!(resp["data"]["controllers"], 1);
+    // Every queue thread (admin + io) reports its ring counters.
+    let threads = resp["data"]["threads"].as_array().expect("threads array");
+    assert!(!threads.is_empty(), "{resp}");
+    for thread in threads {
+        assert!(thread["ring"]["sqes"].is_u64(), "thread reply: {thread}");
+        assert!(thread["tid"].as_i64().unwrap_or(0) > 0, "{thread}");
+    }
 
     // Bad requests are rejected, connection stays usable.
     let resp = ctl(&socket, r#"{"op":"REMOVE_NAMESPACE","nsid":42}"#);
