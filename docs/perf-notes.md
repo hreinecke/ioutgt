@@ -180,3 +180,36 @@ interleaved reps. Baseline median 409.4K IOPS (393.3–415.6K), with
 counters 408.1K (407.6–409.7K), p50 ~172 µs both sides — well inside
 the run-to-run spread. Design:
 `docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+
+## SENDMSG_ZC loopback A/B (2026-06-12)
+
+`--send-zc` (design: `docs/superpowers/specs/2026-06-12-send-zc-design.md`)
+landed opt-in; loopback A/B with memory backend, 4 IO threads,
+loadgen conns=4 qd=32, 10 s runs:
+
+| Workload | Baseline | --send-zc | Δ |
+|---|---|---|---|
+| 4K randread | 336.6K IOPS, p50 205 µs | 322.9K IOPS, p50 220 µs | −4% |
+| 128K read | 7776 MiB/s, p50 1864 µs | 3020 MiB/s, p50 1076 µs | −61% |
+
+Both regressions are the *documented loopback* behavior, not a defect
+in the default path (flag off ⇒ identical code; baseline numbers are
+healthy):
+
+- Loopback ZC always falls back to a kernel copy — REPORT_USAGE
+  confirms `zc_copied == zc_batches` (25,189/25,189 in a 3 s smoke
+  run) — so the copy is still paid, plus page pinning and a second
+  CQE per op.
+- The 128K collapse is **ACK-gated tag reuse**: payload slots stay
+  claimed until the notification (≈ the peer's ACK), shrinking the
+  effective queue depth — visible as p50 *dropping* (less queueing)
+  while throughput halves. On a real NIC the copy disappears and the
+  pin cost is traded against DMA-from-userspace; whether the ACK
+  gating still dominates at line rate is exactly the open question.
+- 4K@qd32 also rides ZC because the 16 KiB `SEND_ZC_MIN` threshold is
+  per *batch* (32 pending 4K responses ≈ 128K staged payload), not
+  per response — a future sweep knob if small-IO ZC stays a loss on
+  hardware.
+
+Verdict: keep `--send-zc` experimental/default-off; the honest
+evaluation needs a real NIC (roadmap).
