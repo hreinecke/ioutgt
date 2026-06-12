@@ -228,9 +228,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     queue.submit(tag, conn.connect_sqe);
 
     // Receive path (this task).
-    if let Err(err) =
-        recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest, conn.send_zc).await
-    {
+    if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest, conn.send_zc).await {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 

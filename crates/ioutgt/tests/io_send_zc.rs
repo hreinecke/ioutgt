@@ -102,7 +102,12 @@ fn zc_read_write_verify_digests() {
 
     for round in 0u8..4 {
         let slba = u64::from(round) * (u64::from(BIG) / BLOCK);
-        write_big(&mut io, u16::from(round) + 10, slba, round.wrapping_add(0x40));
+        write_big(
+            &mut io,
+            u16::from(round) + 10,
+            slba,
+            round.wrapping_add(0x40),
+        );
 
         io.send_capsule(&read_big_sqe(u16::from(round) + 100, slba), &[]);
         let (decoded, payload) = io.recv_pdu();
