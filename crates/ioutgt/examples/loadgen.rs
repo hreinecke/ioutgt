@@ -278,8 +278,12 @@ fn worker(
     ) -> bool {
         let end = offset as usize + length as usize;
         assert!(end <= payload.len(), "R2T solicits beyond command length");
+        // LAST only when this H2CData completes the transfer — fails loud
+        // (target's missing-bytes check) if the solicitation strategy
+        // ever moves to partial R2Ts.
+        let last = end == payload.len();
         let mut hdr = [0u8; 32];
-        let n = pdu::encode_h2c_data(&mut hdr, cid, ttag, offset, length, true, false, false);
+        let n = pdu::encode_h2c_data(&mut hdr, cid, ttag, offset, length, last, false, false);
         let mut frame = Vec::with_capacity(n + length as usize);
         frame.extend_from_slice(&hdr[..n]);
         frame.extend_from_slice(&payload[offset as usize..end]);
