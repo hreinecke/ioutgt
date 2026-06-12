@@ -44,7 +44,9 @@ anything else touches the wire.
   slab and come back on completion (`send_partial`,
   `send_vectored_partial`) — zero steady-state allocations on the send
   path, at the cost of one payload memcpy into staging (which the
-  batched encoder needs anyway for ordering).
+  batched encoder needs anyway for ordering). *Since superseded: the
+  gather send below removed staging and `send_partial` entirely;
+  payloads now ship by reference.*
 
 ## Measured environment pitfalls (for reproducers)
 
