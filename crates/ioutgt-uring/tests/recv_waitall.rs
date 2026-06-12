@@ -88,7 +88,7 @@ fn waitall_short_on_close() {
         // SAFETY: slice pointer is valid for PARTIAL bytes.
         let ret = unsafe { libc::send(client.as_raw_fd(), data.as_ptr().cast(), PARTIAL, 0) };
         assert_eq!(ret as usize, PARTIAL, "partial send failed: {ret}");
-        // Drop client → TCP FIN → EOF on server side.
+        // Drop client → peer hangup → EOF on server side.
     });
 
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
