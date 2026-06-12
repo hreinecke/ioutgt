@@ -20,6 +20,7 @@ ioutgt --config target.json
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
 | `--no-pin` | pinning on | Disable topology-aware IO-thread pinning (each IO thread pins to one CPU of its `group_cpus_evenly` group — NUMA/cluster/SMT-aware) |
+| `--send-zc` | off | **Experimental.** Ship payload-carrying send batches as `SENDMSG_ZC` (zero-copy), gating slot-buffer reuse on the kernel's notification CQE. Loopback always falls back to copying — a real NIC is needed for any benefit. Startup fails if the kernel lacks `IORING_OP_SENDMSG_ZC` |
 | `--control-socket <path>` | `$XDG_RUNTIME_DIR/ioutgt.sock`, else `/tmp/ioutgt.sock` | Runtime control API socket, created mode 0600 (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
@@ -37,6 +38,7 @@ The well-known discovery subsystem is always served; `nvme discover
   "io_threads": 2,
   "header_digest": true,
   "data_digest": true,
+  "send_zc": false,
   "control_socket": "/tmp/ioutgt.sock",
   "subsystems": [
     {

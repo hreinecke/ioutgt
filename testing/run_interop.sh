@@ -28,6 +28,11 @@ file)
 *) echo "unknown IOUTGT_BACKEND"; exit 1 ;;
 esac
 
+# IOUTGT_SEND_ZC=1: start the target with --send-zc (loopback-copy
+# path inside the VM net; exercises notification-gated tag reuse).
+ZC_ARGS=()
+[ "${IOUTGT_SEND_ZC:-0}" = "1" ] && ZC_ARGS=(--send-zc)
+
 CTL_SOCK="$TOP/target/ioutgt-interop.sock"
 MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
 PID_FILE="$TOP/target/ioutgt-interop.pid"
@@ -44,7 +49,7 @@ echo "$PORT" > "$MARKER_DIR/ioutgt_port"
 
 start_target() {
     "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
-        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" >>"$LOG" 2>&1 &
+        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" >>"$LOG" 2>&1 &
     echo $! >"$PID_FILE"
 }
 start_target

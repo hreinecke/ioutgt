@@ -23,12 +23,14 @@ two IO threads. This file orders what comes next.
 - **Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED`** for
   the O_DIRECT backend: removes per-op page pinning; evaluate by
   CPU-per-IOP on ext4, not loopback IOPS.
-- **`SEND_ZC` with notification-gated buffer reuse**: removes the
-  kernel user→skb copy, riding the gather send's existing iovecs
-  (the userspace staging copy is already gone); slot reuse gates on
-  the notification CQE instead of the send CQE. Loopback falls back
-  to copying (REPORT_USAGE confirms), so honest evaluation needs a
-  real NIC.
+- ~~`SEND_ZC` with notification-gated buffer reuse~~ — **landed
+  opt-in** (2026-06-12, `--send-zc`): `SENDMSG_ZC` over the gather
+  iovecs, double-buffered batches, payload tags release on the
+  notification CQE, recv path parks on tag exhaustion. Design in
+  `docs/superpowers/specs/2026-06-12-send-zc-design.md`. **Still
+  open: real-NIC evaluation** — loopback falls back to copying
+  (REPORT_USAGE confirms: `zc_copied == zc_batches`), so the flag
+  stays experimental until benched on hardware.
 - **`RECV_ZC` (zcrx)**: requires NIC header-data split + flow
   steering; revisit when 100G hardware is on the bench.
 - ~~Per-queue stats counters surfaced through `GET_STATS`~~ — **done**

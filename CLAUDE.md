@@ -38,7 +38,8 @@ testing/run_affinity.sh           # multi-NUMA guest: group_cpus_evenly placemen
 Requires the external vmtest harness (`~/git/utils/vmtest`, config
 `~/git/linux-knext/vmtest.conf`; override via `VMTEST`/`VMTEST_CONF`).
 Knobs: `IOUTGT_BACKEND=memory|null|file`, `IOUTGT_ENABLE_KILL=1`
-(kill/recovery), `IOUTGT_SOAK_ONLY=N` (reconnect-leak gate). The harness
+(kill/recovery), `IOUTGT_SOAK_ONLY=N` (reconnect-leak gate),
+`IOUTGT_SEND_ZC=1` (zero-copy send path). The harness
 binds port **14420**, not 4420 — 4420 is often owned by other targets on
 a dev box. Host↔guest signalling goes through the vmtest 9p marker
 directory, not env vars.
