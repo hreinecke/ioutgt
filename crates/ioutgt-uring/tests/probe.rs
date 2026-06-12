@@ -9,3 +9,10 @@ fn kernel_supports_phase1_features() {
         "kernel lacks required io_uring features: {features:?}"
     );
 }
+
+#[test]
+fn sendmsg_zc_supported_on_project_floor() {
+    let features = ioutgt_uring::probe().unwrap();
+    // SENDMSG_ZC is kernel 6.1+; the project floor is 6.11.
+    assert!(features.sendmsg_zc);
+}
