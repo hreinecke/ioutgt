@@ -40,6 +40,9 @@ pub struct TargetConfig {
     /// Pin each IO queue thread to one CPU of its `group_cpus_evenly`
     /// group (disable in tests).
     pub pin_threads: bool,
+    /// Zero-copy sends (SENDMSG_ZC) with notification-gated buffer
+    /// reuse.
+    pub send_zc: bool,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
     /// Subsystems served on this port.
@@ -55,6 +58,7 @@ impl TargetConfig {
             allow_hdgst: true,
             allow_ddgst: true,
             pin_threads: false,
+            send_zc: false,
             control_socket: None,
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
@@ -78,6 +82,7 @@ impl TargetConfig {
             allow_hdgst: file.header_digest,
             allow_ddgst: file.data_digest,
             pin_threads: file.pin_threads,
+            send_zc: file.send_zc,
             control_socket: file.control_socket,
             subsystems: file.subsystems,
         })
@@ -490,6 +495,7 @@ async fn control_loop(
         let io_txs = io_txs.clone();
         let allow_hdgst = config.allow_hdgst;
         let allow_ddgst = config.allow_ddgst;
+        let send_zc = config.send_zc;
         let registry = Arc::clone(&registry);
         let port = Arc::clone(&port);
         tokio::task::spawn_local(async move {
@@ -497,6 +503,7 @@ async fn control_loop(
                 stream,
                 allow_hdgst,
                 allow_ddgst,
+                send_zc,
                 &admin_tx,
                 &io_txs,
                 port,
@@ -518,6 +525,7 @@ async fn setup_connection(
     mut stream: tokio::net::TcpStream,
     allow_hdgst: bool,
     allow_ddgst: bool,
+    send_zc: bool,
     admin_tx: &MailboxSender<AdminMsg>,
     io_txs: &[MailboxSender<IoMsg>],
     port: Arc<PortConfig<AnyBackend>>,
@@ -556,6 +564,7 @@ async fn setup_connection(
         #[allow(clippy::cast_possible_truncation)]
         sqsize: entries as u16,
         sqhd_disabled,
+        send_zc,
         connect_sqe: first.sqe,
         connect_data: first.data,
         port,
