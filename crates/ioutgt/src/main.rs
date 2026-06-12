@@ -172,8 +172,11 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
     // Per-second (rounded) when an interval is given, raw total otherwise.
     let val = |cur: u64, before: u64| -> u64 {
         match prev {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss)]
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             Some((_, secs)) if secs > 0.0 => {
                 (cur.saturating_sub(before) as f64 / secs).round() as u64
             }
@@ -197,7 +200,11 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
     let mut out = String::new();
     for thread in data["threads"].as_array().into_iter().flatten() {
         if let Some(err) = thread["error"].as_str() {
-            let _ = writeln!(out, "thread {}: {err}", thread["name"].as_str().unwrap_or("?"));
+            let _ = writeln!(
+                out,
+                "thread {}: {err}",
+                thread["name"].as_str().unwrap_or("?")
+            );
             continue;
         }
         let name = thread["name"].as_str().unwrap_or("?");
@@ -238,9 +245,15 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
             );
         }
         let retired = &thread["retired"];
-        let any_retired = ["read_cmds", "write_cmds", "flush_cmds", "other_cmds", "errors"]
-            .iter()
-            .any(|k| u(retired, k) > 0);
+        let any_retired = [
+            "read_cmds",
+            "write_cmds",
+            "flush_cmds",
+            "other_cmds",
+            "errors",
+        ]
+        .iter()
+        .any(|k| u(retired, k) > 0);
         if any_retired {
             let r0 = &before["retired"];
             let _ = writeln!(

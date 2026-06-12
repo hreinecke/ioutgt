@@ -441,8 +441,9 @@ async fn control_loop(
                 let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
                     Vec::with_capacity(1 + io_txs.len());
                 let stats_admin = admin_tx.clone();
-                stats_sources
-                    .push(Box::new(move |reply| stats_admin.send(AdminMsg::Stats(reply))));
+                stats_sources.push(Box::new(move |reply| {
+                    stats_admin.send(AdminMsg::Stats(reply))
+                }));
                 for io_tx in &io_txs {
                     let io_tx = io_tx.clone();
                     stats_sources.push(Box::new(move |reply| io_tx.send(IoMsg::Stats(reply))));

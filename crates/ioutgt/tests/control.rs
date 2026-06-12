@@ -265,7 +265,14 @@ fn get_stats_counts_ios_and_folds_retired() {
     const BS: u32 = 4096;
     let data = pattern(BS as usize, 0x37);
     for i in 0..4u16 {
-        let sqe = rw_sqe(spec::io_opcode::WRITE, 10 + i, u64::from(i) * 8, 7, BS, false);
+        let sqe = rw_sqe(
+            spec::io_opcode::WRITE,
+            10 + i,
+            u64::from(i) * 8,
+            7,
+            BS,
+            false,
+        );
         io.send_capsule(&sqe, &data);
         assert_eq!(io.recv_response().status.get() >> 1, status::SUCCESS);
     }
@@ -283,9 +290,14 @@ fn get_stats_counts_ios_and_folds_retired() {
     let threads = resp["data"]["threads"].as_array().expect("threads");
     let find_queue = |threads: &[serde_json::Value], qid: u64| -> Option<serde_json::Value> {
         threads.iter().find_map(|t| {
-            t["queues"].as_array()?.iter().find(|q| {
-                q["cntlid"].as_u64() == Some(u64::from(cntlid)) && q["qid"].as_u64() == Some(qid)
-            }).cloned()
+            t["queues"]
+                .as_array()?
+                .iter()
+                .find(|q| {
+                    q["cntlid"].as_u64() == Some(u64::from(cntlid))
+                        && q["qid"].as_u64() == Some(qid)
+                })
+                .cloned()
         })
     };
     let q = find_queue(threads, 1).expect("io queue in stats");
@@ -308,8 +320,14 @@ fn get_stats_counts_ios_and_folds_retired() {
                 .is_some_and(|qs| qs.iter().any(|q| q["qid"].as_u64() == Some(1)))
         })
         .expect("thread serving qid 1");
-    assert!(io_thread["ring"]["sqes"].as_u64().unwrap() > 0, "{io_thread}");
-    assert!(io_thread["ring"]["enters"].as_u64().unwrap() > 0, "{io_thread}");
+    assert!(
+        io_thread["ring"]["sqes"].as_u64().unwrap() > 0,
+        "{io_thread}"
+    );
+    assert!(
+        io_thread["ring"]["enters"].as_u64().unwrap() > 0,
+        "{io_thread}"
+    );
 
     // Teardown folds the final counts into retired totals (monotonic).
     drop(io);

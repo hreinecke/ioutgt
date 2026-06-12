@@ -519,10 +519,7 @@ mod tests {
         stat_add(&stats.errors, 1);
         let snap = stats.snapshot();
         assert_eq!((snap.qid, snap.cntlid), (3, 7));
-        assert_eq!(
-            (snap.read_cmds, snap.read_bytes, snap.errors),
-            (2, 8192, 1)
-        );
+        assert_eq!((snap.read_cmds, snap.read_bytes, snap.errors), (2, 8192, 1));
 
         let mut retired = QueueStatsSnapshot::default();
         retired.absorb(&snap);
@@ -538,9 +535,12 @@ mod tests {
     #[test]
     fn queue_core_owns_zeroed_stats() {
         let queue = QueueCore::new(1, 4, 4096, false);
-        assert_eq!(queue.stats.snapshot(), QueueStatsSnapshot {
-            qid: 1,
-            ..QueueStatsSnapshot::default()
-        });
+        assert_eq!(
+            queue.stats.snapshot(),
+            QueueStatsSnapshot {
+                qid: 1,
+                ..QueueStatsSnapshot::default()
+            }
+        );
     }
 }

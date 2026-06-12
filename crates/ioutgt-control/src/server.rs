@@ -244,8 +244,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 source(tx);
                 // A wedged queue thread must not hang the control API.
-                let reply =
-                    tokio::time::timeout(std::time::Duration::from_millis(500), rx).await;
+                let reply = tokio::time::timeout(std::time::Duration::from_millis(500), rx).await;
                 threads.push(match reply {
                     Ok(Ok(value)) => value,
                     _ => json!({ "error": "thread unresponsive" }),
