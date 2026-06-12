@@ -14,7 +14,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ioutgt_core::backend::Backend;
@@ -96,34 +96,155 @@ enum RecvPhase {
     /// Assembling a PDU header in the decoder.
     Header,
     /// Copying payload bytes into the slot buffer.
-    Data {
-        tag: u16,
-        base: u32,
-        remaining: u32,
-        crc: digest::Crc32c,
-        ddgst: bool,
-        kind: PayloadKind,
-    },
+    Data(DataPhase),
     /// Consuming the 4-byte data digest.
-    Ddgst {
-        tag: u16,
-        expected: u32,
-        have: [u8; 4],
-        have_len: u8,
-        kind: PayloadKind,
-    },
+    Ddgst(DdgstPhase),
 }
 
 impl RecvPhase {
     /// Payload fully received: consume its 4-byte digest next.
     fn ddgst(tag: u16, expected: u32, kind: PayloadKind) -> RecvPhase {
-        RecvPhase::Ddgst {
+        RecvPhase::Ddgst(DdgstPhase {
             tag,
             expected,
             have: [0; 4],
             have_len: 0,
             kind,
+        })
+    }
+}
+
+/// Mid-payload state: copying bytes from the recv buffer into the slot.
+/// Every field is `Copy` (`Crc32c` included), so snapshotting the phase
+/// for the direct-recv tail path is cheap.
+#[derive(Clone, Copy)]
+struct DataPhase {
+    tag: u16,
+    /// Slot offset where this PDU's payload begins.
+    base: u32,
+    remaining: u32,
+    crc: digest::Crc32c,
+    ddgst: bool,
+    kind: PayloadKind,
+}
+
+impl DataPhase {
+    /// Copy payload bytes from the recv buffer into the slot; returns
+    /// the next phase once this PDU's payload has fully arrived.
+    fn advance(
+        &mut self,
+        queue: &Rc<QueueCore>,
+        slice: &mut &[u8],
+    ) -> Result<Option<RecvPhase>, RecvEnd> {
+        let take = (self.remaining as usize).min(slice.len());
+        {
+            let slot = queue.slot(self.tag);
+            let total = match self.kind {
+                PayloadKind::InCapsule => slot.data_len(),
+                PayloadKind::H2c { length, .. } => length,
+            };
+            let dest = (self.base + (total - self.remaining)) as usize;
+            slot.data()[dest..dest + take].copy_from_slice(&slice[..take]);
         }
+        self.crc.update(&slice[..take]);
+        *slice = &slice[take..];
+        self.remaining -= u32::try_from(take).expect("take <= remaining: u32");
+        if self.remaining > 0 {
+            return Ok(None);
+        }
+        if self.ddgst {
+            Ok(Some(RecvPhase::ddgst(
+                self.tag,
+                self.crc.finalize(),
+                self.kind,
+            )))
+        } else {
+            finish_payload(queue, self.tag, self.kind)?;
+            Ok(Some(RecvPhase::Header))
+        }
+    }
+}
+
+/// Consuming the 4-byte data digest that trails a payload.
+#[derive(Clone, Copy)]
+struct DdgstPhase {
+    tag: u16,
+    expected: u32,
+    have: [u8; 4],
+    have_len: u8,
+    kind: PayloadKind,
+}
+
+impl DdgstPhase {
+    /// Accumulate digest bytes; on the 4th, verify and finish the
+    /// payload. A mismatch fails the command but keeps the connection.
+    fn advance(
+        &mut self,
+        queue: &Rc<QueueCore>,
+        slice: &mut &[u8],
+    ) -> Result<Option<RecvPhase>, RecvEnd> {
+        let take = (4 - self.have_len as usize).min(slice.len());
+        self.have[self.have_len as usize..self.have_len as usize + take]
+            .copy_from_slice(&slice[..take]);
+        self.have_len += u8::try_from(take).expect("take <= 4");
+        *slice = &slice[take..];
+        if self.have_len < 4 {
+            return Ok(None);
+        }
+        let wire = u32::from_le_bytes(self.have);
+        if wire != self.expected {
+            // There is no NVMe/TCP "data digest error" FES; nvmet
+            // completes the offending command with
+            // NVME_SC_DATA_XFER_ERROR and keeps the connection.
+            // Executing the write is skipped so corrupt data never
+            // reaches the backend.
+            let cid = queue.slot(self.tag).stashed_sqe().cid.get();
+            warn!(qid = queue.qid, cid, "DDGST mismatch; failing command");
+            let cqe = Cqe::new(
+                0,
+                queue.advance_sqhd(),
+                queue.qid,
+                cid,
+                status::DATA_XFER_ERROR | status::DNR,
+            );
+            queue.complete_receiving(self.tag, cqe);
+            return Ok(Some(RecvPhase::Header));
+        }
+        finish_payload(queue, self.tag, self.kind)?;
+        Ok(Some(RecvPhase::Header))
+    }
+}
+
+/// Why the receive path is finished with the connection. `recv_loop`
+/// maps each ending onto the connection contract exactly once instead
+/// of every protocol-check site hand-rolling `send_term` + return.
+enum RecvEnd {
+    /// Transport error: surfaces to the connection-closed log line.
+    Io(std::io::Error),
+    /// Protocol violation: send a C2HTermReq, then close.
+    Term(PduError),
+    /// The host sent an H2CTermReq; close without replying.
+    HostTerm { fes: u16, fei: u32 },
+    /// Orderly EOF mid-payload (direct-recv tail path).
+    Closed,
+}
+
+impl RecvEnd {
+    /// Protocol violation at `fes` with no field-error information.
+    fn term(fes: u16) -> RecvEnd {
+        RecvEnd::Term(PduError { fes, fei: 0 })
+    }
+}
+
+impl From<std::io::Error> for RecvEnd {
+    fn from(err: std::io::Error) -> RecvEnd {
+        RecvEnd::Io(err)
+    }
+}
+
+impl From<PduError> for RecvEnd {
+    fn from(err: PduError) -> RecvEnd {
+        RecvEnd::Term(err)
     }
 }
 
@@ -157,78 +278,17 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
 
     on_ctx(&ctx);
 
-    // Persistent task per tag.
-    let mut tasks: Vec<JoinHandle<()>> = (0..conn.sqsize)
-        .map(|tag| {
-            let queue = Rc::clone(&queue);
-            let ctx = Rc::clone(&ctx);
-            tokio::task::spawn_local(async move {
-                loop {
-                    let sqe = queue.await_command(tag).await;
-                    let outcome = dispatch::execute(&ctx, tag, &sqe).await;
-                    queue.complete(tag, outcome.cqe, outcome.data_len);
-                }
-            })
-        })
-        .collect();
-
-    // Keep-alive watchdog (admin queues): close the socket when the host
-    // goes silent past KATO + grace, which unwinds the whole connection.
+    let mut tasks = spawn_slot_tasks(&queue, &ctx);
     if let Role::Admin(_) = &ctx.role {
-        let ctx = Rc::clone(&ctx);
-        tasks.push(tokio::task::spawn_local(async move {
-            loop {
-                let Ok(sleep) = ops::sleep(Duration::from_secs(5)) else {
-                    return;
-                };
-                if sleep.await.is_err() {
-                    return;
-                }
-                let Role::Admin(admin) = &ctx.role else {
-                    return;
-                };
-                let kato = u64::from(admin.kato_ms.get());
-                if kato == 0 {
-                    continue;
-                }
-                let silent =
-                    u64::try_from(admin.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
-                if silent > kato * 2 + 5_000 {
-                    info!(
-                        cntlid = admin.cntlid.get(),
-                        silent_ms = silent,
-                        "keep-alive expired; closing connection"
-                    );
-                    // SAFETY: fd is valid for the connection's lifetime;
-                    // shutdown only signals, never frees.
-                    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-                    return;
-                }
-            }
-        }));
+        tasks.push(spawn_keepalive_watchdog(Rc::clone(&ctx), fd));
     }
-
-    // Send path. Held separately: teardown must join it (the gather
-    // send references slot buffers) before freeing the queue.
-    let send_task = {
-        let queue = Rc::clone(&queue);
-        let hdr_digest = conn.hdr_digest;
-        let data_digest = conn.data_digest;
-        let send_zc = conn.send_zc;
-        tokio::task::spawn_local(async move {
-            if let Err(err) = send_loop(&queue, fd, hdr_digest, data_digest, send_zc).await {
-                debug!(qid = queue.qid, "send loop ended: {err}");
-                // A dead send path leaves the connection half-alive:
-                // the recv loop keeps accepting commands whose
-                // responses can never ship, and the host only notices
-                // at its IO timeout (~30 s). Shut the socket down so
-                // the recv loop sees EOF and teardown runs now.
-                // SAFETY: fd is valid for the connection's lifetime;
-                // shutdown only signals, never frees.
-                unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-            }
-        })
-    };
+    let send_task = spawn_send_task(
+        Rc::clone(&queue),
+        fd,
+        conn.hdr_digest,
+        conn.data_digest,
+        conn.send_zc,
+    );
 
     // The Connect command was consumed on the control thread; run it
     // through the normal slot pipeline as this queue's first command.
@@ -240,14 +300,97 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 
-    // Resolve parked AERs (their slots count as executing but reference
-    // no kernel-visible memory) so the drain below terminates promptly.
-    ctx.close();
+    teardown(&queue, &ctx, fd, send_task, tasks).await;
+    // conn.fd drops here, closing the socket; in-flight ops orphan and
+    // drain through the reactor.
+}
 
-    // Backend ops in flight reference slot memory: wait for executing
-    // slots to finish before aborting tasks and freeing the queue.
+/// One persistent task per command slot: each waits for its tag's next
+/// command, executes it, and posts the completion.
+fn spawn_slot_tasks<B: Backend>(
+    queue: &Rc<QueueCore>,
+    ctx: &Rc<ConnCtx<B>>,
+) -> Vec<JoinHandle<()>> {
+    (0..queue.sqsize)
+        .map(|tag| {
+            let queue = Rc::clone(queue);
+            let ctx = Rc::clone(ctx);
+            tokio::task::spawn_local(async move {
+                loop {
+                    let sqe = queue.await_command(tag).await;
+                    let outcome = dispatch::execute(&ctx, tag, &sqe).await;
+                    queue.complete(tag, outcome.cqe, outcome.data_len);
+                }
+            })
+        })
+        .collect()
+}
+
+/// Keep-alive watchdog (admin queues): close the socket when the host
+/// goes silent past KATO + grace, which unwinds the whole connection.
+fn spawn_keepalive_watchdog<B: Backend>(ctx: Rc<ConnCtx<B>>, fd: i32) -> JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        loop {
+            let Ok(sleep) = ops::sleep(Duration::from_secs(5)) else {
+                return;
+            };
+            if sleep.await.is_err() {
+                return;
+            }
+            let Role::Admin(admin) = &ctx.role else {
+                return;
+            };
+            let kato = u64::from(admin.kato_ms.get());
+            if kato == 0 {
+                continue;
+            }
+            let silent =
+                u64::try_from(admin.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
+            if silent > kato * 2 + 5_000 {
+                info!(
+                    cntlid = admin.cntlid.get(),
+                    silent_ms = silent,
+                    "keep-alive expired; closing connection"
+                );
+                // SAFETY: fd is valid for the connection's lifetime;
+                // shutdown only signals, never frees.
+                unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                return;
+            }
+        }
+    })
+}
+
+/// Send path. Held separately from the slot tasks: teardown must join
+/// it (the gather send references slot buffers) before freeing the
+/// queue.
+fn spawn_send_task(
+    queue: Rc<QueueCore>,
+    fd: i32,
+    hdr_digest: bool,
+    data_digest: bool,
+    send_zc: bool,
+) -> JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        if let Err(err) = send_loop(&queue, fd, hdr_digest, data_digest, send_zc).await {
+            debug!(qid = queue.qid, "send loop ended: {err}");
+            // A dead send path leaves the connection half-alive:
+            // the recv loop keeps accepting commands whose
+            // responses can never ship, and the host only notices
+            // at its IO timeout (~30 s). Shut the socket down so
+            // the recv loop sees EOF and teardown runs now.
+            // SAFETY: fd is valid for the connection's lifetime;
+            // shutdown only signals, never frees.
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+    })
+}
+
+/// Poll `done` every 2 ms for up to 10 s; each call gets its own
+/// budget. The teardown quiesce primitive.
+async fn quiesce(mut done: impl FnMut() -> bool) {
     let mut waited = 0u32;
-    while queue.executing() > 0 && waited < 10_000 {
+    while !done() && waited < 10_000 {
         match ops::sleep(Duration::from_millis(2)) {
             Ok(sleep) => {
                 let _ = sleep.await;
@@ -256,6 +399,24 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         }
         waited += 2;
     }
+}
+
+/// Post-recv teardown: quiesce executing slots and the send task, then
+/// abort the per-tag tasks — or leak everything on timeout.
+async fn teardown<B: Backend>(
+    queue: &Rc<QueueCore>,
+    ctx: &Rc<ConnCtx<B>>,
+    fd: i32,
+    send_task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
+) {
+    // Resolve parked AERs (their slots count as executing but reference
+    // no kernel-visible memory) so the drain below terminates promptly.
+    ctx.close();
+
+    // Backend ops in flight reference slot memory: wait for executing
+    // slots to finish before aborting tasks and freeing the queue.
+    quiesce(|| queue.executing() == 0).await;
     // Stop the send task and wait for any in-flight send op before
     // anything it references is freed. shutdown() unwedges a send
     // parked on a full socket buffer; close_send() unparks an idle
@@ -264,19 +425,10 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     // SAFETY: fd is valid for the connection's lifetime; shutdown only
     // signals, never frees.
     unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-    // Own budget: the executing drain may have spent all of `waited`,
+    // Own budget: the executing drain may have spent all of its wait,
     // and the send task needs at least one poll cycle to observe
     // close_send/shutdown.
-    let mut send_waited = 0u32;
-    while !send_task.is_finished() && send_waited < 10_000 {
-        match ops::sleep(Duration::from_millis(2)) {
-            Ok(sleep) => {
-                let _ = sleep.await;
-            }
-            Err(_) => break,
-        }
-        send_waited += 2;
-    }
+    quiesce(|| send_task.is_finished()).await;
     if queue.executing() > 0 || !send_task.is_finished() {
         // A wedged backend op: leak the queue AND the slot tasks rather
         // than free memory the kernel may still write to. A suspended
@@ -288,11 +440,11 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         // to the send task: its in-flight gather op references slot
         // buffers and the batch arena.
         warn!(
-            qid = conn.qid,
+            qid = queue.qid,
             executing = queue.executing(),
             "teardown timeout; leaking queue and tasks"
         );
-        std::mem::forget(Rc::clone(&queue));
+        std::mem::forget(Rc::clone(queue));
         std::mem::forget(send_task);
         for task in tasks {
             std::mem::forget(task);
@@ -311,8 +463,6 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
             info!(cntlid, "controller removed");
         }
     }
-    // conn.fd drops here, closing the socket; in-flight ops orphan and
-    // drain through the reactor.
 }
 
 async fn send_term(fd: i32, error: PduError) {
@@ -368,7 +518,10 @@ fn needs_r2t(sqe: &Sqe) -> bool {
         && sqe.dptr.length.get() > 0
 }
 
-/// Receive loop: bytes → decoder → slot pipeline.
+/// Receive loop: bytes → decoder → slot pipeline. Maps every recv-path
+/// ending onto the connection contract in one place: protocol
+/// violations send a C2HTermReq and close cleanly; transport errors
+/// propagate to the connection-closed log line.
 async fn recv_loop(
     queue: &Rc<QueueCore>,
     fd: i32,
@@ -376,6 +529,30 @@ async fn recv_loop(
     data_digest: bool,
     send_zc: bool,
 ) -> std::io::Result<()> {
+    match drive_recv(queue, fd, hdr_digest, data_digest, send_zc).await {
+        Ok(()) | Err(RecvEnd::Closed) => Ok(()),
+        Err(RecvEnd::Io(err)) => Err(err),
+        Err(RecvEnd::Term(err)) => {
+            warn!(qid = queue.qid, "protocol error: {err}");
+            send_term(fd, err).await;
+            Ok(())
+        }
+        Err(RecvEnd::HostTerm { fes, fei }) => {
+            warn!(qid = queue.qid, fes, fei, "host terminated connection");
+            Ok(())
+        }
+    }
+}
+
+/// Receive loop body: each recv buffer steps the phase machine; large
+/// H2C tails switch to direct-into-slot receives between buffers.
+async fn drive_recv(
+    queue: &Rc<QueueCore>,
+    fd: i32,
+    hdr_digest: bool,
+    data_digest: bool,
+    send_zc: bool,
+) -> Result<(), RecvEnd> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
     let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
@@ -390,203 +567,114 @@ async fn recv_loop(
         let mut slice = &buf[..n];
 
         while !slice.is_empty() {
-            match &mut phase {
+            let next = match &mut phase {
                 RecvPhase::Header => {
-                    let consumed = match decoder.feed(slice) {
-                        Ok(consumed) => consumed,
-                        Err(err) => {
-                            warn!(qid = queue.qid, "PDU error: {err}");
-                            send_term(fd, err).await;
-                            return Ok(());
-                        }
-                    };
-                    slice = &slice[consumed..];
-                    if !decoder.is_complete() {
-                        continue;
-                    }
-                    let decoded = match decoder.take() {
-                        Ok(decoded) => decoded,
-                        Err(err) => {
-                            warn!(qid = queue.qid, "PDU error: {err}");
-                            send_term(fd, err).await;
-                            return Ok(());
-                        }
-                    };
-                    match handle_pdu(queue, decoded, data_digest, send_zc).await {
-                        Ok(Some(next)) => phase = next,
-                        Ok(None) => {}
-                        Err(HandleError::Term(err)) => {
-                            warn!(qid = queue.qid, "protocol error: {err}");
-                            send_term(fd, err).await;
-                            return Ok(());
-                        }
-                        Err(HandleError::HostTerm { fes, fei }) => {
-                            warn!(qid = queue.qid, fes, fei, "host terminated connection");
-                            return Ok(());
-                        }
-                    }
+                    feed_header(queue, &mut decoder, &mut slice, data_digest, send_zc).await?
                 }
-                RecvPhase::Data {
-                    tag,
-                    base,
-                    remaining,
-                    crc,
-                    ddgst,
-                    kind,
-                } => {
-                    let take = (*remaining as usize).min(slice.len());
-                    {
-                        let slot = queue.slot(*tag);
-                        let total = match kind {
-                            PayloadKind::InCapsule => slot.data_len(),
-                            PayloadKind::H2c { length, .. } => *length,
-                        };
-                        let dest = (*base + (total - *remaining)) as usize;
-                        slot.data()[dest..dest + take].copy_from_slice(&slice[..take]);
-                    }
-                    crc.update(&slice[..take]);
-                    slice = &slice[take..];
-                    *remaining -= u32::try_from(take).expect("take <= remaining: u32");
-                    if *remaining == 0 {
-                        if *ddgst {
-                            phase = RecvPhase::ddgst(*tag, crc.finalize(), *kind);
-                        } else {
-                            let kind = *kind;
-                            let tag = *tag;
-                            if let Err(err) = finish_payload(queue, tag, kind) {
-                                send_term(fd, err).await;
-                                return Ok(());
-                            }
-                            phase = RecvPhase::Header;
-                        }
-                    }
-                }
-                RecvPhase::Ddgst {
-                    tag,
-                    expected,
-                    have,
-                    have_len,
-                    kind,
-                } => {
-                    let take = (4 - *have_len as usize).min(slice.len());
-                    have[*have_len as usize..*have_len as usize + take]
-                        .copy_from_slice(&slice[..take]);
-                    *have_len += u8::try_from(take).expect("take <= 4");
-                    slice = &slice[take..];
-                    if *have_len == 4 {
-                        let wire = u32::from_le_bytes(*have);
-                        if wire != *expected {
-                            // There is no NVMe/TCP "data digest error" FES;
-                            // nvmet completes the offending command with
-                            // NVME_SC_DATA_XFER_ERROR and keeps the
-                            // connection. Executing the write is skipped so
-                            // corrupt data never reaches the backend.
-                            let cid = queue.slot(*tag).stashed_sqe().cid.get();
-                            warn!(qid = queue.qid, cid, "DDGST mismatch; failing command");
-                            let cqe = Cqe::new(
-                                0,
-                                queue.advance_sqhd(),
-                                queue.qid,
-                                cid,
-                                status::DATA_XFER_ERROR | status::DNR,
-                            );
-                            queue.complete_receiving(*tag, cqe);
-                            phase = RecvPhase::Header;
-                            continue;
-                        }
-                        let kind = *kind;
-                        let tag = *tag;
-                        if let Err(err) = finish_payload(queue, tag, kind) {
-                            send_term(fd, err).await;
-                            return Ok(());
-                        }
-                        phase = RecvPhase::Header;
-                    }
-                }
+                RecvPhase::Data(data) => data.advance(queue, &mut slice)?,
+                RecvPhase::Ddgst(ddgst) => ddgst.advance(queue, &mut slice)?,
+            };
+            if let Some(next) = next {
+                phase = next;
             }
         }
 
         // Buffer exhausted mid-payload with a large H2C tail still to
-        // come: pull it straight into the slot at the reassembly
-        // offset, skipping the buffer→slot copy. The tail is by
-        // definition the next bytes on the TCP stream, so the buffer
-        // recv is NOT re-armed until the tail lands — this serializes
-        // nothing that could have proceeded, and there is never more
-        // than one outstanding recv on the socket. MSG_WAITALL is
-        // best-effort: short-but-nonzero returns resume IN PLACE at
-        // the advanced slot offset (never staged elsewhere, never
-        // restarted); 0 is an orderly close mid-payload, as today.
-        //
-        // Copy-snapshot of the phase (every field is Copy — Crc32c
-        // included — so this is cheap): a failed guard falls through
-        // with `phase`, including its partially-accumulated CRC,
-        // untouched for the normal copy path.
-        if let &RecvPhase::Data {
-            tag,
-            base,
-            remaining,
-            crc,
-            ddgst,
-            kind: kind @ PayloadKind::H2c { length, .. },
-        } = &phase
-            && remaining >= H2C_DIRECT_MIN
+        // come: pull it straight into the slot, skipping the
+        // buffer→slot copy. Copy-snapshot of the phase (every field is
+        // Copy — Crc32c included — so this is cheap): a failed guard
+        // falls through with `phase`, including its
+        // partially-accumulated CRC, untouched for the normal copy
+        // path.
+        if let &RecvPhase::Data(data) = &phase
+            && matches!(data.kind, PayloadKind::H2c { .. })
+            && data.remaining >= H2C_DIRECT_MIN
         {
-            let mut crc = crc;
-            let mut remaining = remaining;
-            let mut dest = (base + (length - remaining)) as usize;
-            let tail_start = dest;
-            while remaining > 0 {
-                let ptr = {
-                    // Scoped: the RefCell borrow must end before the
-                    // await below.
-                    let mut data = queue.slot(tag).data();
-                    data[dest..dest + remaining as usize].as_mut_ptr()
-                };
-                // SAFETY: ptr..ptr+remaining is slot-buffer memory
-                // (bounds-checked by the slicing above) owned by
-                // QueueCore, to which this function holds an Rc, and
-                // the op is awaited inline — recv_loop cannot return
-                // while it is in flight, so the memory outlives the
-                // terminal CQE. If the whole run_queue future is
-                // instead dropped mid-await (LocalSet teardown), the
-                // reactor's orphan protocol holds the op entry until
-                // its terminal CQE — the same accepted envelope as
-                // backend raw ops on slot memory (queue threads run
-                // for the process lifetime; reactor drain/leak is the
-                // backstop before anything is freed). Nothing else
-                // touches this slot's data while its state is
-                // Receiving.
-                let n = unsafe { ops::recv_raw_waitall(fd, ptr, remaining) }?.await?;
-                if n == 0 {
-                    return Ok(()); // orderly close mid-payload
-                }
-                dest += n as usize;
-                remaining -= n; // recv returns at most `remaining`
-            }
-            if ddgst {
-                {
-                    // Re-borrowed after the await: warm pass over the
-                    // tail the kernel just wrote.
-                    let data = queue.slot(tag).data();
-                    crc.update(&data[tail_start..dest]);
-                }
-                phase = RecvPhase::ddgst(tag, crc.finalize(), kind);
-                // Next ops::recv starts at the 4-byte digest.
-            } else {
-                if let Err(err) = finish_payload(queue, tag, kind) {
-                    send_term(fd, err).await;
-                    return Ok(());
-                }
-                phase = RecvPhase::Header;
-                // Next ops::recv starts at the next PDU header.
-            }
+            phase = recv_tail_direct(queue, fd, data).await?;
         }
     }
 }
 
-enum HandleError {
-    Term(PduError),
-    HostTerm { fes: u16, fei: u32 },
+/// Header phase: feed the decoder; once a header is complete, route
+/// the PDU. Returns the next phase if payload follows on the stream.
+async fn feed_header(
+    queue: &Rc<QueueCore>,
+    decoder: &mut PduDecoder,
+    slice: &mut &[u8],
+    data_digest: bool,
+    send_zc: bool,
+) -> Result<Option<RecvPhase>, RecvEnd> {
+    let consumed = decoder.feed(slice)?;
+    *slice = &slice[consumed..];
+    if !decoder.is_complete() {
+        return Ok(None);
+    }
+    let decoded = decoder.take()?;
+    handle_pdu(queue, decoded, data_digest, send_zc).await
+}
+
+/// Receive a payload tail straight into the slot buffer at the
+/// reassembly offset. The tail is by definition the next bytes on the
+/// TCP stream, so the buffer recv is NOT re-armed until the tail
+/// lands — this serializes nothing that could have proceeded, and
+/// there is never more than one outstanding recv on the socket.
+/// MSG_WAITALL is best-effort: short-but-nonzero returns resume IN
+/// PLACE at the advanced slot offset (never staged elsewhere, never
+/// restarted); 0 is an orderly close mid-payload, as on the buffered
+/// path.
+async fn recv_tail_direct(
+    queue: &Rc<QueueCore>,
+    fd: i32,
+    mut data: DataPhase,
+) -> Result<RecvPhase, RecvEnd> {
+    let total = match data.kind {
+        PayloadKind::InCapsule => queue.slot(data.tag).data_len(),
+        PayloadKind::H2c { length, .. } => length,
+    };
+    let mut dest = (data.base + (total - data.remaining)) as usize;
+    let tail_start = dest;
+    while data.remaining > 0 {
+        let ptr = {
+            // Scoped: the RefCell borrow must end before the
+            // await below.
+            let mut slot_data = queue.slot(data.tag).data();
+            slot_data[dest..dest + data.remaining as usize].as_mut_ptr()
+        };
+        // SAFETY: ptr..ptr+remaining is slot-buffer memory
+        // (bounds-checked by the slicing above) owned by
+        // QueueCore, to which this function holds an Rc, and
+        // the op is awaited inline — the recv path cannot return
+        // while it is in flight, so the memory outlives the
+        // terminal CQE. If the whole run_queue future is
+        // instead dropped mid-await (LocalSet teardown), the
+        // reactor's orphan protocol holds the op entry until
+        // its terminal CQE — the same accepted envelope as
+        // backend raw ops on slot memory (queue threads run
+        // for the process lifetime; reactor drain/leak is the
+        // backstop before anything is freed). Nothing else
+        // touches this slot's data while its state is
+        // Receiving.
+        let n = unsafe { ops::recv_raw_waitall(fd, ptr, data.remaining) }?.await?;
+        if n == 0 {
+            return Err(RecvEnd::Closed); // orderly close mid-payload
+        }
+        dest += n as usize;
+        data.remaining -= n; // recv returns at most `remaining`
+    }
+    if data.ddgst {
+        {
+            // Re-borrowed after the await: warm pass over the
+            // tail the kernel just wrote.
+            let slot_data = queue.slot(data.tag).data();
+            data.crc.update(&slot_data[tail_start..dest]);
+        }
+        // Next ops::recv starts at the 4-byte digest.
+        Ok(RecvPhase::ddgst(data.tag, data.crc.finalize(), data.kind))
+    } else {
+        finish_payload(queue, data.tag, data.kind)?;
+        // Next ops::recv starts at the next PDU header.
+        Ok(RecvPhase::Header)
+    }
 }
 
 /// Route one decoded PDU header. Returns the next recv phase if payload
@@ -597,66 +685,11 @@ async fn handle_pdu(
     decoded: pdu::DecodedPdu,
     data_digest: bool,
     send_zc: bool,
-) -> Result<Option<RecvPhase>, HandleError> {
+) -> Result<Option<RecvPhase>, RecvEnd> {
+    let ddgst = decoded.ddgst && data_digest;
     match decoded.kind {
         PduKind::CapsuleCmd(sqe) => {
-            // ZC mode: payload tags release on the send notification
-            // (≈ the peer's ACK), racing the host's next command — an
-            // empty freelist is an expected transient; park (TCP
-            // backpressure) instead of terminating. Non-ZC keeps the
-            // strict depth-violation term.
-            let tag = if send_zc {
-                queue.await_tag().await
-            } else {
-                match queue.claim_tag() {
-                    Some(tag) => tag,
-                    None => {
-                        // Host exceeded the negotiated queue depth.
-                        return Err(HandleError::Term(PduError {
-                            fes: pdu::fes::PDU_SEQ_ERR,
-                            fei: 0,
-                        }));
-                    }
-                }
-            };
-            let slot = queue.slot(tag);
-            if decoded.data_len > 0 {
-                // In-capsule payload follows the capsule on the wire.
-                if decoded.data_len as usize > slot.data().len() {
-                    return Err(HandleError::Term(PduError {
-                        fes: pdu::fes::DATA_LIMIT_EXCEEDED,
-                        fei: 0,
-                    }));
-                }
-                slot.set_data_len(decoded.data_len);
-                slot.stash_sqe(sqe);
-                Ok(Some(RecvPhase::Data {
-                    tag,
-                    base: 0,
-                    remaining: decoded.data_len,
-                    crc: digest::Crc32c::new(),
-                    ddgst: decoded.ddgst && data_digest,
-                    kind: PayloadKind::InCapsule,
-                }))
-            } else if needs_r2t(&sqe) {
-                let length = sqe.dptr.length.get();
-                if length as usize > slot.data().len() {
-                    return Err(HandleError::Term(PduError {
-                        fes: pdu::fes::DATA_LIMIT_EXCEEDED,
-                        fei: 0,
-                    }));
-                }
-                slot.set_data_len(length);
-                slot.set_recv_offset(0);
-                slot.stash_sqe(sqe);
-                // Solicit the whole transfer with one R2T; the host may
-                // split it into several H2CData PDUs.
-                queue.solicit(tag, sqe.cid.get(), 0, length);
-                Ok(None)
-            } else {
-                queue.submit(tag, sqe);
-                Ok(None)
-            }
+            handle_capsule_cmd(queue, sqe, decoded.data_len, ddgst, send_zc).await
         }
         PduKind::H2CData {
             cid,
@@ -665,52 +698,116 @@ async fn handle_pdu(
             length,
             last,
         } => {
-            let tag = ttag;
-            if usize::from(tag) >= usize::from(queue.sqsize) {
-                return Err(HandleError::Term(PduError {
-                    fes: pdu::fes::INVALID_PDU_HDR,
-                    fei: 10, // ttag field offset
-                }));
-            }
-            let slot = queue.slot(tag);
-            let valid = slot.state() == ioutgt_core::queue::SlotState::Receiving
-                && slot.stashed_sqe().cid.get() == cid
-                && offset == slot.recv_offset()
-                && offset
-                    .checked_add(length)
-                    .is_some_and(|end| end <= slot.data_len())
-                && length > 0;
-            if !valid {
-                return Err(HandleError::Term(PduError {
-                    fes: pdu::fes::DATA_OUT_OF_RANGE,
-                    fei: 0,
-                }));
-            }
-            if decoded.data_len != length {
-                return Err(HandleError::Term(PduError {
-                    fes: pdu::fes::INVALID_PDU_HDR,
-                    fei: 16, // data_length field offset
-                }));
-            }
-            Ok(Some(RecvPhase::Data {
+            let tag = validate_h2c(queue, cid, ttag, offset, length, decoded.data_len)?;
+            Ok(Some(RecvPhase::Data(DataPhase {
                 tag,
                 base: offset,
                 remaining: length,
                 crc: digest::Crc32c::new(),
-                ddgst: decoded.ddgst && data_digest,
+                ddgst,
                 kind: PayloadKind::H2c { last, length },
-            }))
+            })))
         }
-        PduKind::H2CTerm { fes, fei } => Err(HandleError::HostTerm { fes, fei }),
+        PduKind::H2CTerm { fes, fei } => Err(RecvEnd::HostTerm { fes, fei }),
         PduKind::IcReq(_)
         | PduKind::IcResp(_)
         | PduKind::CapsuleResp(_)
         | PduKind::C2HData { .. }
-        | PduKind::R2T { .. } => Err(HandleError::Term(PduError {
-            fes: pdu::fes::PDU_SEQ_ERR,
-            fei: 0,
-        })),
+        | PduKind::R2T { .. } => Err(RecvEnd::term(pdu::fes::PDU_SEQ_ERR)),
     }
+}
+
+/// A new command capsule: claim a slot, then route by payload
+/// residency — in-capsule data, host-resident via R2T, or no data.
+async fn handle_capsule_cmd(
+    queue: &Rc<QueueCore>,
+    sqe: Sqe,
+    data_len: u32,
+    ddgst: bool,
+    send_zc: bool,
+) -> Result<Option<RecvPhase>, RecvEnd> {
+    // ZC mode: payload tags release on the send notification
+    // (≈ the peer's ACK), racing the host's next command — an
+    // empty freelist is an expected transient; park (TCP
+    // backpressure) instead of terminating. Non-ZC keeps the
+    // strict depth-violation term.
+    let tag = if send_zc {
+        queue.await_tag().await
+    } else {
+        // An empty freelist means the host exceeded the negotiated
+        // queue depth.
+        queue
+            .claim_tag()
+            .ok_or_else(|| RecvEnd::term(pdu::fes::PDU_SEQ_ERR))?
+    };
+    let slot = queue.slot(tag);
+    if data_len > 0 {
+        // In-capsule payload follows the capsule on the wire.
+        if data_len as usize > slot.data().len() {
+            return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
+        }
+        slot.set_data_len(data_len);
+        slot.stash_sqe(sqe);
+        Ok(Some(RecvPhase::Data(DataPhase {
+            tag,
+            base: 0,
+            remaining: data_len,
+            crc: digest::Crc32c::new(),
+            ddgst,
+            kind: PayloadKind::InCapsule,
+        })))
+    } else if needs_r2t(&sqe) {
+        let length = sqe.dptr.length.get();
+        if length as usize > slot.data().len() {
+            return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
+        }
+        slot.set_data_len(length);
+        slot.set_recv_offset(0);
+        slot.stash_sqe(sqe);
+        // Solicit the whole transfer with one R2T; the host may
+        // split it into several H2CData PDUs.
+        queue.solicit(tag, sqe.cid.get(), 0, length);
+        Ok(None)
+    } else {
+        queue.submit(tag, sqe);
+        Ok(None)
+    }
+}
+
+/// Validate one H2CData header against its slot's expected reassembly
+/// state; returns the target tag.
+fn validate_h2c(
+    queue: &Rc<QueueCore>,
+    cid: u16,
+    ttag: u16,
+    offset: u32,
+    length: u32,
+    data_len: u32,
+) -> Result<u16, RecvEnd> {
+    if usize::from(ttag) >= usize::from(queue.sqsize) {
+        return Err(RecvEnd::Term(PduError {
+            fes: pdu::fes::INVALID_PDU_HDR,
+            fei: 10, // ttag field offset
+        }));
+    }
+    let slot = queue.slot(ttag);
+    let valid = slot.state() == ioutgt_core::queue::SlotState::Receiving
+        && slot.stashed_sqe().cid.get() == cid
+        && offset == slot.recv_offset()
+        && offset
+            .checked_add(length)
+            .is_some_and(|end| end <= slot.data_len())
+        && length > 0;
+    if !valid {
+        return Err(RecvEnd::term(pdu::fes::DATA_OUT_OF_RANGE));
+    }
+    if data_len != length {
+        return Err(RecvEnd::Term(PduError {
+            fes: pdu::fes::INVALID_PDU_HDR,
+            fei: 16, // data_length field offset
+        }));
+    }
+    Ok(ttag)
 }
 
 /// Worst-case arena bytes per staged item: C2HData header (24+4
@@ -828,6 +925,15 @@ impl SendBatch {
     /// Consume `sent` bytes; true when the whole batch hit the socket.
     fn advance(&mut self, sent: usize) -> bool {
         advance_iovecs(&mut self.iovs, &mut self.live, sent)
+    }
+
+    /// Release the notif-gated tags and recycle the batch for staging.
+    /// Callers must have reaped every pending notification first.
+    fn recycle(&mut self, queue: &Rc<QueueCore>) {
+        for tag in self.tags_at_notif.drain(..) {
+            queue.release_tag(tag);
+        }
+        self.reset();
     }
 }
 
@@ -966,18 +1072,19 @@ impl SendState {
     /// Await every notification of the oldest in-flight batch, then
     /// release its notif-gated tags and recycle it.
     async fn reap_oldest(&mut self, queue: &Rc<QueueCore>) {
-        let Some(idx) = self.inflight.pop_front() else {
-            return;
-        };
+        if let Some(idx) = self.inflight.pop_front() {
+            self.reap(queue, idx).await;
+        }
+    }
+
+    /// Await every notification of one batch, then recycle it.
+    async fn reap(&mut self, queue: &Rc<QueueCore>, idx: usize) {
         while let Some(notif) = self.batches[idx].pending_notifs.pop() {
             if notif.await {
                 self.zc_copied += 1;
             }
         }
-        for tag in self.batches[idx].tags_at_notif.drain(..) {
-            queue.release_tag(tag);
-        }
-        self.batches[idx].reset();
+        self.batches[idx].recycle(queue);
     }
 
     /// Drain every outstanding notification. Teardown MUST run this
@@ -987,18 +1094,11 @@ impl SendState {
     /// batch a send error abandoned mid-ship — that one is not on
     /// the list but may hold notifs from its earlier ZC ops.
     async fn drain(&mut self, queue: &Rc<QueueCore>) {
-        while !self.inflight.is_empty() {
-            self.reap_oldest(queue).await;
+        while let Some(idx) = self.inflight.pop_front() {
+            self.reap(queue, idx).await;
         }
         for idx in 0..self.batches.len() {
-            while let Some(notif) = self.batches[idx].pending_notifs.pop() {
-                if notif.await {
-                    self.zc_copied += 1;
-                }
-            }
-            for tag in self.batches[idx].tags_at_notif.drain(..) {
-                queue.release_tag(tag);
-            }
+            self.reap(queue, idx).await;
         }
     }
 
@@ -1022,22 +1122,7 @@ impl SendState {
                 if let Poll::Ready(work) = queue.poll_send_work(cx) {
                     return Poll::Ready(Wait::Work(work));
                 }
-                // Poll each notification; completed ones are recorded
-                // and removed. No future is ever dropped unfinished,
-                // so completion is never silently lost.
-                let mut i = 0;
-                while i < batch.pending_notifs.len() {
-                    match Pin::new(&mut batch.pending_notifs[i]).poll(cx) {
-                        Poll::Ready(copied) => {
-                            batch.pending_notifs.swap_remove(i);
-                            if copied {
-                                *zc_copied += 1;
-                            }
-                        }
-                        Poll::Pending => i += 1,
-                    }
-                }
-                if batch.pending_notifs.is_empty() {
+                if poll_notifs(&mut batch.pending_notifs, zc_copied, cx) {
                     return Poll::Ready(Wait::Reaped);
                 }
                 Poll::Pending
@@ -1047,14 +1132,47 @@ impl SendState {
                 Wait::Work(work) => return work,
                 Wait::Reaped => {
                     self.inflight.pop_front();
-                    for tag in self.batches[front].tags_at_notif.drain(..) {
-                        queue.release_tag(tag);
-                    }
-                    self.batches[front].reset();
+                    self.batches[front].recycle(queue);
                 }
             }
         }
     }
+
+    /// A batch just hit the socket: release what the send CQE allows
+    /// and classify the batch. Notif-gated iff it actually holds
+    /// notifications — a batch whose every ZC attempt fell back has
+    /// none and is immediately reusable, like the plain path.
+    fn retire(&mut self, queue: &Rc<QueueCore>, idx: usize) {
+        let batch = &mut self.batches[idx];
+        for tag in batch.tags_at_cqe.drain(..) {
+            queue.release_tag(tag);
+        }
+        if batch.pending_notifs.is_empty() {
+            batch.recycle(queue);
+        } else {
+            self.zc_batches += 1;
+            self.inflight.push_back(idx);
+        }
+    }
+}
+
+/// Poll every pending notification once; completed ones are recorded
+/// in `zc_copied` and removed. No future is ever dropped unfinished,
+/// so completion is never silently lost. True when none remain.
+fn poll_notifs(notifs: &mut Vec<ops::ZcNotif>, zc_copied: &mut u64, cx: &mut Context<'_>) -> bool {
+    let mut i = 0;
+    while i < notifs.len() {
+        match Pin::new(&mut notifs[i]).poll(cx) {
+            Poll::Ready(copied) => {
+                notifs.swap_remove(i);
+                if copied {
+                    *zc_copied += 1;
+                }
+            }
+            Poll::Pending => i += 1,
+        }
+    }
+    notifs.is_empty()
 }
 
 /// Send loop: drain ALL pending completions/R2Ts into one iovec
@@ -1110,90 +1228,89 @@ async fn send_batches(
         };
         let idx = state.acquire(queue).await;
         let batch = &mut state.batches[idx];
-        let mut work = Some(first);
-        while let Some(item) = work {
-            if !batch.fits() {
-                carry = Some(item); // flush first, stage next round
-                break;
-            }
-            stage_and_account(queue, batch, &item, hdr_digest, data_digest);
-            work = queue.try_next_send_work();
-        }
+        carry = stage_batch(queue, batch, first, hdr_digest, data_digest);
+        ship_batch(fd, batch, send_zc, &mut state.zc_fallbacks).await?;
+        state.retire(queue, idx);
+    }
+}
 
-        let mut use_zc = send_zc;
-        // Ship; on short send advance the iovecs and re-issue so
-        // nothing else can interleave on the wire (ordering). The
-        // re-issue stays ZC: the batch's pages are pinned regardless.
-        loop {
-            if use_zc {
-                // SAFETY: msghdr, iovecs, arena, and referenced slot
-                // buffers stay allocated until this batch's notifs
-                // are reaped (reap_oldest/drain precede reset, and
-                // run_queue joins this task — or leaks the queue —
-                // before freeing anything). The kernel snapshots the
-                // iovec array at issue, so advance() after the send
-                // CQE never races it.
-                let mut op = unsafe { ops::sendmsg_zc_raw(fd, batch.msghdr()) }?;
-                let res = op.sent().await;
-                // Stash the notif BEFORE examining the result: a
-                // failed ZC send can still have pinned pages
-                // (F_MORE), and only the stashed handle makes the
-                // teardown drain wait for them.
-                batch.pending_notifs.push(op.into_notif());
-                let n = match res {
-                    Ok(n) => n as usize,
-                    // ZC pins pages against the per-user
-                    // RLIMIT_MEMLOCK (ENOMEM past it; ENOBUFS for
-                    // the optmem variant); two full batches alone
-                    // can exceed the default 8 MiB, and the budget
-                    // is shared across connections. An expected
-                    // operational condition, not a connection
-                    // error: ship the rest of this batch by copy.
-                    Err(err)
-                        if matches!(err.raw_os_error(), Some(libc::ENOMEM | libc::ENOBUFS)) =>
-                    {
-                        state.zc_fallbacks += 1;
-                        use_zc = false;
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
-                if n == 0 {
-                    return Err(std::io::ErrorKind::WriteZero.into());
-                }
-                if batch.advance(n) {
-                    break;
-                }
-            } else {
-                // SAFETY: the msghdr, iovec array, arena, and
-                // referenced slot buffers all outlive the await — the
-                // batch is owned by this task, slots release only
-                // after the batch completes, and run_queue joins this
-                // task (or leaks the queue) before freeing anything.
-                let op = unsafe { ops::sendmsg_raw(fd, batch.msghdr()) }?;
-                let n = op.await? as usize;
-                if n == 0 {
-                    return Err(std::io::ErrorKind::WriteZero.into());
-                }
-                if batch.advance(n) {
-                    break;
-                }
-            }
+/// Stage `first` and every immediately-available work item into the
+/// batch, stopping at its headroom. Returns the item that didn't fit
+/// (it is staged first next round).
+fn stage_batch(
+    queue: &Rc<QueueCore>,
+    batch: &mut SendBatch,
+    first: SendWork,
+    hdr_digest: bool,
+    data_digest: bool,
+) -> Option<SendWork> {
+    let mut work = Some(first);
+    while let Some(item) = work {
+        if !batch.fits() {
+            return Some(item); // flush first, stage next round
         }
-        for tag in batch.tags_at_cqe.drain(..) {
-            queue.release_tag(tag);
-        }
-        // Notif-gate the batch iff it actually holds notifications
-        // (a batch whose every ZC attempt fell back has none and is
-        // immediately reusable, like the plain path).
-        if batch.pending_notifs.is_empty() {
-            for tag in batch.tags_at_notif.drain(..) {
-                queue.release_tag(tag);
+        stage_and_account(queue, batch, &item, hdr_digest, data_digest);
+        work = queue.try_next_send_work();
+    }
+    None
+}
+
+/// Ship one staged batch; on short send advance the iovecs and
+/// re-issue so nothing else can interleave on the wire (ordering).
+/// The re-issue stays ZC: the batch's pages are pinned regardless.
+async fn ship_batch(
+    fd: i32,
+    batch: &mut SendBatch,
+    send_zc: bool,
+    zc_fallbacks: &mut u64,
+) -> std::io::Result<()> {
+    let mut use_zc = send_zc;
+    loop {
+        let n = if use_zc {
+            // SAFETY: msghdr, iovecs, arena, and referenced slot
+            // buffers stay allocated until this batch's notifs
+            // are reaped (reap_oldest/drain precede reset, and
+            // run_queue joins this task — or leaks the queue —
+            // before freeing anything). The kernel snapshots the
+            // iovec array at issue, so advance() after the send
+            // CQE never races it.
+            let mut op = unsafe { ops::sendmsg_zc_raw(fd, batch.msghdr()) }?;
+            let res = op.sent().await;
+            // Stash the notif BEFORE examining the result: a
+            // failed ZC send can still have pinned pages
+            // (F_MORE), and only the stashed handle makes the
+            // teardown drain wait for them.
+            batch.pending_notifs.push(op.into_notif());
+            match res {
+                Ok(n) => n as usize,
+                // ZC pins pages against the per-user
+                // RLIMIT_MEMLOCK (ENOMEM past it; ENOBUFS for
+                // the optmem variant); two full batches alone
+                // can exceed the default 8 MiB, and the budget
+                // is shared across connections. An expected
+                // operational condition, not a connection
+                // error: ship the rest of this batch by copy.
+                Err(err) if matches!(err.raw_os_error(), Some(libc::ENOMEM | libc::ENOBUFS)) => {
+                    *zc_fallbacks += 1;
+                    use_zc = false;
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
-            batch.reset();
         } else {
-            state.zc_batches += 1;
-            state.inflight.push_back(idx);
+            // SAFETY: the msghdr, iovec array, arena, and
+            // referenced slot buffers all outlive the await — the
+            // batch is owned by this task, slots release only
+            // after the batch completes, and run_queue joins this
+            // task (or leaks the queue) before freeing anything.
+            let op = unsafe { ops::sendmsg_raw(fd, batch.msghdr()) }?;
+            op.await? as usize
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        if batch.advance(n) {
+            return Ok(());
         }
     }
 }
