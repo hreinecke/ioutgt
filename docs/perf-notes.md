@@ -105,13 +105,62 @@ workload, the validated fix is threshold-inlining — staging as the
 old staging footprint; a one-entry batch could additionally drop to
 plain SEND (`ITER_UBUF`).
 
+## Direct-to-slot payload recv (2026-06-11)
+
+Design: `docs/superpowers/specs/2026-06-11-direct-slot-recv-design.md`.
+Large H2C payload tails (`remaining >= H2C_DIRECT_MIN` = 16 KiB at
+buffer-drain time) recv straight into the slot at the reassembly
+offset via one `MSG_WAITALL` raw op; in-capsule payloads and buffered
+prefixes keep the fused copy+CRC path. Removes the recv-buffer → slot
+memcpy for the bytes that dominate large writes, plus the buffer
+refill wakeups for the tail.
+
+Rig: null backend, 4 IO threads (pin default-on), loopback, digests
+off, loadgen `--rw randwrite --bs 131072`, 10 s runs, 3 reps, medians;
+ON = commit 316288a (threshold 16 KiB), OFF = same commit with
+`H2C_DIRECT_MIN = u32::MAX`. CPU from `perf stat -p <target>` over the
+middle 8 s window (target process only — loadgen's R2T answering grew
+its own cost). Load avg ~2 during runs (background dev box, not a
+clean bench).
+
+| config | 128K ×1 qd32 IOPS | c/IOP¹ | 128K ×4 qd32 IOPS (BW) | c/IOP¹ | insns/IOP |
+|---|---|---|---|---|---|
+| copy (off) | 25.7K | 86.6K | 56.9K (6.9 GiB/s) | 109.8K | ~178K |
+| direct (on) | **29.5K (+15%)** | **47.8K (−45%)** | **73.4K (+29%, 9.0 GiB/s)** | **61.4K (−44%)** | **~92K (−48%)** |
+
+¹ target cycles per IOP (perf `cycles` ÷ ops in window).
+
+4K guards flat (single runs): randread 255K/3.3Kc (on) vs 262K/3.4Kc
+(off); randwrite (in-capsule, path untouched) 249K/6.1Kc vs 237K/6.3Kc
+— within noise. p50 at 128K ×1 fell ~1110 µs → ~590 µs.
+
+Correctness gates on this branch: workspace + ASAN green, the
+9-test io_direct_recv matrix ×stability runs, and the VM interop
+fio --verify matrix on the FILE backend
+(`IOUTGT_BACKEND=file testing/run_interop.sh ioutgt_fio` →
+`PASS fio-verify`, which includes 128 KiB R2T writes through the
+real kernel host driver — i.e. the direct path end to end).
+
+Instructions/IOP halving says the win is more than the memcpy: the
+copy path also re-arms the 64 KiB buffer recv 2–3× per 128 KiB
+payload (each a wakeup + state-machine pass), where the direct path
+parks once on the WAITALL tail. Verdict: **keep, threshold 16 KiB**
+(8–64 KiB sweep not needed at this margin). Note the strategy
+tension recorded in the design: this is irreconcilable with multishot
+recv + provided buffers (next-steps item below) on the same
+connection — landing that item means a per-connection strategy
+choice.
+
 ## Next steps (in measured-isolation order)
 
 1. Optional: threshold-inline small payloads (validated by the
    prototype above) if a real workload surfaces the 4K kernel-side
    cost.
 2. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
-   fallback): saves the recv re-arm SQE and the recv-buffer round trip.
+   fallback): saves the recv re-arm SQE and the recv-buffer round trip
+   for the small-IO path; for large H2C tails the direct-to-slot path
+   above already removes both, so this targets headers + in-capsule
+   traffic (and needs the per-connection strategy seam).
 3. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
    file backend: removes per-op page pinning; measure CPU/IOP on
    O_DIRECT ext4.

@@ -331,6 +331,27 @@ pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
     Ok(RawOp { op })
 }
 
+/// Receive into caller-managed memory, requesting `MSG_WAITALL`: the
+/// kernel holds the op until `len` bytes arrive (best-effort — may still
+/// return short on EOF/error; callers must loop on progress).
+///
+/// # Safety
+///
+/// Same contract as [`recv_raw`]: `ptr..ptr+len` must remain valid and
+/// unaliased for writes until this op's terminal CQE has been reaped.
+pub unsafe fn recv_raw_waitall(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
+    let op = Op::submit(
+        |key| {
+            opcode::Recv::new(types::Fd(fd), ptr, len)
+                .flags(libc::MSG_WAITALL)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+    )?;
+    Ok(RawOp { op })
+}
+
 /// Send from caller-managed memory.
 ///
 /// # Safety

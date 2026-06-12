@@ -112,7 +112,8 @@ cargo run --release --example loadgen -- \
 Raw NVMe/TCP client on the project's own codec: pipelines `--qd`
 commands per connection (`--conns` connections, one IO queue each)
 and reports IOPS plus p50/p99/p999 latency. `--rw randwrite` uses
-in-capsule writes (≤ 16 KiB block sizes). Intended for loopback A/B
+in-capsule writes for blocks ≤ 16 KiB and R2T-solicited H2CData for
+larger blocks (e.g. `--bs 131072`). Intended for loopback A/B
 work on the target itself — see `docs/perf-notes.md` for why fio
 through the test VM is not a useful target benchmark.
 

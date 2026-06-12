@@ -64,34 +64,41 @@ time. MAXH2CDATA 16 MiB, inline data 16 KiB, CRC32C digests optional.
 **ioutgt.** Identical wire-state machines (deliberately), but driven
 by io_uring completions on a pinned thread. Receive: one in-flight
 recv into a 64 KiB connection buffer feeding the sans-io header
-decoder; payloads are copied straight into slot buffers with
-incremental CRC32C. Send: the loop drains *all* pending
-completions/R2Ts into one staging buffer and ships a single send op —
-ordering on the socket is preserved by construction, and the queue
-thread parks once per batch instead of once per response (the M9
-finding: the naive one-op-per-response loop cost a full
-park/`io_uring_enter` cycle per IO and capped a connection at ~85K
-4K IOPS; batching took it to 202K single-connection, 506K at four).
+decoder; in-capsule payloads and buffered prefixes copy into slot
+buffers with incremental CRC32C, while large H2C payload tails land
+**directly in the slot** via a `MSG_WAITALL` raw recv — matching
+nvmet's no-second-copy property (`kernel_recvmsg` into the command's
+SG list after the header) for the bytes that dominate large writes.
+Send: the loop drains *all* pending completions/R2Ts into one gather
+batch (headers/digests in a small arena, payload iovecs pointing into
+slot buffers) and ships a single sendmsg op — ordering on the socket
+is preserved by construction, and the queue thread parks once per
+batch instead of once per response (the M9 finding: the naive
+one-op-per-response loop cost a full park/`io_uring_enter` cycle per
+IO and capped a connection at ~85K 4K IOPS; batching took it to 202K
+single-connection, 506K at four).
 
 **Differences.** nvmet's budget loop and ioutgt's batch drain solve
 the same problem (amortize wakeups, bound latency injection) from
 opposite directions: nvmet caps how much it does per wakeup, ioutgt
-caps how often it sleeps. nvmet can `sendpage` slot pages zero-copy;
-ioutgt phase 1 memcpys payloads into staging (one copy, amortized
-into the batch encoder; SEND_ZC with notification-gated reuse is the
-roadmap item that removes it).
+caps how often it sleeps. Payload copies now match nvmet on both
+directions' hot paths: reads go by reference via the gather iovecs
+(nvmet: `sendpage`), large write tails land direct (nvmet:
+`recvmsg` into SG); ioutgt still copies in-capsule writes and
+buffered prefixes (nvmet copies neither, at the price of
+per-command bounded recvs — ioutgt's 64 KiB batched recv buys
+cross-command batching for small IO instead).
 
 **Benefits.** Submission batching is automatic (SQEs accumulate while
 tasks run; one `io_uring_enter` flushes the lot — measured 0.065
 syscalls/op on the echo fixture). No softirq sharing: the thread's
 cycles are entirely its own.
 
-**Risks.** The staging copy costs memory bandwidth at 128K sizes
-(measured: still +8% over the allocating variant, but nvmet's
-sendpage path avoids it entirely). DDGST failure currently terminates
-the connection, where nvmet fails only the affected command with
-`NVME_SC_DATA_XFER_ERROR` and keeps the connection — stricter than
-needed, noted for the hardening backlog.
+**Risks.** DDGST failure fails the affected command with
+`NVME_SC_DATA_XFER_ERROR` and keeps the connection, matching nvmet.
+The remaining copy asymmetry vs nvmet is the small-write/prefix copy
+noted above — accepted deliberately for the batching win
+(`docs/perf-notes.md` has the A/B numbers).
 
 ## 3. Fabrics connect and controller model
 
@@ -236,9 +243,10 @@ registry removal, with the reactor reclaiming orphaned ops on their
 terminal CQEs. The whole workspace runs clean under AddressSanitizer.
 
 **Risks.** Termination is used in a few places where nvmet degrades
-more gracefully (DDGST mismatch, queue-depth overrun); a hostile or
-buggy host gets disconnected rather than per-command errors. Defensible
-for a v1, but the gentler responses are catalogued in the roadmap.
+more gracefully (queue-depth overrun; DDGST mismatch is already
+per-command, §2); a hostile or buggy host gets disconnected rather
+than per-command errors. Defensible for a v1, but the gentler
+responses are catalogued in the roadmap.
 
 ---
 

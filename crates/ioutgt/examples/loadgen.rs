@@ -7,13 +7,18 @@
 //! through the sans-io codec, pipelines a fixed queue depth per
 //! connection, and reports IOPS plus latency percentiles.
 //!
+//! `--rw randwrite` covers both write paths: blocks ≤ 16 KiB go
+//! in-capsule; larger blocks use a transport SGL and answer the
+//! target's R2T with a single H2CData PDU (the target solicits the
+//! whole transfer at once — MAXH2CDATA is 16 MiB, far above MDTS).
+//!
 //!   cargo run --release --example loadgen -- \
 //!       --addr 127.0.0.1:4420 --conns 4 --qd 32 --bs 4096 --secs 10 --rw randread
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use ioutgt_nvme::fabrics::{ConnectCommand, ConnectData, fctype};
@@ -124,6 +129,25 @@ fn nvme_connect(stream: &mut TcpStream, qid: u16, sqsize: u16, cntlid: u16) -> u
     u16::try_from(cqe.result.get() & 0xFFFF).unwrap()
 }
 
+/// Everything the RX thread hands back to the TX thread. One mpsc
+/// channel (instead of two channels or the old Mutex+Condvar free
+/// list) keeps the TX loop a single blocking point — `recv_timeout`
+/// when idle, `try_recv` drain otherwise — with no busy-wait and no
+/// second wakeup primitive. The socket keeps a single writer: R2Ts
+/// are decoded on the RX thread but the H2CData answer is written
+/// here, so it can never interleave with a capsule mid-PDU.
+enum RxEvent {
+    /// A CapsuleResp freed this CID slot.
+    FreeCid(u16),
+    /// The target solicited write data; answer with one H2CData.
+    R2t {
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        length: u32,
+    },
+}
+
 struct XorShift(u64);
 
 impl XorShift {
@@ -164,14 +188,12 @@ fn worker(
     let starts: Arc<Vec<AtomicU64>> = Arc::new((0..qd).map(|_| AtomicU64::new(0)).collect());
     let epoch = Instant::now();
 
-    // RX side: drain responses, record latency, signal slot free.
-    let free = Arc::new(std::sync::Mutex::new((0..qd as u16).collect::<Vec<u16>>()));
-    let condvar = Arc::new(std::sync::Condvar::new());
+    // RX side: drain responses, record latency, forward events to TX.
+    let (event_tx, event_rx) = mpsc::channel::<RxEvent>();
     let latencies = Arc::new(std::sync::Mutex::new(Vec::<u64>::with_capacity(1 << 20)));
 
     let rx_thread = {
-        let free = Arc::clone(&free);
-        let condvar = Arc::clone(&condvar);
+        let event_tx = event_tx;
         let starts = Arc::clone(&starts);
         let latencies = Arc::clone(&latencies);
         let total_ops = Arc::clone(&total_ops);
@@ -203,41 +225,121 @@ fn worker(
                     }
                     let decoded = decoder.take().expect("take");
                     skip = decoded.data_len as usize + if decoded.ddgst { 4 } else { 0 };
-                    if let PduKind::CapsuleResp(cqe) = decoded.kind {
-                        assert_eq!(cqe.status.get() >> 1, 0, "IO failed");
-                        let cid = cqe.cid.get();
-                        let started = starts[usize::from(cid)].load(Ordering::Relaxed);
-                        let now = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        latencies.lock().unwrap().push(now - started);
-                        total_ops.fetch_add(1, Ordering::Relaxed);
-                        free.lock().unwrap().push(cid);
-                        condvar.notify_one();
+                    match decoded.kind {
+                        PduKind::CapsuleResp(cqe) => {
+                            assert_eq!(cqe.status.get() >> 1, 0, "IO failed");
+                            let cid = cqe.cid.get();
+                            let started = starts[usize::from(cid)].load(Ordering::Relaxed);
+                            let now = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            latencies.lock().unwrap().push(now - started);
+                            total_ops.fetch_add(1, Ordering::Relaxed);
+                            if event_tx.send(RxEvent::FreeCid(cid)).is_err() {
+                                return;
+                            }
+                        }
+                        PduKind::R2T {
+                            cid,
+                            ttag,
+                            offset,
+                            length,
+                        } => {
+                            // The TX thread owns the socket writes;
+                            // forward the solicitation.
+                            if event_tx
+                                .send(RxEvent::R2t {
+                                    cid,
+                                    ttag,
+                                    offset,
+                                    length,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         })
     };
 
-    // TX side: keep QD outstanding.
-    while !stop.load(Ordering::Relaxed) {
-        let cid = {
-            let mut guard = free.lock().unwrap();
-            while guard.is_empty() {
-                let (g, timeout) = condvar
-                    .wait_timeout(guard, Duration::from_millis(100))
-                    .unwrap();
-                guard = g;
-                if timeout.timed_out() && stop.load(Ordering::Relaxed) {
-                    drop(guard);
-                    // try_clone'd fds keep the socket open: shut it down
-                    // so the blocked RX recv returns.
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    rx_thread.join().ok();
-                    return Arc::try_unwrap(latencies).unwrap().into_inner().unwrap();
+    // Answer one R2T: header + payload slice, LAST set, digests off
+    // (the icreq negotiated hdgst/ddgst false/false). The target
+    // solicits the whole transfer with a single R2T, so one H2CData
+    // per command suffices at MDTS sizes.
+    fn answer_r2t(
+        stream: &mut TcpStream,
+        payload: &[u8],
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        length: u32,
+    ) -> bool {
+        let end = offset as usize + length as usize;
+        assert!(end <= payload.len(), "R2T solicits beyond command length");
+        // LAST only when this H2CData completes the transfer — fails loud
+        // (target's missing-bytes check) if the solicitation strategy
+        // ever moves to partial R2Ts.
+        let last = end == payload.len();
+        let mut hdr = [0u8; 32];
+        let n = pdu::encode_h2c_data(&mut hdr, cid, ttag, offset, length, last, false, false);
+        let mut frame = Vec::with_capacity(n + length as usize);
+        frame.extend_from_slice(&hdr[..n]);
+        frame.extend_from_slice(&payload[offset as usize..end]);
+        stream.write_all(&frame).is_ok()
+    }
+
+    // TX side: keep QD outstanding; also the single socket writer for
+    // H2CData answers to R2Ts forwarded by the RX thread.
+    //
+    // Payload state: loadgen writes one constant 0xA5 pattern, so the
+    // shared `payload` buffer serves every in-flight write — no
+    // per-CID payload bookkeeping is needed to answer an R2T (the
+    // bytes for any CID are identical by construction).
+    let mut free: Vec<u16> = (0..qd as u16).collect();
+    'tx: while !stop.load(Ordering::Relaxed) {
+        // Drain pending events first: an R2T must be answered promptly
+        // even when free CIDs are already in hand (the command it
+        // belongs to cannot complete until its data is sent).
+        loop {
+            match event_rx.try_recv() {
+                Ok(RxEvent::FreeCid(cid)) => free.push(cid),
+                Ok(RxEvent::R2t {
+                    cid,
+                    ttag,
+                    offset,
+                    length,
+                }) => {
+                    if !answer_r2t(&mut stream, &payload, cid, ttag, offset, length) {
+                        break 'tx;
+                    }
                 }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break 'tx,
             }
-            guard.pop().unwrap()
-        };
+        }
+        if free.is_empty() {
+            // Queue full: block on the channel (the sole wakeup
+            // source) with a timeout so `stop` is still observed.
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(RxEvent::FreeCid(cid)) => free.push(cid),
+                Ok(RxEvent::R2t {
+                    cid,
+                    ttag,
+                    offset,
+                    length,
+                }) => {
+                    if !answer_r2t(&mut stream, &payload, cid, ttag, offset, length) {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
+        let cid = free.pop().unwrap();
         let max_slba = device_blocks - blocks_per_io;
         let slba = rng.next() % (max_slba + 1);
         let opcode = if write {
@@ -274,13 +376,9 @@ fn worker(
         if stream.write_all(&frame).is_err() {
             break;
         }
-        // Large writes: target sends R2T; the RX thread would have to
-        // hand it back. Keep the loadgen to reads + inline writes.
-        assert!(
-            inline > 0 || !write,
-            "loadgen supports reads and inline writes only"
-        );
     }
+    // try_clone'd fds keep the socket open: shut it down so the
+    // blocked RX recv returns.
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = rx_thread.join();
     Arc::try_unwrap(latencies).unwrap().into_inner().unwrap()

@@ -238,14 +238,22 @@ teardown joins the send task before the queue is freed.
 
 **Data copies.** The slot buffer (preallocated per tag: 8 KiB admin,
 128 KiB = MDTS io) is the single rendezvous for payload bytes; the
-transport costs one userspace memcpy on the write side and none on
-the read side:
+transport costs one userspace memcpy on the write side (small
+payloads and prefixes only) and none on the read side:
 
-- **Host write (H2C)**: kernel → recv buffer (`ops::recv`); recv
-  loop memcpys recv buffer → slot buffer (`RecvPhase::Data`); the
-  backend then gets `&slot.data()[..len]` borrowed directly — the
-  file backend issues `write_at` on that pointer, zero further
-  copies.
+- **Host write (H2C)**: in-capsule payloads and buffered prefixes go
+  kernel → recv buffer (`ops::recv`), then memcpy to the slot with
+  fused CRC (`RecvPhase::Data`); a large not-yet-arrived tail
+  (`remaining >= H2C_DIRECT_MIN` = 16 KiB at buffer drain) instead
+  lands **directly in the slot** via one `MSG_WAITALL` raw recv at
+  the reassembly offset — safe because the tail is by definition the
+  next bytes on the TCP stream, so the buffer recv is simply not
+  re-armed until it completes (never two outstanding recvs; DDGST
+  for a direct tail is a separate warm read pass over the slot).
+  The backend then gets `&slot.data()[..len]` borrowed directly —
+  the file backend issues `write_at` on that pointer, zero further
+  copies. Measured: −44% target cycles/IOP on 128 KiB writes
+  (`docs/perf-notes.md`).
 - **Host read (C2H)**: the file backend `read_at`s straight into the
   slot buffer; send loop references the payload **in place** via the
   gather iovec (`stage_send_work`), one `ops::sendmsg_raw` → kernel.
@@ -383,8 +391,12 @@ The transport boundary is a pair of abstractions so phase-2 optimizations
 and future transports slot in without touching protocol logic:
 
 - `RecvSource` — yields borrowed byte chunks to the codec. Phase 1: plain
-  single-shot `RECV` into a per-connection recv buffer. Phase 2: multishot
-  recv with a provided-buffer ring. (RECV_ZC requires NIC header-data
+  single-shot `RECV` into a per-connection recv buffer, with a
+  payload bypass as built: large H2C tails skip the buffer and land
+  in the slot via `MSG_WAITALL` raw recv (§4.2). Phase 2: multishot
+  recv with a provided-buffer ring — irreconcilable with the bypass
+  on one connection (the kernel picks the buffer), so it becomes a
+  per-connection strategy choice. (RECV_ZC requires NIC header-data
   split; deferred to real-NIC benchmarking.)
 - Send side — queue tasks emit `SendWork` onto the ordered send list;
   the per-connection sender ships vectored `SENDMSG` gather batches
