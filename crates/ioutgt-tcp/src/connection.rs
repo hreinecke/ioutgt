@@ -228,7 +228,9 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     queue.submit(tag, conn.connect_sqe);
 
     // Receive path (this task).
-    if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest).await {
+    if let Err(err) =
+        recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest, conn.send_zc).await
+    {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 
@@ -374,6 +376,7 @@ async fn recv_loop(
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
+    send_zc: bool,
 ) -> std::io::Result<()> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
@@ -411,7 +414,7 @@ async fn recv_loop(
                             return Ok(());
                         }
                     };
-                    match handle_pdu(queue, decoded, data_digest) {
+                    match handle_pdu(queue, decoded, data_digest, send_zc).await {
                         Ok(Some(next)) => phase = next,
                         Ok(None) => {}
                         Err(HandleError::Term(err)) => {
@@ -589,20 +592,34 @@ enum HandleError {
 }
 
 /// Route one decoded PDU header. Returns the next recv phase if payload
-/// follows on the stream.
-fn handle_pdu(
+/// follows on the stream. Async only for the ZC-mode tag wait; every
+/// other path resolves immediately.
+async fn handle_pdu(
     queue: &Rc<QueueCore>,
     decoded: pdu::DecodedPdu,
     data_digest: bool,
+    send_zc: bool,
 ) -> Result<Option<RecvPhase>, HandleError> {
     match decoded.kind {
         PduKind::CapsuleCmd(sqe) => {
-            let Some(tag) = queue.claim_tag() else {
-                // Host exceeded the negotiated queue depth.
-                return Err(HandleError::Term(PduError {
-                    fes: pdu::fes::PDU_SEQ_ERR,
-                    fei: 0,
-                }));
+            // ZC mode: payload tags release on the send notification
+            // (≈ the peer's ACK), racing the host's next command — an
+            // empty freelist is an expected transient; park (TCP
+            // backpressure) instead of terminating. Non-ZC keeps the
+            // strict depth-violation term.
+            let tag = if send_zc {
+                queue.await_tag().await
+            } else {
+                match queue.claim_tag() {
+                    Some(tag) => tag,
+                    None => {
+                        // Host exceeded the negotiated queue depth.
+                        return Err(HandleError::Term(PduError {
+                            fes: pdu::fes::PDU_SEQ_ERR,
+                            fei: 0,
+                        }));
+                    }
+                }
             };
             let slot = queue.slot(tag);
             if decoded.data_len > 0 {
