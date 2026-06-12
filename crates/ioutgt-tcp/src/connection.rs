@@ -323,6 +323,13 @@ fn finish_payload(queue: &Rc<QueueCore>, tag: u16, kind: PayloadKind) -> Result<
     }
 }
 
+/// H2C payload tails at least this large — bytes not yet arrived when
+/// the connection buffer drains mid-payload — are received straight
+/// into the slot buffer, skipping the recv-buffer→slot copy. Below it
+/// the op-issue cost outweighs the copy. `u32::MAX` disables the path
+/// entirely (A/B measurement).
+const H2C_DIRECT_MIN: u32 = 16 * 1024;
+
 /// True when this command moves data host→controller (opcode bits 1:0
 /// = 01b) and the host kept it resident (transport SGL): solicit it.
 fn needs_r2t(sqe: &Sqe) -> bool {
@@ -471,6 +478,76 @@ async fn recv_loop(
                         phase = RecvPhase::Header;
                     }
                 }
+            }
+        }
+
+        // Buffer exhausted mid-payload with a large H2C tail still to
+        // come: pull it straight into the slot at the reassembly
+        // offset, skipping the buffer→slot copy. The tail is by
+        // definition the next bytes on the TCP stream, so the buffer
+        // recv is NOT re-armed until the tail lands — this serializes
+        // nothing that could have proceeded, and there is never more
+        // than one outstanding recv on the socket. MSG_WAITALL is
+        // best-effort: short-but-nonzero returns resume IN PLACE at
+        // the advanced slot offset (never staged elsewhere, never
+        // restarted); 0 is an orderly close mid-payload, as today.
+        if let &RecvPhase::Data {
+            tag,
+            base,
+            remaining,
+            crc,
+            ddgst,
+            kind: kind @ PayloadKind::H2c { length, .. },
+        } = &phase
+            && remaining >= H2C_DIRECT_MIN
+        {
+            let mut crc = crc;
+            let mut remaining = remaining;
+            let mut dest = (base + (length - remaining)) as usize;
+            let tail_start = dest;
+            while remaining > 0 {
+                let ptr = {
+                    // Scoped: the RefCell borrow must end before the
+                    // await below.
+                    let mut data = queue.slot(tag).data();
+                    data[dest..dest + remaining as usize].as_mut_ptr()
+                };
+                // SAFETY: ptr..ptr+remaining is slot-buffer memory
+                // (bounds-checked by the slicing above) owned by
+                // QueueCore, to which this function holds an Rc, and
+                // the op is awaited inline — recv_loop cannot return
+                // while it is in flight, so the memory outlives the
+                // terminal CQE. Nothing else touches this slot's data
+                // while its state is Receiving.
+                let n = unsafe { ops::recv_raw_waitall(fd, ptr, remaining) }?.await?;
+                if n == 0 {
+                    return Ok(()); // orderly close mid-payload
+                }
+                dest += n as usize;
+                remaining -= n; // recv returns at most `remaining`
+            }
+            if ddgst {
+                {
+                    // Re-borrowed after the await: warm pass over the
+                    // tail the kernel just wrote.
+                    let data = queue.slot(tag).data();
+                    crc.update(&data[tail_start..dest]);
+                }
+                phase = RecvPhase::Ddgst {
+                    tag,
+                    expected: crc.finalize(),
+                    have: [0; 4],
+                    have_len: 0,
+                    kind,
+                };
+                // Next ops::recv starts at the 4-byte digest.
+            } else {
+                if let Err(err) = finish_payload(queue, tag, kind) {
+                    send_term(fd, err).await;
+                    return Ok(());
+                }
+                phase = RecvPhase::Header;
+                // Next ops::recv starts at the next PDU header.
             }
         }
     }
