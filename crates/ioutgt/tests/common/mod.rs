@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use ioutgt_nvme::fabrics::{ConnectCommand, ConnectData, fctype};
 use ioutgt_nvme::pdu::{self, DecodedPdu, PduDecoder, PduKind};
@@ -21,6 +22,9 @@ pub struct Client {
 impl Client {
     pub fn handshake(addr: std::net::SocketAddr, hdgst: bool, ddgst: bool) -> Client {
         let mut stream = TcpStream::connect(addr).unwrap();
+        // Segmentation-sensitive tests rely on each write hitting the
+        // wire immediately (the target side sets nodelay already).
+        stream.set_nodelay(true).unwrap();
         let mut buf = [0u8; 128];
         let n = pdu::encode_icreq(&mut buf, hdgst, ddgst, 4);
         stream.write_all(&buf[..n]).unwrap();
@@ -78,6 +82,140 @@ impl Client {
                 .write_all(&digest::crc32c(data).to_le_bytes())
                 .unwrap();
         }
+    }
+
+    /// Send an H2CData PDU with controlled wire segmentation: the
+    /// header is written (and pushed — nodelay) alone, then the payload
+    /// in `chunks`-sized pieces (any remainder as one final chunk),
+    /// sleeping `inter_chunk_delay` before each payload write so the
+    /// target observes the segmentation. The DDGST trailer (when the
+    /// connection negotiated data digests) follows the last chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_h2c_data_fragmented(
+        &mut self,
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        data: &[u8],
+        last: bool,
+        chunks: &[usize],
+        inter_chunk_delay: Duration,
+    ) {
+        self.send_h2c_data_chunked(
+            cid,
+            ttag,
+            offset,
+            data,
+            last,
+            chunks,
+            inter_chunk_delay,
+            false,
+        );
+    }
+
+    /// [`Client::send_h2c_data_fragmented`] with the DDGST trailer
+    /// bit-flipped (digest connections only): the payload bytes are
+    /// intact, the digest is wrong.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_h2c_data_fragmented_bad_ddgst(
+        &mut self,
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        data: &[u8],
+        last: bool,
+        chunks: &[usize],
+        inter_chunk_delay: Duration,
+    ) {
+        assert!(self.ddgst, "corrupting a DDGST needs a ddgst connection");
+        self.send_h2c_data_chunked(
+            cid,
+            ttag,
+            offset,
+            data,
+            last,
+            chunks,
+            inter_chunk_delay,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_h2c_data_chunked(
+        &mut self,
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        data: &[u8],
+        last: bool,
+        chunks: &[usize],
+        inter_chunk_delay: Duration,
+        corrupt_ddgst: bool,
+    ) {
+        let mut hdr = [0u8; 32];
+        let n = pdu::encode_h2c_data(
+            &mut hdr,
+            cid,
+            ttag,
+            offset,
+            u32::try_from(data.len()).unwrap(),
+            last,
+            self.hdgst,
+            self.ddgst,
+        );
+        self.stream.write_all(&hdr[..n]).unwrap();
+        let mut sent = 0;
+        for &chunk in chunks {
+            if sent >= data.len() {
+                break;
+            }
+            std::thread::sleep(inter_chunk_delay);
+            let end = (sent + chunk).min(data.len());
+            self.stream.write_all(&data[sent..end]).unwrap();
+            sent = end;
+        }
+        if sent < data.len() {
+            std::thread::sleep(inter_chunk_delay);
+            self.stream.write_all(&data[sent..]).unwrap();
+        }
+        if self.ddgst {
+            let mut crc = digest::crc32c(data);
+            if corrupt_ddgst {
+                crc ^= 0xFFFF_FFFF;
+            }
+            self.stream.write_all(&crc.to_le_bytes()).unwrap();
+        }
+    }
+
+    /// Send an H2CData PDU as one buffer in a single write (header +
+    /// payload + digest), so the whole payload arrives in the target's
+    /// connection buffer together with the header.
+    pub fn send_h2c_data_one_write(
+        &mut self,
+        cid: u16,
+        ttag: u16,
+        offset: u32,
+        data: &[u8],
+        last: bool,
+    ) {
+        let mut frame = Vec::with_capacity(32 + data.len() + 4);
+        let mut hdr = [0u8; 32];
+        let n = pdu::encode_h2c_data(
+            &mut hdr,
+            cid,
+            ttag,
+            offset,
+            u32::try_from(data.len()).unwrap(),
+            last,
+            self.hdgst,
+            self.ddgst,
+        );
+        frame.extend_from_slice(&hdr[..n]);
+        frame.extend_from_slice(data);
+        if self.ddgst {
+            frame.extend_from_slice(&digest::crc32c(data).to_le_bytes());
+        }
+        self.stream.write_all(&frame).unwrap();
     }
 
     /// Read one PDU (header + payload), verifying digests.
