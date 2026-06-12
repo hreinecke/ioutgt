@@ -81,6 +81,15 @@ enum Command {
         #[arg(long, default_value_os_t = default_control_socket())]
         socket: std::path::PathBuf,
     },
+    /// Per-thread ring and per-queue IO counters from a running target.
+    Stat {
+        /// Control socket path.
+        #[arg(long, default_value_os_t = default_control_socket())]
+        socket: std::path::PathBuf,
+        /// Repeat every N seconds, printing per-interval rates.
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: Option<u64>,
+    },
 }
 
 /// Send one request line over the control socket; return the raw
@@ -122,6 +131,201 @@ fn list_target(socket: &std::path::Path) -> std::io::Result<()> {
     }
     print!("{}", render_ctrl_list(&response["data"]));
     Ok(())
+}
+
+/// `ioutgt stat`: one snapshot, or `-i N` for iostat-style rates
+/// (client-side deltas of the monotonic counters — the target never
+/// computes rates).
+fn stat_target(socket: &std::path::Path, interval: Option<u64>) -> std::io::Result<()> {
+    let fetch = || -> std::io::Result<serde_json::Value> {
+        let raw = ctl_request(socket, r#"{"op":"GET_STATS"}"#)?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(std::io::Error::other(raw));
+        }
+        Ok(v["data"].clone())
+    };
+    let mut prev = fetch()?;
+    print!("{}", render_stat(&prev, None));
+    let Some(secs) = interval else { return Ok(()) };
+    // Divide by measured elapsed, not the nominal interval: the fetch
+    // itself can take a while (up to 500 ms per unresponsive thread).
+    let mut prev_at = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let next = fetch()?;
+        let now = std::time::Instant::now();
+        println!();
+        print!(
+            "{}",
+            render_stat(&next, Some((&prev, (now - prev_at).as_secs_f64())))
+        );
+        prev = next;
+        prev_at = now;
+    }
+}
+
+/// Counter keys in the order the `read … write … flush other err` rows
+/// print them (bytes follow their cmd counter).
+const STAT_KEYS: [&str; 7] = [
+    "read_cmds",
+    "read_bytes",
+    "write_cmds",
+    "write_bytes",
+    "flush_cmds",
+    "other_cmds",
+    "errors",
+];
+
+/// Render GET_STATS `data`. With `prev` = (previous snapshot, elapsed
+/// seconds), counters print as per-second deltas; deltas saturate at
+/// zero so a target restart between samples shows zeros, not garbage.
+fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>) -> String {
+    use std::fmt::Write;
+
+    fn u(v: &serde_json::Value, key: &str) -> u64 {
+        v[key].as_u64().unwrap_or(0)
+    }
+    // Per-second (rounded) when an interval is given, identity otherwise.
+    let rate = |raw: u64| -> u64 {
+        match prev {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            Some((_, secs)) if secs > 0.0 => (raw as f64 / secs).round() as u64,
+            _ => raw,
+        }
+    };
+    let val = |cur: u64, before: u64| -> u64 {
+        if prev.is_some() {
+            rate(cur.saturating_sub(before))
+        } else {
+            cur
+        }
+    };
+    let mib = |bytes: u64| -> String {
+        #[allow(clippy::cast_precision_loss)]
+        let v = bytes as f64 / f64::from(1u32 << 20);
+        format!("{v:.1} MiB")
+    };
+    let suffix = if prev.is_some() { "/s" } else { "" };
+
+    let find_thread = |name: &str| -> Option<&serde_json::Value> {
+        prev?.0["threads"]
+            .as_array()?
+            .iter()
+            .find(|t| t["name"] == name)
+    };
+    let match_queue = |t: &serde_json::Value, q: &serde_json::Value| -> serde_json::Value {
+        t["queues"]
+            .as_array()
+            .and_then(|qs| {
+                qs.iter()
+                    .find(|p| p["cntlid"] == q["cntlid"] && p["qid"] == q["qid"])
+            })
+            .cloned()
+            .unwrap_or_default()
+    };
+    // Live queues + retired: monotonic per thread (a retiring queue's
+    // counts move, they never vanish).
+    let thread_total = |t: &serde_json::Value, key: &str| -> u64 {
+        let live: u64 = t["queues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|q| u(q, key))
+            .sum();
+        live + u(&t["retired"], key)
+    };
+
+    let mut out = String::new();
+    for thread in data["threads"].as_array().into_iter().flatten() {
+        if let Some(err) = thread["error"].as_str() {
+            let _ = writeln!(
+                out,
+                "thread {}: {err}",
+                thread["name"].as_str().unwrap_or("?")
+            );
+            continue;
+        }
+        let name = thread["name"].as_str().unwrap_or("?");
+        let before = find_thread(name).cloned().unwrap_or_default();
+        let ring = &thread["ring"];
+        let ring0 = &before["ring"];
+        let _ = writeln!(
+            out,
+            "{name}  tid {}  enters{suffix} {}  parks{suffix} {}  sqes{suffix} {}  cqes{suffix} {}",
+            thread["tid"],
+            val(u(ring, "enters"), u(ring0, "enters")),
+            val(u(ring, "parks"), u(ring0, "parks")),
+            val(u(ring, "sqes"), u(ring0, "sqes")),
+            val(u(ring, "cqes"), u(ring0, "cqes")),
+        );
+        for q in thread["queues"].as_array().into_iter().flatten() {
+            let q0 = match_queue(&before, q);
+            let _ = writeln!(
+                out,
+                "  cntlid {} qid {}   read {}{suffix} ({}{suffix})  write {}{suffix} \
+                 ({}{suffix})  flush {}{suffix}  other {}{suffix}  err {}{suffix}",
+                q["cntlid"],
+                q["qid"],
+                val(u(q, "read_cmds"), u(&q0, "read_cmds")),
+                mib(val(u(q, "read_bytes"), u(&q0, "read_bytes"))),
+                val(u(q, "write_cmds"), u(&q0, "write_cmds")),
+                mib(val(u(q, "write_bytes"), u(&q0, "write_bytes"))),
+                val(u(q, "flush_cmds"), u(&q0, "flush_cmds")),
+                val(u(q, "other_cmds"), u(&q0, "other_cmds")),
+                val(u(q, "errors"), u(&q0, "errors")),
+            );
+        }
+        // Retired row. In rate mode, diffing `retired` alone would
+        // re-report a mid-interval-retired queue's whole lifetime as one
+        // interval's "rate"; instead diff the monotonic thread total and
+        // attribute whatever the live rows above did not already show.
+        let r: Vec<u64> = if prev.is_some() {
+            STAT_KEYS
+                .iter()
+                .map(|key| {
+                    let total_delta =
+                        thread_total(thread, key).saturating_sub(thread_total(&before, key));
+                    let shown: u64 = thread["queues"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|q| u(q, key).saturating_sub(u(&match_queue(&before, q), key)))
+                        .sum();
+                    rate(total_delta.saturating_sub(shown))
+                })
+                .collect()
+        } else {
+            STAT_KEYS
+                .iter()
+                .map(|key| u(&thread["retired"], key))
+                .collect()
+        };
+        let any_retired = STAT_KEYS
+            .iter()
+            .zip(&r)
+            .any(|(key, v)| *v > 0 && !key.ends_with("_bytes"));
+        if any_retired {
+            let _ = writeln!(
+                out,
+                "  retired          read {}{suffix} ({}{suffix})  write {}{suffix} \
+                 ({}{suffix})  flush {}{suffix}  other {}{suffix}  err {}{suffix}",
+                r[0],
+                mib(r[1]),
+                r[2],
+                mib(r[3]),
+                r[4],
+                r[5],
+                r[6],
+            );
+        }
+    }
+    out
 }
 
 /// One block per controller; NQNs are too long for fixed columns.
@@ -229,6 +433,7 @@ fn main() -> std::io::Result<()> {
         match command {
             Command::Ctl { socket, request } => return ctl(socket, request),
             Command::List { socket } => return list_target(socket),
+            Command::Stat { socket, interval } => return stat_target(socket, *interval),
         }
     }
 
@@ -368,5 +573,94 @@ mod tests {
              \x20 queues: 0:32@100 cpus *\n\
              \x20 ns:     -\n"
         );
+    }
+
+    fn stat_sample() -> serde_json::Value {
+        serde_json::json!({ "threads": [{
+            "name": "ioutgt-io0", "tid": 42,
+            "ring": { "enters": 100, "parks": 90, "sqes": 5000, "cqes": 5000 },
+            "queues": [{ "cntlid": 1, "qid": 1,
+                "read_cmds": 3000u64, "write_cmds": 1000u64, "flush_cmds": 0u64,
+                "other_cmds": 2u64, "read_bytes": 12_288_000u64,
+                "write_bytes": 4_096_000u64, "errors": 0u64 }],
+            "retired": { "read_cmds": 0, "write_cmds": 0, "flush_cmds": 0,
+                "other_cmds": 0, "read_bytes": 0, "write_bytes": 0, "errors": 0 },
+        }]})
+    }
+
+    #[test]
+    fn render_stat_totals() {
+        let out = super::render_stat(&stat_sample(), None);
+        assert!(out.contains("ioutgt-io0"), "{out}");
+        assert!(out.contains("tid 42"), "{out}");
+        assert!(out.contains("5000"), "sqes visible: {out}");
+        assert!(out.contains("cntlid 1 qid 1"), "{out}");
+        assert!(out.contains("read 3000"), "{out}");
+    }
+
+    #[test]
+    fn render_stat_interval_rates() {
+        let prev = stat_sample();
+        let mut next = stat_sample();
+        next["threads"][0]["queues"][0]["read_cmds"] = 5000.into();
+        next["threads"][0]["ring"]["enters"] = 300.into();
+        // 2000 reads over 2 s → 1000/s; 200 enters over 2 s → 100/s.
+        let out = super::render_stat(&next, Some((&prev, 2.0)));
+        assert!(out.contains("read 1000"), "rate visible: {out}");
+        assert!(out.contains("enters/s 100"), "enter rate visible: {out}");
+        // Counters that did not move render as zero rates, not totals.
+        assert!(out.contains("write 0"), "{out}");
+    }
+
+    #[test]
+    fn render_stat_saturates_on_restart() {
+        // Target restarted between samples: counters went backwards.
+        let prev = stat_sample();
+        let mut next = stat_sample();
+        next["threads"][0]["queues"][0]["read_cmds"] = 10.into();
+        let out = super::render_stat(&next, Some((&prev, 1.0)));
+        assert!(out.contains("read 0"), "saturating delta: {out}");
+    }
+
+    #[test]
+    fn render_stat_retired_rate_is_interval_work_only() {
+        // A queue retired between samples: its lifetime counts moved
+        // from queues[] into retired. Only work done *this interval*
+        // may show as a retired rate — never the re-folded history.
+        let prev = stat_sample(); // queue live: 3000 reads, retired 0
+        let mut next = stat_sample();
+        next["threads"][0]["queues"] = serde_json::json!([]);
+        // 3000 historical + 500 new reads folded on teardown.
+        next["threads"][0]["retired"]["read_cmds"] = 3500.into();
+        next["threads"][0]["retired"]["read_bytes"] = 14_336_000u64.into();
+        let out = super::render_stat(&next, Some((&prev, 2.0)));
+        // (3500 total - 3000 already shown) / 2 s = 250/s, not 1750/s.
+        assert!(out.contains("retired"), "{out}");
+        assert!(out.contains("read 250"), "interval work only: {out}");
+
+        // No new work at all → no retired row in rate mode.
+        let mut idle = stat_sample();
+        idle["threads"][0]["queues"] = serde_json::json!([]);
+        idle["threads"][0]["retired"]["read_cmds"] = 3000.into();
+        idle["threads"][0]["retired"]["read_bytes"] = 12_288_000u64.into();
+        let out = super::render_stat(&idle, Some((&prev, 2.0)));
+        assert!(!out.contains("retired"), "{out}");
+    }
+
+    #[test]
+    fn render_stat_unresponsive_thread() {
+        let v = serde_json::json!({ "threads": [{ "error": "thread unresponsive" }] });
+        let out = super::render_stat(&v, None);
+        assert!(out.contains("unresponsive"), "{out}");
+    }
+
+    #[test]
+    fn render_stat_skips_retired_when_zero() {
+        let out = super::render_stat(&stat_sample(), None);
+        assert!(!out.contains("retired"), "{out}");
+        let mut v = stat_sample();
+        v["threads"][0]["retired"]["write_cmds"] = 7.into();
+        let out = super::render_stat(&v, None);
+        assert!(out.contains("retired"), "{out}");
     }
 }

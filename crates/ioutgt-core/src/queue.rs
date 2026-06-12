@@ -21,6 +21,106 @@ use ioutgt_nvme::spec::{Cqe, Sqe};
 
 use crate::buf::AlignedBuf;
 
+/// Per-queue lifetime IO counters. All writers run on the owning queue
+/// thread (`Cell`, hence `!Sync` — a cross-thread read cannot compile);
+/// GET_STATS snapshots them *on that thread* via the mailbox. Shared as
+/// `Rc` so the thread's stats list can outlive the connection without
+/// pinning slot memory.
+#[derive(Debug)]
+pub struct QueueStats {
+    /// Queue id (immutable; reporting identity together with `cntlid`).
+    pub qid: u16,
+    /// Owning controller, set when Connect executes (0 until then).
+    pub cntlid: Cell<u16>,
+    /// NVM Read commands dispatched.
+    pub read_cmds: Cell<u64>,
+    /// NVM Write commands dispatched.
+    pub write_cmds: Cell<u64>,
+    /// NVM Flush commands dispatched.
+    pub flush_cmds: Cell<u64>,
+    /// Admin, fabrics, and non-Read/Write/Flush IO commands.
+    pub other_cmds: Cell<u64>,
+    /// Payload bytes of successful backend reads.
+    pub read_bytes: Cell<u64>,
+    /// Payload bytes of successful backend writes.
+    pub write_bytes: Cell<u64>,
+    /// IO-path commands completed with non-success status (validation
+    /// and backend failures). Admin/fabrics failures are not counted,
+    /// and a pre-dispatch rejection (unknown namespace, bad opcode)
+    /// bumps this without a cmd-class counter — so the class counters
+    /// do not necessarily sum to commands received.
+    pub errors: Cell<u64>,
+}
+
+/// Plain-`u64` copy of [`QueueStats`]; doubles as the fold accumulator
+/// for torn-down queues ([`QueueStatsSnapshot::absorb`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct QueueStatsSnapshot {
+    pub qid: u16,
+    pub cntlid: u16,
+    pub read_cmds: u64,
+    pub write_cmds: u64,
+    pub flush_cmds: u64,
+    pub other_cmds: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub errors: u64,
+}
+
+/// Counter increment used on the IO path: a plain `Cell` add — no
+/// atomics, no locks.
+#[inline]
+pub fn stat_add(cell: &Cell<u64>, n: u64) {
+    cell.set(cell.get() + n);
+}
+
+impl QueueStats {
+    /// Fresh zeroed counters for queue `qid`.
+    pub fn new(qid: u16) -> QueueStats {
+        QueueStats {
+            qid,
+            cntlid: Cell::new(0),
+            read_cmds: Cell::new(0),
+            write_cmds: Cell::new(0),
+            flush_cmds: Cell::new(0),
+            other_cmds: Cell::new(0),
+            read_bytes: Cell::new(0),
+            write_bytes: Cell::new(0),
+            errors: Cell::new(0),
+        }
+    }
+
+    /// Copy out the current values (owning thread only).
+    pub fn snapshot(&self) -> QueueStatsSnapshot {
+        QueueStatsSnapshot {
+            qid: self.qid,
+            cntlid: self.cntlid.get(),
+            read_cmds: self.read_cmds.get(),
+            write_cmds: self.write_cmds.get(),
+            flush_cmds: self.flush_cmds.get(),
+            other_cmds: self.other_cmds.get(),
+            read_bytes: self.read_bytes.get(),
+            write_bytes: self.write_bytes.get(),
+            errors: self.errors.get(),
+        }
+    }
+}
+
+impl QueueStatsSnapshot {
+    /// Accumulate `other`'s counters; identity fields stay untouched
+    /// (the accumulator represents "all retired queues").
+    pub fn absorb(&mut self, other: &QueueStatsSnapshot) {
+        self.read_cmds += other.read_cmds;
+        self.write_cmds += other.write_cmds;
+        self.flush_cmds += other.flush_cmds;
+        self.other_cmds += other.other_cmds;
+        self.read_bytes += other.read_bytes;
+        self.write_bytes += other.write_bytes;
+        self.errors += other.errors;
+    }
+}
+
 /// Slot lifecycle. Transitions are all same-thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
@@ -157,6 +257,8 @@ pub struct QueueCore {
     /// that references slot memory). Teardown drains this to zero
     /// before freeing the slots.
     executing: Cell<u16>,
+    /// Lifetime IO counters, shared with the owning thread's stats list.
+    pub stats: Rc<QueueStats>,
 }
 
 impl QueueCore {
@@ -177,6 +279,7 @@ impl QueueCore {
             send_waker: Cell::new(None),
             send_closed: Cell::new(false),
             executing: Cell::new(0),
+            stats: Rc::new(QueueStats::new(qid)),
         })
     }
 
@@ -409,5 +512,39 @@ mod tests {
             std::future::Future::poll(fut.as_mut(), &mut cx),
             Poll::Ready(None)
         ));
+    }
+
+    #[test]
+    fn queue_stats_snapshot_and_absorb() {
+        let stats = QueueStats::new(3);
+        stats.cntlid.set(7);
+        stat_add(&stats.read_cmds, 2);
+        stat_add(&stats.read_bytes, 8192);
+        stat_add(&stats.errors, 1);
+        let snap = stats.snapshot();
+        assert_eq!((snap.qid, snap.cntlid), (3, 7));
+        assert_eq!((snap.read_cmds, snap.read_bytes, snap.errors), (2, 8192, 1));
+
+        let mut retired = QueueStatsSnapshot::default();
+        retired.absorb(&snap);
+        retired.absorb(&snap);
+        assert_eq!(retired.read_cmds, 4);
+        assert_eq!(retired.read_bytes, 16384);
+        assert_eq!(retired.errors, 2);
+        // Identity does not aggregate: the accumulator is "all retired
+        // queues", not any one of them.
+        assert_eq!((retired.qid, retired.cntlid), (0, 0));
+    }
+
+    #[test]
+    fn queue_core_owns_zeroed_stats() {
+        let queue = QueueCore::new(1, 4, 4096, false);
+        assert_eq!(
+            queue.stats.snapshot(),
+            QueueStatsSnapshot {
+                qid: 1,
+                ..QueueStatsSnapshot::default()
+            }
+        );
     }
 }

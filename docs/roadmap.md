@@ -31,8 +31,12 @@ two IO threads. This file orders what comes next.
   real NIC.
 - **`RECV_ZC` (zcrx)**: requires NIC header-data split + flow
   steering; revisit when 100G hardware is on the bench.
-- Recv/send **budget tuning** (configurable, swept), per-queue
-  **stats counters** surfaced through `GET_STATS`, optional second
+- ~~Per-queue stats counters surfaced through `GET_STATS`~~ — **done**
+  (2026-06-12): `Cell` counters snapshotted on the owning thread via a
+  mailbox round trip, rendered by `ioutgt stat` (`-i` for rates);
+  A/B-verified free. Design in
+  `docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+- Recv/send **budget tuning** (configurable, swept), optional second
   **IOPOLL ring** per thread for disk ops, `OpEntry` slab/waker
   micro-costs.
 
@@ -84,6 +88,12 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
   IO-queue fds — the registry has the qid routing records but holds no
   fd today, so teardown needs a shutdown handle per installed queue
   (nvmet analog: `nvmet_ctrl_fatal_error` schedules all queues dead).
+- **Mailbox sends to a dead queue thread accumulate forever**: the
+  sender queues unconditionally, so if a queue thread exited (runtime
+  init failure), every NsChanged nudge or stats request leaks one
+  queued message (bytes per event; `ioutgt stat -i` makes it steady).
+  Found by review of the stats work; pre-existing class. Fix shape: a
+  closed flag on the mailbox set when the receiver drops.
 - RAE semantics on log pages; real SMART/error-log content; Get Log
   Page offset support beyond discovery.
 - **Persistent discovery controllers**: discovery genctr maintenance
@@ -124,8 +134,9 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 
 ## 5. Operational
 
-- Per-queue/throughput counters in `GET_STATS`; optional Prometheus
-  text endpoint on the control socket.
+- ~~Per-queue/throughput counters in `GET_STATS`~~ — **done**
+  (2026-06-12, see §1); an optional Prometheus text endpoint on the
+  control socket would build on the same per-thread JSON.
 - Graceful shutdown command (drain + SHST_COMPLETE on all
   controllers) instead of process kill.
 - Packaging: systemd unit, config reload via control socket.

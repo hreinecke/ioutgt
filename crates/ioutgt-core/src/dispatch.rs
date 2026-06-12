@@ -215,11 +215,13 @@ pub async fn execute<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, sqe: &Sqe) -> O
 
     // Fabrics commands are legal on both queue types.
     if sqe.opcode == admin_opcode::FABRICS {
+        crate::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
         return crate::fabrics_exec::execute(ctx, tag, sqe);
     }
 
     match &ctx.role {
         Role::Admin(admin) => {
+            crate::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
             // Everything but Connect/Property requires an enabled
             // controller.
             if !admin.regs.borrow().ready() {

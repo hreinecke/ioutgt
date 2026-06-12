@@ -17,6 +17,7 @@ use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, Subsyst
 use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::ConnCtx;
+use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
 use ioutgt_tcp::connection::{ConnPermit, QueueConn, run_queue};
@@ -93,22 +94,105 @@ const MAX_CONNECTIONS: usize = 256;
 
 type Conn = QueueConn<AnyBackend>;
 
+/// Reply channel for a stats request: the queue thread builds its JSON
+/// on-thread (control-plane rate) and sends it back.
+type StatsRequest = tokio::sync::oneshot::Sender<serde_json::Value>;
+
+/// Messages to an IO queue thread.
+enum IoMsg {
+    Conn(Conn),
+    Stats(StatsRequest),
+}
+
 /// Messages to the admin queue thread.
 enum AdminMsg {
     Conn(Conn),
     /// A namespace changed: nudge every live controller's AERs.
     NsChanged,
+    Stats(StatsRequest),
 }
 
-/// IO queue threads receive connections only.
-fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<Conn>> {
-    let (tx, mut rx): (MailboxSender<Conn>, Mailbox<Conn>) = mailbox()?;
+/// Fold queues whose connection is gone (this list holds the only
+/// remaining ref) into the retired accumulator, so lifetime totals stay
+/// monotonic across reconnects. Called on every connection handoff and
+/// stats request — each list entry was added by a handoff that pruned
+/// first, which bounds the list under churn even if stats are never
+/// queried.
+fn prune_dead_queues(queues: &RefCell<Vec<Rc<QueueStats>>>, retired: &mut QueueStatsSnapshot) {
+    queues.borrow_mut().retain(|stats| {
+        if Rc::strong_count(stats) > 1 {
+            return true;
+        }
+        retired.absorb(&stats.snapshot());
+        false
+    });
+}
+
+/// One queue thread's stats reply, built on the owning thread (the only
+/// place its `Cell` counters may be read).
+fn thread_stats_json(
+    name: &str,
+    queues: &[Rc<QueueStats>],
+    retired: &QueueStatsSnapshot,
+) -> serde_json::Value {
+    fn counters_json(s: &QueueStatsSnapshot) -> serde_json::Value {
+        serde_json::json!({
+            "read_cmds": s.read_cmds, "write_cmds": s.write_cmds,
+            "flush_cmds": s.flush_cmds, "other_cmds": s.other_cmds,
+            "read_bytes": s.read_bytes, "write_bytes": s.write_bytes,
+            "errors": s.errors,
+        })
+    }
+    let ring = ioutgt_uring::reactor_stats().unwrap_or_default();
+    let queues: Vec<_> = queues
+        .iter()
+        .map(|stats| {
+            let snap = stats.snapshot();
+            let mut value = counters_json(&snap);
+            value["qid"] = snap.qid.into();
+            value["cntlid"] = snap.cntlid.into();
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "name": name,
+        "tid": ioutgt_core::controller::current_tid(),
+        "ring": { "enters": ring.enters, "parks": ring.parks,
+                  "sqes": ring.sqes, "cqes": ring.cqes },
+        "queues": queues,
+        "retired": counters_json(retired),
+    })
+}
+
+/// IO queue threads receive connections and stats requests.
+fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<IoMsg>> {
+    let (tx, mut rx): (MailboxSender<IoMsg>, Mailbox<IoMsg>) = mailbox()?;
     spawn_pinned(name.clone(), core_id, move || {
-        run_queue_thread(name, move |spawner| async move {
+        let rt = match QueueRuntime::new(RingConfig::default()) {
+            Ok(rt) => rt,
+            Err(err) => {
+                warn!(thread = %name, "queue runtime failed: {err}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
+            let mut retired = QueueStatsSnapshot::default();
             loop {
                 match rx.recv().await {
-                    Ok(conn) => {
-                        spawner(conn);
+                    Ok(IoMsg::Conn(conn)) => {
+                        prune_dead_queues(&queues, &mut retired);
+                        let queues = Rc::clone(&queues);
+                        tokio::task::spawn_local(async move {
+                            run_queue(conn, |ctx| {
+                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
+                            })
+                            .await;
+                        });
+                    }
+                    Ok(IoMsg::Stats(reply)) => {
+                        prune_dead_queues(&queues, &mut retired);
+                        let _ = reply.send(thread_stats_json(&name, &queues.borrow(), &retired));
                     }
                     Err(err) => {
                         warn!("io mailbox failed: {err}");
@@ -116,7 +200,7 @@ fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSe
                     }
                 }
             }
-        })
+        });
     })?;
     Ok(tx)
 }
@@ -135,14 +219,19 @@ fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
         rt.block_on(async move {
             let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
                 Rc::new(RefCell::new(Vec::new()));
+            let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
+            let mut retired = QueueStatsSnapshot::default();
             loop {
                 match rx.recv().await {
                     Ok(AdminMsg::Conn(conn)) => {
                         live.borrow_mut().retain(|weak| weak.strong_count() > 0);
+                        prune_dead_queues(&queues, &mut retired);
                         let live = Rc::clone(&live);
+                        let queues = Rc::clone(&queues);
                         tokio::task::spawn_local(async move {
                             run_queue(conn, |ctx| {
                                 live.borrow_mut().push(Rc::downgrade(ctx));
+                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
                             })
                             .await;
                         });
@@ -154,6 +243,10 @@ fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
                                 true
                             })
                         });
+                    }
+                    Ok(AdminMsg::Stats(reply)) => {
+                        prune_dead_queues(&queues, &mut retired);
+                        let _ = reply.send(thread_stats_json(&name, &queues.borrow(), &retired));
                     }
                     Err(err) => {
                         warn!("admin mailbox failed: {err}");
@@ -226,26 +319,6 @@ fn spawn_pinned(
     Ok(())
 }
 
-/// Run a queue-thread runtime whose main future receives a spawner for
-/// connections.
-fn run_queue_thread<F, Fut>(name: String, main: F)
-where
-    F: FnOnce(fn(Conn)) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    fn spawner(conn: Conn) {
-        tokio::task::spawn_local(run_queue(conn, |_| {}));
-    }
-    let rt = match QueueRuntime::new(RingConfig::default()) {
-        Ok(rt) => rt,
-        Err(err) => {
-            warn!(thread = %name, "queue runtime failed: {err}");
-            return;
-        }
-    };
-    rt.block_on(main(spawner));
-}
-
 /// Build the port snapshot from the configured subsystems.
 /// `bound` is the listener's actual local address, so ephemeral ports
 /// (`--listen …:0`) report the real port in discovery log entries and
@@ -294,7 +367,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
     } else {
         vec![None; config.io_threads]
     };
-    let io_txs: Vec<MailboxSender<Conn>> = (0..config.io_threads)
+    let io_txs: Vec<MailboxSender<IoMsg>> = (0..config.io_threads)
         .map(|i| spawn_io_thread(format!("ioutgt-io{i}"), io_cpus[i]))
         .collect::<io::Result<_>>()?;
 
@@ -324,7 +397,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
 async fn control_loop(
     config: TargetConfig,
     admin_tx: MailboxSender<AdminMsg>,
-    io_txs: Vec<MailboxSender<Conn>>,
+    io_txs: Vec<MailboxSender<IoMsg>>,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
     let registry = Registry::new();
@@ -367,10 +440,21 @@ async fn control_loop(
                     return;
                 }
                 let nudge_tx = admin_tx.clone();
+                let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
+                    Vec::with_capacity(1 + io_txs.len());
+                let stats_admin = admin_tx.clone();
+                stats_sources.push(Box::new(move |reply| {
+                    stats_admin.send(AdminMsg::Stats(reply))
+                }));
+                for io_tx in &io_txs {
+                    let io_tx = io_tx.clone();
+                    stats_sources.push(Box::new(move |reply| io_tx.send(IoMsg::Stats(reply))));
+                }
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),
                     registry: Arc::clone(&registry),
                     notify_ns_changed: Box::new(move || nudge_tx.send(AdminMsg::NsChanged)),
+                    stats_sources,
                 });
                 info!(path = %path.display(), "control socket listening");
                 tokio::task::spawn_local(ioutgt_control::server::serve(listener, state));
@@ -435,7 +519,7 @@ async fn setup_connection(
     allow_hdgst: bool,
     allow_ddgst: bool,
     admin_tx: &MailboxSender<AdminMsg>,
-    io_txs: &[MailboxSender<Conn>],
+    io_txs: &[MailboxSender<IoMsg>],
     port: Arc<PortConfig<AnyBackend>>,
     registry: Arc<Registry>,
     permit: ConnPermit,
@@ -483,7 +567,7 @@ async fn setup_connection(
     } else if io_txs.is_empty() {
         return Err(io::Error::other("no IO threads"));
     } else {
-        io_txs[(usize::from(qid) - 1) % io_txs.len()].send(conn);
+        io_txs[(usize::from(qid) - 1) % io_txs.len()].send(IoMsg::Conn(conn));
     }
     Ok(())
 }

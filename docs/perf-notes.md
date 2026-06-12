@@ -169,4 +169,14 @@ choice.
 4. `SEND_ZC`: loopback falls back to copying (REPORT_USAGE confirms),
    so this needs a real NIC to evaluate honestly; rides the same
    gather iovecs with notification-gated slot reuse.
-5. Recv/send budget sweeps; per-queue stats counters for GET_STATS.
+5. Recv/send budget sweeps.
+
+## Stats counters cost check (2026-06-12)
+
+Per-queue/per-thread counters (GET_STATS `threads`, `ioutgt stat`) are
+`Cell<u64>` adds on the owning thread — design said free, A/B confirms:
+null backend, 4 IO threads, loadgen 4K randread conns=4 qd=32, 3
+interleaved reps. Baseline median 409.4K IOPS (393.3–415.6K), with
+counters 408.1K (407.6–409.7K), p50 ~172 µs both sides — well inside
+the run-to-run spread. Design:
+`docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
