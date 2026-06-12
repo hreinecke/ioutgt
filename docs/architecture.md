@@ -226,14 +226,16 @@ brought; any phase can pause mid-PDU and resume on the next recv:
    ├─ CapsuleCmd, in-capsule    claim_tag; payload is next
    │                            on the stream                 ─► Data
    ├─ H2CData for a live TTAG   validate offset/length        ─► Data
+   ├─ H2CTermReq from the host  close WITHOUT replying
    └─ anything else             C2HTermReq, close
 
  ┌────────┐  memcpy recv buffer → slot at (PDU offset + reassembly
  │  Data  │  progress), CRC32C fused into the copy; resumes
  └────────┘  across recvs
-   ├─ buffer drained, tail ≥ 16 KiB (H2C_DIRECT_MIN): receive the
-   │    tail straight into the slot — one MSG_WAITALL raw recv,
-   │    no buffer→slot copy (DDGST then re-reads the warm tail)
+   ├─ buffer drained, H2CData tail ≥ 16 KiB (H2C_DIRECT_MIN;
+   │    never in-capsule): receive the tail straight into the slot
+   │    via MSG_WAITALL raw recv (best-effort — a short recv resumes
+   │    in place), no buffer→slot copy; DDGST re-reads the warm tail
    ├─ payload done, no DDGST    finish(tag)                   ─► Header
    └─ payload done, DDGST       4 digest bytes trail          ─► Ddgst
 
@@ -247,7 +249,8 @@ brought; any phase can pause mid-PDU and resume on the next recv:
  finish(tag) = submit(tag) — wakes the slot task — once the full
    transfer is present (in-capsule: always; R2T: reassembly offset
    reached the SGL length). A mid-transfer H2CData just returns to
-   Header to await the next one.
+   Header to await the next one; one marked `last` with bytes still
+   missing is a protocol violation (DATA_OUT_OF_RANGE term).
 ```
 
 Three rules keep this simple and safe:
@@ -322,7 +325,9 @@ What the shape buys, and what it must protect:
   send op is ever in flight, preserving wire order; only the waits
   overlap. The recv side then parks on tag exhaustion (`await_tag`)
   instead of terminating, since the notification races the host's
-  next command.
+  next command — and the idle park reaps the oldest batch's
+  notifications too (`next_work_reaping`), so tag release never
+  depends on new send work arriving (the anti-deadlock invariant).
 
 #### 4.2.3 Data copies: one slot, one visible budget
 
@@ -339,8 +344,8 @@ accounted against it:
     (in-capsule data,    │                       │
      buffered prefixes)  ▼                       ▼
    ┌──────────────┐                    ┌──────────────┐
-   │ slot buffer  │ ◄══ ①' tail        │ slot buffer  │
-   └──────────────┘     ≥ 16 KiB:      └──────────────┘
+   │ slot buffer  │ ◄══ ①' H2CData     │ slot buffer  │
+   └──────────────┘     tail ≥ 16 KiB: └──────────────┘
           │             MSG_WAITALL           │ ② gather iovec
           │ borrow      straight from         │ references the slot
           ▼             the kernel —          │ IN PLACE — no copy
@@ -354,11 +359,11 @@ accounted against it:
 
 The transport's userspace copy budget:
 
-| Path                                | Copies | Notes                          |
-|-------------------------------------|--------|--------------------------------|
-| H2C in-capsule / buffered prefix    | 1  (①) | recv buffer → slot, CRC fused  |
-| H2C tail ≥ `H2C_DIRECT_MIN` (16 KiB)| 0 (①') | lands directly in the slot     |
-| C2H payload                         | 0  (②) | slot referenced by the iovec   |
+| Path                                     | Copies | Notes                         |
+|------------------------------------------|--------|-------------------------------|
+| H2C in-capsule / buffered prefix         | 1 (①)  | recv buffer → slot, CRC fused |
+| H2CData tail ≥ `H2C_DIRECT_MIN` (16 KiB) | 0 (①') | lands directly in the slot    |
+| C2H payload                              | 0 (②)  | slot referenced by the iovec  |
 
 Backends add their own: file adds **none** when the open gets O_DIRECT
 (the device DMAs against the slot pages; where the filesystem refuses
