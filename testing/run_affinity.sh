@@ -18,6 +18,11 @@ cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt
 # which holds locks on the default data dir's disk images).
 MARKER_DIR="${VMTEST_DATA_DIR:-$(dirname "$VMTEST")/data}/tmp"
 mkdir -p "$MARKER_DIR"
+# The target runs inside the guest, so there is no host-side process to
+# reap — only the marker, dropped on exit so a later manual vmtest run
+# cannot pick up a stale checkout path.
+trap 'rm -f "$MARKER_DIR/ioutgt_top"' EXIT
+trap 'exit 129' INT TERM
 echo "$TOP" > "$MARKER_DIR/ioutgt_top"
 
 "$VMTEST" -c "$VMTEST_CONF" run ioutgt_affinity

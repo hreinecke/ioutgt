@@ -31,6 +31,23 @@ esac
 CTL_SOCK="$TOP/target/ioutgt-interop.sock"
 MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
 PID_FILE="$TOP/target/ioutgt-interop.pid"
+
+# Kill the target (and watcher) however the script exits: a surviving
+# target squats the port and poisons the next harness or bench run.
+# Installed before anything starts so an early failure cannot leak;
+# the stale PID file from a previous run is dropped first so cleanup
+# can never kill an unrelated reused pid.
+rm -f "$PID_FILE"
+WATCHER_PID=""
+cleanup() {
+    [ -s "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
+    rm -f "$PID_FILE"
+}
+trap cleanup EXIT
+# Fatal signals bypass the EXIT trap unless turned into an exit.
+trap 'exit 129' INT TERM
+
 mkdir -p "$MARKER_DIR"
 rm -f "$MARKER_DIR/ioutgt_want_ns2" "$MARKER_DIR/ioutgt_want_kill" \
     "$MARKER_DIR/ioutgt_kill_enabled" "$MARKER_DIR/ioutgt_soak_only"
@@ -75,7 +92,6 @@ TARGET_PID=$(cat "$PID_FILE")
     done
 ) &
 WATCHER_PID=$!
-trap 'kill $(cat "$PID_FILE" 2>/dev/null) $WATCHER_PID 2>/dev/null || true' EXIT
 
 # Wait for the listener.
 for _ in $(seq 50); do
