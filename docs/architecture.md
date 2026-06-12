@@ -49,6 +49,8 @@ locks**.
 
 One process manages one NVMe controller set (one port, N subsystems).
 
+**Process layout — control thread, admin thread, N pinned IO threads**
+
 ```text
 Controller Process
 │
@@ -95,6 +97,8 @@ algorithm is pure (driven by a `CpuTopology` value, synthetic in tests),
 with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 `ioutgt` binary uses it (§11).
 
+**Crate map — the dependency DAG**
+
 ```text
   app       ┌──────────────────────────────────────────────────────┐
             │ ioutgt — binary; loads TargetConfig, spawn_target()  │
@@ -138,6 +142,8 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 (`crates/ioutgt/src/lib.rs`), which is the only place all seven crates
 meet:
 
+**`spawn_target()` — what gets spawned and wired**
+
 ```text
 spawn_target(config)                                   [ioutgt]
   ├─ spawn_admin_thread() ─┐  each queue thread:
@@ -172,6 +178,8 @@ orchestrator. It builds the core-side state, then spawns the task set whose
 **only rendezvous is `QueueCore`** — the recv loop, slot tasks, and send
 loop never call each other directly:
 
+**`run_queue()` — the per-connection task set**
+
 ```text
 run_queue(QueueConn)                                   [ioutgt-tcp]
   ├─ QueueCore::new(qid, sqsize, slot_buf, …)          [ioutgt-core]
@@ -184,6 +192,8 @@ run_queue(QueueConn)                                   [ioutgt-tcp]
   ├─ spawn_local keep-alive watchdog (admin only)      [tcp → uring ops::sleep]
   └─ recv_loop(queue, fd)        (runs as the task body)
 ```
+
+**`QueueCore` — the tasks' only rendezvous, command lifecycle left to right**
 
 ```text
             recv_loop                 QueueCore              send_loop
@@ -212,6 +222,8 @@ One task, one reused 64 KiB recv buffer (passed by value through each
 `ops::recv` per the reactor's buffer-ownership rule), three phases
 (`RecvPhase`). Each completed recv steps the machine over the bytes it
 brought; any phase can pause mid-PDU and resume on the next recv:
+
+**`RecvPhase` machine — Header / Data / Ddgst and every transition**
 
 ```text
  ops::recv ─► reused 64 KiB buffer ─► step the phase machine:
@@ -276,6 +288,8 @@ the wire cannot be pipelined with multiple ops. The loop instead makes
 each op as large as possible — block for one work item, greedily drain
 the rest, ship the whole batch as a single gather sendmsg:
 
+**Send pipeline — drain, stage, ship one gather op, retire**
+
 ```text
  next_send_work().await   blocks; None after close_send() = teardown
       │ first item
@@ -334,6 +348,8 @@ What the shape buys, and what it must protect:
 The slot buffer (preallocated per tag: 8 KiB admin, 128 KiB = MDTS io)
 is the single rendezvous for payload bytes; every copy on the path is
 accounted against it:
+
+**Payload byte flow — where the copies are, in both directions**
 
 ```text
  Host write (H2C)                     Host read (C2H)
@@ -466,6 +482,8 @@ replacing).
 
 State machines mirror `drivers/nvme/target/tcp.c`:
 
+**Wire state machines — recv phases and the ordered send list**
+
 ```text
 recv:  PduHeader ──→ Data ──→ DataDigest ──→ (back to PduHeader)
                  └────────────── Error → C2HTermReq → close
@@ -520,6 +538,8 @@ and future transports slot in without touching protocol logic:
   built, opt-in).
 
 ## 7. Core model
+
+**Object model — Port / Subsystem / Namespace, and the per-Connect Controller**
 
 ```text
 Port ──┬── Subsystem (NQN) ──┬── Namespace (nsid → Backend)
