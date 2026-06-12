@@ -218,6 +218,14 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         tokio::task::spawn_local(async move {
             if let Err(err) = send_loop(&queue, fd, hdr_digest, data_digest, send_zc).await {
                 debug!(qid = queue.qid, "send loop ended: {err}");
+                // A dead send path leaves the connection half-alive:
+                // the recv loop keeps accepting commands whose
+                // responses can never ship, and the host only notices
+                // at its IO timeout (~30 s). Shut the socket down so
+                // the recv loop sees EOF and teardown runs now.
+                // SAFETY: fd is valid for the connection's lifetime;
+                // shutdown only signals, never frees.
+                unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
             }
         })
     };
@@ -941,6 +949,9 @@ struct SendState {
     inflight: VecDeque<usize>,
     zc_batches: u64,
     zc_copied: u64,
+    /// ZC sends refused by the kernel's pinned-page accounting
+    /// (RLIMIT_MEMLOCK) and shipped by copy instead.
+    zc_fallbacks: u64,
 }
 
 impl SendState {
@@ -950,6 +961,7 @@ impl SendState {
             inflight: VecDeque::with_capacity(2),
             zc_batches: 0,
             zc_copied: 0,
+            zc_fallbacks: 0,
         }
     }
 
@@ -984,10 +996,22 @@ impl SendState {
     /// Drain every outstanding notification. Teardown MUST run this
     /// on every send-task exit path: the kernel may still hold page
     /// references (arena + slot buffers) that `run_queue` frees right
-    /// after joining the task.
+    /// after joining the task. Covers the in-flight list AND the
+    /// batch a send error abandoned mid-ship — that one is not on
+    /// the list but may hold notifs from its earlier ZC ops.
     async fn drain(&mut self, queue: &Rc<QueueCore>) {
         while !self.inflight.is_empty() {
             self.reap_oldest(queue).await;
+        }
+        for idx in 0..self.batches.len() {
+            while let Some(notif) = self.batches[idx].pending_notifs.pop() {
+                if notif.await {
+                    self.zc_copied += 1;
+                }
+            }
+            for tag in self.batches[idx].tags_at_notif.drain(..) {
+                queue.release_tag(tag);
+            }
         }
     }
 
@@ -1073,6 +1097,7 @@ async fn send_loop(
             qid = queue.qid,
             zc_batches = state.zc_batches,
             zc_copied = state.zc_copied,
+            zc_fallbacks = state.zc_fallbacks,
             "send loop ZC stats"
         );
     }
@@ -1108,7 +1133,7 @@ async fn send_batches(
             work = queue.try_next_send_work();
         }
 
-        let use_zc = send_zc && batch.payload_bytes >= SEND_ZC_MIN as usize;
+        let mut use_zc = send_zc && batch.payload_bytes >= SEND_ZC_MIN as usize;
         // Ship; on short send advance the iovecs and re-issue so
         // nothing else can interleave on the wire (ordering). The
         // re-issue stays ZC: the batch's pages are pinned regardless.
@@ -1128,7 +1153,24 @@ async fn send_batches(
                 // (F_MORE), and only the stashed handle makes the
                 // teardown drain wait for them.
                 batch.pending_notifs.push(op.into_notif());
-                let n = res? as usize;
+                let n = match res {
+                    Ok(n) => n as usize,
+                    // ZC pins pages against the per-user
+                    // RLIMIT_MEMLOCK (ENOMEM past it; ENOBUFS for
+                    // the optmem variant); two full batches alone
+                    // can exceed the default 8 MiB, and the budget
+                    // is shared across connections. An expected
+                    // operational condition, not a connection
+                    // error: ship the rest of this batch by copy.
+                    Err(err)
+                        if matches!(err.raw_os_error(), Some(libc::ENOMEM | libc::ENOBUFS)) =>
+                    {
+                        state.zc_fallbacks += 1;
+                        use_zc = false;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if n == 0 {
                     return Err(std::io::ErrorKind::WriteZero.into());
                 }
@@ -1151,20 +1193,20 @@ async fn send_batches(
                 }
             }
         }
-        if use_zc {
-            for tag in batch.tags_at_cqe.drain(..) {
-                queue.release_tag(tag);
-            }
-            state.zc_batches += 1;
-            state.inflight.push_back(idx);
-        } else {
-            for tag in batch.tags_at_cqe.drain(..) {
-                queue.release_tag(tag);
-            }
+        for tag in batch.tags_at_cqe.drain(..) {
+            queue.release_tag(tag);
+        }
+        // Notif-gate the batch iff it actually holds notifications
+        // (a batch whose every ZC attempt fell back has none and is
+        // immediately reusable, like the plain path).
+        if batch.pending_notifs.is_empty() {
             for tag in batch.tags_at_notif.drain(..) {
                 queue.release_tag(tag);
             }
             batch.reset();
+        } else {
+            state.zc_batches += 1;
+            state.inflight.push_back(idx);
         }
     }
 }
