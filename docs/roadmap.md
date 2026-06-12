@@ -31,8 +31,12 @@ two IO threads. This file orders what comes next.
   real NIC.
 - **`RECV_ZC` (zcrx)**: requires NIC header-data split + flow
   steering; revisit when 100G hardware is on the bench.
-- Recv/send **budget tuning** (configurable, swept), per-queue
-  **stats counters** surfaced through `GET_STATS`, optional second
+- ~~Per-queue stats counters surfaced through `GET_STATS`~~ — **done**
+  (2026-06-12): `Cell` counters snapshotted on the owning thread via a
+  mailbox round trip, rendered by `ioutgt stat` (`-i` for rates);
+  A/B-verified free. Design in
+  `docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+- Recv/send **budget tuning** (configurable, swept), optional second
   **IOPOLL ring** per thread for disk ops, `OpEntry` slab/waker
   micro-costs.
 
@@ -124,8 +128,9 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
 
 ## 5. Operational
 
-- Per-queue/throughput counters in `GET_STATS`; optional Prometheus
-  text endpoint on the control socket.
+- ~~Per-queue/throughput counters in `GET_STATS`~~ — **done**
+  (2026-06-12, see §1); an optional Prometheus text endpoint on the
+  control socket would build on the same per-thread JSON.
 - Graceful shutdown command (drain + SHST_COMPLETE on all
   controllers) instead of process kill.
 - Packaging: systemd unit, config reload via control socket.

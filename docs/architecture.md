@@ -476,7 +476,13 @@ allocated once at queue install and registered with the ring in phase 2.
 - Unix domain socket, newline-delimited JSON: `ADD_NAMESPACE`,
   `REMOVE_NAMESPACE`, `LIST_NAMESPACE`, `LIST_CONTROLLER`, `GET_STATS`.
   Stats are aggregated by querying each queue thread's mailbox — no
-  shared counters.
+  shared counters: per-queue IO counters (`QueueStats`) and per-thread
+  ring counters (`ReactorStats`, `io_uring_enter`/parks/SQEs/CQEs) are
+  plain `Cell`s written only by the owning thread; GET_STATS sends a
+  oneshot-reply message through the mailbox and each thread snapshots
+  its own cells (500 ms timeout per thread, so a wedged backend can't
+  hang the control API). `ioutgt stat` renders them, `-i N` for
+  iostat-style rates computed client-side.
 - The target is fully constructible from a JSON config file: subsystems,
   namespaces (backend type + path + nsid), listen address, thread/affinity
   map, digest policy, inline data size. Validation produces line-precise
