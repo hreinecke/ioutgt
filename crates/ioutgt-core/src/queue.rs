@@ -44,7 +44,11 @@ pub struct QueueStats {
     pub read_bytes: Cell<u64>,
     /// Payload bytes of successful backend writes.
     pub write_bytes: Cell<u64>,
-    /// Commands completed with non-success status.
+    /// IO-path commands completed with non-success status (validation
+    /// and backend failures). Admin/fabrics failures are not counted,
+    /// and a pre-dispatch rejection (unknown namespace, bad opcode)
+    /// bumps this without a cmd-class counter — so the class counters
+    /// do not necessarily sum to commands received.
     pub errors: Cell<u64>,
 }
 

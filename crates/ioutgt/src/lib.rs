@@ -114,8 +114,10 @@ enum AdminMsg {
 
 /// Fold queues whose connection is gone (this list holds the only
 /// remaining ref) into the retired accumulator, so lifetime totals stay
-/// monotonic across reconnects. Called on every mailbox message, which
-/// bounds the list under churn even if stats are never queried.
+/// monotonic across reconnects. Called on every connection handoff and
+/// stats request — each list entry was added by a handoff that pruned
+/// first, which bounds the list under churn even if stats are never
+/// queried.
 fn prune_dead_queues(queues: &RefCell<Vec<Rc<QueueStats>>>, retired: &mut QueueStatsSnapshot) {
     queues.borrow_mut().retain(|stats| {
         if Rc::strong_count(stats) > 1 {

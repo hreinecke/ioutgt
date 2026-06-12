@@ -95,7 +95,8 @@ shows what hosts would discover rather than only `no controllers`.
 `GET_STATS` carries a `threads` array: one entry per queue thread with
 its ring counters (`enters` = `io_uring_enter` syscalls, `parks`,
 `sqes`, `cqes`) and per-queue IO counters (read/write/flush/other
-commands, read/write bytes, errors, keyed by cntlid+qid — correlate
+commands, read/write bytes, errors — IO-path failures only, admin and
+fabrics rejections are not counted — keyed by cntlid+qid; correlate
 with `LIST_CONTROLLER` for tid/cpus). Counts from disconnected queues
 fold into the thread's monotonic `retired` totals. Counters are plain
 per-thread `Cell`s snapshotted via a mailbox round trip — the IO path
