@@ -206,86 +206,182 @@ run_queue(QueueConn)                                   [ioutgt-tcp]
                 │                        │                       │   [uring]
 ```
 
-**recv_loop** is a resumable state machine across `ops::recv`
-completions (one reused 64 KiB recv buffer, passed by value through
-each op per the reactor's ownership rule). `Header` feeds bytes to
-`PduDecoder` [nvme]; a decoded CapsuleCmd claims a tag and either
-expects in-capsule payload next on the stream, or — for a
-host-resident write (transport SGL) — `solicit()`s the whole transfer
-with a single R2T (TTAG = slot index) and returns to `Header` until
-the H2CData PDUs arrive. `Data` memcpys payload from the recv buffer
-into the slot buffer at the PDU's data offset plus reassembly
-progress, resuming across recvs; the command is `submit()`ed only
-once the full transfer is present. `Ddgst` collects the trailing
-4-byte digest; a mismatch fails just that command
-(`DATA_XFER_ERROR|DNR`, as nvmet does) and keeps the connection,
-while malformed or out-of-place PDUs produce C2HTermReq and close.
+#### 4.2.1 `recv_loop`: a resumable PDU state machine
 
-**send_loop** blocks on `next_send_work()` (`None` after
-`close_send()` at teardown), then greedily drains
-`try_next_send_work()`, staging R2Ts, C2HData headers, digests, and
-response capsules into a small per-connection arena (sqsize × 64 B,
-min 4 KiB)
-while read payloads are referenced **in place** from slot buffers;
-the batch ships as one gather `ops::sendmsg_raw` (byte-contiguous
-arena chunks merge, so a payload-free batch is a single iovec
-entry). A short send advances the iovec list and re-issues — no
-memmove — so nothing else can interleave on the wire. With SQ flow
-control off, a successful read elides the response capsule (SUCCESS
-bit in C2HData). Slots are `release_tag()`ed only after the whole
-batch send completes — under gather this is the memory-safety line,
-not bookkeeping: the kernel reads slot pages during the send, and
-teardown joins the send task before the queue is freed.
+One task, one reused 64 KiB recv buffer (passed by value through each
+`ops::recv` per the reactor's buffer-ownership rule), three phases
+(`RecvPhase`). Each completed recv steps the machine over the bytes it
+brought; any phase can pause mid-PDU and resume on the next recv:
 
-**Data copies.** The slot buffer (preallocated per tag: 8 KiB admin,
-128 KiB = MDTS io) is the single rendezvous for payload bytes; the
-transport costs one userspace memcpy on the write side (small
-payloads and prefixes only) and none on the read side:
+```text
+ ops::recv ─► reused 64 KiB buffer ─► step the phase machine:
 
-- **Host write (H2C)**: in-capsule payloads and buffered prefixes go
-  kernel → recv buffer (`ops::recv`), then memcpy to the slot with
-  fused CRC (`RecvPhase::Data`); a large not-yet-arrived tail
-  (`remaining >= H2C_DIRECT_MIN` = 16 KiB at buffer drain) instead
-  lands **directly in the slot** via one `MSG_WAITALL` raw recv at
-  the reassembly offset — safe because the tail is by definition the
-  next bytes on the TCP stream, so the buffer recv is simply not
-  re-armed until it completes (never two outstanding recvs; DDGST
-  for a direct tail is a separate warm read pass over the slot).
-  The backend then gets `&slot.data()[..len]` borrowed directly —
-  the file backend issues `write_at` on that pointer, zero further
-  copies. Measured: −44% target cycles/IOP on 128 KiB writes
+ ┌────────┐  PduDecoder [nvme] assembles one PDU header
+ │ Header │  (headers can straddle recvs), then routes it:
+ └────────┘
+   ├─ CapsuleCmd, no data       claim_tag, submit(tag)        ─► Header
+   ├─ CapsuleCmd, host write    claim_tag, solicit() ONE R2T
+   │    (transport SGL)         (TTAG = slot index); payload
+   │                            arrives later as H2CData      ─► Header
+   ├─ CapsuleCmd, in-capsule    claim_tag; payload is next
+   │                            on the stream                 ─► Data
+   ├─ H2CData for a live TTAG   validate offset/length        ─► Data
+   └─ anything else             C2HTermReq, close
+
+ ┌────────┐  memcpy recv buffer → slot at (PDU offset + reassembly
+ │  Data  │  progress), CRC32C fused into the copy; resumes
+ └────────┘  across recvs
+   ├─ buffer drained, tail ≥ 16 KiB (H2C_DIRECT_MIN): receive the
+   │    tail straight into the slot — one MSG_WAITALL raw recv,
+   │    no buffer→slot copy (DDGST then re-reads the warm tail)
+   ├─ payload done, no DDGST    finish(tag)                   ─► Header
+   └─ payload done, DDGST       4 digest bytes trail          ─► Ddgst
+
+ ┌────────┐  collect the 4 trailing bytes, compare to the fused CRC
+ │ Ddgst  │
+ └────────┘
+   ├─ match                     finish(tag)                   ─► Header
+   └─ mismatch                  fail THIS command only
+        (DATA_XFER_ERROR|DNR, as nvmet; connection lives)     ─► Header
+
+ finish(tag) = submit(tag) — wakes the slot task — once the full
+   transfer is present (in-capsule: always; R2T: reassembly offset
+   reached the SGL length). A mid-transfer H2CData just returns to
+   Header to await the next one.
+```
+
+Three rules keep this simple and safe:
+
+- **One outstanding recv, ever.** The direct-tail path works because
+  the tail is by definition the next bytes on the TCP stream — the
+  buffer recv simply isn't re-armed until the tail lands, so nothing
+  is reordered and nothing that could have proceeded is delayed.
+  Measured: −44% target cycles/IOP on 128 KiB writes
   (`docs/perf-notes.md`).
-- **Host read (C2H)**: the file backend `read_at`s straight into the
-  slot buffer; send loop references the payload **in place** via the
-  gather iovec (`stage_send_work`), one `ops::sendmsg_raw` → kernel.
-  DDGST is a read-only `crc32c` pass over the slot, trailed in the
-  arena.
+- **Failures are graded like nvmet's** (§6): a digest mismatch fails
+  just that command; a malformed or out-of-place PDU is a protocol
+  violation → C2HTermReq and close.
+- **The decoder never sees payload.** Only header bytes pass through
+  `PduDecoder` [nvme]; payload bytes go recv-buffer → slot (or
+  kernel → slot), keeping the codec sans-IO and the whole copy budget
+  visible in one place (§4.2.3).
 
-The write-side copy is what lets one flat, MDTS-sized buffer absorb
-arbitrarily fragmented TCP segments and H2CData splits, so backends
-never see scatter (the unreceived tail of large R2T transfers no
-longer pays it — the direct-to-slot recv above); the read side's
-remaining copy is
-the kernel's user→skb gather, which opt-in `SENDMSG_ZC` (`--send-zc`,
-§9) removes over the same iovecs — slot reuse then gates on the
-kernel's notification CQE instead of the send CQE, and the recv path
-parks on tag exhaustion (`await_tag`) instead of terminating, since
-the notification races the host's next command. The budget is the transport's: the memory
-backend adds one payload copy per direction (chunk-wise across its
-2 MiB chunks), null adds none (reads memset the slot — visible when
-measuring protocol overhead with it), and the file backend adds
-none — when the open gets O_DIRECT the device DMAs against the slot
-pages; where the filesystem refuses (e.g. tmpfs) it falls back to
-buffered IO and the kernel copies through the page cache
-(`FileBackend::is_direct`). Everything else on the path is bounded
-per PDU — header assembly in the decoder (headers can straddle
-recvs), the 64-byte SQE stash, and header/digest encoding into the
+#### 4.2.2 `send_loop`: drain everything, ship one op
+
+Independent send SQEs on one socket have **no ordering guarantee**, so
+the wire cannot be pipelined with multiple ops. The loop instead makes
+each op as large as possible — block for one work item, greedily drain
+the rest, ship the whole batch as a single gather sendmsg:
+
+```text
+ next_send_work().await   blocks; None after close_send() = teardown
+      │ first item
+      ▼
+ stage_batch              drains try_next_send_work() until the batch
+      │                   headroom is hit (the item that didn't fit
+      │                   leads the next batch)
+      ▼
+ ┌─ SendBatch (preallocated at queue install) ──────────────────────┐
+ │  arena: sqsize × 64 B (≥ 4 KiB)    iovec list (≤ UIO_MAXIOV)     │
+ │   R2Ts, C2HData headers,            [hdr][payload][hdr]…         │
+ │   DDGSTs, response capsules         payload entries point INTO   │
+ │   encoded by sans-IO [nvme]         slot buffers — staged by     │
+ │                                     reference, zero copy         │
+ │  byte-contiguous arena chunks merge: a payload-free batch        │
+ │  collapses to a single iovec entry                               │
+ └──────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+ ship_batch               ONE ops::sendmsg_raw (--send-zc:
+      │                   sendmsg_zc_raw; pin-budget ENOMEM/ENOBUFS
+      │                   falls back to the copying op). Short send:
+      │                   advance the iovec list in place, re-issue —
+      │                   no memmove, nothing else can interleave
+      ▼
+ retire                   release_tag(): capsule-only responses at
+                          the send CQE; payload-carrying responses
+                          only when the kernel is done with the slot
+                          pages — send CQE (copy) or ZC notification
+                          (≈ the peer's ACK)
+```
+
+What the shape buys, and what it must protect:
+
+- **`release_tag` placement is the memory-safety line**, not
+  bookkeeping: the kernel reads slot pages for the whole send, so a
+  tag — and with it the slot buffer — is released only when the
+  kernel provably no longer references it. Teardown joins the send
+  task (and drains pending ZC notifications) before the queue is
+  freed.
+- **SUCCESS elision**: with SQ flow control off (`sqhd_disabled`), a
+  successful read sets the SUCCESS bit in the last C2HData and skips
+  the response capsule entirely — one fewer PDU per read.
+- **ZC overlaps notifications, never sends** (`--send-zc`, §9):
+  `SendState` is double-buffered — while one batch waits out its
+  notification (≈ one RTT), the other stages and ships. At most one
+  send op is ever in flight, preserving wire order; only the waits
+  overlap. The recv side then parks on tag exhaustion (`await_tag`)
+  instead of terminating, since the notification races the host's
+  next command.
+
+#### 4.2.3 Data copies: one slot, one visible budget
+
+The slot buffer (preallocated per tag: 8 KiB admin, 128 KiB = MDTS io)
+is the single rendezvous for payload bytes; every copy on the path is
+accounted against it:
+
+```text
+ Host write (H2C)                     Host read (C2H)
+
+ kernel ──ops::recv──► recv buffer    backend fills the slot:
+                        (64 KiB)        file read_at — O_DIRECT DMAs
+    ① memcpy + fused CRC │              into slot pages, zero copy
+    (in-capsule data,    │                       │
+     buffered prefixes)  ▼                       ▼
+   ┌──────────────┐                    ┌──────────────┐
+   │ slot buffer  │ ◄══ ①' tail        │ slot buffer  │
+   └──────────────┘     ≥ 16 KiB:      └──────────────┘
+          │             MSG_WAITALL           │ ② gather iovec
+          │ borrow      straight from         │ references the slot
+          ▼             the kernel —          │ IN PLACE — no copy
+   backend write_at     skips the             ▼
+   on &slot[..len] —    buffer hop     ops::sendmsg_raw ──► kernel
+   no further copy                       kernel user→skb copy;
+                                         --send-zc pins pages instead:
+                                         zero copy, slot reuse gated
+                                         on the notification (§9)
+```
+
+The transport's userspace copy budget:
+
+| Path                                | Copies | Notes                          |
+|-------------------------------------|--------|--------------------------------|
+| H2C in-capsule / buffered prefix    | 1  (①) | recv buffer → slot, CRC fused  |
+| H2C tail ≥ `H2C_DIRECT_MIN` (16 KiB)| 0 (①') | lands directly in the slot     |
+| C2H payload                         | 0  (②) | slot referenced by the iovec   |
+
+Backends add their own: file adds **none** when the open gets O_DIRECT
+(the device DMAs against the slot pages; where the filesystem refuses
+— e.g. tmpfs — it falls back to buffered IO and the kernel copies
+through the page cache, `FileBackend::is_direct`); memory adds one per
+direction (chunk-wise across its 2 MiB chunks); null adds none (reads
+memset the slot — visible when measuring protocol overhead with it).
+
+Two principles behind the budget:
+
+- **The one write-side copy (①) is the product, not waste**: it lets a
+  single flat, MDTS-sized buffer absorb arbitrarily fragmented TCP
+  segments and H2CData splits, so backends never see scatter — and the
+  large tails that dominate bulk writes skip it (①').
+- **CRC32C runs while the bytes are cache-hot**, never as a cold pass
+  later: the recv side accumulates inside the reassembly copy (digest
+  negotiation gates only verification and emission), a direct tail is
+  re-read right after the kernel wrote it, and the send side reads the
+  slot right after the backend filled it.
+
+Everything else on the path is bounded per PDU: header assembly in the
+decoder, the 64-byte SQE stash, and header/digest encoding into the
 send arena.
-
-CRC32C runs while the bytes are cache-hot, never as a cold pass long
-after: the recv side accumulates alongside the reassembly copy
-(digest negotiation gates only verification and emission), and the
-send side reads the slot right after the backend filled it.
 
 ### 4.3 One IO command end to end
 
@@ -398,7 +494,7 @@ and future transports slot in without touching protocol logic:
 - `RecvSource` — yields borrowed byte chunks to the codec. Phase 1: plain
   single-shot `RECV` into a per-connection recv buffer, with a
   payload bypass as built: large H2C tails skip the buffer and land
-  in the slot via `MSG_WAITALL` raw recv (§4.2). Phase 2: multishot
+  in the slot via `MSG_WAITALL` raw recv (§4.2.3). Phase 2: multishot
   recv with a provided-buffer ring — irreconcilable with the bypass
   on one connection (the kernel picks the buffer), so it becomes a
   per-connection strategy choice. (RECV_ZC requires NIC header-data
