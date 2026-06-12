@@ -88,6 +88,12 @@ drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
   IO-queue fds — the registry has the qid routing records but holds no
   fd today, so teardown needs a shutdown handle per installed queue
   (nvmet analog: `nvmet_ctrl_fatal_error` schedules all queues dead).
+- **Mailbox sends to a dead queue thread accumulate forever**: the
+  sender queues unconditionally, so if a queue thread exited (runtime
+  init failure), every NsChanged nudge or stats request leaks one
+  queued message (bytes per event; `ioutgt stat -i` makes it steady).
+  Found by review of the stats work; pre-existing class. Fix shape: a
+  closed flag on the mailbox set when the receiver drops.
 - RAE semantics on log pages; real SMART/error-log content; Get Log
   Page offset support beyond discovery.
 - **Persistent discovery controllers**: discovery genctr maintenance
