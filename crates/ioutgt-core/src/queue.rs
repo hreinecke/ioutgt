@@ -257,6 +257,10 @@ pub struct QueueCore {
     /// that references slot memory). Teardown drains this to zero
     /// before freeing the slots.
     executing: Cell<u16>,
+    /// Recv-path doorbell for [`Self::await_tag`] (ZC mode): woken by
+    /// `release_tag` so a parked claim retries. Single waiter — the
+    /// recv loop is the only claimer.
+    tag_waiter: Cell<Option<Waker>>,
     /// Lifetime IO counters, shared with the owning thread's stats list.
     pub stats: Rc<QueueStats>,
 }
@@ -279,6 +283,7 @@ impl QueueCore {
             send_waker: Cell::new(None),
             send_closed: Cell::new(false),
             executing: Cell::new(0),
+            tag_waiter: Cell::new(None),
             stats: Rc::new(QueueStats::new(qid)),
         })
     }
@@ -299,6 +304,25 @@ impl QueueCore {
         slot.data_len.set(0);
         slot.recv_offset.set(0);
         Some(tag)
+    }
+
+    /// Claim a free tag, parking until one frees if the list is empty.
+    ///
+    /// ZC mode only: payload tags release on the send *notification*
+    /// (≈ the peer's TCP ACK), which races the host's next command —
+    /// an empty freelist is an expected transient there, not a
+    /// depth violation. Parking the recv path is deliberate TCP
+    /// backpressure; release never depends on the recv path, so this
+    /// cannot deadlock.
+    pub async fn await_tag(self: &Rc<QueueCore>) -> u16 {
+        std::future::poll_fn(|cx| match self.claim_tag() {
+            Some(tag) => Poll::Ready(tag),
+            None => {
+                self.tag_waiter.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     /// Deliver a fully received command to the slot task (recv path).
@@ -392,20 +416,25 @@ impl QueueCore {
         self.send_work.borrow_mut().pop_front()
     }
 
+    /// Poll-shaped core of [`Self::next_send_work`]: pending work
+    /// first, `None` once closed, else park the send waker. Public so
+    /// the transport's send loop can combine it with ZC notification
+    /// polling in a single hand-rolled future.
+    pub fn poll_send_work(&self, cx: &mut std::task::Context<'_>) -> Poll<Option<SendWork>> {
+        if let Some(work) = self.send_work.borrow_mut().pop_front() {
+            return Poll::Ready(Some(work));
+        }
+        if self.send_closed.get() {
+            return Poll::Ready(None);
+        }
+        self.send_waker.set(Some(cx.waker().clone()));
+        Poll::Pending
+    }
+
     /// Await the next send-path work item; `None` after [`close_send`]
     /// (pending work is delivered first).
     pub async fn next_send_work(self: &Rc<QueueCore>) -> Option<SendWork> {
-        std::future::poll_fn(|cx| {
-            if let Some(work) = self.send_work.borrow_mut().pop_front() {
-                return Poll::Ready(Some(work));
-            }
-            if self.send_closed.get() {
-                return Poll::Ready(None);
-            }
-            self.send_waker.set(Some(cx.waker().clone()));
-            Poll::Pending
-        })
-        .await
+        std::future::poll_fn(|cx| self.poll_send_work(cx)).await
     }
 
     /// Wake the send loop into orderly exit: `next_send_work` yields
@@ -426,6 +455,9 @@ impl QueueCore {
         debug_assert_eq!(slot.state.get(), SlotState::Responding);
         slot.state.set(SlotState::Free);
         self.free_tags.borrow_mut().push(tag);
+        if let Some(waker) = self.tag_waiter.take() {
+            waker.wake();
+        }
     }
 
     /// Slots currently executing a command (teardown gate: their
@@ -490,6 +522,47 @@ mod tests {
         let q = QueueCore::new(1, 8, 64, true);
         assert_eq!(q.advance_sqhd(), 0);
         assert_eq!(q.advance_sqhd(), 0);
+    }
+
+    #[test]
+    fn await_tag_immediate_when_free() {
+        let q = QueueCore::new(1, 2, 64, false);
+        let fut = q.await_tag();
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let Poll::Ready(tag) = std::future::Future::poll(fut.as_mut(), &mut cx) else {
+            panic!("free tags must claim immediately");
+        };
+        assert_eq!(q.slot(tag).state(), SlotState::Receiving);
+    }
+
+    #[test]
+    fn await_tag_parks_until_release() {
+        let q = QueueCore::new(1, 2, 64, false);
+        let t0 = q.claim_tag().unwrap();
+        let _t1 = q.claim_tag().unwrap();
+
+        let fut = q.await_tag();
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
+
+        // Walk t0 to Responding so release_tag's debug_assert holds.
+        q.submit(t0, Sqe::zeroed());
+        {
+            let cmd = q.await_command(t0);
+            let mut cmd = std::pin::pin!(cmd);
+            assert!(std::future::Future::poll(cmd.as_mut(), &mut cx).is_ready());
+        }
+        q.complete(t0, Cqe::new(0, 0, 1, 7, 0), 0);
+        q.release_tag(t0);
+
+        assert!(matches!(
+            std::future::Future::poll(fut.as_mut(), &mut cx),
+            Poll::Ready(tag) if tag == t0
+        ));
     }
 
     #[test]
