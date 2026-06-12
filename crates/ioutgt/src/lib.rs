@@ -366,6 +366,16 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
 /// Start every thread of a target; returns the bound address (for
 /// ephemeral-port tests). Runs until the process exits.
 pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
+    if config.send_zc {
+        // Opt-in experiment: refuse to start rather than silently
+        // fall back to the copying path.
+        let features = ioutgt_uring::probe()?;
+        if !features.sendmsg_zc {
+            return Err(io::Error::other(
+                "--send-zc requested but the kernel lacks IORING_OP_SENDMSG_ZC (need >= 6.1)",
+            ));
+        }
+    }
     let admin_tx = spawn_admin_thread("ioutgt-admin".into())?;
     let io_cpus = if config.pin_threads {
         io_thread_cpus(config.io_threads)
