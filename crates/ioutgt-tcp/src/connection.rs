@@ -555,6 +555,15 @@ async fn drive_recv(
 ) -> Result<(), RecvEnd> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
+    // 64 KiB recv buffer, allocated once per connection: only headers,
+    // in-capsule payloads (≤ 16 KiB inline limit), and payload prefixes
+    // pass through it — H2C tails ≥ H2C_DIRECT_MIN bypass it into the
+    // slot, and read data never touches it. The size is the small-IO
+    // batching unit (~15 × 4 KiB write capsules per wakeup) and matches
+    // the kernel's max GRO/loopback burst (64 KiB), so one recv drains
+    // the largest coalesced unit the stack delivers per softirq pass.
+    // Larger buys nothing (big payloads are routed around it); smaller
+    // splits one burst into several wakeup + state-machine passes.
     let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
 
     loop {
