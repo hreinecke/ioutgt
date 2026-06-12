@@ -14,9 +14,11 @@ use std::time::Duration;
 use common::{Client, NQN, pattern, rw_sqe};
 use ioutgt_nvme::pdu::{self, PduKind};
 use ioutgt_nvme::{spec, status};
+use ioutgt_tcp::H2C_DIRECT_MIN;
 
-/// Mirror of connection.rs's `H2C_DIRECT_MIN` (16 KiB).
-const THRESHOLD: usize = 16 * 1024;
+/// The direct-path gate, taken from the target crate so a retuned
+/// threshold cannot silently de-fang the edge tests.
+const THRESHOLD: usize = H2C_DIRECT_MIN as usize;
 /// Long enough that the target's recv loop drains its buffer (and arms
 /// the next recv) between our writes on loopback.
 const DELAY: Duration = Duration::from_millis(30);

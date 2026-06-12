@@ -16,6 +16,8 @@
 pub mod connection;
 pub mod handshake;
 
+pub use connection::H2C_DIRECT_MIN;
+
 /// MAXH2CDATA we advertise in ICResp (16 MiB, as kernel nvmet).
 pub const MAX_H2C_DATA: u32 = 0x40_0000 * 4;
 

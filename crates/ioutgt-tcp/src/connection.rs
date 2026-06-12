@@ -107,6 +107,19 @@ enum RecvPhase {
     },
 }
 
+impl RecvPhase {
+    /// Payload fully received: consume its 4-byte digest next.
+    fn ddgst(tag: u16, expected: u32, kind: PayloadKind) -> RecvPhase {
+        RecvPhase::Ddgst {
+            tag,
+            expected,
+            have: [0; 4],
+            have_len: 0,
+            kind,
+        }
+    }
+}
+
 /// Drive one queue connection to completion (EOF, error, or term).
 ///
 /// `on_ctx` runs once the dispatch context exists — the binary's admin
@@ -327,8 +340,9 @@ fn finish_payload(queue: &Rc<QueueCore>, tag: u16, kind: PayloadKind) -> Result<
 /// the connection buffer drains mid-payload — are received straight
 /// into the slot buffer, skipping the recv-buffer→slot copy. Below it
 /// the op-issue cost outweighs the copy. `u32::MAX` disables the path
-/// entirely (A/B measurement).
-const H2C_DIRECT_MIN: u32 = 16 * 1024;
+/// entirely (A/B measurement). Public so the threshold-edge tests pin
+/// their segmentation to the real gate value.
+pub const H2C_DIRECT_MIN: u32 = 16 * 1024;
 
 /// True when this command moves data host→controller (opcode bits 1:0
 /// = 01b) and the host kept it resident (transport SGL): solicit it.
@@ -418,13 +432,7 @@ async fn recv_loop(
                     *remaining -= u32::try_from(take).expect("take <= remaining: u32");
                     if *remaining == 0 {
                         if *ddgst {
-                            phase = RecvPhase::Ddgst {
-                                tag: *tag,
-                                expected: crc.finalize(),
-                                have: [0; 4],
-                                have_len: 0,
-                                kind: *kind,
-                            };
+                            phase = RecvPhase::ddgst(*tag, crc.finalize(), *kind);
                         } else {
                             let kind = *kind;
                             let tag = *tag;
@@ -491,6 +499,11 @@ async fn recv_loop(
         // best-effort: short-but-nonzero returns resume IN PLACE at
         // the advanced slot offset (never staged elsewhere, never
         // restarted); 0 is an orderly close mid-payload, as today.
+        //
+        // Copy-snapshot of the phase (every field is Copy — Crc32c
+        // included — so this is cheap): a failed guard falls through
+        // with `phase`, including its partially-accumulated CRC,
+        // untouched for the normal copy path.
         if let &RecvPhase::Data {
             tag,
             base,
@@ -517,8 +530,15 @@ async fn recv_loop(
                 // QueueCore, to which this function holds an Rc, and
                 // the op is awaited inline — recv_loop cannot return
                 // while it is in flight, so the memory outlives the
-                // terminal CQE. Nothing else touches this slot's data
-                // while its state is Receiving.
+                // terminal CQE. If the whole run_queue future is
+                // instead dropped mid-await (LocalSet teardown), the
+                // reactor's orphan protocol holds the op entry until
+                // its terminal CQE — the same accepted envelope as
+                // backend raw ops on slot memory (queue threads run
+                // for the process lifetime; reactor drain/leak is the
+                // backstop before anything is freed). Nothing else
+                // touches this slot's data while its state is
+                // Receiving.
                 let n = unsafe { ops::recv_raw_waitall(fd, ptr, remaining) }?.await?;
                 if n == 0 {
                     return Ok(()); // orderly close mid-payload
@@ -533,13 +553,7 @@ async fn recv_loop(
                     let data = queue.slot(tag).data();
                     crc.update(&data[tail_start..dest]);
                 }
-                phase = RecvPhase::Ddgst {
-                    tag,
-                    expected: crc.finalize(),
-                    have: [0; 4],
-                    have_len: 0,
-                    kind,
-                };
+                phase = RecvPhase::ddgst(tag, crc.finalize(), kind);
                 // Next ops::recv starts at the 4-byte digest.
             } else {
                 if let Err(err) = finish_payload(queue, tag, kind) {
