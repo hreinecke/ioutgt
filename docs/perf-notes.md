@@ -80,22 +80,36 @@ relative claim holds either way. The very first single-shot pair
 (staging 445K, gather 408K) sat above both repeat ranges — a
 quiet-period artifact, excluded from the table.
 
-128K reads are an unambiguous win: +22% bandwidth, −21% CPU per
-IOP, p50 −20%. 4K reads show a possible ~0–4% IOPS deficit
-(repeat means 392K vs 378K = −3.6%) with heavily overlapping run
-distributions and CPU ticks identical within 2%, on a
-non-quiesced machine — below the rig's resolution. The
-per-response iovec count (3 entries vs staging's 1 contiguous
-stream) is the suspected mechanism if real.
-If a quiet rig confirms it, the candidate fix is inlining payloads
-below a threshold (≤ ~8K) into the arena so small-IO batches
-collapse back to one contiguous iovec — i.e. staging as the *small*
-case of gather, not a separate path.
+Large reads are an unambiguous win: +22% bandwidth, −21% CPU per
+IOP, p50 −20% (confirmed on Ming's rig as a clear sequential-read
+improvement). 4K reads carry a small consistent cost, root-caused
+in a follow-up (2026-06-11, null backend, 2 threads, per-run
+utime/stime split):
+
+- gather *lowers* user CPU per op ~5% — the staging `__memmove`
+  (13.5% of target CPU in perf) is gone — but *raises* kernel CPU
+  per op ~4.6%; kernel is ~85% of the per-op budget, so 4K nets a
+  few percent loss (−3..5% per paired run here; acceptable on
+  Ming's rig).
+- Mechanism confirmed by experiment, not just suspected: a
+  prototype inlining payloads ≤16K into the arena — one contiguous
+  iovec segment, still SENDMSG — restored kernel CPU and IOPS to
+  staging parity while keeping the large-read by-reference win
+  (+13% at 128K qd16×2). The cost is the kernel's multi-segment
+  `ITER_IOVEC` walk (3 segments per small response vs staging's 1
+  contiguous stream), not the SENDMSG opcode itself.
+
+Verdict: keep gather as-is. If small-IO CPU ever matters on a
+workload, the validated fix is threshold-inlining — staging as the
+*small* case of gather, arena sized sqsize × (64 + threshold) ≈ the
+old staging footprint; a one-entry batch could additionally drop to
+plain SEND (`ITER_UBUF`).
 
 ## Next steps (in measured-isolation order)
 
-1. Quiet-rig 4K re-measure of gather vs staging; threshold-inline
-   small payloads into the arena if the deficit is real.
+1. Optional: threshold-inline small payloads (validated by the
+   prototype above) if a real workload surfaces the 4K kernel-side
+   cost.
 2. Multishot recv + provided buffer ring (`ENOBUFS` → single-shot
    fallback): saves the recv re-arm SQE and the recv-buffer round trip.
 3. Registered (fixed) slot buffers + `READ_FIXED`/`WRITE_FIXED` for the
