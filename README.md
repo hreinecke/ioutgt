@@ -69,6 +69,13 @@ Licensed under either of
 
 at your option.
 
+**Exception**: the `ioutgt-cpus` crate is licensed **GPL-2.0-only** — it
+is a derivative of the Linux kernel's `lib/group_cpus.c` (see
+[`crates/ioutgt-cpus/LICENSE`](crates/ioutgt-cpus/LICENSE)). It is used
+only by the `ioutgt` binary, so the binary as distributed is governed by
+GPL-2.0 (the other crates contribute under their MIT option); every
+library crate other than `ioutgt-cpus` remains dual-licensed as above.
+
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally

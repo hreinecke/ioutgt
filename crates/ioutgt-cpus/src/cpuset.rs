@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Growable CPU bitset mirroring the kernel `cpumask` operations that
 //! `group_cpus_evenly()` relies on.
 
