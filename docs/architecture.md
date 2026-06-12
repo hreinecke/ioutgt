@@ -406,21 +406,25 @@ A host `Read` crosses every crate boundary exactly once per hop:
 4. **Dispatch**: the woken slot task calls `dispatch::execute()` [core],
    which routes fabrics/admin/io; `io::execute` resolves the namespace via
    the generation-checked `NsCache` and awaits `Backend::read()`
-   [backend], which issues `ops::read_at` on the same thread's ring
-   [uring].
+   [backend], which issues `ops::read_at_raw` straight against the slot
+   buffer on the same thread's ring [uring].
 5. **Respond**: `complete()` [core] queues a `SendWork`; `send_loop` [tcp]
    drains the whole send list, encodes C2HData/response headers [nvme]
    into the arena with payloads referenced from slot buffers, ships one
    gather `ops::sendmsg_raw` [uring], then `release_tag()` returns the
-   slot to the freelist.
+   slot to the freelist (under `--send-zc`, payload-carrying tags wait
+   for the ZC notification instead — §4.2.2).
 
-Boundary summary: **bin→tcp** is two handshake calls; **bin/tcp→uring** is
-op futures + mailbox; **tcp→core** is the `QueueCore` slot API plus
+Boundary summary: **bin→tcp** is the two handshake calls plus
+`run_queue()` itself — the queue threads' entry point, with the
+`on_ctx` hook that registers each connection's stats; **bin/tcp→uring**
+is op futures + mailbox; **tcp→core** is the `QueueCore` slot API plus
 `dispatch::execute`; **core→backend** is the `Backend` trait behind
 `Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
-add/remove + the NS-changed nudge; **core/tcp→nvme** is types and
-encode/decode only — the codec never does IO, and the reactor never sees
-a PDU.
+add/remove + the NS-changed nudge, while GET_STATS reaches the queue
+threads through binary-injected `StatsSource` closures over the same
+mailboxes; **core/tcp→nvme** is types and encode/decode only — the
+codec never does IO, and the reactor never sees a PDU.
 
 ## 5. Reactor: io_uring under Tokio current-thread
 
