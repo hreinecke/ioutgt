@@ -184,32 +184,36 @@ the run-to-run spread. Design:
 ## SENDMSG_ZC loopback A/B (2026-06-12)
 
 `--send-zc` (design: `docs/superpowers/specs/2026-06-12-send-zc-design.md`)
-landed opt-in; loopback A/B with memory backend, 4 IO threads,
-loadgen conns=4 qd=32, 10 s runs:
+landed opt-in. An earlier table in this section recorded −4%/−61% —
+those runs were **invalid**: queues were silently wedging on ENOMEM
+from ZC pinned-page accounting (see the RLIMIT_MEMLOCK note below;
+fixed the same day, with the field symptom being ~27 s IO hangs under
+`t/io_uring` until the host's 30 s IO timeout reset the controller).
+Corrected loopback A/B, memory backend, 4 IO threads, loadgen conns=4
+qd=32, 10 s runs, default 8 MiB `ulimit -l`:
 
 | Workload | Baseline | --send-zc | Δ |
 |---|---|---|---|
-| 4K randread | 336.6K IOPS, p50 205 µs | 322.9K IOPS, p50 220 µs | −4% |
-| 128K read | 7776 MiB/s, p50 1864 µs | 3020 MiB/s, p50 1076 µs | −61% |
+| 4K randread | 378.3K IOPS, p50 184 µs | 353.3K IOPS, p50 201 µs | −6.6% |
+| 128K read | 10140 MiB/s, p50 1489 µs | 7215 MiB/s, p50 1911 µs | −29% |
 
-Both regressions are the *documented loopback* behavior, not a defect
-in the default path (flag off ⇒ identical code; baseline numbers are
-healthy):
+What the numbers mean on loopback:
 
-- Loopback ZC always falls back to a kernel copy — REPORT_USAGE
-  confirms `zc_copied == zc_batches` (25,189/25,189 in a 3 s smoke
-  run) — so the copy is still paid, plus page pinning and a second
-  CQE per op.
-- The 128K collapse is **ACK-gated tag reuse**: payload slots stay
-  claimed until the notification (≈ the peer's ACK), shrinking the
-  effective queue depth — visible as p50 *dropping* (less queueing)
-  while throughput halves. On a real NIC the copy disappears and the
-  pin cost is traded against DMA-from-userspace; whether the ACK
-  gating still dominates at line rate is exactly the open question.
+- ZC always degrades to a kernel copy here — REPORT_USAGE confirms
+  `zc_copied == zc_batches` — so the copy is still paid, plus page
+  pinning, a second CQE per op, and notif-gated tag reuse.
+- **RLIMIT_MEMLOCK is the binding constraint**: ZC pins are charged
+  against the per-user memlock limit (8 MiB default), *shared across
+  all connections*; two full-depth 128K batches alone fill it. At
+  this load ~29% of batches hit ENOMEM and fell back to the copying
+  path (`zc_fallbacks` ≈ 4K of ≈ 14K batches per queue). Raising
+  `ulimit -l` (or systemd `LimitMEMLOCK`) is part of any honest
+  real-NIC evaluation; with the default limit a large fraction of
+  "ZC" traffic is copies plus a failed-pin round trip.
 - 4K@qd32 also rides ZC because the 16 KiB `SEND_ZC_MIN` threshold is
   per *batch* (32 pending 4K responses ≈ 128K staged payload), not
   per response — a future sweep knob if small-IO ZC stays a loss on
   hardware.
 
 Verdict: keep `--send-zc` experimental/default-off; the honest
-evaluation needs a real NIC (roadmap).
+evaluation needs a real NIC **and a raised memlock limit** (roadmap).

@@ -29,7 +29,8 @@ two IO threads. This file orders what comes next.
   notification CQE, recv path parks on tag exhaustion. Design in
   `docs/superpowers/specs/2026-06-12-send-zc-design.md`. **Still
   open: real-NIC evaluation** — loopback falls back to copying
-  (REPORT_USAGE confirms: `zc_copied == zc_batches`), so the flag
+  (REPORT_USAGE confirms: `zc_copied == zc_batches`) and the default
+  8 MiB `RLIMIT_MEMLOCK` forces copy fallbacks under load, so the flag
   stays experimental until benched on hardware.
 - **`RECV_ZC` (zcrx)**: requires NIC header-data split + flow
   steering; revisit when 100G hardware is on the bench.
