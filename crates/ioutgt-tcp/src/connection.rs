@@ -35,25 +35,7 @@ pub const ADMIN_SLOT_BUF: usize = 8 * 1024;
 /// IO-queue slot buffers: MDTS.
 pub const IO_SLOT_BUF: usize = 128 * 1024;
 
-/// RAII guard for the active-connection counter: the count is
-/// incremented by the acceptor before the permit is built, and
-/// decremented here when the connection's `run_queue` returns. This is
-/// how the control thread bounds concurrent connections (and thus total
-/// preallocated queue memory) across queue threads.
-pub struct ConnPermit(Arc<std::sync::atomic::AtomicUsize>);
-
-impl ConnPermit {
-    /// Wrap an already-incremented counter; drop decrements it.
-    pub fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        ConnPermit(counter)
-    }
-}
-
-impl Drop for ConnPermit {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
+pub use ioutgt_core::permit::ConnPermit;
 
 /// Everything a queue thread receives to run one connection.
 #[allow(missing_docs)]
