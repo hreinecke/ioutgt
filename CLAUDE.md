@@ -40,8 +40,8 @@ testing/run_interop.sh ioutgt_fio # only the fio data-integrity stage
 testing/run_affinity.sh           # multi-NUMA guest: group_cpus_evenly placement (default-on)
 ```
 
-Requires the external vmtest harness (`~/git/utils/vmtest`, config
-`~/git/linux-knext/vmtest.conf`; override via `VMTEST`/`VMTEST_CONF`).
+Requires the external vmtest harness (`https://github.com/ublk-org/vmtest`, config
+`vmtest.conf`; override via `VMTEST`/`VMTEST_CONF`).
 Knobs: `IOUTGT_BACKEND=memory|null|file`, `IOUTGT_ENABLE_KILL=1`
 (kill/recovery), `IOUTGT_SOAK_ONLY=N` (reconnect-leak gate),
 `IOUTGT_SEND_ZC=1` (zero-copy send path). The harness

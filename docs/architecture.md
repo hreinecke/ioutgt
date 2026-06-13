@@ -652,8 +652,8 @@ API change (development machine is single-node).
    `ioutgt-nvme` codec drives the target on localhost, including malformed
    frames (term-request paths) and mid-R2T disconnects.
 3. **VM interop (primary acceptance)**: `testing/run_interop.sh` starts the
-   target on the host; a vmtest VM (`~/git/utils/vmtest -c
-   ~/git/linux-knext/vmtest.conf`) runs `nvme discover`, `nvme connect`,
+   target on the host; a vmtest VM (`https://github.com/ublk-org/vmtest -c
+   vmtest.conf`) runs `nvme discover`, `nvme connect`,
    `nvme list/id-ctrl/id-ns`, fio `--verify=crc32c`, `nvme disconnect`
    against `10.0.2.2:14420` (the harness avoids 4420, which is often
    owned by other targets on a dev box; the port is published to the
