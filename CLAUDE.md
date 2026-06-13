@@ -10,6 +10,11 @@ authoritative as-built spec — thread model, reactor, command-slot
 lifecycle, crate map, milestone status. Keep it updated when behavior
 changes.
 
+The project is still early-stage and lives in a private GitHub repo with
+no outside users, so there is no API/ABI stability obligation:
+refactoring and public-API changes are fine when they improve the design
+— no deprecation shims or backward-compatibility layers needed.
+
 ## Commands
 
 ```sh
