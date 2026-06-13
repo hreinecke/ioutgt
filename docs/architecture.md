@@ -513,7 +513,8 @@ send (per command, items on an ordered queue-local send list):
 - **Digests**: incremental CRC32C (Castagnoli, hardware-accelerated).
 - **Errors**: malformed PDUs produce C2HTermReq with the spec'd FES codes,
   never a panic or silent close; backend errors map via an errno→NVMe-SC
-  table copied from nvmet semantics.
+  table copied from nvmet semantics (`io::nvme_status`, a free function —
+  not a `Backend`-trait method, since the trait is transport-neutral).
 - **Send batching (M9) + gather**: the send task drains the entire
   completion/R2T queue into one gather SENDMSG — headers in a small
   arena, payloads referenced from slot buffers — because send SQEs on
