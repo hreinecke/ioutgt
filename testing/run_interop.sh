@@ -47,7 +47,9 @@ WATCHER_PID=""
 cleanup() {
     [ -s "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
     [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
-    rm -f "$PID_FILE"
+    # Drop the checkout marker so a later manual vmtest run cannot pick
+    # up a stale path (run_affinity.sh does the same).
+    rm -f "$PID_FILE" "$MARKER_DIR/ioutgt_top"
 }
 trap cleanup EXIT
 # Fatal signals bypass the EXIT trap unless turned into an exit.
@@ -58,6 +60,9 @@ rm -f "$MARKER_DIR/ioutgt_want_ns2" "$MARKER_DIR/ioutgt_want_kill" \
     "$MARKER_DIR/ioutgt_kill_enabled" "$MARKER_DIR/ioutgt_soak_only"
 # Tell the guest which port we serve on (env does not cross into the VM).
 echo "$PORT" > "$MARKER_DIR/ioutgt_port"
+# Publish this checkout to the guest test wrappers (same 9p marker
+# mechanism as run_affinity.sh) so they never need a hardcoded path.
+echo "$TOP" > "$MARKER_DIR/ioutgt_top"
 # Fresh log: the startup gate below greps it for the listener line.
 : > "$LOG"
 # IOUTGT_SOAK_ONLY=N: reconnect-leak mode — the guest only runs N

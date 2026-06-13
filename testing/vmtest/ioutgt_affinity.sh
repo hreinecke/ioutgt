@@ -28,7 +28,9 @@ ioutgt_expand_cpulist() {
 ioutgt_run_affinity() {
     local top
     top=$(cat "${VMTEST_DATA_DIR:-/nonexistent}/tmp/ioutgt_top" 2>/dev/null ||
-        echo "${IOUTGT_DIR:-/home/ming/git/ioustgt}")
+        echo "${IOUTGT_DIR:-}")
+    [ -n "$top" ] ||
+        vt_die "no ioutgt checkout (missing ioutgt_top marker and IOUTGT_DIR)"
     local bin="$top/target/release/ioutgt"
     [ -x "$bin" ] || vt_die "no ioutgt binary at $bin (run testing/run_affinity.sh)"
 
