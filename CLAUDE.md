@@ -62,9 +62,13 @@ Eight crates in a strict dependency DAG (full diagrams: architecture.md
 §4). Two deliberately opposite leaves: `ioutgt-nvme` is **sans-IO**
 (bytes ↔ structs only, no sockets/async — shared by target, test client,
 and the decoder fuzz test) and `ioutgt-uring` is **pure IO** (reactor +
-op futures, zero protocol knowledge). `ioutgt-core` sits between
-(model, `QueueCore` command slots, dispatch, `Backend` trait);
-`ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose them; the
+op futures, zero protocol knowledge). `ioutgt-core` sits between (NVMe model + dispatch + the protocol-neutral
+slot engine `ioutgt-core::slotq`; the per-connection queue context is
+`NvmeQueue` in core, with the transport-side `TcpQueue` composing it with
+a `SendList<SendWork>`); `ioutgt-uring` gained `sendbatch` — the
+protocol-free `GatherBatch` shared by stream transports;
+`ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose the core
+crates; the
 `ioutgt` binary assembles everything in `spawn_target()`
 (`crates/ioutgt/src/lib.rs`). A third leaf, `ioutgt-cpus`, ports the
 kernel's `group_cpus_evenly()` for topology-aware IO-thread pinning
@@ -79,9 +83,10 @@ Tokio current-thread runtime with no Tokio IO driver; the reactor hooks
 
 Per connection, `run_queue()` (ioutgt-nvme-tcp) spawns one persistent task per
 command slot ("task per tag"); the recv loop, slot tasks, and send loop
-never call each other — their only rendezvous is `QueueCore`
-(ioutgt-core): `claim_tag`/`submit` → `await_command` →
-`dispatch::execute` → `complete` → `next_send_work`/`release_tag`.
+never call each other — their only rendezvous is `TcpQueue`
+(ioutgt-nvme-tcp): `claim_tag`/`submit` → `await_command` →
+`dispatch::execute` → `begin_respond` + `SendWork::push` →
+`next_send_work`/`release_tag`.
 
 ### Invariants — do not break
 

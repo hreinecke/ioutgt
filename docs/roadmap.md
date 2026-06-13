@@ -56,11 +56,19 @@ bdev backend path.
 
 ## 3. New transports (the framework bet)
 
+2026-06-12: the prerequisite transport-abstraction refactor landed
+(transport contract in architecture.md §6.1; design spec
+`docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`).
+NBD is next (its superseded spec holds the protocol design); NVMe/RDMA
+after.
+
 The split that makes this tractable: `ioutgt-nvme` is sans-io,
-`ioutgt-core` owns slots/dispatch/controllers, and a transport
-supplies (a) connection setup that yields a routed queue, (b) a recv
-path that fills slot buffers and submits SQEs, (c) a send path that
-drains `SendWork`. NVMe/TCP's `connection.rs` is the template.
+`ioutgt-core` owns the slot engine (`slotq`), NVMe model, and
+dispatch/controllers, and a transport supplies the six obligations of
+the transport contract (setup → install → recv path → slot task body →
+send path → teardown) using its own `SlotArray<C>` + `SendList<W>`
+instantiation. NVMe/TCP's `connection.rs` (now `ioutgt-nvme-tcp`) is
+the template.
 
 - **NVMe/RDMA** (`ioutgt-rdma`): same fabrics/core unchanged; the
   transport maps `SendWork::Response`/data to RDMA SEND/WRITE and
