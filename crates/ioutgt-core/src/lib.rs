@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod fabrics_exec;
 pub mod io;
 pub mod queue;
+pub mod slotq;
 pub mod subsystem;
 
 pub use backend::{Backend, BackendError, LbaRange};
