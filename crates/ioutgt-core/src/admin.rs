@@ -334,7 +334,7 @@ fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
 
     for (index, (nqn, _subsys)) in subsystems.iter().enumerate() {
         let mut entry = DiscoveryLogEntry::zeroed();
-        entry.trtype = fabrics::trtype::TCP;
+        entry.trtype = ctx.port.trtype.trtype();
         entry.adrfam = 1; // IPv4
         entry.subtype = fabrics::subtype::NVM;
         entry.treq = 0;

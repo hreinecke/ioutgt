@@ -14,6 +14,27 @@ use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
 
+/// Fabric transport serving a port; selects the TRTYPE byte in
+/// discovery log entries (NVMe-oF: RDMA = 1, TCP = 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportType {
+    /// NVMe/TCP.
+    Tcp,
+    /// NVMe/RDMA (no transport implementation yet; the discovery
+    /// plumbing is transport-complete ahead of it).
+    Rdma,
+}
+
+impl TransportType {
+    /// Discovery-log TRTYPE encoding.
+    pub fn trtype(self) -> u8 {
+        match self {
+            TransportType::Tcp => ioutgt_nvme::fabrics::trtype::TCP,
+            TransportType::Rdma => ioutgt_nvme::fabrics::trtype::RDMA,
+        }
+    }
+}
+
 /// One namespace: an NSID bound to a backend.
 #[allow(missing_docs)]
 pub struct Namespace<B> {
@@ -143,6 +164,8 @@ pub struct PortConfig<B> {
     pub traddr: String,
     /// Port number as a string (`trsvcid`).
     pub trsvcid: String,
+    /// Transport serving this port (TRTYPE in discovery entries).
+    pub trtype: TransportType,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }

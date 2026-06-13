@@ -18,7 +18,7 @@ use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
-use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
+use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
 use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue};
 use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
@@ -381,6 +381,7 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
     Ok(Arc::new(PortConfig {
         traddr: bound.ip().to_string(),
         trsvcid: bound.port().to_string(),
+        trtype: TransportType::Tcp,
         subsystems,
     }))
 }
