@@ -15,6 +15,7 @@
 
 pub mod connection;
 pub mod handshake;
+pub mod queue;
 
 pub use connection::H2C_DIRECT_MIN;
 

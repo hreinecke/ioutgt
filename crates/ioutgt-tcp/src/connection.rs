@@ -20,7 +20,7 @@ use std::time::Duration;
 use ioutgt_core::backend::Backend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Role};
-use ioutgt_core::queue::{QueueCore, SendWork};
+use crate::queue::{SendWork, TcpQueue};
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
@@ -115,7 +115,7 @@ impl DataPhase {
     /// the next phase once this PDU's payload has fully arrived.
     fn advance(
         &mut self,
-        queue: &Rc<QueueCore>,
+        queue: &Rc<TcpQueue>,
         slice: &mut &[u8],
     ) -> Result<Option<RecvPhase>, RecvEnd> {
         let take = (self.remaining as usize).min(slice.len());
@@ -162,7 +162,7 @@ impl DdgstPhase {
     /// payload. A mismatch fails the command but keeps the connection.
     fn advance(
         &mut self,
-        queue: &Rc<QueueCore>,
+        queue: &Rc<TcpQueue>,
         slice: &mut &[u8],
     ) -> Result<Option<RecvPhase>, RecvEnd> {
         let take = (4 - self.have_len as usize).min(slice.len());
@@ -240,18 +240,18 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     } else {
         IO_SLOT_BUF
     };
-    let queue = QueueCore::new(conn.qid, conn.sqsize, slot_buf, conn.sqhd_disabled);
+    let queue = TcpQueue::new(conn.qid, conn.sqsize, slot_buf, conn.sqhd_disabled);
     let fd = conn.fd.as_raw_fd();
     let ctx = if conn.qid == 0 {
         ConnCtx::new_admin(
-            Rc::clone(&queue),
+            Rc::clone(&queue.nvme),
             Arc::clone(&conn.port),
             Arc::clone(&conn.registry),
             conn.connect_data,
         )
     } else {
         ConnCtx::new_io(
-            Rc::clone(&queue),
+            Rc::clone(&queue.nvme),
             Arc::clone(&conn.port),
             Arc::clone(&conn.registry),
             conn.connect_data,
@@ -290,7 +290,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
 /// One persistent task per command slot: each waits for its tag's next
 /// command, executes it, and posts the completion.
 fn spawn_slot_tasks<B: Backend>(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     ctx: &Rc<ConnCtx<B>>,
 ) -> Vec<JoinHandle<()>> {
     (0..queue.sqsize)
@@ -347,7 +347,7 @@ fn spawn_keepalive_watchdog<B: Backend>(ctx: Rc<ConnCtx<B>>, fd: i32) -> JoinHan
 /// it (the gather send references slot buffers) before freeing the
 /// queue.
 fn spawn_send_task(
-    queue: Rc<QueueCore>,
+    queue: Rc<TcpQueue>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
@@ -386,7 +386,7 @@ async fn quiesce(mut done: impl FnMut() -> bool) {
 /// Post-recv teardown: quiesce executing slots and the send task, then
 /// abort the per-tag tasks — or leak everything on timeout.
 async fn teardown<B: Backend>(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     ctx: &Rc<ConnCtx<B>>,
     fd: i32,
     send_task: JoinHandle<()>,
@@ -458,7 +458,7 @@ async fn send_term(fd: i32, error: PduError) {
 
 /// Payload for this PDU fully received (and digest-verified): advance
 /// the slot; submit the command once the whole transfer is present.
-fn finish_payload(queue: &Rc<QueueCore>, tag: u16, kind: PayloadKind) -> Result<(), PduError> {
+fn finish_payload(queue: &Rc<TcpQueue>, tag: u16, kind: PayloadKind) -> Result<(), PduError> {
     let slot = queue.slot(tag);
     match kind {
         PayloadKind::InCapsule => {
@@ -505,7 +505,7 @@ fn needs_r2t(sqe: &Sqe) -> bool {
 /// violations send a C2HTermReq and close cleanly; transport errors
 /// propagate to the connection-closed log line.
 async fn recv_loop(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
@@ -529,7 +529,7 @@ async fn recv_loop(
 /// Receive loop body: each recv buffer steps the phase machine; large
 /// H2C tails switch to direct-into-slot receives between buffers.
 async fn drive_recv(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
@@ -589,7 +589,7 @@ async fn drive_recv(
 /// Header phase: feed the decoder; once a header is complete, route
 /// the PDU. Returns the next phase if payload follows on the stream.
 async fn feed_header(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     decoder: &mut PduDecoder,
     slice: &mut &[u8],
     data_digest: bool,
@@ -614,7 +614,7 @@ async fn feed_header(
 /// restarted); 0 is an orderly close mid-payload, as on the buffered
 /// path.
 async fn recv_tail_direct(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     fd: i32,
     mut data: DataPhase,
 ) -> Result<RecvPhase, RecvEnd> {
@@ -633,7 +633,7 @@ async fn recv_tail_direct(
         };
         // SAFETY: ptr..ptr+remaining is slot-buffer memory
         // (bounds-checked by the slicing above) owned by
-        // QueueCore, to which this function holds an Rc, and
+        // TcpQueue, to which this function holds an Rc, and
         // the op is awaited inline — the recv path cannot return
         // while it is in flight, so the memory outlives the
         // terminal CQE. If the whole run_queue future is
@@ -672,7 +672,7 @@ async fn recv_tail_direct(
 /// follows on the stream. Async only for the ZC-mode tag wait; every
 /// other path resolves immediately.
 async fn handle_pdu(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     decoded: pdu::DecodedPdu,
     data_digest: bool,
     send_zc: bool,
@@ -711,7 +711,7 @@ async fn handle_pdu(
 /// A new command capsule: claim a slot, then route by payload
 /// residency — in-capsule data, host-resident via R2T, or no data.
 async fn handle_capsule_cmd(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     sqe: Sqe,
     data_len: u32,
     ddgst: bool,
@@ -768,7 +768,7 @@ async fn handle_capsule_cmd(
 /// Validate one H2CData header against its slot's expected reassembly
 /// state; returns the target tag.
 fn validate_h2c(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     cid: u16,
     ttag: u16,
     offset: u32,
@@ -920,7 +920,7 @@ impl SendBatch {
 
     /// Release the notif-gated tags and recycle the batch for staging.
     /// Callers must have reaped every pending notification first.
-    fn recycle(&mut self, queue: &Rc<QueueCore>) {
+    fn recycle(&mut self, queue: &Rc<TcpQueue>) {
         for tag in self.tags_at_notif.drain(..) {
             queue.release_tag(tag);
         }
@@ -949,7 +949,7 @@ fn advance_iovecs(iovs: &mut [libc::iovec], live: &mut usize, mut sent: usize) -
 /// unchanged), payload referenced in place from the slot buffer, DDGST
 /// computed over the slot and trailed in the arena.
 fn stage_send_work(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     batch: &mut SendBatch,
     work: &SendWork,
     hdr_digest: bool,
@@ -1004,7 +1004,7 @@ fn stage_send_work(
 /// responses release at the send CQE (their slot memory is not
 /// referenced by the op), R2Ts release nothing.
 fn stage_and_account(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     batch: &mut SendBatch,
     work: &SendWork,
     hdr_digest: bool,
@@ -1051,7 +1051,7 @@ impl SendState {
 
     /// Index of a batch free for staging, reaping the oldest
     /// in-flight batch first when both are awaiting notifications.
-    async fn acquire(&mut self, queue: &Rc<QueueCore>) -> usize {
+    async fn acquire(&mut self, queue: &Rc<TcpQueue>) -> usize {
         if self.inflight.len() == self.batches.len() {
             self.reap_oldest(queue).await;
         }
@@ -1062,14 +1062,14 @@ impl SendState {
 
     /// Await every notification of the oldest in-flight batch, then
     /// release its notif-gated tags and recycle it.
-    async fn reap_oldest(&mut self, queue: &Rc<QueueCore>) {
+    async fn reap_oldest(&mut self, queue: &Rc<TcpQueue>) {
         if let Some(idx) = self.inflight.pop_front() {
             self.reap(queue, idx).await;
         }
     }
 
     /// Await every notification of one batch, then recycle it.
-    async fn reap(&mut self, queue: &Rc<QueueCore>, idx: usize) {
+    async fn reap(&mut self, queue: &Rc<TcpQueue>, idx: usize) {
         while let Some(notif) = self.batches[idx].pending_notifs.pop() {
             if notif.await {
                 self.zc_copied += 1;
@@ -1084,7 +1084,7 @@ impl SendState {
     /// after joining the task. Covers the in-flight list AND the
     /// batch a send error abandoned mid-ship — that one is not on
     /// the list but may hold notifs from its earlier ZC ops.
-    async fn drain(&mut self, queue: &Rc<QueueCore>) {
+    async fn drain(&mut self, queue: &Rc<TcpQueue>) {
         while let Some(idx) = self.inflight.pop_front() {
             self.reap(queue, idx).await;
         }
@@ -1098,7 +1098,7 @@ impl SendState {
     /// never depend on new send work arriving (with all tags
     /// notif-gated and the host idle, work can only be *produced*
     /// once a notif frees a tag).
-    async fn next_work_reaping(&mut self, queue: &Rc<QueueCore>) -> Option<SendWork> {
+    async fn next_work_reaping(&mut self, queue: &Rc<TcpQueue>) -> Option<SendWork> {
         loop {
             let Some(&front) = self.inflight.front() else {
                 return queue.next_send_work().await;
@@ -1133,7 +1133,7 @@ impl SendState {
     /// and classify the batch. Notif-gated iff it actually holds
     /// notifications — a batch whose every ZC attempt fell back has
     /// none and is immediately reusable, like the plain path.
-    fn retire(&mut self, queue: &Rc<QueueCore>, idx: usize) {
+    fn retire(&mut self, queue: &Rc<TcpQueue>, idx: usize) {
         let batch = &mut self.batches[idx];
         for tag in batch.tags_at_cqe.drain(..) {
             queue.release_tag(tag);
@@ -1176,7 +1176,7 @@ fn poll_notifs(notifs: &mut Vec<ops::ZcNotif>, zc_copied: &mut u64, cx: &mut Con
 /// keeps that while the payload entries point straight into slot
 /// buffers (no staging copy). One park per batch, zero payload memcpy.
 async fn send_loop(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
@@ -1201,7 +1201,7 @@ async fn send_loop(
 }
 
 async fn send_batches(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
@@ -1229,7 +1229,7 @@ async fn send_batches(
 /// batch, stopping at its headroom. Returns the item that didn't fit
 /// (it is staged first next round).
 fn stage_batch(
-    queue: &Rc<QueueCore>,
+    queue: &Rc<TcpQueue>,
     batch: &mut SendBatch,
     first: SendWork,
     hdr_digest: bool,
@@ -1308,7 +1308,7 @@ async fn ship_batch(
 
 #[cfg(test)]
 mod gather_tests {
-    use ioutgt_core::queue::Completion;
+    use crate::queue::Completion;
 
     use super::*;
 
@@ -1326,7 +1326,7 @@ mod gather_tests {
 
     #[test]
     fn batch_matches_linear_encoding() {
-        let queue = QueueCore::new(1, 4, 4096, false);
+        let queue = TcpQueue::new(1, 4, 4096, false);
         #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         queue.slot(2).data()[..1000].copy_from_slice(&payload);
@@ -1373,7 +1373,7 @@ mod gather_tests {
     fn batch_elides_and_merges_without_digests() {
         // sqhd_disabled queue: a successful read elides the response
         // capsule; digests off exercises the bare-header layout.
-        let queue = QueueCore::new(1, 4, 4096, true);
+        let queue = TcpQueue::new(1, 4, 4096, true);
         let payload = [0xa5u8; 512];
         queue.slot(1).data()[..512].copy_from_slice(&payload);
 
@@ -1414,7 +1414,7 @@ mod gather_tests {
 
     #[test]
     fn staging_splits_tag_release_classes() {
-        let queue = QueueCore::new(1, 4, 4096, false);
+        let queue = TcpQueue::new(1, 4, 4096, false);
         let mut batch = SendBatch::new(queue.sqsize);
         let read_cqe = Cqe::new(0, 1, 1, 5, 0);
         let flush_cqe = Cqe::new(0, 2, 1, 6, 0);
