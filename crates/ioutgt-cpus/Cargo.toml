@@ -4,7 +4,10 @@ description = "Userspace port of the kernel's group_cpus_evenly() CPU grouping"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Not the workspace dual license: this crate is a derivative of the
+# kernel's GPL-2.0 lib/group_cpus.c. The ioutgt binary remains
+# distributable under GPL-2.0 via the MIT arm of the other crates.
+license = "GPL-2.0-only"
 repository.workspace = true
 authors.workspace = true
 

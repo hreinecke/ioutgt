@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//
+// Derived from the Linux kernel's lib/group_cpus.c:
+// Copyright (C) 2016 Thomas Gleixner.
+// Copyright (C) 2016-2017 Christoph Hellwig.
+// Rust port Copyright (C) 2026 Ming Lei.
+
 //! Userspace port of the kernel's `group_cpus_evenly()`
 //! (`lib/group_cpus.c`): group CPUs evenly per NUMA / cluster / SMT
 //! locality.

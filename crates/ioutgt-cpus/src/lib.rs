@@ -1,5 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Userspace port of the kernel's `group_cpus_evenly()`
 //! (`lib/group_cpus.c`).
+//!
+//! **License**: unlike the rest of the workspace (MIT OR Apache-2.0),
+//! this crate is GPL-2.0-only — `group.rs` is a derivative of the
+//! kernel's GPL-2.0 `lib/group_cpus.c` (see the copyright notices
+//! there and `LICENSE` in this crate).
 //!
 //! Groups all possible CPUs evenly per NUMA / cluster / SMT locality:
 //! present CPUs are spread first, then possible-but-not-present ones,

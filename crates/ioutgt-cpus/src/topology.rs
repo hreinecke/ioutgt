@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! CPU topology snapshot read from sysfs — the userspace stand-in for
 //! the kernel topology masks consumed by `group_cpus_evenly()`.
 
