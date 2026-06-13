@@ -122,7 +122,9 @@ impl<C: Copy> SlotArray<C> {
     /// Allocate `nslots` slots, each with a `slot_buf_size` data
     /// buffer, command stash initialized to `init`.
     pub fn new(nslots: u16, slot_buf_size: usize, init: C) -> SlotArray<C> {
-        let slots: Vec<Slot<C>> = (0..nslots).map(|_| Slot::new(init, slot_buf_size)).collect();
+        let slots: Vec<Slot<C>> = (0..nslots)
+            .map(|_| Slot::new(init, slot_buf_size))
+            .collect();
         // LIFO freelist: hot slots stay cache-warm.
         let free_tags: Vec<u16> = (0..nslots).rev().collect();
         SlotArray {

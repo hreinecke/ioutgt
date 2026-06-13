@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::queue::{SendWork, TcpQueue};
 use ioutgt_core::backend::Backend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Role};
-use crate::queue::{SendWork, TcpQueue};
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
@@ -290,10 +290,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
 
 /// One persistent task per command slot: each waits for its tag's next
 /// command, executes it, and posts the completion.
-fn spawn_slot_tasks<B: Backend>(
-    queue: &Rc<TcpQueue>,
-    ctx: &Rc<ConnCtx<B>>,
-) -> Vec<JoinHandle<()>> {
+fn spawn_slot_tasks<B: Backend>(queue: &Rc<TcpQueue>, ctx: &Rc<ConnCtx<B>>) -> Vec<JoinHandle<()>> {
     (0..queue.sqsize)
         .map(|tag| {
             let queue = Rc::clone(queue);

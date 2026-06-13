@@ -113,9 +113,7 @@ fn checked_len<B: Backend>(
     if u64::from(sqe.dptr.length.get()) != len {
         return Err(status::DATA_SGL_LEN_INVALID | status::DNR);
     }
-    backend
-        .check_range(rw.slba, nlb)
-        .map_err(nvme_status)?;
+    backend.check_range(rw.slba, nlb).map_err(nvme_status)?;
     #[allow(clippy::cast_possible_truncation)]
     Ok((rw, len as u32))
 }
