@@ -31,6 +31,7 @@ pub mod ops;
 mod probe;
 mod reactor;
 mod runtime;
+pub mod sendbatch;
 
 pub use cqe::CqeResult;
 pub use probe::{Features, probe};

@@ -27,6 +27,7 @@ use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
 use ioutgt_nvme::spec::{Cqe, Sqe, sgl};
 use ioutgt_nvme::{digest, status};
 use ioutgt_uring::ops;
+use ioutgt_uring::sendbatch::GatherBatch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -807,23 +808,14 @@ const ARENA_PER_ITEM: usize = 64;
 /// Worst-case iovec entries per staged item (header, payload, digest,
 /// capsule). Adjacent arena chunks merge; this is the unmerged bound.
 const IOVS_PER_ITEM: usize = 4;
-/// Kernel cap on msg_iovlen.
-const UIO_MAXIOV: usize = libc::UIO_MAXIOV as usize;
 
-/// One batch's gather state: headers and digests packed into a small
-/// arena, payloads referenced in place from slot buffers. Exactly one
-/// batch is in flight at a time; `reset()` recycles everything. All
-/// memory is preallocated at queue install.
+/// One batch's gather state: a [`GatherBatch`] for the
+/// protocol-free arena/iovec/msghdr mechanics, plus NVMe-specific
+/// tag-accounting and ZC notification vectors. Exactly one batch is
+/// in flight at a time; `reset()` recycles everything. All memory is
+/// preallocated at queue install.
 struct SendBatch {
-    arena: Box<[u8]>,
-    arena_used: usize,
-    iovs: Vec<libc::iovec>,
-    /// Hard entry cap (≤ UIO_MAXIOV). `Vec::with_capacity` may
-    /// over-allocate, so the fit check must not use `capacity()`.
-    iov_cap: usize,
-    /// First entry not yet fully sent (short-send resume point).
-    live: usize,
-    msghdr: Box<libc::msghdr>,
+    gather: GatherBatch,
     /// Response tags safe to release at the send CQE: capsule-only
     /// responses, whose slot memory the op never references.
     tags_at_cqe: Vec<u16>,
@@ -838,16 +830,8 @@ struct SendBatch {
 impl SendBatch {
     fn new(sqsize: u16) -> SendBatch {
         let n = usize::from(sqsize);
-        let iov_cap = (n * IOVS_PER_ITEM + IOVS_PER_ITEM).min(UIO_MAXIOV);
         SendBatch {
-            arena: vec![0u8; (n * ARENA_PER_ITEM).max(4096)].into_boxed_slice(),
-            arena_used: 0,
-            iovs: Vec::with_capacity(iov_cap),
-            iov_cap,
-            live: 0,
-            // SAFETY: a zeroed msghdr is a valid value; msg_iov[len]
-            // are set in msghdr() before every submit.
-            msghdr: Box::new(unsafe { std::mem::zeroed() }),
+            gather: GatherBatch::new(n * ARENA_PER_ITEM, n * IOVS_PER_ITEM + IOVS_PER_ITEM),
             tags_at_cqe: Vec::with_capacity(n),
             tags_at_notif: Vec::with_capacity(n),
             pending_notifs: Vec::with_capacity(8),
@@ -855,9 +839,7 @@ impl SendBatch {
     }
 
     fn reset(&mut self) {
-        self.arena_used = 0;
-        self.iovs.clear();
-        self.live = 0;
+        self.gather.reset();
         self.tags_at_cqe.clear();
         self.tags_at_notif.clear();
         debug_assert!(
@@ -868,54 +850,34 @@ impl SendBatch {
 
     /// Headroom for one more worst-case item?
     fn fits(&self) -> bool {
-        self.arena_used + ARENA_PER_ITEM <= self.arena.len()
-            && self.iovs.len() + IOVS_PER_ITEM <= self.iov_cap
+        self.gather.fits(ARENA_PER_ITEM, IOVS_PER_ITEM)
     }
 
     /// Unused arena to encode the next header piece into.
     fn arena_tail(&mut self) -> &mut [u8] {
-        &mut self.arena[self.arena_used..]
+        self.gather.arena_tail()
     }
 
     /// Publish `len` bytes just written at the arena tail.
     fn push_arena(&mut self, len: usize) {
-        let start = self.arena_used;
-        self.arena_used += len;
-        let ptr = self.arena[start..].as_ptr();
-        self.push_raw(ptr, len);
+        self.gather.push_arena(len);
     }
 
     /// Append a wire chunk; merges with the previous entry when
     /// byte-contiguous (consecutive arena pieces collapse, so pure
     /// header batches degenerate to a single entry).
     fn push_raw(&mut self, ptr: *const u8, len: usize) {
-        if len == 0 {
-            return;
-        }
-        if let Some(last) = self.iovs.last_mut() {
-            // SAFETY: one-past-the-end pointer, used only for equality.
-            let end = unsafe { last.iov_base.cast::<u8>().add(last.iov_len) };
-            if std::ptr::eq(end, ptr) {
-                last.iov_len += len;
-                return;
-            }
-        }
-        self.iovs.push(libc::iovec {
-            iov_base: ptr.cast_mut().cast(),
-            iov_len: len,
-        });
+        self.gather.push_raw(ptr, len);
     }
 
     /// msghdr describing the unsent suffix; call before each submit.
     fn msghdr(&mut self) -> *const libc::msghdr {
-        self.msghdr.msg_iov = self.iovs[self.live..].as_mut_ptr();
-        self.msghdr.msg_iovlen = self.iovs.len() - self.live;
-        &raw const *self.msghdr
+        self.gather.msghdr()
     }
 
     /// Consume `sent` bytes; true when the whole batch hit the socket.
     fn advance(&mut self, sent: usize) -> bool {
-        advance_iovecs(&mut self.iovs, &mut self.live, sent)
+        self.gather.advance(sent)
     }
 
     /// Release the notif-gated tags and recycle the batch for staging.
@@ -926,23 +888,6 @@ impl SendBatch {
         }
         self.reset();
     }
-}
-
-/// Skip fully-sent entries, bump the partial one in place. Returns
-/// true when `sent` consumed everything from `live` onward.
-fn advance_iovecs(iovs: &mut [libc::iovec], live: &mut usize, mut sent: usize) -> bool {
-    while *live < iovs.len() {
-        let e = &mut iovs[*live];
-        if sent < e.iov_len {
-            // SAFETY: stays within the entry's own chunk.
-            e.iov_base = unsafe { e.iov_base.cast::<u8>().add(sent).cast() };
-            e.iov_len -= sent;
-            return false;
-        }
-        sent -= e.iov_len;
-        *live += 1;
-    }
-    true
 }
 
 /// Stage one work item: header pieces into the arena (sans-IO encoders
@@ -1315,7 +1260,7 @@ mod gather_tests {
     /// Linearize a batch's iovecs (what the kernel would put on the wire).
     fn gather(batch: &SendBatch) -> Vec<u8> {
         let mut out = Vec::new();
-        for e in &batch.iovs {
+        for e in batch.gather.iovs() {
             // SAFETY: entries reference the batch arena and slot
             // buffers owned by the test, sized by construction.
             let s = unsafe { std::slice::from_raw_parts(e.iov_base.cast::<u8>(), e.iov_len) };
@@ -1366,7 +1311,7 @@ mod gather_tests {
 
         assert_eq!(gather(&batch), expect);
         // Arena-contiguous chunks merge: [R2T+C2H hdr][payload][DDGST+capsule].
-        assert_eq!(batch.iovs.len(), 3);
+        assert_eq!(batch.gather.iovs().len(), 3);
     }
 
     #[test]
@@ -1409,7 +1354,7 @@ mod gather_tests {
         assert_eq!(gather(&batch), expect);
         // [C2H hdr][payload][capsule]: capsule can't merge across the
         // slot-payload entry.
-        assert_eq!(batch.iovs.len(), 3);
+        assert_eq!(batch.gather.iovs().len(), 3);
     }
 
     #[test]
@@ -1447,29 +1392,5 @@ mod gather_tests {
 
         batch.reset();
         assert!(batch.tags_at_notif.is_empty() && batch.tags_at_cqe.is_empty());
-    }
-
-    #[test]
-    fn advance_iovecs_walks_short_sends() {
-        let a = [1u8, 2, 3, 4];
-        let b = [5u8, 6, 7];
-        let mut iovs = vec![
-            libc::iovec {
-                iov_base: a.as_ptr().cast_mut().cast(),
-                iov_len: 4,
-            },
-            libc::iovec {
-                iov_base: b.as_ptr().cast_mut().cast(),
-                iov_len: 3,
-            },
-        ];
-        let mut live = 0;
-        assert!(!advance_iovecs(&mut iovs, &mut live, 5)); // all of a + 1 byte of b
-        assert_eq!(live, 1);
-        assert_eq!(iovs[1].iov_len, 2);
-        assert!(!advance_iovecs(&mut iovs, &mut live, 1));
-        assert_eq!(iovs[1].iov_len, 1);
-        assert!(advance_iovecs(&mut iovs, &mut live, 1));
-        assert_eq!(live, 2);
     }
 }
