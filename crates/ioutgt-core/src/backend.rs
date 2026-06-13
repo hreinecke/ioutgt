@@ -7,8 +7,6 @@
 //! dispatch monomorphized (no per-IO boxing) while allowing heterogeneous
 //! namespaces.
 
-use ioutgt_nvme::status;
-
 /// A contiguous LBA range (discard / write-zeroes).
 #[derive(Debug, Clone, Copy)]
 #[allow(missing_docs)]
@@ -29,18 +27,6 @@ pub enum BackendError {
     Unsupported,
     /// IO error (errno).
     Io(i32),
-}
-
-impl BackendError {
-    /// NVMe status code for a CQE, per nvmet's blk_to_nvme_status mapping.
-    pub fn to_status(self) -> u16 {
-        match self {
-            BackendError::OutOfRange => status::LBA_RANGE | status::DNR,
-            BackendError::NoSpace => status::CAP_EXCEEDED | status::DNR,
-            BackendError::Unsupported => status::INVALID_OPCODE | status::DNR,
-            BackendError::Io(_) => status::INTERNAL | status::DNR,
-        }
-    }
 }
 
 /// Block storage provider for one namespace.

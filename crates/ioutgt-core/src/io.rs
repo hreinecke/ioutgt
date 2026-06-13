@@ -16,6 +16,18 @@ use crate::dispatch::{ConnCtx, IoState, Outcome};
 use crate::queue::stat_add;
 use crate::subsystem::Namespace;
 
+/// NVMe status code for a backend failure, per nvmet's
+/// blk_to_nvme_status mapping. Lives here — not on the `Backend`
+/// trait — because the trait is shared with non-NVMe transports.
+pub fn nvme_status(err: BackendError) -> u16 {
+    match err {
+        BackendError::OutOfRange => status::LBA_RANGE | status::DNR,
+        BackendError::NoSpace => status::CAP_EXCEEDED | status::DNR,
+        BackendError::Unsupported => status::INVALID_OPCODE | status::DNR,
+        BackendError::Io(_) => status::INTERNAL | status::DNR,
+    }
+}
+
 fn err_outcome<B: Backend>(ctx: &Rc<ConnCtx<B>>, cid: u16, code: u16) -> Outcome {
     stat_add(&ctx.queue.stats.errors, 1);
     Outcome::status(ctx.cqe(0, cid, code))
@@ -29,7 +41,7 @@ fn map_backend<B: Backend>(
 ) -> Outcome {
     match result {
         Ok(()) => Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), data_len),
-        Err(err) => err_outcome(ctx, cid, err.to_status()),
+        Err(err) => err_outcome(ctx, cid, nvme_status(err)),
     }
 }
 
@@ -103,7 +115,7 @@ fn checked_len<B: Backend>(
     }
     backend
         .check_range(rw.slba, nlb)
-        .map_err(|e| e.to_status())?;
+        .map_err(nvme_status)?;
     #[allow(clippy::cast_possible_truncation)]
     Ok((rw, len as u32))
 }
