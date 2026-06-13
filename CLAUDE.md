@@ -64,7 +64,7 @@ Eight crates in a strict dependency DAG (full diagrams: architecture.md
 and the decoder fuzz test) and `ioutgt-uring` is **pure IO** (reactor +
 op futures, zero protocol knowledge). `ioutgt-core` sits between
 (model, `QueueCore` command slots, dispatch, `Backend` trait);
-`ioutgt-tcp`, `ioutgt-backend`, `ioutgt-control` compose them; the
+`ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose them; the
 `ioutgt` binary assembles everything in `spawn_target()`
 (`crates/ioutgt/src/lib.rs`). A third leaf, `ioutgt-cpus`, ports the
 kernel's `group_cpus_evenly()` for topology-aware IO-thread pinning
@@ -77,7 +77,7 @@ thread runs its own io_uring (`SINGLE_ISSUER | DEFER_TASKRUN`) under a
 Tokio current-thread runtime with no Tokio IO driver; the reactor hooks
 `on_thread_park` so idle waits become one `submit_and_wait` syscall.
 
-Per connection, `run_queue()` (ioutgt-tcp) spawns one persistent task per
+Per connection, `run_queue()` (ioutgt-nvme-tcp) spawns one persistent task per
 command slot ("task per tag"); the recv loop, slot tasks, and send loop
 never call each other — their only rendezvous is `QueueCore`
 (ioutgt-core): `claim_tag`/`submit` → `await_command` →

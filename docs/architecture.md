@@ -105,7 +105,7 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
             │ spawns all threads, owns the TCP accept loop         │
             └──────────────────────────────────────────────────────┘
   frontends ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt-control          │  │ ioutgt-tcp              │
+            │ ioutgt-control          │  │ ioutgt-nvme-tcp              │
             │ JSON config schema,     │  │ ICReq handshake, recv/  │
             │ UDS control server      │  │ send loops, slot tasks  │
             └─────────────────────────┘  └─────────────────────────┘
@@ -129,7 +129,7 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 |-------|------|------------------------|
 | `ioutgt` | binary + assembly | all seven |
 | `ioutgt-control` | config + UDS control plane | core, backend |
-| `ioutgt-tcp` | NVMe/TCP transport | core, nvme, uring |
+| `ioutgt-nvme-tcp` | NVMe/TCP transport | core, nvme, uring |
 | `ioutgt-backend` | storage backends | core, uring |
 | `ioutgt-core` | NVMe model + dispatch | nvme |
 | `ioutgt-nvme` | sans-IO codec | — |
@@ -150,7 +150,7 @@ spawn_target(config)                                   [ioutgt]
   ├─ spawn_io_thread() × N ┤   QueueRuntime::new()     [ioutgt-uring]
   │                        │   mailbox()               [ioutgt-uring]
   │                        └─  block_on: loop { conn = mailbox.recv()
-  │                               → spawn run_queue(conn) }   [ioutgt-tcp]
+  │                               → spawn run_queue(conn) }   [ioutgt-nvme-tcp]
   └─ control thread (plain Tokio): control_loop()
        ├─ Registry::new()                              [ioutgt-core]
        ├─ build_port(): per namespace
@@ -160,8 +160,8 @@ spawn_target(config)                                   [ioutgt]
        │    └─ notify_ns_changed ──► admin mailbox ──► ctx.fire_ns_changed()
        │       (UDS ADD/REMOVE_NAMESPACE → AER NS_CHANGED on live ctrls)
        └─ TCP accept loop → setup_connection() per socket
-            ├─ accept_handshake()  ICReq/ICResp        [ioutgt-tcp]
-            ├─ read_connect()      first capsule       [ioutgt-tcp]
+            ├─ accept_handshake()  ICReq/ICResp        [ioutgt-nvme-tcp]
+            ├─ read_connect()      first capsule       [ioutgt-nvme-tcp]
             └─ MailboxSender::send(QueueConn)          [ioutgt-uring mailbox]
                  qid 0 → admin thread, qid n → io thread[(n-1) % N]
 ```
@@ -173,7 +173,7 @@ thread's hot path.
 
 ### 4.2 Queue thread: who calls whom inside `run_queue()`
 
-`run_queue()` (`ioutgt-tcp/src/connection.rs`) is the per-connection
+`run_queue()` (`ioutgt-nvme-tcp/src/connection.rs`) is the per-connection
 orchestrator. It builds the core-side state, then spawns the task set whose
 **only rendezvous is `QueueCore`** — the recv loop, slot tasks, and send
 loop never call each other directly:
@@ -181,7 +181,7 @@ loop never call each other directly:
 **`run_queue()` — the per-connection task set**
 
 ```text
-run_queue(QueueConn)                                   [ioutgt-tcp]
+run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
   ├─ QueueCore::new(qid, sqsize, slot_buf, …)          [ioutgt-core]
   ├─ ConnCtx::new_admin() / new_io()                   [ioutgt-core]
   ├─ spawn_local × sqsize  ── slot tasks ("task per tag"):
@@ -197,7 +197,7 @@ run_queue(QueueConn)                                   [ioutgt-tcp]
 
 ```text
             recv_loop                 QueueCore              send_loop
-            (ioutgt-tcp)            (ioutgt-core)           (ioutgt-tcp)
+            (ioutgt-nvme-tcp)            (ioutgt-core)           (ioutgt-nvme-tcp)
                 │                        │                       │
   ops::recv ──► │  PduDecoder [nvme]     │                       │
                 │  claim_tag() ────────► │                       │

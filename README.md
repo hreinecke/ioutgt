@@ -27,7 +27,7 @@ implementations behind the same core.
 | `ioutgt-uring` | per-thread io_uring reactor + op futures, Tokio park integration |
 | `ioutgt-nvme` | sans-io NVMe spec types, NVMe/TCP PDU codec, CRC32C digests |
 | `ioutgt-core` | subsystems, controllers, namespaces, queues, dispatch, `Backend`/`Transport` traits |
-| `ioutgt-tcp` | NVMe/TCP transport state machines |
+| `ioutgt-nvme-tcp` | NVMe/TCP transport state machines |
 | `ioutgt-backend` | null / memory / file / block backends |
 | `ioutgt-control` | UDS JSON control plane + config schema |
 | `ioutgt` | the target binary |

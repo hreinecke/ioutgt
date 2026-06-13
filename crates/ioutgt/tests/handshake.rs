@@ -56,7 +56,7 @@ fn handshake(stream: &mut TcpStream, want_hdgst: bool, want_ddgst: bool) -> (boo
     };
     assert_eq!(icresp.pfv.get(), pdu::PFV_1_0);
     assert_eq!(icresp.cpda, 0);
-    assert_eq!(icresp.maxdata.get(), ioutgt_tcp::MAX_H2C_DATA);
+    assert_eq!(icresp.maxdata.get(), ioutgt_nvme_tcp::MAX_H2C_DATA);
     (
         icresp.digest & pdu::DIGEST_HDGST != 0,
         icresp.digest & pdu::DIGEST_DDGST != 0,

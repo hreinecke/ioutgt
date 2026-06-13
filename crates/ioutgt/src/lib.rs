@@ -20,8 +20,8 @@ use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
-use ioutgt_tcp::connection::{ConnPermit, QueueConn, run_queue};
-use ioutgt_tcp::handshake::{accept_handshake, read_connect};
+use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue};
+use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{info, warn};
@@ -571,7 +571,7 @@ async fn setup_connection(
         &mut stream,
         allow_hdgst,
         allow_ddgst,
-        ioutgt_tcp::MAX_H2C_DATA,
+        ioutgt_nvme_tcp::MAX_H2C_DATA,
     )
     .await?;
     let first = read_connect(&mut stream, negotiated).await?;

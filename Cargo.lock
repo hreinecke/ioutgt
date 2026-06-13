@@ -259,7 +259,7 @@ dependencies = [
  "ioutgt-core",
  "ioutgt-cpus",
  "ioutgt-nvme",
- "ioutgt-tcp",
+ "ioutgt-nvme-tcp",
  "ioutgt-uring",
  "libc",
  "serde_json",
@@ -317,7 +317,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ioutgt-tcp"
+name = "ioutgt-nvme-tcp"
 version = "0.1.0"
 dependencies = [
  "ioutgt-core",

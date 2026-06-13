@@ -1,5 +1,5 @@
 [package]
-name = "ioutgt-tcp"
+name = "ioutgt-nvme-tcp"
 description = "NVMe/TCP transport: ICReq handshake, PDU recv/send state machines, digests, R2T"
 version.workspace = true
 edition.workspace = true

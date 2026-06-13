@@ -5,7 +5,7 @@ members = [
     "crates/ioutgt-nvme",
     "crates/ioutgt-cpus",
     "crates/ioutgt-core",
-    "crates/ioutgt-tcp",
+    "crates/ioutgt-nvme-tcp",
     "crates/ioutgt-backend",
     "crates/ioutgt-control",
     "crates/ioutgt",
@@ -25,7 +25,7 @@ ioutgt-uring = { path = "crates/ioutgt-uring" }
 ioutgt-nvme = { path = "crates/ioutgt-nvme" }
 ioutgt-cpus = { path = "crates/ioutgt-cpus" }
 ioutgt-core = { path = "crates/ioutgt-core" }
-ioutgt-tcp = { path = "crates/ioutgt-tcp" }
+ioutgt-nvme-tcp = { path = "crates/ioutgt-nvme-tcp" }
 ioutgt-backend = { path = "crates/ioutgt-backend" }
 ioutgt-control = { path = "crates/ioutgt-control" }
 

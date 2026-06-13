@@ -5,7 +5,7 @@
 //!
 //! The send-work types (`SendWork`, `Completion`) and the methods that
 //! push onto the list (`complete`, `solicit`, etc.) live in the
-//! transport-side [`TcpQueue`][ioutgt_tcp::queue::TcpQueue] (or its
+//! transport-side [`TcpQueue`][ioutgt_nvme_tcp::queue::TcpQueue] (or its
 //! equivalent for other transports), not here.
 
 use std::cell::Cell;

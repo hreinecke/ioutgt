@@ -14,7 +14,7 @@ ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
 ioutgt-cpus = { workspace = true }
 ioutgt-nvme = { workspace = true }
-ioutgt-tcp = { workspace = true }
+ioutgt-nvme-tcp = { workspace = true }
 ioutgt-uring = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }

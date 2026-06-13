@@ -14,7 +14,7 @@ use std::time::Duration;
 use common::{Client, NQN, pattern, rw_sqe};
 use ioutgt_nvme::pdu::{self, PduKind};
 use ioutgt_nvme::{spec, status};
-use ioutgt_tcp::H2C_DIRECT_MIN;
+use ioutgt_nvme_tcp::H2C_DIRECT_MIN;
 
 /// The direct-path gate, taken from the target crate so a retuned
 /// threshold cannot silently de-fang the edge tests.

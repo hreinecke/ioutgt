@@ -25,7 +25,7 @@ ioutgt --config target.json
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
 `RUST_LOG=debug ioutgt …`, or per-module
-`RUST_LOG=ioutgt_tcp=debug,info`.
+`RUST_LOG=ioutgt_nvme_tcp=debug,info`.
 
 The well-known discovery subsystem is always served; `nvme discover
 -t tcp -a <ip> -s <port>` lists every configured subsystem.
