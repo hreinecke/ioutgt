@@ -59,24 +59,23 @@ cargo run --release --example loadgen -- \
 ## Architecture
 
 Nine crates in a strict dependency DAG (full diagrams: architecture.md
-§4). Two deliberately opposite leaves: `ioutgt-nvme` is **sans-IO**
-(bytes ↔ structs only, no sockets/async — shared by target, test client,
-and the decoder fuzz test) and `ioutgt-uring` is **pure IO** (reactor +
-op futures, zero protocol knowledge). `ioutgt-core` sits between (NVMe model + dispatch + the protocol-neutral
-slot engine `ioutgt-core::slotq`; the per-connection queue context is
-the generic `QueueCore<C>` in core (`QueueCore<Sqe>` for NVMe,
-`QueueCore<NbdReq>` for a future NBD), with the transport-side
-`NvmeTcpQueue` composing it with a `SendList<SendWork>`; the
-transport-shared ZC gather-send harness `StreamSender` lives in its own
-crate `ioutgt-stream`, layered above core+uring); `ioutgt-uring` gained
-`sendbatch` — the protocol-free `GatherBatch` shared by stream
-transports;
-`ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose the core
-crates; the
-`ioutgt` binary assembles everything in `spawn_target()`
-(`crates/ioutgt/src/lib.rs`). A third leaf, `ioutgt-cpus`, ports the
-kernel's `group_cpus_evenly()` for topology-aware IO-thread pinning
-(used only by the binary).
+§4). The two main leaves are deliberately opposite: `ioutgt-nvme` is
+**sans-IO** (bytes ↔ structs only, no sockets/async — shared by target,
+test client, and the decoder fuzz test) and `ioutgt-uring` is **pure
+IO** (reactor + op futures + the protocol-free gather-send mechanics
+`sendbatch::GatherBatch`, zero protocol knowledge). `ioutgt-core` sits
+above them: the NVMe model, dispatch, and the protocol-neutral slot
+engine (`slotq`); its per-connection context is the generic
+`QueueCore<C>` (`QueueCore<Sqe>` for NVMe, `QueueCore<NbdReq>` for a
+future NBD). `ioutgt-stream` is the transport-shared, ZC-aware
+gather-send harness `StreamSender`, layered above core + uring (walked
+end to end in `docs/stream-sender.md`). The frontends compose these:
+`ioutgt-nvme-tcp` (NVMe/TCP transport — joins `QueueCore<Sqe>` with a
+`SendList<SendWork>` as `NvmeTcpQueue` and drives `StreamSender`),
+`ioutgt-backend`, and `ioutgt-control`. The `ioutgt` binary assembles
+everything in `spawn_target()` (`crates/ioutgt/src/lib.rs`). The last
+leaf, `ioutgt-cpus`, ports the kernel's `group_cpus_evenly()` for
+topology-aware IO-thread pinning (used only by the binary).
 
 Threading: a control thread on plain Tokio does accept + ICReq handshake
 + first-Connect parse, then routes the socket by qid to a pinned queue
@@ -89,8 +88,9 @@ Per connection, `run_queue()` (ioutgt-nvme-tcp) spawns one persistent task per
 command slot ("task per tag"); the recv loop, slot tasks, and send loop
 never call each other — their only rendezvous is `NvmeTcpQueue`
 (ioutgt-nvme-tcp): `claim_tag`/`submit` → `await_command` →
-`dispatch::execute` → `begin_respond` + `SendWork::push` → the
-`StreamSender` send loop drains `queue.send` → `release_tag`.
+`dispatch::execute` → `complete()` (= `begin_respond` + push a
+`SendWork`) → the `StreamSender` send loop drains `queue.send` →
+`release_tag`.
 
 ### Invariants — do not break
 
