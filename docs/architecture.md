@@ -1,7 +1,7 @@
 # ioutgt Architecture Specification
 
 Status: as-built specification (M0–M10, plus the post-M10 perf work —
-gather send and direct-to-slot recv — and the M11–M12 transport
+gather send and direct-to-slot recv — and the M11–M13 transport
 refactors). The milestone table at the end records what shipped;
 `docs/roadmap.md` holds what's next.
 
@@ -113,7 +113,8 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
   shared    ┌─────────────────────────┐  ┌─────────────────────────┐
             │ ioutgt-backend          │  │ ioutgt-stream           │
             │ AnyBackend:             │  │ ZC gather-send harness  │
-            │ Null / Memory / File    │  │ (StreamSender)          │
+            │ Null / Memory / File    │  │ + recv byte-source      │
+            │                         │  │ (StreamSender/Reader)   │
             └─────────────────────────┘  └─────────────────────────┘
   model     ┌──────────────────────────────────────────────────────┐
             │ ioutgt-core — Port/Subsystem/Namespace, Registry,    │
@@ -135,7 +136,7 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 | `ioutgt-control` | config + UDS control plane | core, backend |
 | `ioutgt-nvme-tcp` | NVMe/TCP transport | core, stream, nvme, uring |
 | `ioutgt-backend` | storage backends | core, uring |
-| `ioutgt-stream` | protocol-neutral ZC gather-send harness (`StreamSender`) | core, uring |
+| `ioutgt-stream` | protocol-neutral stream-transport mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
 | `ioutgt-core` | NVMe model + dispatch + `slotq` engine | nvme |
 | `ioutgt-nvme` | sans-IO codec | — |
 | `ioutgt-uring` | reactor + op futures + `sendbatch` | — |
@@ -230,10 +231,15 @@ run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
 
 #### 4.2.1 `recv_loop`: a resumable PDU state machine
 
-One task, one reused 64 KiB recv buffer (passed by value through each
-`ops::recv` per the reactor's buffer-ownership rule), three phases
-(`RecvPhase`). Each completed recv steps the machine over the bytes it
-brought; any phase can pause mid-PDU and resume on the next recv:
+One task drives the protocol-neutral `StreamReader` (`ioutgt-stream`):
+it owns a reused 64 KiB scratch buffer and the `ops::recv` issuing
+(`fill`/`consume`), plus the large-payload direct-into-slot path
+(`read_direct`, below). The NVMe phase machine (three `RecvPhase`
+states) stays here in `ioutgt-nvme-tcp`, decoding PDUs out of the
+reader's window; the reader has no protocol or slot knowledge — the
+same split NBD/RDMA reuse. Each completed recv steps the machine over
+the bytes it brought; any phase can pause mid-PDU and resume on the next
+recv:
 
 **`RecvPhase` machine — Header / Data / Ddgst and every transition**
 
@@ -772,6 +778,7 @@ API change (development machine is single-node).
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
 | M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§6.1) |
 | M12 | shared send harness | done — ZC gather-send machinery extracted to `ioutgt-stream::StreamSender` behind a per-transport staging closure; NVMe/TCP keeps only PDU encoding |
+| M13 | shared recv byte-source | done — buffered scratch + `ops::recv` (`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail (`read_direct`) extracted to `ioutgt-stream::StreamReader`; NVMe/TCP keeps the PDU phase machine |
 
 ## 14. Risks
 

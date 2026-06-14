@@ -29,6 +29,9 @@ use ioutgt_core::slotq::{SendList, SlotArray};
 use ioutgt_uring::ops;
 use ioutgt_uring::sendbatch::GatherBatch;
 
+mod reader;
+pub use reader::StreamReader;
+
 /// How a staged work item's slot tag is released, decided by the
 /// transport's staging closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

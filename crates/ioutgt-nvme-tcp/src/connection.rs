@@ -22,7 +22,7 @@ use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
 use ioutgt_nvme::spec::{Cqe, Sqe, sgl};
 use ioutgt_nvme::{digest, status};
-use ioutgt_stream::{Staged, StreamSender};
+use ioutgt_stream::{Staged, StreamReader, StreamSender};
 use ioutgt_uring::ops;
 use ioutgt_uring::sendbatch::GatherBatch;
 use tokio::task::JoinHandle;
@@ -535,25 +535,25 @@ async fn drive_recv(
 ) -> Result<(), RecvEnd> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
-    // 64 KiB recv buffer, allocated once per connection: only headers,
+    // 64 KiB scratch buffer, allocated once per connection: only headers,
     // in-capsule payloads (≤ 16 KiB inline limit), and payload prefixes
     // pass through it — H2C tails ≥ H2C_DIRECT_MIN bypass it into the
-    // slot, and read data never touches it. The size is the small-IO
-    // batching unit (~15 × 4 KiB write capsules per wakeup) and matches
-    // the kernel's max GRO/loopback burst (64 KiB), so one recv drains
-    // the largest coalesced unit the stack delivers per softirq pass.
-    // Larger buys nothing (big payloads are routed around it); smaller
-    // splits one burst into several wakeup + state-machine passes.
-    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+    // slot via reader.read_direct, and read data never touches it. The
+    // size is the small-IO batching unit (~15 × 4 KiB write capsules per
+    // wakeup) and matches the kernel's max GRO/loopback burst (64 KiB),
+    // so one recv drains the largest coalesced unit the stack delivers
+    // per softirq pass. Larger buys nothing (big payloads are routed
+    // around it); smaller splits one burst into several wakeup +
+    // state-machine passes.
+    let mut reader = StreamReader::new(fd, 64 * 1024);
 
     loop {
-        let (res, b) = ops::recv(fd, buf)?.await;
-        buf = b;
-        let n = res? as usize;
-        if n == 0 {
+        let window = reader.fill().await?;
+        if window.is_empty() {
             return Ok(()); // orderly shutdown
         }
-        let mut slice = &buf[..n];
+        let window_len = window.len();
+        let mut slice = window;
 
         while !slice.is_empty() {
             let next = match &mut phase {
@@ -567,6 +567,10 @@ async fn drive_recv(
                 phase = next;
             }
         }
+        // The inner loop drains the window to empty; mark it consumed
+        // before the next fill. (Computed up front, not inline in the
+        // call, so the window borrow ends before this `&mut reader`.)
+        reader.consume(window_len);
 
         // Buffer exhausted mid-payload with a large H2C tail still to
         // come: pull it straight into the slot, skipping the
@@ -579,7 +583,7 @@ async fn drive_recv(
             && matches!(data.kind, PayloadKind::H2c { .. })
             && data.remaining >= H2C_DIRECT_MIN
         {
-            phase = recv_tail_direct(queue, fd, data).await?;
+            phase = recv_tail_direct(queue, &mut reader, data).await?;
         }
     }
 }
@@ -603,65 +607,60 @@ async fn feed_header(
 }
 
 /// Receive a payload tail straight into the slot buffer at the
-/// reassembly offset. The tail is by definition the next bytes on the
-/// TCP stream, so the buffer recv is NOT re-armed until the tail
-/// lands — this serializes nothing that could have proceeded, and
-/// there is never more than one outstanding recv on the socket.
-/// MSG_WAITALL is best-effort: short-but-nonzero returns resume IN
-/// PLACE at the advanced slot offset (never staged elsewhere, never
-/// restarted); 0 is an orderly close mid-payload, as on the buffered
-/// path.
+/// reassembly offset, via [`StreamReader::read_direct`] (the scratch
+/// buffer is bypassed). The tail is by definition the next bytes on the
+/// stream, so no buffered recv is re-armed until it lands — there is
+/// never more than one outstanding recv on the socket. `read_direct`'s
+/// `MSG_WAITALL` loop is best-effort: short-but-nonzero returns resume
+/// in place; a total shorter than `remaining` means an orderly close
+/// mid-payload, as on the buffered path. For a digested transfer the
+/// `on_chunk` callback is the warm-cache CRC pass over each landed
+/// fragment (one pass in the common single-completion case); with the
+/// data digest off no CRC is computed.
 async fn recv_tail_direct(
     queue: &Rc<NvmeTcpQueue>,
-    fd: i32,
+    reader: &mut StreamReader,
     mut data: DataPhase,
 ) -> Result<RecvPhase, RecvEnd> {
     let total = match data.kind {
         PayloadKind::InCapsule => queue.slot(data.tag).data_len(),
         PayloadKind::H2c { length, .. } => length,
     };
-    let mut dest = (data.base + (total - data.remaining)) as usize;
-    let tail_start = dest;
-    while data.remaining > 0 {
-        let ptr = {
-            // Scoped: the RefCell borrow must end before the
-            // await below.
-            let mut slot_data = queue.slot(data.tag).data();
-            slot_data[dest..dest + data.remaining as usize].as_mut_ptr()
-        };
-        // SAFETY: ptr..ptr+remaining is slot-buffer memory
-        // (bounds-checked by the slicing above) owned by
-        // NvmeTcpQueue, to which this function holds an Rc, and
-        // the op is awaited inline — the recv path cannot return
-        // while it is in flight, so the memory outlives the
-        // terminal CQE. If the whole run_queue future is
-        // instead dropped mid-await (LocalSet teardown), the
-        // reactor's orphan protocol holds the op entry until
-        // its terminal CQE — the same accepted envelope as
-        // backend raw ops on slot memory (queue threads run
-        // for the process lifetime; reactor drain/leak is the
-        // backstop before anything is freed). Nothing else
-        // touches this slot's data while its state is
-        // Receiving.
-        let n = unsafe { ops::recv_raw_waitall(fd, ptr, data.remaining) }?.await?;
-        if n == 0 {
-            return Err(RecvEnd::Closed); // orderly close mid-payload
+    let dest = (data.base + (total - data.remaining)) as usize;
+    let ptr = {
+        // Scoped: the RefCell borrow must end before the await below.
+        let mut slot_data = queue.slot(data.tag).data();
+        slot_data[dest..dest + data.remaining as usize].as_mut_ptr()
+    };
+    // SAFETY: ptr..ptr+remaining is slot-buffer memory (bounds-checked
+    // by the slicing above) owned by NvmeTcpQueue, to which this recv
+    // task holds an Rc; the slot's state is Receiving, so nothing else
+    // touches its data. read_direct awaits the recv inline — the recv
+    // path cannot return while it is in flight — and on whole-future
+    // drop (LocalSet teardown) the reactor's orphan protocol holds the
+    // op entry until its terminal CQE, the same accepted envelope as
+    // backend raw ops on slot memory (queue threads run for the process
+    // lifetime; reactor drain/leak is the backstop before anything is
+    // freed). The two arms differ only in the digest seam: the ddgst
+    // path hashes each landed fragment, the plain path computes nothing.
+    let n = unsafe {
+        if data.ddgst {
+            reader
+                .read_direct(ptr, data.remaining, |c| data.crc.update(c))
+                .await?
+        } else {
+            reader.read_direct(ptr, data.remaining, |_| {}).await?
         }
-        dest += n as usize;
-        data.remaining -= n; // recv returns at most `remaining`
+    };
+    if n < data.remaining {
+        return Err(RecvEnd::Closed); // orderly close mid-payload
     }
     if data.ddgst {
-        {
-            // Re-borrowed after the await: warm pass over the
-            // tail the kernel just wrote.
-            let slot_data = queue.slot(data.tag).data();
-            data.crc.update(&slot_data[tail_start..dest]);
-        }
-        // Next ops::recv starts at the 4-byte digest.
+        // Next recv starts at the 4-byte digest.
         Ok(RecvPhase::ddgst(data.tag, data.crc.finalize(), data.kind))
     } else {
         finish_payload(queue, data.tag, data.kind)?;
-        // Next ops::recv starts at the next PDU header.
+        // Next recv starts at the next PDU header.
         Ok(RecvPhase::Header)
     }
 }
