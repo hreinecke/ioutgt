@@ -303,7 +303,10 @@ transport supplies only a *staging closure* (`stage_send_work` +
 PDUs into the gather arena and return the item's tag-release class
 (`Staged::{NoRelease, AtCqe, AtNotif}`). The harness drives the loop,
 owns the batches and the ZC-notification lifetime, and never inspects
-the work type — so a future NBD transport reuses it unchanged.
+the work type — so a future NBD transport reuses it unchanged. A
+top-to-bottom walkthrough — motivation, every related data structure,
+the staging closure, and the zero-copy lifecycle — is in
+[`docs/stream-sender.md`](stream-sender.md).
 
 Independent send SQEs on one socket have **no ordering guarantee**, so
 the wire cannot be pipelined with multiple ops. The loop instead makes
