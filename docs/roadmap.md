@@ -59,8 +59,7 @@ bdev backend path.
 2026-06-12: the prerequisite transport-abstraction refactor landed
 (transport contract in architecture.md §6.1; design spec
 `docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`).
-NBD is next (its superseded spec holds the protocol design); NVMe/RDMA
-after.
+NBD is next; NVMe/RDMA after.
 
 The split that makes this tractable: `ioutgt-nvme` is sans-io,
 `ioutgt-core` owns the slot engine (`slotq`), NVMe model, and
