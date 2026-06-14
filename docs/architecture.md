@@ -351,6 +351,20 @@ What the shape buys, and what it must protect:
   notifications too (`next_work_reaping`), so tag release never
   depends on new send work arriving (the anti-deadlock invariant).
 
+"One send op in flight" is a **per-connection** ordering rule, not a
+syscall-count claim — the two batch at different levels. A connection
+contributes at most one send SQE at a time (the gather op above). But
+the queue thread shares one ring across every connection and op type
+on it, and submission is deferred to the park (§ reactor): the send op
+just writes its SQE into the SQ ring (no syscall) and awaits. So a
+single `io_uring_enter` flushes that connection's lone send SQE
+*alongside* every other connection's sends and all the recv/backend
+SQEs queued since the last park — one syscall per idle→busy
+transition, not one per send. Intra-op gather coalesces many PDUs into
+one `SENDMSG`; submission batching coalesces many SQEs into one
+`io_uring_enter`; the per-connection rule only bounds how many send
+SQEs *one socket* adds to that syscall (≤ 1).
+
 #### 4.2.3 Data copies: one slot, one visible budget
 
 The slot buffer (preallocated per tag: 8 KiB admin, 128 KiB = MDTS io)

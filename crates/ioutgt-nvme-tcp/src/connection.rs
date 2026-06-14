@@ -1145,6 +1145,21 @@ async fn send_loop(
     result
 }
 
+/// The send loop's core: a serial state machine that drains
+/// `SendWork` and puts it on the wire, one op at a time.
+///
+/// Each turn runs five phases — get a first work item, `acquire` a
+/// free batch, `stage_batch` to greedily gather more behind it,
+/// `ship_batch` to issue the single gather op (looping only to finish
+/// a short send), then `retire` to release tags and classify the
+/// batch. Headers and digests are packed into the batch arena;
+/// payloads are referenced in place from slot buffers, so a batch is
+/// one `sendmsg` with zero payload memcpy.
+///
+/// `carry` is the batch-full handoff: when an item doesn't fit the
+/// current batch, `stage_batch` returns it and it seeds the next
+/// round with no extra await. A `None` from `next_work_reaping`
+/// (i.e. `close_send`) ends the loop for orderly teardown.
 async fn send_batches(
     queue: &Rc<NvmeTcpQueue>,
     fd: i32,
