@@ -106,7 +106,7 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
             │ spawns all threads, owns the TCP accept loop         │
             └──────────────────────────────────────────────────────┘
   frontends ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt-control          │  │ ioutgt-nvme-tcp              │
+            │ ioutgt-control          │  │ ioutgt-nvme-tcp         │
             │ JSON config schema,     │  │ ICReq handshake, recv/  │
             │ UDS control server      │  │ send loops, slot tasks  │
             └─────────────────────────┘  └─────────────────────────┘
@@ -144,7 +144,7 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 ### 4.1 Assembly: what `spawn_target()` wires up
 
 `main()` parses the config and hands everything to `spawn_target()`
-(`crates/ioutgt/src/lib.rs`), which is the only place all seven crates
+(`crates/ioutgt/src/lib.rs`), which is the only place all eight crates
 meet:
 
 **`spawn_target()` — what gets spawned and wired**
@@ -332,8 +332,7 @@ architecturally load-bearing:
 
 "One send op in flight" is a **per-connection** ordering rule, not a
 syscall-count claim — the two batch at different levels. A connection
-contributes at most one send SQE at a time (its one gather `sendmsg`).
-But
+contributes at most one send SQE at a time (its one gather `sendmsg`). But
 the queue thread shares one ring across every connection and op type
 on it, and submission is deferred to the park (§ reactor): the send op
 just writes its SQE into the SQ ring (no syscall) and awaits. So a
