@@ -295,83 +295,45 @@ Three rules keep this simple and safe:
 
 #### 4.2.2 `send_loop`: drain everything, ship one op
 
-The whole pipeline below — drain, stage, ship one gather op, retire,
-and the ZC double-buffering — is the protocol-neutral `StreamSender`
-(`ioutgt-stream`), reused by every stream transport. The NVMe/TCP
-transport supplies only a *staging closure* (`stage_send_work` +
-`release_class`, `connection.rs`): given one `SendWork` item, encode its
-PDUs into the gather arena and return the item's tag-release class
+The send path is the protocol-neutral `StreamSender` (`ioutgt-stream`),
+reused by every stream transport. Each turn it blocks for one work item,
+greedily drains the rest of the `SendList`, and ships the whole batch as
+a single gather `sendmsg` (`--send-zc`: `SENDMSG_ZC`): PDU headers and
+digests packed into a per-batch arena, read payloads referenced in place
+from the slot buffers (zero copy), byte-contiguous chunks merged so a
+payload-free batch collapses to one iovec. The NVMe/TCP transport
+supplies only a *staging closure* (`stage_send_work` + `release_class`,
+`connection.rs`): given one `SendWork` item, encode its PDUs into the
+arena and return its tag-release class
 (`Staged::{NoRelease, AtCqe, AtNotif}`). The harness drives the loop,
 owns the batches and the ZC-notification lifetime, and never inspects
-the work type — so a future NBD transport reuses it unchanged. A
-top-to-bottom walkthrough — motivation, every related data structure,
-the staging closure, and the zero-copy lifecycle — is in
-[`docs/stream-sender.md`](stream-sender.md).
+the work type — so a future NBD transport reuses it unchanged.
 
-Independent send SQEs on one socket have **no ordering guarantee**, so
-the wire cannot be pipelined with multiple ops. The loop instead makes
-each op as large as possible — block for one work item, greedily drain
-the rest, ship the whole batch as a single gather sendmsg:
+The full walkthrough — every related data structure, staging, shipping,
+short-send resume, and the zero-copy lifecycle, with diagrams — is in
+[`docs/stream-sender.md`](stream-sender.md). Two facts are
+architecturally load-bearing:
 
-**Send pipeline — drain, stage, ship one gather op, retire**
-
-```text
- SendList::next().await    blocks; None after close() = teardown
-      │ first item
-      ▼
- stage_batch              drains SendList::try_next() until the batch
-      │                   headroom is hit (the item that didn't fit
-      │                   leads the next batch); the per-item staging
-      │                   closure encodes its PDUs + classifies its tag
-      ▼
- ┌─ GatherSendBatch (preallocated at queue install) ────────────────┐
- │  arena: sqsize × 64 B (≥ 4 KiB)    iovec list (≤ UIO_MAXIOV)     │
- │   R2Ts, C2HData headers,            [hdr][payload][hdr]…         │
- │   DDGSTs, response capsules         payload entries point INTO   │
- │   encoded by sans-IO [nvme] in      slot buffers — staged by     │
- │   the staging closure               reference, zero copy         │
- │  byte-contiguous arena chunks merge: a payload-free batch        │
- │  collapses to a single iovec entry                               │
- └──────────────────────────────────────────────────────────────────┘
-      │
-      ▼
- ship_batch               ONE ops::sendmsg_raw (--send-zc:
-      │                   sendmsg_zc_raw; pin-budget ENOMEM/ENOBUFS
-      │                   falls back to the copying op). Short send:
-      │                   advance the iovec list in place, re-issue —
-      │                   no memmove, nothing else can interleave
-      ▼
- retire                   release_tag(): capsule-only responses at
-                          the send CQE; payload-carrying responses
-                          only when the kernel is done with the slot
-                          pages — send CQE (copy) or ZC notification
-                          (≈ the peer's ACK)
-```
-
-What the shape buys, and what it must protect:
-
-- **`release_tag` placement is the memory-safety line**, not
-  bookkeeping: the kernel reads slot pages for the whole send, so a
-  tag — and with it the slot buffer — is released only when the
-  kernel provably no longer references it. Teardown joins the send
-  task (and drains pending ZC notifications) before the queue is
-  freed.
-- **SUCCESS elision**: with SQ flow control off (`sqhd_disabled`), a
-  successful read sets the SUCCESS bit in the last C2HData and skips
-  the response capsule entirely — one fewer PDU per read.
-- **ZC overlaps notifications, never sends** (`--send-zc`, §9):
-  `StreamSender` is double-buffered — while one batch waits out its
-  notification (≈ one RTT), the other stages and ships. At most one
-  send op is ever in flight, preserving wire order; only the waits
-  overlap. The recv side then parks on tag exhaustion (`await_tag`)
-  instead of terminating, since the notification races the host's
-  next command — and the idle park reaps the oldest batch's
-  notifications too (`next_work_reaping`), so tag release never
-  depends on new send work arriving (the anti-deadlock invariant).
+- **One send op in flight per connection.** Independent send SQEs on one
+  socket carry no ordering guarantee, so the wire is never pipelined.
+  `StreamSender` double-buffers so a batch's ZC notification (≈ one RTT)
+  overlaps the *next* batch's staging — only the waits overlap, never
+  the sends. The recv side then parks on tag exhaustion (`await_tag`)
+  rather than terminating, and the idle park reaps the oldest batch's
+  notifications (`next_work_reaping`), so tag release never depends on
+  new send work arriving (the anti-deadlock invariant).
+- **`release_tag` timing is the memory-safety line**, not bookkeeping.
+  The kernel reads slot pages for the whole send, so a tag — and with it
+  the slot buffer — is released only once the kernel provably no longer
+  references it: at the send CQE for capsule-only responses, at the ZC
+  notification (≈ the peer's ACK) for payload-carrying ones. Teardown
+  joins the send task, draining pending ZC notifications, before the
+  queue is freed.
 
 "One send op in flight" is a **per-connection** ordering rule, not a
 syscall-count claim — the two batch at different levels. A connection
-contributes at most one send SQE at a time (the gather op above). But
+contributes at most one send SQE at a time (its one gather `sendmsg`).
+But
 the queue thread shares one ring across every connection and op type
 on it, and submission is deferred to the park (§ reactor): the send op
 just writes its SQE into the SQ ring (no syscall) and awaits. So a
