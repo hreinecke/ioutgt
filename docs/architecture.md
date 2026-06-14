@@ -299,6 +299,14 @@ Three rules keep this simple and safe:
   kernel → slot), keeping the codec sans-IO and the whole copy budget
   visible in one place (§4.2.3).
 
+The byte plumbing under this machine — the scratch buffer + `ops::recv`
+(`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail
+(`read_direct`) — is the protocol-neutral `StreamReader` (`ioutgt-stream`),
+reused by every stream transport; only the phase machine above stays in
+NVMe/TCP. The full walkthrough — the window model, the digest seam, and
+the split raw-pointer safety argument, with diagrams — is in
+[`docs/stream-reader.md`](stream-reader.md).
+
 #### 4.2.2 `send_loop`: drain everything, ship one op
 
 The send path is the protocol-neutral `StreamSender` (`ioutgt-stream`),
