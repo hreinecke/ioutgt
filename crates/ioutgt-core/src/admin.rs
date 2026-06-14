@@ -176,7 +176,11 @@ fn build_id_ctrl<B: Backend>(
     id.kas.set(KAS_UNITS);
     id.sqes = 0x66;
     id.cqes = 0x44;
-    id.maxcmd.set(ctx.queue.sqsize);
+    // Advertise the configured IO queue-depth ceiling, not the admin
+    // queue's size: the host clamps every IO queue down to MAXCMD, so
+    // pinning it to the admin depth (NVME_AQ_DEPTH = 32) would cap IO
+    // queues there too.
+    id.maxcmd.set(ctx.port.io_queue_size);
     id.acl = 3;
     id.aerl = 3;
     // MDTS: slot buffer / CAP.MPSMIN(4K) pages: 128K = 2^5 * 4K.

@@ -29,6 +29,10 @@ pub struct FileConfig {
     /// reuse; off by default.
     #[serde(default)]
     pub send_zc: bool,
+    /// Advertised IO MAXCMD ceiling (entries): max IO queue depth the
+    /// host may use. Admin queue unaffected. Default 128.
+    #[serde(default = "default_io_queue_size")]
+    pub io_queue_size: u16,
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,
@@ -38,6 +42,10 @@ pub struct FileConfig {
 
 fn default_io_threads() -> usize {
     2
+}
+
+fn default_io_queue_size() -> u16 {
+    128
 }
 
 fn default_true() -> bool {
@@ -103,6 +111,17 @@ impl FileConfig {
             .map_err(|e| format!("listen '{}': {e}", self.listen))?;
         if self.io_threads == 0 {
             return Err("io_threads must be >= 1".into());
+        }
+        // Mirror the CLI's clap range: the advertised MAXCMD must stay
+        // within [2, CAP.MQES]. Without this the JSON path would bypass
+        // the connect-time memory-amplification guard (a huge value lets a
+        // host preallocate oversized IO queues; < 2 rejects every connect).
+        if !(2..=ioutgt_core::MAX_QUEUE_ENTRIES).contains(&self.io_queue_size) {
+            return Err(format!(
+                "io_queue_size {} out of range (2..={})",
+                self.io_queue_size,
+                ioutgt_core::MAX_QUEUE_ENTRIES
+            ));
         }
         if self.subsystems.is_empty() {
             return Err("at least one subsystem is required".into());
@@ -174,6 +193,17 @@ mod tests {
         assert!(parse(r#"{ "listen": "nope", "subsystems": [] }"#).is_err());
         // Unknown field caught by serde.
         assert!(parse(r#"{ "listen": "1.2.3.4:1", "bogus": 1, "subsystems": [] }"#).is_err());
+        // io_queue_size above CAP.MQES must be rejected, not silently let
+        // through to advertise MAXCMD > MQES / oversize IO queues.
+        assert!(
+            parse(
+                r#"{ "listen": "127.0.0.1:4420", "io_queue_size": 1000,
+                 "subsystems": [ { "nqn": "nqn.x", "namespaces": [
+                   { "nsid": 1, "backend": { "type": "memory", "size_mb": 1 } } ] } ] }"#
+            )
+            .unwrap_err()
+            .contains("io_queue_size")
+        );
         // nsid 0 reserved.
         assert!(
             parse(

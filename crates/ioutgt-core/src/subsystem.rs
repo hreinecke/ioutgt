@@ -166,6 +166,11 @@ pub struct PortConfig<B> {
     pub trsvcid: String,
     /// Transport serving this port (TRTYPE in discovery entries).
     pub trtype: TransportType,
+    /// Advertised IO MAXCMD ceiling (Identify Controller): the maximum
+    /// IO queue depth in entries the host may use. The host clamps each
+    /// IO queue to `min(its queue-size, this)`; the admin queue is
+    /// unaffected. Bounded by `MAX_QUEUE_ENTRIES`.
+    pub io_queue_size: u16,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }

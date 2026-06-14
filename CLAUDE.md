@@ -44,7 +44,9 @@ Requires the external vmtest harness (`https://github.com/ublk-org/vmtest`, conf
 `vmtest.conf`; override via `VMTEST`/`VMTEST_CONF`).
 Knobs: `IOUTGT_BACKEND=memory|null|file`, `IOUTGT_ENABLE_KILL=1`
 (kill/recovery), `IOUTGT_SOAK_ONLY=N` (reconnect-leak gate),
-`IOUTGT_SEND_ZC=1` (zero-copy send path). The harness
+`IOUTGT_SEND_ZC=1` (zero-copy send path), `IOUTGT_IO_QUEUE_SIZE=N`
+(advertised IO MAXCMD ceiling; set below the host's depth, e.g. 64, to
+see the guest kernel clamp to N). The harness
 binds port **14420**, not 4420 — 4420 is often owned by other targets on
 a dev box. Host↔guest signalling goes through the vmtest 9p marker
 directory, not env vars.

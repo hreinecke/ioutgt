@@ -33,6 +33,12 @@ esac
 ZC_ARGS=()
 [ "${IOUTGT_SEND_ZC:-0}" = "1" ] && ZC_ARGS=(--send-zc)
 
+# IOUTGT_IO_QUEUE_SIZE=N: advertise N as the IO MAXCMD ceiling
+# (--io-queue-size). Unset → the binary default (128). Set below the
+# host's requested depth (e.g. 64) to see the guest kernel clamp to N.
+IOQS_ARGS=()
+[ -n "${IOUTGT_IO_QUEUE_SIZE:-}" ] && IOQS_ARGS=(--io-queue-size "$IOUTGT_IO_QUEUE_SIZE")
+
 CTL_SOCK="$TOP/target/ioutgt-interop.sock"
 MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
 PID_FILE="$TOP/target/ioutgt-interop.pid"
@@ -71,7 +77,7 @@ echo "$TOP" > "$MARKER_DIR/ioutgt_top"
 
 start_target() {
     "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
-        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" >>"$LOG" 2>&1 &
+        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" "${IOQS_ARGS[@]}" >>"$LOG" 2>&1 &
     echo $! >"$PID_FILE"
 }
 start_target

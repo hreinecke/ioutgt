@@ -37,6 +37,12 @@ struct Args {
     #[arg(long)]
     send_zc: bool,
 
+    /// Max IO queue depth in entries advertised to the host (MAXCMD);
+    /// the host uses min(its queue-size, this). The admin queue is
+    /// unaffected. Capped at CAP.MQES (256).
+    #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(2..=256))]
+    io_queue_size: u16,
+
     /// NVM subsystem NQN.
     #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
     subsys_nqn: String,
@@ -487,6 +493,7 @@ fn main() -> std::io::Result<()> {
             config.allow_ddgst = !args.no_ddgst;
             config.pin_threads = !args.no_pin;
             config.send_zc = args.send_zc;
+            config.io_queue_size = args.io_queue_size;
             config.control_socket = Some(args.control_socket);
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {

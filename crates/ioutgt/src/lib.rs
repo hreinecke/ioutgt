@@ -43,6 +43,9 @@ pub struct TargetConfig {
     /// Zero-copy sends (SENDMSG_ZC) with notification-gated buffer
     /// reuse.
     pub send_zc: bool,
+    /// Advertised IO MAXCMD ceiling (entries): the maximum IO queue
+    /// depth the host may use. The admin queue is unaffected.
+    pub io_queue_size: u16,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
     /// Subsystems served on this port.
@@ -59,6 +62,7 @@ impl TargetConfig {
             allow_ddgst: true,
             pin_threads: false,
             send_zc: false,
+            io_queue_size: 128,
             control_socket: None,
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
@@ -83,6 +87,7 @@ impl TargetConfig {
             allow_ddgst: file.data_digest,
             pin_threads: file.pin_threads,
             send_zc: file.send_zc,
+            io_queue_size: file.io_queue_size,
             control_socket: file.control_socket,
             subsystems: file.subsystems,
         })
@@ -382,6 +387,7 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
         traddr: bound.ip().to_string(),
         trsvcid: bound.port().to_string(),
         trtype: TransportType::Tcp,
+        io_queue_size: config.io_queue_size,
         subsystems,
     }))
 }
@@ -553,6 +559,18 @@ async fn control_loop(
     }
 }
 
+/// Hard ceiling (entries) on a connecting queue's depth. IO queues
+/// (qid > 0) are bounded by the configured MAXCMD (`io_queue_size`); the
+/// admin queue (qid 0), host-fixed at `NVME_AQ_DEPTH`, keeps the CAP.MQES
+/// guard so it is never rejected when `io_queue_size` is set small.
+fn sqsize_cap(qid: u16, io_queue_size: u16) -> u16 {
+    if qid == 0 {
+        ioutgt_core::MAX_QUEUE_ENTRIES
+    } else {
+        io_queue_size
+    }
+}
+
 /// ICReq/ICResp + first Connect capsule, then hand the socket to the
 /// queue thread selected by qid.
 #[allow(clippy::too_many_arguments)]
@@ -579,10 +597,11 @@ async fn setup_connection(
     let connect = first.connect();
     let qid = connect.qid.get();
     let entries = connect.sqsize.get() as u32 + 1;
-    // Enforce the advertised queue-size limit (CAP.MQES + 1): each slot
-    // preallocates a data buffer, so an oversized queue is a memory
-    // amplification vector a hostile host could exploit by ignoring MQES.
-    if !(2..=u32::from(ioutgt_core::MAX_QUEUE_ENTRIES)).contains(&entries) {
+    // Enforce the advertised queue-size limit: each slot preallocates a
+    // data buffer, so an oversized queue is a memory-amplification vector
+    // a hostile host could exploit by ignoring the advertised ceiling.
+    let cap = sqsize_cap(qid, port.io_queue_size);
+    if !(2..=u32::from(cap)).contains(&entries) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "sqsize out of range",
@@ -614,4 +633,21 @@ async fn setup_connection(
         io_txs[(usize::from(qid) - 1) % io_txs.len()].send(IoMsg::Conn(conn));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqsize_cap;
+
+    #[test]
+    fn sqsize_cap_bounds_io_at_config_admin_at_mqes() {
+        // IO queues (qid > 0) are capped at the configured ceiling…
+        assert_eq!(sqsize_cap(1, 64), 64);
+        assert_eq!(sqsize_cap(3, 200), 200);
+        // …while the admin queue keeps the hard CAP.MQES guard, so it is
+        // never rejected even when io_queue_size is set below the admin
+        // depth (NVME_AQ_DEPTH = 32).
+        assert_eq!(sqsize_cap(0, 8), ioutgt_core::MAX_QUEUE_ENTRIES);
+        assert_eq!(sqsize_cap(0, 256), ioutgt_core::MAX_QUEUE_ENTRIES);
+    }
 }
