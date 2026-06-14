@@ -1,12 +1,15 @@
-//! NVMe queue context: the slot array plus SQ-head flow control and
-//! per-queue lifetime stats. The send list is deliberately absent —
-//! its work type belongs to the transport ([`crate::slotq::SendList`]
-//! instantiated next to this in the transport's composite).
+//! Per-queue context: the slot array plus SQ-head flow control and
+//! per-queue lifetime stats. Generic over the per-slot command type
+//! `C` ([`Sqe`] for NVMe, the request header for NBD) so the same
+//! [`QueueCore`] serves every protocol; the send list is deliberately
+//! absent — its work type belongs to the transport
+//! ([`crate::slotq::SendList`] instantiated next to this in the
+//! transport's composite).
 //!
 //! The send-work types (`SendWork`, `Completion`) and the methods that
 //! push onto the list (`complete`, `solicit`, etc.) live in the
-//! transport-side [`TcpQueue`][ioutgt_nvme_tcp::queue::TcpQueue] (or its
-//! equivalent for other transports), not here.
+//! transport-side [`NvmeTcpQueue`][ioutgt_nvme_tcp::queue::NvmeTcpQueue]
+//! (or its equivalent for other transports), not here.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -149,39 +152,50 @@ impl Slot<Sqe> {
     }
 }
 
-/// Transport-neutral NVMe queue context: the slot array plus SQ-head
-/// flow control and stats. The send list is deliberately absent —
-/// its work type belongs to the transport ([`crate::slotq::SendList`]
-/// instantiated next to this in the transport's composite).
-pub struct NvmeQueue {
+/// Transport-neutral per-queue context: the slot array plus SQ-head
+/// flow control and stats, generic over the per-slot command type `C`
+/// (`Sqe` for NVMe, the request header for NBD). The send list is
+/// deliberately absent — its work type belongs to the transport
+/// ([`crate::slotq::SendList`] instantiated next to this in the
+/// transport's composite). `sqhd`/`sqhd_disabled` are NVMe SQ-head
+/// flow control; protocols without it (NBD) construct with
+/// `sqhd_disabled` and never advance.
+pub struct QueueCore<C: Copy> {
     /// The command slots (also reachable through `Deref`).
-    pub slots: SlotArray<Sqe>,
+    pub slots: SlotArray<C>,
     /// Queue depth in entries; slot count.
     pub sqsize: u16,
     /// Queue id (0 = admin).
     pub qid: u16,
     sqhd: Cell<u16>,
-    /// Host requested SQ flow control disabled (Connect cattr bit).
+    /// Host requested SQ flow control disabled (Connect cattr bit;
+    /// always true for protocols without SQ-head flow control).
     pub sqhd_disabled: bool,
     /// Lifetime IO counters, shared with the owning thread's stats
     /// list.
     pub stats: Rc<QueueStats>,
 }
 
-impl std::ops::Deref for NvmeQueue {
-    type Target = SlotArray<Sqe>;
+impl<C: Copy> std::ops::Deref for QueueCore<C> {
+    type Target = SlotArray<C>;
 
     fn deref(&self) -> &Self::Target {
         &self.slots
     }
 }
 
-impl NvmeQueue {
+impl<C: Copy> QueueCore<C> {
     /// Allocate a queue: `sqsize` slots each with a `slot_buf_size`
-    /// data buffer.
-    pub fn new(qid: u16, sqsize: u16, slot_buf_size: usize, sqhd_disabled: bool) -> Rc<NvmeQueue> {
-        Rc::new(NvmeQueue {
-            slots: SlotArray::new(sqsize, slot_buf_size, Sqe::zeroed()),
+    /// data buffer, every slot's command stash initialized to `init`.
+    pub fn new(
+        qid: u16,
+        sqsize: u16,
+        slot_buf_size: usize,
+        sqhd_disabled: bool,
+        init: C,
+    ) -> Rc<QueueCore<C>> {
+        Rc::new(QueueCore {
+            slots: SlotArray::new(sqsize, slot_buf_size, init),
             sqsize,
             qid,
             sqhd: Cell::new(0),
@@ -209,7 +223,7 @@ mod tests {
 
     #[test]
     fn tag_lifecycle_and_sqhd_wrap() {
-        let q = NvmeQueue::new(1, 4, 4096, false);
+        let q = QueueCore::new(1, 4, 4096, false, Sqe::zeroed());
         // sqhd wraps modulo sqsize.
         assert_eq!(q.advance_sqhd(), 1);
         assert_eq!(q.advance_sqhd(), 2);
@@ -247,7 +261,7 @@ mod tests {
 
     #[test]
     fn sqhd_disabled_reports_zero() {
-        let q = NvmeQueue::new(1, 8, 64, true);
+        let q = QueueCore::new(1, 8, 64, true, Sqe::zeroed());
         assert_eq!(q.advance_sqhd(), 0);
         assert_eq!(q.advance_sqhd(), 0);
     }
@@ -288,8 +302,8 @@ mod tests {
     }
 
     #[test]
-    fn nvme_queue_owns_zeroed_stats() {
-        let queue = NvmeQueue::new(1, 4, 4096, false);
+    fn queue_core_owns_zeroed_stats() {
+        let queue = QueueCore::new(1, 4, 4096, false, Sqe::zeroed());
         assert_eq!(
             queue.stats.snapshot(),
             QueueStatsSnapshot {

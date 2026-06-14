@@ -1,16 +1,16 @@
-//! The NVMe/TCP per-connection rendezvous: the core's [`NvmeQueue`]
-//! plus this transport's ordered send list. The recv loop, slot
-//! tasks, and send loop share one `Rc<TcpQueue>` and never call each
-//! other — exactly the shape `QueueCore` had, with the send-work
-//! types now owned here (an NVMe/RDMA transport has no R2T; an NBD
+//! The NVMe/TCP per-connection rendezvous: the core's
+//! [`QueueCore<Sqe>`][QueueCore] plus this transport's ordered send
+//! list. The recv loop, slot tasks, and send loop share one
+//! `Rc<NvmeTcpQueue>` and never call each other, with the send-work
+//! types owned here (an NVMe/RDMA transport has no R2T; an NBD
 //! transport has no CQE — the work type is transport property).
 
 use std::rc::Rc;
 use std::task::Poll;
 
-use ioutgt_core::queue::NvmeQueue;
+use ioutgt_core::queue::QueueCore;
 use ioutgt_core::slotq::{SendList, SlotState};
-use ioutgt_nvme::spec::Cqe;
+use ioutgt_nvme::spec::{Cqe, Sqe};
 
 /// A completed command waiting for the send path.
 #[derive(Debug, Clone, Copy)]
@@ -40,26 +40,31 @@ pub enum SendWork {
 }
 
 /// The connection's shared queue state.
-pub struct TcpQueue {
-    /// Core-side NVMe context (slots, sqhd, stats).
-    pub nvme: Rc<NvmeQueue>,
+pub struct NvmeTcpQueue {
+    /// Core-side NVMe queue context (slots, sqhd, stats).
+    pub nvme: Rc<QueueCore<Sqe>>,
     /// This transport's send list.
     pub send: SendList<SendWork>,
 }
 
-impl std::ops::Deref for TcpQueue {
-    type Target = NvmeQueue;
+impl std::ops::Deref for NvmeTcpQueue {
+    type Target = QueueCore<Sqe>;
 
     fn deref(&self) -> &Self::Target {
         &self.nvme
     }
 }
 
-impl TcpQueue {
+impl NvmeTcpQueue {
     /// Allocate the queue pair for one connection.
-    pub fn new(qid: u16, sqsize: u16, slot_buf_size: usize, sqhd_disabled: bool) -> Rc<TcpQueue> {
-        Rc::new(TcpQueue {
-            nvme: NvmeQueue::new(qid, sqsize, slot_buf_size, sqhd_disabled),
+    pub fn new(
+        qid: u16,
+        sqsize: u16,
+        slot_buf_size: usize,
+        sqhd_disabled: bool,
+    ) -> Rc<NvmeTcpQueue> {
+        Rc::new(NvmeTcpQueue {
+            nvme: QueueCore::new(qid, sqsize, slot_buf_size, sqhd_disabled, Sqe::zeroed()),
             send: SendList::new(sqsize),
         })
     }

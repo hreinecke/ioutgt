@@ -15,14 +15,14 @@ use ioutgt_nvme::status;
 
 use crate::backend::Backend;
 use crate::controller::{RegisterState, Registry};
-use crate::queue::NvmeQueue;
+use crate::queue::QueueCore;
 use crate::subsystem::{NsCache, PortConfig, Subsystem};
 
 /// Per-connection dispatch context (single-threaded, shared by the
 /// connection's tasks via `Rc`).
 #[allow(missing_docs)]
 pub struct ConnCtx<B> {
-    pub queue: Rc<NvmeQueue>,
+    pub queue: Rc<QueueCore<Sqe>>,
     pub port: Arc<PortConfig<B>>,
     pub registry: Arc<Registry>,
     /// Connect data of this queue's Connect command.
@@ -81,7 +81,7 @@ pub struct IoState<B> {
 impl<B: Backend> ConnCtx<B> {
     /// Context for an admin queue: owns the controller registers.
     pub fn new_admin(
-        queue: Rc<NvmeQueue>,
+        queue: Rc<QueueCore<Sqe>>,
         port: Arc<PortConfig<B>>,
         registry: Arc<Registry>,
         connect_data: Box<ConnectData>,
@@ -111,7 +111,7 @@ impl<B: Backend> ConnCtx<B> {
 
     /// Context for an IO queue.
     pub fn new_io(
-        queue: Rc<NvmeQueue>,
+        queue: Rc<QueueCore<Sqe>>,
         port: Arc<PortConfig<B>>,
         registry: Arc<Registry>,
         connect_data: Box<ConnectData>,

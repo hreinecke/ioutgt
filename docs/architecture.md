@@ -175,18 +175,20 @@ thread's hot path.
 ### 4.2 Queue thread: who calls whom inside `run_queue()`
 
 `run_queue()` (`ioutgt-nvme-tcp/src/connection.rs`) is the per-connection
-orchestrator. It builds the queue state — `NvmeQueue` (core) wrapped in a
-`TcpQueue` (transport-side composite of `Rc<NvmeQueue>` + `SendList<SendWork>`)
-— then spawns the task set whose **only rendezvous is `TcpQueue`** — the recv
-loop, slot tasks, and send loop never call each other directly:
+orchestrator. It builds the queue state — `QueueCore<Sqe>` (core, the
+generic `QueueCore<C>` instantiated for NVMe) wrapped in an
+`NvmeTcpQueue` (transport-side composite of `Rc<QueueCore<Sqe>>` +
+`SendList<SendWork>`) — then spawns the task set whose **only rendezvous
+is `NvmeTcpQueue`** — the recv loop, slot tasks, and send loop never call
+each other directly:
 
 **`run_queue()` — the per-connection task set**
 
 ```text
 run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
-  ├─ NvmeQueue::new(qid, sqsize, …)                    [ioutgt-core]
-  ├─ TcpQueue::new(NvmeQueue, …)    (NvmeQueue +       [ioutgt-nvme-tcp]
-  │                                  SendList<SendWork>)
+  ├─ QueueCore::new(qid, sqsize, …, Sqe::zeroed())     [ioutgt-core]
+  ├─ NvmeTcpQueue::new(…)    (QueueCore<Sqe> +         [ioutgt-nvme-tcp]
+  │                          SendList<SendWork>)
   ├─ ConnCtx::new_admin() / new_io()                   [ioutgt-core]
   ├─ spawn_local × sqsize  ── slot tasks ("task per tag"):
   │     loop { sqe = queue.slots.await_command(tag)    [core slotq]
@@ -198,12 +200,12 @@ run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
   └─ recv_loop(queue, fd)        (runs as the task body)
 ```
 
-**`TcpQueue` — the tasks' only rendezvous, command lifecycle left to right**
+**`NvmeTcpQueue` — the tasks' only rendezvous, command lifecycle left to right**
 
 ```text
-            recv_loop                 TcpQueue               send_loop
+            recv_loop               NvmeTcpQueue             send_loop
             (ioutgt-nvme-tcp)     (ioutgt-nvme-tcp)      (ioutgt-nvme-tcp)
-                │              NvmeQueue  │  SendList          │
+                │            QueueCore<Sqe> │ SendList          │
   ops::recv ──► │  PduDecoder [nvme]     │                    │
                 │  claim_tag() ────────► │                    │
                 │  solicit() R2T ──────► │ ─ SendWork::R2t ──►│ encode_r2t [nvme]
@@ -418,7 +420,7 @@ A host `Read` crosses every crate boundary exactly once per hop:
    `accept_handshake()` then `read_connect()` [tcp]; the parsed
    `ConnectCommand` [nvme] yields the qid; a `QueueConn` is mailed to the
    owning queue thread [uring mailbox].
-2. **Install**: `run_queue()` [tcp] builds `NvmeQueue` + `TcpQueue` + `ConnCtx`
+2. **Install**: `run_queue()` [tcp] builds `QueueCore<Sqe>` + `NvmeTcpQueue` + `ConnCtx`
    [core/tcp] and spawns the slot tasks; the stashed Connect SQE is the first
    `claim_tag()`/`submit()`.
 3. **Receive**: `recv_loop` [tcp] awaits `ops::recv` [uring], feeds bytes
@@ -431,7 +433,7 @@ A host `Read` crosses every crate boundary exactly once per hop:
    [backend], which issues `ops::read_at_raw` straight against the slot
    buffer on the same thread's ring [uring].
 5. **Respond**: the slot task calls `begin_respond` [core slotq] and pushes a
-   `SendWork::Response` onto `TcpQueue`'s send list [tcp]; `send_loop` [tcp]
+   `SendWork::Response` onto `NvmeTcpQueue`'s send list [tcp]; `send_loop` [tcp]
    drains the whole send list, encodes C2HData/response headers [nvme]
    into the arena with payloads referenced from slot buffers, ships one
    gather `ops::sendmsg_raw` [uring], then `release_tag()` returns the
@@ -441,9 +443,9 @@ A host `Read` crosses every crate boundary exactly once per hop:
 Boundary summary: **bin→tcp** is the two handshake calls plus
 `run_queue()` itself — the queue threads' entry point, with the
 `on_ctx` hook that registers each connection's stats; **bin/tcp→uring**
-is op futures + mailbox; **tcp→core** is the `NvmeQueue`/`SlotArray` slot
+is op futures + mailbox; **tcp→core** is the `QueueCore<Sqe>`/`SlotArray` slot
 API plus `dispatch::execute` (the send list and `SendWork` type are
-transport-owned in `TcpQueue`); **core→backend** is the `Backend` trait behind
+transport-owned in `NvmeTcpQueue`); **core→backend** is the `Backend` trait behind
 `Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
 add/remove + the NS-changed nudge, while GET_STATS reaches the queue
 threads through binary-injected `StatsSource` closures over the same
@@ -628,7 +630,7 @@ mandatory here). Setup uses an rdma_cm event channel on the control thread;
 qid is read from CONNECT_REQUEST private data and routed `(qid-1) % N` as
 today. The verbs completion-channel fd gets a persistent ring read on the
 queue thread — the same mailbox-doorbell pattern — so one wait primitive
-still rules the thread. `NvmeQueue`, dispatch, controller model, and discovery
+still rules the thread. `QueueCore<Sqe>`, dispatch, controller model, and discovery
 are all reused unchanged; `PortConfig.trtype = TransportType::Rdma` makes
 discovery advertise the correct TRTYPE.
 
@@ -773,7 +775,7 @@ API change (development machine is single-node).
 | M8 | hardening + fuzz | done — abuse suite, kill-recovery, RSS-gated soak, workspace ASAN |
 | M9 | performance pass | part 1 done — batched send 4.2×; post-M10: gather send (+22% 128K read BW), direct-to-slot recv (−44% c/IOP 128K write); rest in roadmap |
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
-| M11 | transport-abstraction refactor | done — engine split (`slotq`), transport-owned send work (`TcpQueue`), contract documented (§6.1) |
+| M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§6.1) |
 
 ## 14. Risks
 

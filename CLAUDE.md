@@ -64,8 +64,10 @@ Eight crates in a strict dependency DAG (full diagrams: architecture.md
 and the decoder fuzz test) and `ioutgt-uring` is **pure IO** (reactor +
 op futures, zero protocol knowledge). `ioutgt-core` sits between (NVMe model + dispatch + the protocol-neutral
 slot engine `ioutgt-core::slotq`; the per-connection queue context is
-`NvmeQueue` in core, with the transport-side `TcpQueue` composing it with
-a `SendList<SendWork>`); `ioutgt-uring` gained `sendbatch` — the
+the generic `QueueCore<C>` in core (`QueueCore<Sqe>` for NVMe,
+`QueueCore<NbdReq>` for a future NBD), with the transport-side
+`NvmeTcpQueue` composing it with a `SendList<SendWork>`); `ioutgt-uring`
+gained `sendbatch` — the
 protocol-free `GatherBatch` shared by stream transports;
 `ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose the core
 crates; the
@@ -83,7 +85,7 @@ Tokio current-thread runtime with no Tokio IO driver; the reactor hooks
 
 Per connection, `run_queue()` (ioutgt-nvme-tcp) spawns one persistent task per
 command slot ("task per tag"); the recv loop, slot tasks, and send loop
-never call each other — their only rendezvous is `TcpQueue`
+never call each other — their only rendezvous is `NvmeTcpQueue`
 (ioutgt-nvme-tcp): `claim_tag`/`submit` → `await_command` →
 `dispatch::execute` → `begin_respond` + `SendWork::push` →
 `next_send_work`/`release_tag`.
