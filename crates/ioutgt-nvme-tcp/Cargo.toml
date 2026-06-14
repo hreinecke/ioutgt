@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 ioutgt-core = { workspace = true }
 ioutgt-nvme = { workspace = true }
+ioutgt-stream = { workspace = true }
 ioutgt-uring = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util"] }

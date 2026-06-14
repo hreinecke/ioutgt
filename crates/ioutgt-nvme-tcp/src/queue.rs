@@ -6,7 +6,6 @@
 //! transport has no CQE — the work type is transport property).
 
 use std::rc::Rc;
-use std::task::Poll;
 
 use ioutgt_core::queue::QueueCore;
 use ioutgt_core::slotq::{SendList, SlotState};
@@ -98,24 +97,6 @@ impl NvmeTcpQueue {
             offset,
             length,
         });
-    }
-
-    /// Non-blocking pop of send work (batching: drain without
-    /// parking).
-    pub fn try_next_send_work(&self) -> Option<SendWork> {
-        self.send.try_next()
-    }
-
-    /// Poll-shaped pop, for combining with ZC-notification polling in
-    /// one hand-rolled future.
-    pub fn poll_send_work(&self, cx: &mut std::task::Context<'_>) -> Poll<Option<SendWork>> {
-        self.send.poll_next(cx)
-    }
-
-    /// Await the next send-path work item; `None` after
-    /// [`Self::close_send`] (pending work is delivered first).
-    pub async fn next_send_work(&self) -> Option<SendWork> {
-        self.send.next().await
     }
 
     /// Wake the send loop into orderly exit.

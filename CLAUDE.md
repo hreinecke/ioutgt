@@ -58,7 +58,7 @@ cargo run --release --example loadgen -- \
 
 ## Architecture
 
-Eight crates in a strict dependency DAG (full diagrams: architecture.md
+Nine crates in a strict dependency DAG (full diagrams: architecture.md
 §4). Two deliberately opposite leaves: `ioutgt-nvme` is **sans-IO**
 (bytes ↔ structs only, no sockets/async — shared by target, test client,
 and the decoder fuzz test) and `ioutgt-uring` is **pure IO** (reactor +
@@ -66,9 +66,11 @@ op futures, zero protocol knowledge). `ioutgt-core` sits between (NVMe model + d
 slot engine `ioutgt-core::slotq`; the per-connection queue context is
 the generic `QueueCore<C>` in core (`QueueCore<Sqe>` for NVMe,
 `QueueCore<NbdReq>` for a future NBD), with the transport-side
-`NvmeTcpQueue` composing it with a `SendList<SendWork>`); `ioutgt-uring`
-gained `sendbatch` — the
-protocol-free `GatherBatch` shared by stream transports;
+`NvmeTcpQueue` composing it with a `SendList<SendWork>`; the
+transport-shared ZC gather-send harness `StreamSender` lives in its own
+crate `ioutgt-stream`, layered above core+uring); `ioutgt-uring` gained
+`sendbatch` — the protocol-free `GatherBatch` shared by stream
+transports;
 `ioutgt-nvme-tcp`, `ioutgt-backend`, `ioutgt-control` compose the core
 crates; the
 `ioutgt` binary assembles everything in `spawn_target()`
@@ -87,8 +89,8 @@ Per connection, `run_queue()` (ioutgt-nvme-tcp) spawns one persistent task per
 command slot ("task per tag"); the recv loop, slot tasks, and send loop
 never call each other — their only rendezvous is `NvmeTcpQueue`
 (ioutgt-nvme-tcp): `claim_tag`/`submit` → `await_command` →
-`dispatch::execute` → `begin_respond` + `SendWork::push` →
-`next_send_work`/`release_tag`.
+`dispatch::execute` → `begin_respond` + `SendWork::push` → the
+`StreamSender` send loop drains `queue.send` → `release_tag`.
 
 ### Invariants — do not break
 
@@ -99,6 +101,8 @@ never call each other — their only rendezvous is `NvmeTcpQueue`
   `Send`; the type system enforces this rule.
 - **The codec stays sans-IO**: no sockets, no async, no allocation-driven
   APIs in ioutgt-nvme. `ioutgt-core` must not depend on `ioutgt-uring`.
+  (The transport-shared send harness that needs both — `StreamSender` —
+  lives in its own crate `ioutgt-stream`, layered above the two leaves.)
 - **Reactor cancellation safety**: the slab entry, not the op future,
   owns kernel-visible resources. A future dropped mid-flight orphans its
   entry; the entry is freed only on the terminal CQE. Anything touching

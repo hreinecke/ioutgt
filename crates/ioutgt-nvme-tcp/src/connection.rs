@@ -8,13 +8,9 @@
 //! C2HData for reads (with the SUCCESS elision when SQ flow control is
 //! off), R2Ts, response capsules — all serialized on one send task.
 
-use std::collections::VecDeque;
-use std::future::Future;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::queue::{NvmeTcpQueue, SendWork};
@@ -26,6 +22,7 @@ use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
 use ioutgt_nvme::spec::{Cqe, Sqe, sgl};
 use ioutgt_nvme::{digest, status};
+use ioutgt_stream::{Staged, StreamSender};
 use ioutgt_uring::ops;
 use ioutgt_uring::sendbatch::GatherBatch;
 use tokio::task::JoinHandle;
@@ -809,93 +806,12 @@ const ARENA_PER_ITEM: usize = 64;
 /// capsule). Adjacent arena chunks merge; this is the unmerged bound.
 const IOVS_PER_ITEM: usize = 4;
 
-/// One batch's gather state: a [`GatherBatch`] for the
-/// protocol-free arena/iovec/msghdr mechanics, plus NVMe-specific
-/// tag-accounting and ZC notification vectors. Exactly one batch is
-/// in flight at a time; `reset()` recycles everything. All memory is
-/// preallocated at queue install.
-struct SendBatch {
-    gather: GatherBatch,
-    /// Response tags safe to release at the send CQE: capsule-only
-    /// responses, whose slot memory the op never references.
-    tags_at_cqe: Vec<u16>,
-    /// Response tags whose slot buffers ride in the iovecs: released
-    /// only after every notification for this batch is reaped.
-    tags_at_notif: Vec<u16>,
-    /// One notification per ZC op issued for this batch; >1 only
-    /// after short-send re-issues (the cold path).
-    pending_notifs: Vec<ops::ZcNotif>,
-}
-
-impl SendBatch {
-    fn new(sqsize: u16) -> SendBatch {
-        let n = usize::from(sqsize);
-        SendBatch {
-            gather: GatherBatch::new(n * ARENA_PER_ITEM, n * IOVS_PER_ITEM + IOVS_PER_ITEM),
-            tags_at_cqe: Vec::with_capacity(n),
-            tags_at_notif: Vec::with_capacity(n),
-            pending_notifs: Vec::with_capacity(8),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.gather.reset();
-        self.tags_at_cqe.clear();
-        self.tags_at_notif.clear();
-        debug_assert!(
-            self.pending_notifs.is_empty(),
-            "batch reset with notifications outstanding"
-        );
-    }
-
-    /// Headroom for one more worst-case item?
-    fn fits(&self) -> bool {
-        self.gather.fits(ARENA_PER_ITEM, IOVS_PER_ITEM)
-    }
-
-    /// Unused arena to encode the next header piece into.
-    fn arena_tail(&mut self) -> &mut [u8] {
-        self.gather.arena_tail()
-    }
-
-    /// Publish `len` bytes just written at the arena tail.
-    fn push_arena(&mut self, len: usize) {
-        self.gather.push_arena(len);
-    }
-
-    /// Append a wire chunk; merges with the previous entry when
-    /// byte-contiguous (consecutive arena pieces collapse, so pure
-    /// header batches degenerate to a single entry).
-    fn push_raw(&mut self, ptr: *const u8, len: usize) {
-        self.gather.push_raw(ptr, len);
-    }
-
-    /// msghdr describing the unsent suffix; call before each submit.
-    fn msghdr(&mut self) -> *const libc::msghdr {
-        self.gather.msghdr()
-    }
-
-    /// Consume `sent` bytes; true when the whole batch hit the socket.
-    fn advance(&mut self, sent: usize) -> bool {
-        self.gather.advance(sent)
-    }
-
-    /// Release the notif-gated tags and recycle the batch for staging.
-    /// Callers must have reaped every pending notification first.
-    fn recycle(&mut self, queue: &Rc<NvmeTcpQueue>) {
-        for tag in self.tags_at_notif.drain(..) {
-            queue.release_tag(tag);
-        }
-        self.reset();
-    }
-}
-
 /// Stage one work item: header pieces into the arena (sans-IO encoders
 /// unchanged), payload referenced in place from the slot buffer, DDGST
 /// computed over the slot and trailed in the arena.
 fn stage_send_work(
+    gather: &mut GatherBatch,
     queue: &Rc<NvmeTcpQueue>,
-    batch: &mut SendBatch,
     work: &SendWork,
     hdr_digest: bool,
     data_digest: bool,
@@ -907,8 +823,8 @@ fn stage_send_work(
             offset,
             length,
         } => {
-            let n = pdu::encode_r2t(batch.arena_tail(), cid, tag, offset, length, hdr_digest);
-            batch.push_arena(n);
+            let n = pdu::encode_r2t(gather.arena_tail(), cid, tag, offset, length, hdr_digest);
+            gather.push_arena(n);
         }
         SendWork::Response(completion) => {
             let success_elide =
@@ -916,7 +832,7 @@ fn stage_send_work(
             if completion.data_len > 0 {
                 let data_len = completion.data_len as usize;
                 let n = pdu::encode_c2h_data(
-                    batch.arena_tail(),
+                    gather.arena_tail(),
                     completion.cqe.cid.get(),
                     0,
                     completion.data_len,
@@ -925,201 +841,43 @@ fn stage_send_work(
                     hdr_digest,
                     data_digest,
                 );
-                batch.push_arena(n);
+                gather.push_arena(n);
                 let slot_data = queue.slot(completion.tag).data();
                 // The payload rides in place: the slot stays claimed
                 // until release_tag after the batch send completes.
-                batch.push_raw(slot_data.as_ptr(), data_len);
+                gather.push_raw(slot_data.as_ptr(), data_len);
                 if data_digest {
                     let crc = digest::crc32c(&slot_data[..data_len]);
-                    batch.arena_tail()[..4].copy_from_slice(&crc.to_le_bytes());
-                    batch.push_arena(4);
+                    gather.arena_tail()[..4].copy_from_slice(&crc.to_le_bytes());
+                    gather.push_arena(4);
                 }
             }
             if !success_elide {
-                let n = pdu::encode_capsule_resp(batch.arena_tail(), &completion.cqe, hdr_digest);
-                batch.push_arena(n);
+                let n = pdu::encode_capsule_resp(gather.arena_tail(), &completion.cqe, hdr_digest);
+                gather.push_arena(n);
             }
         }
     }
 }
 
-/// Stage one item and record its tag-release class: payload-carrying
-/// responses gate on the batch's send notification, capsule-only
-/// responses release at the send CQE (their slot memory is not
-/// referenced by the op), R2Ts release nothing.
-fn stage_and_account(
-    queue: &Rc<NvmeTcpQueue>,
-    batch: &mut SendBatch,
-    work: &SendWork,
-    hdr_digest: bool,
-    data_digest: bool,
-) {
-    stage_send_work(queue, batch, work, hdr_digest, data_digest);
-    if let SendWork::Response(completion) = work {
-        if completion.data_len > 0 {
-            batch.tags_at_notif.push(completion.tag);
-        } else {
-            batch.tags_at_cqe.push(completion.tag);
-        }
+/// Tag-release class for a send work item: payload-carrying responses
+/// gate on the batch's ZC notification (the op references the slot
+/// buffer), capsule-only responses release at the send CQE, R2Ts
+/// release nothing.
+fn release_class(work: &SendWork) -> Staged {
+    match *work {
+        SendWork::Response(c) if c.data_len > 0 => Staged::AtNotif(c.tag),
+        SendWork::Response(c) => Staged::AtCqe(c.tag),
+        SendWork::R2t { .. } => Staged::NoRelease,
     }
 }
 
-/// Double-buffered send state for ZC mode: while one batch's
-/// notifications are outstanding (≈ one RTT — the peer's ACK frees
-/// the skbs), the other batch stages and ships. At most one *send*
-/// op is ever in flight, preserving wire ordering; only
-/// notifications overlap. Non-ZC batches recycle immediately, so the
-/// flag-off path degenerates to the previous single-batch behavior.
-struct SendState {
-    batches: [SendBatch; 2],
-    /// Indices into `batches` with outstanding notifications, oldest
-    /// first (len ≤ 2).
-    inflight: VecDeque<usize>,
-    zc_batches: u64,
-    zc_copied: u64,
-    /// ZC sends refused by the kernel's pinned-page accounting
-    /// (RLIMIT_MEMLOCK) and shipped by copy instead.
-    zc_fallbacks: u64,
-}
-
-impl SendState {
-    fn new(sqsize: u16) -> SendState {
-        SendState {
-            batches: [SendBatch::new(sqsize), SendBatch::new(sqsize)],
-            inflight: VecDeque::with_capacity(2),
-            zc_batches: 0,
-            zc_copied: 0,
-            zc_fallbacks: 0,
-        }
-    }
-
-    /// Index of a batch free for staging, reaping the oldest
-    /// in-flight batch first when both are awaiting notifications.
-    async fn acquire(&mut self, queue: &Rc<NvmeTcpQueue>) -> usize {
-        if self.inflight.len() == self.batches.len() {
-            self.reap_oldest(queue).await;
-        }
-        (0..self.batches.len())
-            .find(|i| !self.inflight.contains(i))
-            .expect("two batches, at most one in flight here")
-    }
-
-    /// Await every notification of the oldest in-flight batch, then
-    /// release its notif-gated tags and recycle it.
-    async fn reap_oldest(&mut self, queue: &Rc<NvmeTcpQueue>) {
-        if let Some(idx) = self.inflight.pop_front() {
-            self.reap(queue, idx).await;
-        }
-    }
-
-    /// Await every notification of one batch, then recycle it.
-    async fn reap(&mut self, queue: &Rc<NvmeTcpQueue>, idx: usize) {
-        while let Some(notif) = self.batches[idx].pending_notifs.pop() {
-            if notif.await {
-                self.zc_copied += 1;
-            }
-        }
-        self.batches[idx].recycle(queue);
-    }
-
-    /// Drain every outstanding notification. Teardown MUST run this
-    /// on every send-task exit path: the kernel may still hold page
-    /// references (arena + slot buffers) that `run_queue` frees right
-    /// after joining the task. Covers the in-flight list AND the
-    /// batch a send error abandoned mid-ship — that one is not on
-    /// the list but may hold notifs from its earlier ZC ops.
-    async fn drain(&mut self, queue: &Rc<NvmeTcpQueue>) {
-        while let Some(idx) = self.inflight.pop_front() {
-            self.reap(queue, idx).await;
-        }
-        for idx in 0..self.batches.len() {
-            self.reap(queue, idx).await;
-        }
-    }
-
-    /// Park on send work while reaping the oldest in-flight batch's
-    /// notifications — the anti-deadlock invariant: tag release must
-    /// never depend on new send work arriving (with all tags
-    /// notif-gated and the host idle, work can only be *produced*
-    /// once a notif frees a tag).
-    async fn next_work_reaping(&mut self, queue: &Rc<NvmeTcpQueue>) -> Option<SendWork> {
-        loop {
-            let Some(&front) = self.inflight.front() else {
-                return queue.next_send_work().await;
-            };
-            enum Wait {
-                Work(Option<SendWork>),
-                Reaped,
-            }
-            let zc_copied = &mut self.zc_copied;
-            let batch = &mut self.batches[front];
-            let outcome = std::future::poll_fn(|cx| {
-                if let Poll::Ready(work) = queue.poll_send_work(cx) {
-                    return Poll::Ready(Wait::Work(work));
-                }
-                if poll_notifs(&mut batch.pending_notifs, zc_copied, cx) {
-                    return Poll::Ready(Wait::Reaped);
-                }
-                Poll::Pending
-            })
-            .await;
-            match outcome {
-                Wait::Work(work) => return work,
-                Wait::Reaped => {
-                    self.inflight.pop_front();
-                    self.batches[front].recycle(queue);
-                }
-            }
-        }
-    }
-
-    /// A batch just hit the socket: release what the send CQE allows
-    /// and classify the batch. Notif-gated iff it actually holds
-    /// notifications — a batch whose every ZC attempt fell back has
-    /// none and is immediately reusable, like the plain path.
-    fn retire(&mut self, queue: &Rc<NvmeTcpQueue>, idx: usize) {
-        let batch = &mut self.batches[idx];
-        for tag in batch.tags_at_cqe.drain(..) {
-            queue.release_tag(tag);
-        }
-        if batch.pending_notifs.is_empty() {
-            batch.recycle(queue);
-        } else {
-            self.zc_batches += 1;
-            self.inflight.push_back(idx);
-        }
-    }
-}
-
-/// Poll every pending notification once; completed ones are recorded
-/// in `zc_copied` and removed. No future is ever dropped unfinished,
-/// so completion is never silently lost. True when none remain.
-fn poll_notifs(notifs: &mut Vec<ops::ZcNotif>, zc_copied: &mut u64, cx: &mut Context<'_>) -> bool {
-    let mut i = 0;
-    while i < notifs.len() {
-        match Pin::new(&mut notifs[i]).poll(cx) {
-            Poll::Ready(copied) => {
-                notifs.swap_remove(i);
-                if copied {
-                    *zc_copied += 1;
-                }
-            }
-            Poll::Pending => i += 1,
-        }
-    }
-    notifs.is_empty()
-}
-
-/// Send loop: drain ALL pending completions/R2Ts into one iovec
-/// gather list and ship it as a single SENDMSG — or SENDMSG_ZC when
-/// `--send-zc` is on, gating slot reuse on the zero-copy
-/// notification (pin-budget failures fall back to the copying path).
-///
-/// Independent send SQEs on one socket carry no ordering guarantee, so
-/// pipelining ops is not an option; one op per batch is — and gather
-/// keeps that while the payload entries point straight into slot
-/// buffers (no staging copy). One park per batch, zero payload memcpy.
+/// Send loop: drain ALL pending completions/R2Ts into one gather list
+/// and ship it as a single SENDMSG — or SENDMSG_ZC under `--send-zc`.
+/// All the batching, short-send resume, and zero-copy notification
+/// machinery lives in the transport-neutral [`StreamSender`]; here we
+/// only encode NVMe PDUs (`stage_send_work`) and classify each work
+/// item's tag release.
 async fn send_loop(
     queue: &Rc<NvmeTcpQueue>,
     fd: i32,
@@ -1127,143 +885,30 @@ async fn send_loop(
     data_digest: bool,
     send_zc: bool,
 ) -> std::io::Result<()> {
-    let mut state = SendState::new(queue.sqsize);
-    let result = send_batches(queue, fd, hdr_digest, data_digest, send_zc, &mut state).await;
-    // Every exit path — orderly close, send error, WriteZero — drains
-    // outstanding notifications before the queue's memory can be
-    // freed by run_queue's join.
-    state.drain(queue).await;
+    let mut sender = StreamSender::new(queue.sqsize, ARENA_PER_ITEM, IOVS_PER_ITEM);
+    let result = sender
+        .run(
+            fd,
+            send_zc,
+            &queue.nvme.slots,
+            &queue.send,
+            |gather, work: &SendWork| {
+                stage_send_work(gather, queue, work, hdr_digest, data_digest);
+                release_class(work)
+            },
+        )
+        .await;
     if send_zc {
+        let s = sender.stats();
         debug!(
             qid = queue.qid,
-            zc_batches = state.zc_batches,
-            zc_copied = state.zc_copied,
-            zc_fallbacks = state.zc_fallbacks,
+            zc_batches = s.zc_batches,
+            zc_copied = s.zc_copied,
+            zc_fallbacks = s.zc_fallbacks,
             "send loop ZC stats"
         );
     }
     result
-}
-
-/// The send loop's core: a serial state machine that drains
-/// `SendWork` and puts it on the wire, one op at a time.
-///
-/// Each turn runs five phases — get a first work item, `acquire` a
-/// free batch, `stage_batch` to greedily gather more behind it,
-/// `ship_batch` to issue the single gather op (looping only to finish
-/// a short send), then `retire` to release tags and classify the
-/// batch. Headers and digests are packed into the batch arena;
-/// payloads are referenced in place from slot buffers, so a batch is
-/// one `sendmsg` with zero payload memcpy.
-///
-/// `carry` is the batch-full handoff: when an item doesn't fit the
-/// current batch, `stage_batch` returns it and it seeds the next
-/// round with no extra await. A `None` from `next_work_reaping`
-/// (i.e. `close_send`) ends the loop for orderly teardown.
-async fn send_batches(
-    queue: &Rc<NvmeTcpQueue>,
-    fd: i32,
-    hdr_digest: bool,
-    data_digest: bool,
-    send_zc: bool,
-    state: &mut SendState,
-) -> std::io::Result<()> {
-    let mut carry: Option<SendWork> = None;
-    loop {
-        let first = match carry.take() {
-            Some(work) => work,
-            None => match state.next_work_reaping(queue).await {
-                Some(work) => work,
-                None => return Ok(()), // close_send(): teardown
-            },
-        };
-        let idx = state.acquire(queue).await;
-        let batch = &mut state.batches[idx];
-        carry = stage_batch(queue, batch, first, hdr_digest, data_digest);
-        ship_batch(fd, batch, send_zc, &mut state.zc_fallbacks).await?;
-        state.retire(queue, idx);
-    }
-}
-
-/// Stage `first` and every immediately-available work item into the
-/// batch, stopping at its headroom. Returns the item that didn't fit
-/// (it is staged first next round).
-fn stage_batch(
-    queue: &Rc<NvmeTcpQueue>,
-    batch: &mut SendBatch,
-    first: SendWork,
-    hdr_digest: bool,
-    data_digest: bool,
-) -> Option<SendWork> {
-    let mut work = Some(first);
-    while let Some(item) = work {
-        if !batch.fits() {
-            return Some(item); // flush first, stage next round
-        }
-        stage_and_account(queue, batch, &item, hdr_digest, data_digest);
-        work = queue.try_next_send_work();
-    }
-    None
-}
-
-/// Ship one staged batch; on short send advance the iovecs and
-/// re-issue so nothing else can interleave on the wire (ordering).
-/// The re-issue stays ZC: the batch's pages are pinned regardless.
-async fn ship_batch(
-    fd: i32,
-    batch: &mut SendBatch,
-    send_zc: bool,
-    zc_fallbacks: &mut u64,
-) -> std::io::Result<()> {
-    let mut use_zc = send_zc;
-    loop {
-        let n = if use_zc {
-            // SAFETY: msghdr, iovecs, arena, and referenced slot
-            // buffers stay allocated until this batch's notifs
-            // are reaped (reap_oldest/drain precede reset, and
-            // run_queue joins this task — or leaks the queue —
-            // before freeing anything). The kernel snapshots the
-            // iovec array at issue, so advance() after the send
-            // CQE never races it.
-            let mut op = unsafe { ops::sendmsg_zc_raw(fd, batch.msghdr()) }?;
-            let res = op.sent().await;
-            // Stash the notif BEFORE examining the result: a
-            // failed ZC send can still have pinned pages
-            // (F_MORE), and only the stashed handle makes the
-            // teardown drain wait for them.
-            batch.pending_notifs.push(op.into_notif());
-            match res {
-                Ok(n) => n as usize,
-                // ZC pins pages against the per-user
-                // RLIMIT_MEMLOCK (ENOMEM past it; ENOBUFS for
-                // the optmem variant); two full batches alone
-                // can exceed the default 8 MiB, and the budget
-                // is shared across connections. An expected
-                // operational condition, not a connection
-                // error: ship the rest of this batch by copy.
-                Err(err) if matches!(err.raw_os_error(), Some(libc::ENOMEM | libc::ENOBUFS)) => {
-                    *zc_fallbacks += 1;
-                    use_zc = false;
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
-        } else {
-            // SAFETY: the msghdr, iovec array, arena, and
-            // referenced slot buffers all outlive the await — the
-            // batch is owned by this task, slots release only
-            // after the batch completes, and run_queue joins this
-            // task (or leaks the queue) before freeing anything.
-            let op = unsafe { ops::sendmsg_raw(fd, batch.msghdr()) }?;
-            op.await? as usize
-        };
-        if n == 0 {
-            return Err(std::io::ErrorKind::WriteZero.into());
-        }
-        if batch.advance(n) {
-            return Ok(());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1272,11 +917,17 @@ mod gather_tests {
 
     use super::*;
 
-    /// Linearize a batch's iovecs (what the kernel would put on the wire).
-    fn gather(batch: &SendBatch) -> Vec<u8> {
+    /// Sizing a test gather arena as the send path does for `sqsize`.
+    fn gather_for(sqsize: u16) -> GatherBatch {
+        let n = usize::from(sqsize);
+        GatherBatch::new(n * ARENA_PER_ITEM, n * IOVS_PER_ITEM + IOVS_PER_ITEM)
+    }
+
+    /// Linearize the staged iovecs (what the kernel would put on the wire).
+    fn gather(g: &GatherBatch) -> Vec<u8> {
         let mut out = Vec::new();
-        for e in batch.gather.iovs() {
-            // SAFETY: entries reference the batch arena and slot
+        for e in g.iovs() {
+            // SAFETY: entries reference the gather arena and slot
             // buffers owned by the test, sized by construction.
             let s = unsafe { std::slice::from_raw_parts(e.iov_base.cast::<u8>(), e.iov_len) };
             out.extend_from_slice(s);
@@ -1291,7 +942,7 @@ mod gather_tests {
         let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         queue.slot(2).data()[..1000].copy_from_slice(&payload);
 
-        let mut batch = SendBatch::new(queue.sqsize);
+        let mut g = gather_for(queue.sqsize);
         let cqe = Cqe::new(0, 1, 1, 7, 0);
         let items = [
             SendWork::R2t {
@@ -1307,8 +958,8 @@ mod gather_tests {
             }),
         ];
         for item in &items {
-            assert!(batch.fits());
-            stage_send_work(&queue, &mut batch, item, true, true);
+            assert!(g.fits(ARENA_PER_ITEM, IOVS_PER_ITEM));
+            stage_send_work(&mut g, &queue, item, true, true);
         }
 
         // Reference: the same PDUs encoded linearly (the old staging
@@ -1324,9 +975,9 @@ mod gather_tests {
         off += pdu::encode_capsule_resp(&mut expect[off..], &cqe, true);
         expect.truncate(off);
 
-        assert_eq!(gather(&batch), expect);
+        assert_eq!(gather(&g), expect);
         // Arena-contiguous chunks merge: [R2T+C2H hdr][payload][DDGST+capsule].
-        assert_eq!(batch.gather.iovs().len(), 3);
+        assert_eq!(g.iovs().len(), 3);
     }
 
     #[test]
@@ -1337,7 +988,7 @@ mod gather_tests {
         let payload = [0xa5u8; 512];
         queue.slot(1).data()[..512].copy_from_slice(&payload);
 
-        let mut batch = SendBatch::new(queue.sqsize);
+        let mut g = gather_for(queue.sqsize);
         let read_cqe = Cqe::new(0, 1, 1, 5, 0);
         let flush_cqe = Cqe::new(0, 2, 1, 6, 0);
         let items = [
@@ -1355,8 +1006,8 @@ mod gather_tests {
             }),
         ];
         for item in &items {
-            assert!(batch.fits());
-            stage_send_work(&queue, &mut batch, item, false, false);
+            assert!(g.fits(ARENA_PER_ITEM, IOVS_PER_ITEM));
+            stage_send_work(&mut g, &queue, item, false, false);
         }
 
         let mut expect = vec![0u8; 4096];
@@ -1366,46 +1017,43 @@ mod gather_tests {
         off += pdu::encode_capsule_resp(&mut expect[off..], &flush_cqe, false);
         expect.truncate(off);
 
-        assert_eq!(gather(&batch), expect);
+        assert_eq!(gather(&g), expect);
         // [C2H hdr][payload][capsule]: capsule can't merge across the
         // slot-payload entry.
-        assert_eq!(batch.gather.iovs().len(), 3);
+        assert_eq!(g.iovs().len(), 3);
     }
 
     #[test]
-    fn staging_splits_tag_release_classes() {
-        let queue = NvmeTcpQueue::new(1, 4, 4096, false);
-        let mut batch = SendBatch::new(queue.sqsize);
+    fn release_class_splits_tag_release() {
         let read_cqe = Cqe::new(0, 1, 1, 5, 0);
         let flush_cqe = Cqe::new(0, 2, 1, 6, 0);
-        let items = [
-            // Payload-carrying: slot referenced by the op → notif-gated.
-            SendWork::Response(Completion {
+        // Payload-carrying: slot referenced by the op → notif-gated.
+        assert_eq!(
+            release_class(&SendWork::Response(Completion {
                 tag: 1,
                 cqe: read_cqe,
                 data_len: 4096,
-            }),
-            // Capsule-only: arena bytes only → released at the send CQE.
-            SendWork::Response(Completion {
+            })),
+            Staged::AtNotif(1),
+        );
+        // Capsule-only: arena bytes only → released at the send CQE.
+        assert_eq!(
+            release_class(&SendWork::Response(Completion {
                 tag: 2,
                 cqe: flush_cqe,
                 data_len: 0,
-            }),
-            // R2T: no tag to release at all.
-            SendWork::R2t {
+            })),
+            Staged::AtCqe(2),
+        );
+        // R2T: no tag to release at all.
+        assert_eq!(
+            release_class(&SendWork::R2t {
                 tag: 3,
                 cid: 9,
                 offset: 0,
                 length: 4096,
-            },
-        ];
-        for item in &items {
-            stage_and_account(&queue, &mut batch, item, false, false);
-        }
-        assert_eq!(batch.tags_at_notif, vec![1]);
-        assert_eq!(batch.tags_at_cqe, vec![2]);
-
-        batch.reset();
-        assert!(batch.tags_at_notif.is_empty() && batch.tags_at_cqe.is_empty());
+            }),
+            Staged::NoRelease,
+        );
     }
 }

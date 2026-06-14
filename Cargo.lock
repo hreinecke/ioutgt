@@ -322,11 +322,21 @@ version = "0.1.0"
 dependencies = [
  "ioutgt-core",
  "ioutgt-nvme",
+ "ioutgt-stream",
  "ioutgt-uring",
  "libc",
  "tokio",
  "tracing",
  "zerocopy",
+]
+
+[[package]]
+name = "ioutgt-stream"
+version = "0.1.0"
+dependencies = [
+ "ioutgt-core",
+ "ioutgt-uring",
+ "libc",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "ioutgt-stream"
+description = "Protocol-neutral ZC-aware gather-send harness shared by stream transports (NVMe/TCP, NBD)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ioutgt-core = { workspace = true }
+ioutgt-uring = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true

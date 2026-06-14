@@ -1,8 +1,9 @@
 # ioutgt Architecture Specification
 
-Status: as-built specification (M0–M10, plus the post-M10 perf work:
-gather send and direct-to-slot recv). The milestone table at the end
-records what shipped; `docs/roadmap.md` holds what's next.
+Status: as-built specification (M0–M10, plus the post-M10 perf work —
+gather send and direct-to-slot recv — and the M11–M12 transport
+refactors). The milestone table at the end records what shipped;
+`docs/roadmap.md` holds what's next.
 
 ## 1. Mission and goals
 
@@ -86,7 +87,7 @@ mailbox sender is the only exported handle.
 
 ## 4. Crate map and cross-crate call flow
 
-The workspace is eight crates forming a strict dependency DAG — every
+The workspace is nine crates forming a strict dependency DAG — every
 crate depends only on layers below it, and the main two leaves are
 deliberately opposite in character: `ioutgt-nvme` is **sans-IO** (pure
 bytes ↔ structs, no sockets, no async, fuzzable in isolation) and
@@ -109,9 +110,11 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
             │ JSON config schema,     │  │ ICReq handshake, recv/  │
             │ UDS control server      │  │ send loops, slot tasks  │
             └─────────────────────────┘  └─────────────────────────┘
-  storage   ┌──────────────────────────────────────────────────────┐
-            │ ioutgt-backend — AnyBackend: Null / Memory / File    │
-            └──────────────────────────────────────────────────────┘
+  shared    ┌─────────────────────────┐  ┌─────────────────────────┐
+            │ ioutgt-backend          │  │ ioutgt-stream           │
+            │ AnyBackend:             │  │ ZC gather-send harness  │
+            │ Null / Memory / File    │  │ (StreamSender)          │
+            └─────────────────────────┘  └─────────────────────────┘
   model     ┌──────────────────────────────────────────────────────┐
             │ ioutgt-core — Port/Subsystem/Namespace, Registry,    │
             │ NVMe model + dispatch + the protocol-neutral slot   │
@@ -128,10 +131,11 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 
 | Crate | Role | Depends on (workspace) |
 |-------|------|------------------------|
-| `ioutgt` | binary + assembly | all seven |
+| `ioutgt` | binary + assembly | all eight |
 | `ioutgt-control` | config + UDS control plane | core, backend |
-| `ioutgt-nvme-tcp` | NVMe/TCP transport | core, nvme, uring |
+| `ioutgt-nvme-tcp` | NVMe/TCP transport | core, stream, nvme, uring |
 | `ioutgt-backend` | storage backends | core, uring |
+| `ioutgt-stream` | protocol-neutral ZC gather-send harness (`StreamSender`) | core, uring |
 | `ioutgt-core` | NVMe model + dispatch + `slotq` engine | nvme |
 | `ioutgt-nvme` | sans-IO codec | — |
 | `ioutgt-uring` | reactor + op futures + `sendbatch` | — |
@@ -217,7 +221,7 @@ run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
                 │                        │     → uring read_at/
                 │                        │       write_at]
                 │           begin_respond│
-                │      SendWork::Response│──────────────────► │ next_send_work()
+                │      SendWork::Response│──────────────────► │ SendList::next()
                 │                        │                    │ encode_c2h_data /
                 │                        │                    │ response [nvme]
                 │                        │ ◄─ release_tag() ──│ ops::sendmsg_raw
@@ -291,6 +295,16 @@ Three rules keep this simple and safe:
 
 #### 4.2.2 `send_loop`: drain everything, ship one op
 
+The whole pipeline below — drain, stage, ship one gather op, retire,
+and the ZC double-buffering — is the protocol-neutral `StreamSender`
+(`ioutgt-stream`), reused by every stream transport. The NVMe/TCP
+transport supplies only a *staging closure* (`stage_send_work` +
+`release_class`, `connection.rs`): given one `SendWork` item, encode its
+PDUs into the gather arena and return the item's tag-release class
+(`Staged::{NoRelease, AtCqe, AtNotif}`). The harness drives the loop,
+owns the batches and the ZC-notification lifetime, and never inspects
+the work type — so a future NBD transport reuses it unchanged.
+
 Independent send SQEs on one socket have **no ordering guarantee**, so
 the wire cannot be pipelined with multiple ops. The loop instead makes
 each op as large as possible — block for one work item, greedily drain
@@ -299,19 +313,20 @@ the rest, ship the whole batch as a single gather sendmsg:
 **Send pipeline — drain, stage, ship one gather op, retire**
 
 ```text
- next_send_work().await   blocks; None after close_send() = teardown
+ SendList::next().await    blocks; None after close() = teardown
       │ first item
       ▼
- stage_batch              drains try_next_send_work() until the batch
+ stage_batch              drains SendList::try_next() until the batch
       │                   headroom is hit (the item that didn't fit
-      │                   leads the next batch)
+      │                   leads the next batch); the per-item staging
+      │                   closure encodes its PDUs + classifies its tag
       ▼
- ┌─ SendBatch (preallocated at queue install) ──────────────────────┐
+ ┌─ GatherSendBatch (preallocated at queue install) ────────────────┐
  │  arena: sqsize × 64 B (≥ 4 KiB)    iovec list (≤ UIO_MAXIOV)     │
  │   R2Ts, C2HData headers,            [hdr][payload][hdr]…         │
  │   DDGSTs, response capsules         payload entries point INTO   │
- │   encoded by sans-IO [nvme]         slot buffers — staged by     │
- │                                     reference, zero copy         │
+ │   encoded by sans-IO [nvme] in      slot buffers — staged by     │
+ │   the staging closure               reference, zero copy         │
  │  byte-contiguous arena chunks merge: a payload-free batch        │
  │  collapses to a single iovec entry                               │
  └──────────────────────────────────────────────────────────────────┘
@@ -342,7 +357,7 @@ What the shape buys, and what it must protect:
   successful read sets the SUCCESS bit in the last C2HData and skips
   the response capsule entirely — one fewer PDU per read.
 - **ZC overlaps notifications, never sends** (`--send-zc`, §9):
-  `SendState` is double-buffered — while one batch waits out its
+  `StreamSender` is double-buffered — while one batch waits out its
   notification (≈ one RTT), the other stages and ships. At most one
   send op is ever in flight, preserving wire order; only the waits
   overlap. The recv side then parks on tag exhaustion (`await_tag`)
@@ -447,8 +462,9 @@ A host `Read` crosses every crate boundary exactly once per hop:
    [backend], which issues `ops::read_at_raw` straight against the slot
    buffer on the same thread's ring [uring].
 5. **Respond**: the slot task calls `begin_respond` [core slotq] and pushes a
-   `SendWork::Response` onto `NvmeTcpQueue`'s send list [tcp]; `send_loop` [tcp]
-   drains the whole send list, encodes C2HData/response headers [nvme]
+   `SendWork::Response` onto `NvmeTcpQueue`'s send list [tcp]; the
+   `StreamSender` send loop [stream] drains the whole list, invokes the
+   transport's staging closure to encode C2HData/response headers [nvme]
    into the arena with payloads referenced from slot buffers, ships one
    gather `ops::sendmsg_raw` [uring], then `release_tag()` returns the
    slot to the freelist (under `--send-zc`, payload-carrying tags wait
@@ -459,7 +475,8 @@ Boundary summary: **bin→tcp** is the two handshake calls plus
 `on_ctx` hook that registers each connection's stats; **bin/tcp→uring**
 is op futures + mailbox; **tcp→core** is the `QueueCore<Sqe>`/`SlotArray` slot
 API plus `dispatch::execute` (the send list and `SendWork` type are
-transport-owned in `NvmeTcpQueue`); **core→backend** is the `Backend` trait behind
+transport-owned in `NvmeTcpQueue`); **tcp→stream** is the `StreamSender` send
+harness, driven by the transport's staging closure; **core→backend** is the `Backend` trait behind
 `Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
 add/remove + the NS-changed nudge, while GET_STATS reaches the queue
 threads through binary-injected `StatsSource` closures over the same
@@ -557,7 +574,7 @@ and future transports slot in without touching protocol logic:
   the same iovecs: double-buffered batches keep staging through the
   notification RTT, payload tags release on the notif (capsule-only
   tags still at the send CQE), the idle park polls the oldest batch's
-  notifs alongside `next_send_work` so tag release never depends on
+  notifs alongside the send-list drain so tag release never depends on
   new work arriving, and pin-budget failures (per-user
   `RLIMIT_MEMLOCK`) fall back to the copying SENDMSG per batch (as
   built, opt-in).
@@ -790,6 +807,7 @@ API change (development machine is single-node).
 | M9 | performance pass | part 1 done — batched send 4.2×; post-M10: gather send (+22% 128K read BW), direct-to-slot recv (−44% c/IOP 128K write); rest in roadmap |
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
 | M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§6.1) |
+| M12 | shared send harness | done — ZC gather-send machinery extracted to `ioutgt-stream::StreamSender` behind a per-transport staging closure; NVMe/TCP keeps only PDU encoding |
 
 ## 14. Risks
 
