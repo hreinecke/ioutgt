@@ -237,6 +237,27 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
             cur
         }
     };
+    // The displayed "amount" before any per-second rounding: the interval
+    // delta in rate mode, the lifetime total otherwise. Used for ratios
+    // (e.g. sqes/park), where dividing two rounded rates loses precision.
+    let amt = |cur: u64, before: u64| -> u64 {
+        if prev.is_some() {
+            cur.saturating_sub(before)
+        } else {
+            cur
+        }
+    };
+    // sqes-per-park = ops submitted per io_uring_enter — the park-batching
+    // amortization (how many SQEs ride each idle syscall). Scale-free, so
+    // it reads the same in totals and rate mode.
+    #[allow(clippy::cast_precision_loss)]
+    let per = |num: u64, den: u64| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        }
+    };
     let mib = |bytes: u64| -> String {
         #[allow(clippy::cast_precision_loss)]
         let v = bytes as f64 / f64::from(1u32 << 20);
@@ -304,10 +325,14 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
         let ring0 = &before["ring"];
         let _ = writeln!(
             out,
-            "{name}  tid {}  parks{suffix} {}  sqes{suffix} {}  send{suffix} {}  recv{suffix} {}  read{suffix} {}  write{suffix} {}  cqes{suffix} {}",
+            "{name}  tid {}  parks{suffix} {}  sqes{suffix} {}  sqes/park {:.1}  send{suffix} {}  recv{suffix} {}  read{suffix} {}  write{suffix} {}  cqes{suffix} {}",
             thread["tid"],
             val(u(ring, "parks"), u(ring0, "parks")),
             val(u(ring, "sqes"), u(ring0, "sqes")),
+            per(
+                amt(u(ring, "sqes"), u(ring0, "sqes")),
+                amt(u(ring, "parks"), u(ring0, "parks")),
+            ),
             val(u(ring, "send_sqes"), u(ring0, "send_sqes")),
             val(u(ring, "recv_sqes"), u(ring0, "recv_sqes")),
             val(u(ring, "read_sqes"), u(ring0, "read_sqes")),
@@ -673,6 +698,8 @@ mod tests {
         assert!(out.contains("ioutgt-io0"), "{out}");
         assert!(out.contains("tid 42"), "{out}");
         assert!(out.contains("5000"), "sqes visible: {out}");
+        // sqes/park amortization: 5000 / 90 = 55.6.
+        assert!(out.contains("sqes/park 55.6"), "amortization: {out}");
         assert!(out.contains("cntlid 1 qid 1"), "{out}");
         assert!(out.contains("read 3000"), "{out}");
     }

@@ -119,12 +119,14 @@ ioutgt stat --clear    # print the final totals, then zero everything
 
 ```text
 controller 1: nqn.2026-06.io.ioutgt:test  host nqn.2014-08.org.nvmexpress:uuid:abc…
-ioutgt-io0  tid 12345  parks/s 8011  sqes/s 282600  send/s 16010  recv/s 16080  read/s 250300  write/s 0  cqes/s 282700
+ioutgt-io0  tid 12345  parks/s 8011  sqes/s 282600  sqes/park 35.3  send/s 16010  recv/s 16080  read/s 250300  write/s 0  cqes/s 282700
   cntlid 1 qid 1   read 250310/s (977.8 MiB/s)  write 0/s (0.0 MiB/s)  flush 0/s  other 0/s  err 0/s
 ```
 
-`sqes/parks` is the park-batching amortization (ops per syscall). The
-SQE split shows the op mix: `send`/`recv` are the network ops (the
+`sqes/park` is the park-batching amortization (SQEs per `io_uring_enter`,
+i.e. ops per syscall) — shown directly, and scale-free so it reads the
+same in totals and rate mode. The SQE split shows the op mix:
+`send`/`recv` are the network ops (the
 gather keeps `send` far below the response count), `read`/`write` are
 the backend storage ops (one ring op per command on the file/bdev
 backend — `0` for memory/null, which serve in-CPU); the remainder
