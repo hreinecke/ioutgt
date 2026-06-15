@@ -491,7 +491,7 @@ pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<
 ///
 /// Same contract as [`recv_raw`].
 pub unsafe fn read_at_raw(fd: RawFd, ptr: *mut u8, len: u32, offset: u64) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Read::new(types::Fd(fd), ptr, len)
                 .offset(offset)
@@ -499,6 +499,7 @@ pub unsafe fn read_at_raw(fd: RawFd, ptr: *mut u8, len: u32, offset: u64) -> io:
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Read,
     )?;
     Ok(RawOp { op })
 }
@@ -509,7 +510,7 @@ pub unsafe fn read_at_raw(fd: RawFd, ptr: *mut u8, len: u32, offset: u64) -> io:
 ///
 /// Same contract as [`recv_raw`] (reads only).
 pub unsafe fn write_at_raw(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Write::new(types::Fd(fd), ptr, len)
                 .offset(offset)
@@ -517,6 +518,7 @@ pub unsafe fn write_at_raw(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> 
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Write,
     )?;
     Ok(RawOp { op })
 }

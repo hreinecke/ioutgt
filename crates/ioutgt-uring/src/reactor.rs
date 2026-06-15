@@ -21,13 +21,15 @@ thread_local! {
 const PARK_SAFETY_SECS: u64 = 1;
 
 /// Classifies a submitted SQE for the per-type counters. Most ops are
-/// `Other`; network send/recv are split out so the stats expose the
-/// send/recv syscall mix.
+/// `Other`; network send/recv and backend storage read/write are split
+/// out so the stats expose the op mix.
 #[derive(Clone, Copy)]
 pub(crate) enum SqeClass {
     Other,
     Send,
     Recv,
+    Read,
+    Write,
 }
 
 /// Lifetime ring counters for one queue thread. A snapshot of the
@@ -45,6 +47,13 @@ pub struct ReactorStats {
     pub send_sqes: u64,
     /// Network recv SQEs (Recv) — a subset of `sqes`.
     pub recv_sqes: u64,
+    /// Backend storage read SQEs (file/bdev positional Read) — a subset
+    /// of `sqes`. Zero for the memory/null backends (served in-CPU, no
+    /// ring op).
+    pub read_sqes: u64,
+    /// Backend storage write SQEs (file/bdev positional Write) — a subset
+    /// of `sqes`. Zero for the memory/null backends.
+    pub write_sqes: u64,
     /// CQEs reaped from the completion ring.
     pub cqes: u64,
 }
@@ -57,6 +66,8 @@ struct StatCells {
     sqes: Cell<u64>,
     send_sqes: Cell<u64>,
     recv_sqes: Cell<u64>,
+    read_sqes: Cell<u64>,
+    write_sqes: Cell<u64>,
     cqes: Cell<u64>,
 }
 
@@ -166,6 +177,8 @@ impl Reactor {
             sqes: self.stats.sqes.get(),
             send_sqes: self.stats.send_sqes.get(),
             recv_sqes: self.stats.recv_sqes.get(),
+            read_sqes: self.stats.read_sqes.get(),
+            write_sqes: self.stats.write_sqes.get(),
             cqes: self.stats.cqes.get(),
         }
     }
@@ -177,17 +190,21 @@ impl Reactor {
         self.stats.sqes.set(0);
         self.stats.send_sqes.set(0);
         self.stats.recv_sqes.set(0);
+        self.stats.read_sqes.set(0);
+        self.stats.write_sqes.set(0);
         self.stats.cqes.set(0);
     }
 
     /// Count a successfully pushed SQE: the total plus, for network
-    /// send/recv, the per-type counter.
+    /// send/recv and backend read/write, the per-type counter.
     #[inline]
     fn count_sqe(&self, class: SqeClass) {
         StatCells::bump(&self.stats.sqes);
         match class {
             SqeClass::Send => StatCells::bump(&self.stats.send_sqes),
             SqeClass::Recv => StatCells::bump(&self.stats.recv_sqes),
+            SqeClass::Read => StatCells::bump(&self.stats.read_sqes),
+            SqeClass::Write => StatCells::bump(&self.stats.write_sqes),
             SqeClass::Other => {}
         }
     }

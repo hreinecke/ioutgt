@@ -97,8 +97,9 @@ shows what hosts would discover rather than only `no controllers`.
 `GET_STATS` carries a `controller_info` array (which controller —
 subsystem and host NQN — each cntlid below belongs to) and a `threads`
 array: one entry per queue thread with its ring counters (`parks` =
-idle `io_uring_enter` waits, `sqes` with the `send_sqes`/`recv_sqes`
-network split, `cqes`) and per-queue IO
+idle `io_uring_enter` waits, `sqes` with its `send_sqes`/`recv_sqes`
+network split and `read_sqes`/`write_sqes` backend split, `cqes`) and
+per-queue IO
 counters (read/write/flush/other commands, read/write bytes, errors —
 IO-path failures only, admin and fabrics rejections are not counted —
 keyed by cntlid+qid; correlate with `LIST_CONTROLLER` for tid/cpus).
@@ -118,13 +119,18 @@ ioutgt stat --clear    # print the final totals, then zero everything
 
 ```text
 controller 1: nqn.2026-06.io.ioutgt:test  host nqn.2014-08.org.nvmexpress:uuid:abc…
-ioutgt-io0  tid 12345  parks/s 8011  sqes/s 540210  send/s 270100  recv/s 270110  cqes/s 540231
+ioutgt-io0  tid 12345  parks/s 8011  sqes/s 282600  send/s 16010  recv/s 16080  read/s 250300  write/s 0  cqes/s 282700
   cntlid 1 qid 1   read 250310/s (977.8 MiB/s)  write 0/s (0.0 MiB/s)  flush 0/s  other 0/s  err 0/s
 ```
 
-`sqes/parks` is the park-batching amortization (ops per syscall), and
-`send`/`recv` break the SQEs into the network send/recv mix; rates are
-computed client-side from the monotonic counters, so a target restart
+`sqes/parks` is the park-batching amortization (ops per syscall). The
+SQE split shows the op mix: `send`/`recv` are the network ops (the
+gather keeps `send` far below the response count), `read`/`write` are
+the backend storage ops (one ring op per command on the file/bdev
+backend — `0` for memory/null, which serve in-CPU); the remainder
+`sqes − send − recv − read − write` is keep-alive timers + the mailbox
+doorbell. Rates are computed client-side from the monotonic counters,
+so a target restart
 between samples shows zeros, never garbage.
 
 ## Connecting a Linux host

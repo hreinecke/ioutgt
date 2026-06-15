@@ -304,12 +304,14 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
         let ring0 = &before["ring"];
         let _ = writeln!(
             out,
-            "{name}  tid {}  parks{suffix} {}  sqes{suffix} {}  send{suffix} {}  recv{suffix} {}  cqes{suffix} {}",
+            "{name}  tid {}  parks{suffix} {}  sqes{suffix} {}  send{suffix} {}  recv{suffix} {}  read{suffix} {}  write{suffix} {}  cqes{suffix} {}",
             thread["tid"],
             val(u(ring, "parks"), u(ring0, "parks")),
             val(u(ring, "sqes"), u(ring0, "sqes")),
             val(u(ring, "send_sqes"), u(ring0, "send_sqes")),
             val(u(ring, "recv_sqes"), u(ring0, "recv_sqes")),
+            val(u(ring, "read_sqes"), u(ring0, "read_sqes")),
+            val(u(ring, "write_sqes"), u(ring0, "write_sqes")),
             val(u(ring, "cqes"), u(ring0, "cqes")),
         );
         for q in thread["queues"].as_array().into_iter().flatten() {
@@ -644,7 +646,8 @@ mod tests {
         "threads": [{
             "name": "ioutgt-io0", "tid": 42,
             "ring": { "parks": 90, "sqes": 5000, "send_sqes": 2500,
-                      "recv_sqes": 2400, "cqes": 5000 },
+                      "recv_sqes": 2400, "read_sqes": 60, "write_sqes": 40,
+                      "cqes": 5000 },
             "queues": [{ "cntlid": 1, "qid": 1,
                 "read_cmds": 3000u64, "write_cmds": 1000u64, "flush_cmds": 0u64,
                 "other_cmds": 2u64, "read_bytes": 12_288_000u64,

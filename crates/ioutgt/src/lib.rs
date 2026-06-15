@@ -208,6 +208,7 @@ fn thread_stats_json(
         "tid": ioutgt_core::controller::current_tid(),
         "ring": { "parks": ring.parks, "sqes": ring.sqes,
                   "send_sqes": ring.send_sqes, "recv_sqes": ring.recv_sqes,
+                  "read_sqes": ring.read_sqes, "write_sqes": ring.write_sqes,
                   "cqes": ring.cqes },
         "queues": queues,
         "retired": counters_json(retired),

@@ -25,9 +25,11 @@ fn reactor_counts_sqes_cqes_and_parks() {
         assert!(after.sqes >= before.sqes + 2, "sqes: {after:?}");
         assert!(after.cqes >= before.cqes + 2, "cqes: {after:?}");
         assert!(after.parks > before.parks, "parks: {after:?}");
-        // Timer ops are neither send nor recv.
+        // Timer ops are neither send/recv nor backend read/write.
         assert_eq!(after.send_sqes, before.send_sqes, "send_sqes: {after:?}");
         assert_eq!(after.recv_sqes, before.recv_sqes, "recv_sqes: {after:?}");
+        assert_eq!(after.read_sqes, before.read_sqes, "read_sqes: {after:?}");
+        assert_eq!(after.write_sqes, before.write_sqes, "write_sqes: {after:?}");
     });
 }
 
@@ -53,8 +55,41 @@ fn send_and_recv_sqes_count_separately() {
         assert_eq!(after.send_sqes, before.send_sqes + 1, "send: {after:?}");
         assert_eq!(after.recv_sqes, before.recv_sqes + 1, "recv: {after:?}");
         assert!(after.sqes >= before.sqes + 2, "sqes total: {after:?}");
+        // Sockets are not backend storage.
+        assert_eq!(after.read_sqes, before.read_sqes, "read: {after:?}");
+        assert_eq!(after.write_sqes, before.write_sqes, "write: {after:?}");
     });
     drop((a, b));
+}
+
+#[test]
+fn read_and_write_sqes_count_separately() {
+    // Positional backend ops on a regular file (the file/bdev path).
+    let file = tempfile::tempfile().expect("temp file");
+    let fd = file.as_raw_fd();
+    let rt = QueueRuntime::new(RingConfig::default()).expect("runtime");
+    rt.block_on(async {
+        let before = reactor_stats().expect("reactor live");
+        let wbuf = [0xABu8; 512];
+        // SAFETY: `wbuf` outlives the awaited op.
+        let res = unsafe { ops::write_at_raw(fd, wbuf.as_ptr(), 512, 0) }
+            .expect("write op")
+            .await;
+        assert_eq!(res.expect("write ok"), 512);
+        let mut rbuf = [0u8; 512];
+        // SAFETY: `rbuf` outlives the awaited op.
+        let res = unsafe { ops::read_at_raw(fd, rbuf.as_mut_ptr(), 512, 0) }
+            .expect("read op")
+            .await;
+        assert_eq!(res.expect("read ok"), 512);
+        assert_eq!(rbuf, wbuf);
+        let after = reactor_stats().expect("reactor live");
+        assert_eq!(after.write_sqes, before.write_sqes + 1, "write: {after:?}");
+        assert_eq!(after.read_sqes, before.read_sqes + 1, "read: {after:?}");
+        // Backend storage is not network.
+        assert_eq!(after.send_sqes, before.send_sqes, "send: {after:?}");
+        assert_eq!(after.recv_sqes, before.recv_sqes, "recv: {after:?}");
+    });
 }
 
 #[test]
