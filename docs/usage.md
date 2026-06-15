@@ -96,8 +96,9 @@ shows what hosts would discover rather than only `no controllers`.
 
 `GET_STATS` carries a `controller_info` array (which controller —
 subsystem and host NQN — each cntlid below belongs to) and a `threads`
-array: one entry per queue thread with its ring counters (`enters` =
-`io_uring_enter` syscalls, `parks`, `sqes`, `cqes`) and per-queue IO
+array: one entry per queue thread with its ring counters (`parks` =
+idle `io_uring_enter` waits, `sqes` with the `send_sqes`/`recv_sqes`
+network split, `cqes`) and per-queue IO
 counters (read/write/flush/other commands, read/write bytes, errors —
 IO-path failures only, admin and fabrics rejections are not counted —
 keyed by cntlid+qid; correlate with `LIST_CONTROLLER` for tid/cpus).
@@ -117,13 +118,14 @@ ioutgt stat --clear    # print the final totals, then zero everything
 
 ```text
 controller 1: nqn.2026-06.io.ioutgt:test  host nqn.2014-08.org.nvmexpress:uuid:abc…
-ioutgt-io0  tid 12345  enters/s 8124  parks/s 8011  sqes/s 540210  cqes/s 540231
+ioutgt-io0  tid 12345  parks/s 8011  sqes/s 540210  send/s 270100  recv/s 270110  cqes/s 540231
   cntlid 1 qid 1   read 250310/s (977.8 MiB/s)  write 0/s (0.0 MiB/s)  flush 0/s  other 0/s  err 0/s
 ```
 
-`sqes/enters` is the park-batching amortization (ops per syscall);
-rates are computed client-side from the monotonic counters, so a
-target restart between samples shows zeros, never garbage.
+`sqes/parks` is the park-batching amortization (ops per syscall), and
+`send`/`recv` break the SQEs into the network send/recv mix; rates are
+computed client-side from the monotonic counters, so a target restart
+between samples shows zeros, never garbage.
 
 ## Connecting a Linux host
 

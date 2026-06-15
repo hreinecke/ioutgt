@@ -206,8 +206,9 @@ fn thread_stats_json(
     serde_json::json!({
         "name": name,
         "tid": ioutgt_core::controller::current_tid(),
-        "ring": { "enters": ring.enters, "parks": ring.parks,
-                  "sqes": ring.sqes, "cqes": ring.cqes },
+        "ring": { "parks": ring.parks, "sqes": ring.sqes,
+                  "send_sqes": ring.send_sqes, "recv_sqes": ring.recv_sqes,
+                  "cqes": ring.cqes },
         "queues": queues,
         "retired": counters_json(retired),
     })

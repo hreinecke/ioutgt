@@ -502,7 +502,7 @@ reactor owns the ring:
 - **Parking**: while tasks are runnable, nobody calls `io_uring_enter`.
   When the runtime goes idle it invokes `on_thread_park`; the reactor then
   calls `submit_and_wait(1)` with an EXT_ARG timeout equal to the nearest
-  reactor timer (capped at 100 ms as a missed-wakeup backstop), reaps all
+  reactor timer (capped at 1 s as a missed-wakeup backstop), reaps all
   CQEs, and wakes wakers — which makes Tokio's own park return immediately.
   Result: one syscall per idle→busy transition, zero syscalls while
   saturated.
@@ -818,7 +818,7 @@ API change (development machine is single-node).
 
 | Risk | Mitigation |
 |------|-----------|
-| Reactor orphan/missed-wakeup bugs | M1 first; drop-mid-flight stress; ASAN soak; 100 ms park backstop |
+| Reactor orphan/missed-wakeup bugs | M1 first; drop-mid-flight stress; ASAN soak; 1 s park backstop |
 | Fabrics/enable sequencing vs real host | real nvme-cli connect at M4; pcap fixtures at M2 |
 | R2T flow corruption | fragmentation torture; fio --verify; mid-R2T kill tests |
 | io-uring crate API gaps | M1 feature probe; raw-registration fallback confined to one module |

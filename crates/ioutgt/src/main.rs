@@ -304,11 +304,12 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
         let ring0 = &before["ring"];
         let _ = writeln!(
             out,
-            "{name}  tid {}  enters{suffix} {}  parks{suffix} {}  sqes{suffix} {}  cqes{suffix} {}",
+            "{name}  tid {}  parks{suffix} {}  sqes{suffix} {}  send{suffix} {}  recv{suffix} {}  cqes{suffix} {}",
             thread["tid"],
-            val(u(ring, "enters"), u(ring0, "enters")),
             val(u(ring, "parks"), u(ring0, "parks")),
             val(u(ring, "sqes"), u(ring0, "sqes")),
+            val(u(ring, "send_sqes"), u(ring0, "send_sqes")),
+            val(u(ring, "recv_sqes"), u(ring0, "recv_sqes")),
             val(u(ring, "cqes"), u(ring0, "cqes")),
         );
         for q in thread["queues"].as_array().into_iter().flatten() {
@@ -642,7 +643,8 @@ mod tests {
         ],
         "threads": [{
             "name": "ioutgt-io0", "tid": 42,
-            "ring": { "enters": 100, "parks": 90, "sqes": 5000, "cqes": 5000 },
+            "ring": { "parks": 90, "sqes": 5000, "send_sqes": 2500,
+                      "recv_sqes": 2400, "cqes": 5000 },
             "queues": [{ "cntlid": 1, "qid": 1,
                 "read_cmds": 3000u64, "write_cmds": 1000u64, "flush_cmds": 0u64,
                 "other_cmds": 2u64, "read_bytes": 12_288_000u64,
@@ -677,11 +679,11 @@ mod tests {
         let prev = stat_sample();
         let mut next = stat_sample();
         next["threads"][0]["queues"][0]["read_cmds"] = 5000.into();
-        next["threads"][0]["ring"]["enters"] = 300.into();
-        // 2000 reads over 2 s → 1000/s; 200 enters over 2 s → 100/s.
+        next["threads"][0]["ring"]["parks"] = 290.into();
+        // 2000 reads over 2 s → 1000/s; 200 parks over 2 s → 100/s.
         let out = super::render_stat(&next, Some((&prev, 2.0)));
         assert!(out.contains("read 1000"), "rate visible: {out}");
-        assert!(out.contains("enters/s 100"), "enter rate visible: {out}");
+        assert!(out.contains("parks/s 100"), "park rate visible: {out}");
         // Counters that did not move render as zero rates, not totals.
         assert!(out.contains("write 0"), "{out}");
     }

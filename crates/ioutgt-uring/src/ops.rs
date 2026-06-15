@@ -16,6 +16,7 @@ use std::time::Duration;
 use io_uring::{opcode, types};
 
 use crate::op::{MsgResources, MultiOp, Op, Resources};
+use crate::reactor::SqeClass;
 
 fn buf_len(buf: &[u8]) -> io::Result<u32> {
     u32::try_from(buf.len())
@@ -90,13 +91,14 @@ pub fn write_at(fd: RawFd, buf: Box<[u8]>, offset: u64) -> io::Result<BufOp> {
 pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> io::Result<BufOp> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_mut_ptr();
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Recv::new(types::Fd(fd), ptr, len)
                 .build()
                 .user_data(key)
         },
         Resources::Buffer(buf),
+        SqeClass::Recv,
     )?;
     Ok(BufOp { op })
 }
@@ -105,13 +107,14 @@ pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> io::Result<BufOp> {
 pub fn send(fd: RawFd, buf: Box<[u8]>) -> io::Result<BufOp> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_ptr();
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Send::new(types::Fd(fd), ptr, len)
                 .build()
                 .user_data(key)
         },
         Resources::Buffer(buf),
+        SqeClass::Send,
     )?;
     Ok(BufOp { op })
 }
@@ -149,13 +152,14 @@ pub fn send_vectored_partial(
     msg.iovecs[0].iov_len = hlen;
     msg.iovecs[1].iov_len = plen;
     let msghdr_ptr: *const libc::msghdr = &msg.msghdr;
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::SendMsg::new(types::Fd(fd), msghdr_ptr)
                 .build()
                 .user_data(key)
         },
         Resources::Msg(msg),
+        SqeClass::Send,
     )?;
     Ok(SendVectored { op })
 }
@@ -165,13 +169,14 @@ pub fn send_vectored_partial(
 pub fn send_vectored(fd: RawFd, header: Box<[u8]>, payload: Box<[u8]>) -> io::Result<SendVectored> {
     let msg = MsgResources::new_send(header, payload);
     let msghdr_ptr: *const libc::msghdr = &msg.msghdr;
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::SendMsg::new(types::Fd(fd), msghdr_ptr)
                 .build()
                 .user_data(key)
         },
         Resources::Msg(msg),
+        SqeClass::Send,
     )?;
     Ok(SendVectored { op })
 }
@@ -320,13 +325,14 @@ pub fn fallocate(fd: RawFd, mode: i32, offset: u64, len: u64) -> io::Result<RawO
 /// keep the memory alive until [`crate::Reactor::drain`] (or queue
 /// teardown) confirms no ops are pending.
 pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Recv::new(types::Fd(fd), ptr, len)
                 .build()
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Recv,
     )?;
     Ok(RawOp { op })
 }
@@ -340,7 +346,7 @@ pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
 /// Same contract as [`recv_raw`]: `ptr..ptr+len` must remain valid and
 /// unaliased for writes until this op's terminal CQE has been reaped.
 pub unsafe fn recv_raw_waitall(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Recv::new(types::Fd(fd), ptr, len)
                 .flags(libc::MSG_WAITALL)
@@ -348,6 +354,7 @@ pub unsafe fn recv_raw_waitall(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Recv,
     )?;
     Ok(RawOp { op })
 }
@@ -358,13 +365,14 @@ pub unsafe fn recv_raw_waitall(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<
 ///
 /// Same contract as [`recv_raw`] (valid until terminal CQE; reads only).
 pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::Send::new(types::Fd(fd), ptr, len)
                 .build()
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Send,
     )?;
     Ok(RawOp { op })
 }
@@ -378,13 +386,14 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp>
 /// remain valid (reads only) until this op's terminal CQE has been
 /// reaped — same contract as [`recv_raw`].
 pub unsafe fn sendmsg_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<RawOp> {
-    let op = Op::submit(
+    let op = Op::submit_classed(
         |key| {
             opcode::SendMsg::new(types::Fd(fd), msg)
                 .build()
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Send,
     )?;
     Ok(RawOp { op })
 }
@@ -463,7 +472,7 @@ impl Future for ZcNotif {
 /// stay allocated until the notification is reaped,
 /// [`crate::Reactor::drain`] returns, or queue teardown completes.
 pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<SendZcOp> {
-    let op = MultiOp::submit(
+    let op = MultiOp::submit_classed(
         |key| {
             opcode::SendMsgZc::new(types::Fd(fd), msg)
                 .ioprio(SEND_ZC_REPORT_USAGE)
@@ -471,6 +480,7 @@ pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<
                 .user_data(key)
         },
         Resources::None,
+        SqeClass::Send,
     )?;
     Ok(SendZcOp { op })
 }

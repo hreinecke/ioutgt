@@ -324,8 +324,13 @@ fn get_stats_counts_ios_and_folds_retired() {
         io_thread["ring"]["sqes"].as_u64().unwrap() > 0,
         "{io_thread}"
     );
+    // The IO queue recv'd commands and sent responses, so both buckets moved.
     assert!(
-        io_thread["ring"]["enters"].as_u64().unwrap() > 0,
+        io_thread["ring"]["send_sqes"].as_u64().unwrap() > 0,
+        "{io_thread}"
+    );
+    assert!(
+        io_thread["ring"]["recv_sqes"].as_u64().unwrap() > 0,
         "{io_thread}"
     );
 

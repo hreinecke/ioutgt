@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::cqe::CqeResult;
-use crate::reactor::Reactor;
+use crate::reactor::{Reactor, SqeClass};
 
 /// `user_data` sentinel for SQEs whose CQE carries no op state
 /// (e.g. ASYNC_CANCEL issued on orphaning).
@@ -141,8 +141,17 @@ impl Op {
         build: impl FnOnce(u64) -> io_uring::squeue::Entry,
         resources: Resources,
     ) -> std::io::Result<Op> {
+        Self::submit_classed(build, resources, SqeClass::Other)
+    }
+
+    /// As [`Op::submit`], tagging the SQE for the send/recv counters.
+    pub(crate) fn submit_classed(
+        build: impl FnOnce(u64) -> io_uring::squeue::Entry,
+        resources: Resources,
+        class: SqeClass,
+    ) -> std::io::Result<Op> {
         let reactor = Reactor::current()?;
-        let key = reactor.submit_op(build, resources)?;
+        let key = reactor.submit_op(build, resources, class)?;
         Ok(Op {
             reactor,
             key,
@@ -188,8 +197,17 @@ impl MultiOp {
         build: impl FnOnce(u64) -> io_uring::squeue::Entry,
         resources: Resources,
     ) -> std::io::Result<MultiOp> {
+        Self::submit_classed(build, resources, SqeClass::Other)
+    }
+
+    /// As [`MultiOp::submit`], tagging the SQE for the send/recv counters.
+    pub(crate) fn submit_classed(
+        build: impl FnOnce(u64) -> io_uring::squeue::Entry,
+        resources: Resources,
+        class: SqeClass,
+    ) -> std::io::Result<MultiOp> {
         let reactor = Reactor::current()?;
-        let key = reactor.submit_op(build, resources)?;
+        let key = reactor.submit_op(build, resources, class)?;
         Ok(MultiOp {
             reactor,
             key,

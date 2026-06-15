@@ -245,7 +245,7 @@ accounting is exact: a queue's cycles are its thread's cycles.
 (nvmet's workqueues would just grow); the wedge path leaks by design
 rather than stalls forever, but a slow disk degrades all connections
 sharing the thread. The DEFER_TASKRUN park integration is the
-project's most safety-critical code and carries a 100 ms backstop
+project's most safety-critical code and carries a 1 s backstop
 against missed-wakeup bugs.
 
 ## 7. Configuration and control plane

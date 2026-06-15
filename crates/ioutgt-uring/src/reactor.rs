@@ -15,22 +15,36 @@ thread_local! {
 }
 
 /// Backstop wait inside the park loop: bounds the damage of any missed
-/// wakeup to 100 ms without ever being the *intended* wake mechanism.
-const PARK_SAFETY_NS: u32 = 100_000_000;
+/// wakeup to 1 s without ever being the *intended* wake mechanism (CQEs
+/// wake it long before this). Kept coarse so an idle thread re-parks at
+/// 1 Hz rather than 10 Hz.
+const PARK_SAFETY_SECS: u64 = 1;
+
+/// Classifies a submitted SQE for the per-type counters. Most ops are
+/// `Other`; network send/recv are split out so the stats expose the
+/// send/recv syscall mix.
+#[derive(Clone, Copy)]
+pub(crate) enum SqeClass {
+    Other,
+    Send,
+    Recv,
+}
 
 /// Lifetime ring counters for one queue thread. A snapshot of the
 /// owning thread's `Cell` counters; obtainable only on that thread
 /// (via [`crate::reactor_stats`] or [`Reactor::stats`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReactorStats {
-    /// `io_uring_enter` syscalls (parks + SQ-full flushes + teardown
-    /// waits).
-    pub enters: u64,
-    /// Park-hook waits (`submit_and_wait` from `on_thread_park`); a
-    /// subset of `enters`.
+    /// Park-hook waits (`submit_and_wait` from `on_thread_park`) — the
+    /// thread's idle `io_uring_enter` count, and the syscall-batching
+    /// denominator (`sqes / parks` ≈ ops per syscall).
     pub parks: u64,
-    /// SQEs pushed to the submission ring.
+    /// SQEs pushed to the submission ring (all op types).
     pub sqes: u64,
+    /// Network send SQEs (Send/SendMsg/SendMsgZc) — a subset of `sqes`.
+    pub send_sqes: u64,
+    /// Network recv SQEs (Recv) — a subset of `sqes`.
+    pub recv_sqes: u64,
     /// CQEs reaped from the completion ring.
     pub cqes: u64,
 }
@@ -39,9 +53,10 @@ pub struct ReactorStats {
 /// only by the owning thread — no atomics on the IO path.
 #[derive(Default)]
 struct StatCells {
-    enters: Cell<u64>,
     parks: Cell<u64>,
     sqes: Cell<u64>,
+    send_sqes: Cell<u64>,
+    recv_sqes: Cell<u64>,
     cqes: Cell<u64>,
 }
 
@@ -147,9 +162,10 @@ impl Reactor {
     /// Snapshot the lifetime ring counters (owning thread only).
     pub fn stats(&self) -> ReactorStats {
         ReactorStats {
-            enters: self.stats.enters.get(),
             parks: self.stats.parks.get(),
             sqes: self.stats.sqes.get(),
+            send_sqes: self.stats.send_sqes.get(),
+            recv_sqes: self.stats.recv_sqes.get(),
             cqes: self.stats.cqes.get(),
         }
     }
@@ -157,10 +173,23 @@ impl Reactor {
     /// Zero the ring counters (owning thread only) — the stats-clear
     /// path; in-flight ops keep counting from zero.
     pub fn reset_stats(&self) {
-        self.stats.enters.set(0);
         self.stats.parks.set(0);
         self.stats.sqes.set(0);
+        self.stats.send_sqes.set(0);
+        self.stats.recv_sqes.set(0);
         self.stats.cqes.set(0);
+    }
+
+    /// Count a successfully pushed SQE: the total plus, for network
+    /// send/recv, the per-type counter.
+    #[inline]
+    fn count_sqe(&self, class: SqeClass) {
+        StatCells::bump(&self.stats.sqes);
+        match class {
+            SqeClass::Send => StatCells::bump(&self.stats.send_sqes),
+            SqeClass::Recv => StatCells::bump(&self.stats.recv_sqes),
+            SqeClass::Other => {}
+        }
     }
 
     /// Reserve a slab entry, build the SQE with its key as `user_data`,
@@ -170,6 +199,7 @@ impl Reactor {
         &self,
         build: impl FnOnce(u64) -> squeue::Entry,
         resources: Resources,
+        class: SqeClass,
     ) -> io::Result<usize> {
         let key = {
             let mut slab = self.slab.borrow_mut();
@@ -179,26 +209,25 @@ impl Reactor {
             key
         };
         let sqe = build(key as u64);
-        if let Err(err) = self.push_sqe(&sqe) {
+        if let Err(err) = self.push_sqe(&sqe, class) {
             self.slab.borrow_mut().remove(key);
             return Err(err);
         }
         Ok(key)
     }
 
-    fn push_sqe(&self, sqe: &squeue::Entry) -> io::Result<()> {
+    fn push_sqe(&self, sqe: &squeue::Entry, class: SqeClass) -> io::Result<()> {
         let mut ring = self.ring.borrow_mut();
         // SAFETY: every pointer carried by the SQE refers to memory owned
         // by the corresponding slab entry (or by caller-guaranteed slot
         // memory for raw ops), which outlives the op by construction.
         unsafe {
             if ring.submission().push(sqe).is_ok() {
-                StatCells::bump(&self.stats.sqes);
+                self.count_sqe(class);
                 return Ok(());
             }
         }
         // SQ full: flush to the kernel and retry once.
-        StatCells::bump(&self.stats.enters);
         ring.submit()?;
         // SAFETY: as above.
         unsafe {
@@ -206,7 +235,7 @@ impl Reactor {
                 .push(sqe)
                 .map_err(|_| io::Error::other("SQ ring full after flush"))?;
         }
-        StatCells::bump(&self.stats.sqes);
+        self.count_sqe(class);
         Ok(())
     }
 
@@ -229,9 +258,9 @@ impl Reactor {
         let cancel = opcode::AsyncCancel::new(key as u64)
             .build()
             .user_data(IGNORE_USER_DATA);
-        // Best effort: if the SQ is wedged the 100 ms park backstop and
+        // Best effort: if the SQ is wedged the 1 s park backstop and
         // eventual completion still reclaim the entry.
-        let _ = self.push_sqe(&cancel);
+        let _ = self.push_sqe(&cancel, SqeClass::Other);
     }
 
     /// Park the thread: submit pending SQEs and wait for at least one CQE,
@@ -252,10 +281,9 @@ impl Reactor {
                 // Nothing in flight: nothing a CQE wait could wake.
                 return;
             }
-            let timeout = types::Timespec::new().nsec(PARK_SAFETY_NS);
+            let timeout = types::Timespec::new().sec(PARK_SAFETY_SECS);
             let args = types::SubmitArgs::new().timespec(&timeout);
             StatCells::bump(&self.stats.parks);
-            StatCells::bump(&self.stats.enters);
             let res = self
                 .ring
                 .borrow_mut()
@@ -357,7 +385,6 @@ impl Drop for Reactor {
             }
             let timeout = types::Timespec::new().nsec(10_000_000);
             let args = types::SubmitArgs::new().timespec(&timeout);
-            StatCells::bump(&self.stats.enters);
             let _ = self
                 .ring
                 .borrow_mut()
