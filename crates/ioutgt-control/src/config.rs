@@ -36,6 +36,11 @@ pub struct FileConfig {
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,
+    /// Tear the queue-thread pool down after this many seconds with zero
+    /// active connections, respawning it on the next connect; `0` keeps
+    /// the pool alive for the process lifetime once spawned. Default 30.
+    #[serde(default = "default_idle_teardown_secs")]
+    pub idle_teardown_secs: u64,
     /// At least one subsystem.
     pub subsystems: Vec<SubsystemConfig>,
 }
@@ -46,6 +51,10 @@ fn default_io_threads() -> usize {
 
 fn default_io_queue_size() -> u16 {
     128
+}
+
+fn default_idle_teardown_secs() -> u64 {
+    30
 }
 
 fn default_true() -> bool {

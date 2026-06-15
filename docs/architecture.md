@@ -152,26 +152,27 @@ meet:
 
 ```text
 spawn_target(config)                                   [ioutgt]
-  ├─ make_admin_thread() ─┐  per queue thread, NOW: mailbox()  [ioutgt-uring]
-  ├─ make_io_thread() × N ┤  (sender live; ring/runtime/thread deferred)
-  │                       └─ pending spawn closure, each:
-  │                            QueueRuntime::new()             [ioutgt-uring]
-  │                            block_on: loop { conn = mailbox.recv()
-  │                               → spawn run_queue(conn) }    [ioutgt-nvme-tcp]
   └─ control thread (plain Tokio): control_loop()
        ├─ Registry::new()                              [ioutgt-core]
        ├─ build_port(): per namespace
        │    build_backend() → AnyBackend               [ioutgt-control → -backend]
        │    Namespace / Subsystem::new() / PortConfig  [ioutgt-core]
+       ├─ senders: Mutex<Option<PoolSenders>> = None   (pool down)
        ├─ server::serve(UnixListener, CtlState)        [ioutgt-control]
-       │    └─ notify_ns_changed ──► admin mailbox ──► ctx.fire_ns_changed()
-       │       (UDS ADD/REMOVE_NAMESPACE → AER NS_CHANGED on live ctrls)
-       └─ TCP accept loop → setup_connection() per socket
-            ├─ FIRST accept: run pending closures → spawn the whole pool
-            ├─ accept_handshake()  ICReq/ICResp        [ioutgt-nvme-tcp]
-            ├─ read_connect()      first capsule       [ioutgt-nvme-tcp]
-            └─ MailboxSender::send(QueueConn)          [ioutgt-uring mailbox]
-                 qid 0 → admin thread, qid n → io thread[(n-1) % N]
+       │    └─ stats/nudge read `senders`: Some → admin/io mailbox,
+       │       None → zeroed stats / no-op nudge        (pool down)
+       └─ select! loop:
+            ├─ accept → ensure_pool_up(senders) → setup_connection()
+            │    ensure_pool_up (if down): build_pool() →
+            │      make_admin/make_io: mailbox() + pending spawn closure,
+            │        each → QueueRuntime::new()          [ioutgt-uring]
+            │          block_on: loop { msg = mailbox.recv()
+            │            Conn → spawn run_queue(conn)     [ioutgt-nvme-tcp]
+            │            Shutdown → return (thread exits, ring drops) }
+            │    accept_handshake/read_connect → MailboxSender::send(QueueConn)
+            │      qid 0 → admin thread, qid n → io thread[(n-1) % N]
+            └─ idle tick → active==0 for grace? → teardown_pool(senders)
+                 (Shutdown to every thread; senders → None)
 ```
 
 The mailbox (`ioutgt-uring::mailbox`) is the only cross-thread channel: an
@@ -179,19 +180,28 @@ MPSC queue plus eventfd doorbell that the queue thread watches with a
 persistent ring read, so handing off a connection never touches the queue
 thread's hot path.
 
-**Lazy pool spawn.** `make_admin_thread`/`make_io_thread` create each
-queue thread's mailbox (and eventfd) up front — so the senders, the
-control socket's stats sources, and qid routing are all wired at startup —
-but return the OS-thread/io_uring/runtime construction as a *pending*
-closure. The whole pool (admin + every IO thread) is spawned by the first
-accepted TCP connection, synchronously in the accept loop before that
-connection's `QueueConn` is routed, so a freshly-started but unconnected
-target holds only the control thread. The pool then persists for the
-process lifetime; reconnect/kill-recovery opens fresh TCP connections that
-route through the same threads. A control-socket stats query that races
-ahead of the first client (before the pool exists) is answered with a
-zeroed snapshot via a `pool_started` flag, so it neither blocks nor
-mis-reports threads as unresponsive.
+**Lazy pool spawn + idle teardown.** The queue-thread pool (admin + N IO
+threads) is spawned on the first accepted connection and reclaimed after an
+idle grace period — `control_loop` owns its whole lifecycle through one
+`Arc<Mutex<Option<PoolSenders>>>` (`None` = pool down). On the first accept
+(or the first after a teardown), `ensure_pool_up` runs `build_pool` →
+`make_admin_thread`/`make_io_thread`, which create each thread's mailbox +
+eventfd and a *pending* closure that builds the OS-thread/io_uring/runtime;
+the closures run before the connection's `QueueConn` is routed, so a
+freshly-started or idle-reclaimed target holds only the control thread. An
+`idle_teardown` grace window (default 30s, `--idle-teardown-secs`, `0`
+disables) is polled on a coarse tick: once `active` (the connection count,
+decremented by `ConnPermit` on `run_queue` end) has been zero for the whole
+window, `teardown_pool` sends each thread a `Shutdown` message — they
+return from `block_on`, dropping their rings (the op-slab is empty at idle,
+so no drain) — and clears the senders to `None`. The grace window keeps the
+pool alive across nvme-tcp reconnect / kill-recovery (which re-establishes
+queues within ~10s); only a genuinely idle target reclaims the threads. The
+control socket's stats/nudge closures read the shared cell, so they track
+the live senders across teardown/respawn; while the pool is down a stats
+query is answered with a zeroed snapshot (it neither blocks nor mis-reports
+threads as unresponsive) and a namespace-change nudge no-ops (no live
+controllers — the edit still lands in the port model for the next connect).
 
 ### 4.2 Queue thread: who calls whom inside `run_queue()`
 

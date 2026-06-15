@@ -11,8 +11,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use ioutgt_backend::AnyBackend;
 use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, SubsystemConfig};
@@ -50,6 +51,10 @@ pub struct TargetConfig {
     pub io_queue_size: u16,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
+    /// Tear the queue-thread pool down after this long with zero active
+    /// connections, respawning it on the next connect; `None` keeps the
+    /// pool alive for the process lifetime once spawned.
+    pub idle_teardown: Option<Duration>,
     /// Subsystems served on this port.
     pub subsystems: Vec<SubsystemConfig>,
 }
@@ -66,6 +71,7 @@ impl TargetConfig {
             send_zc: false,
             io_queue_size: 128,
             control_socket: None,
+            idle_teardown: Some(Duration::from_secs(30)),
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
                 serial: "IOUTGT0001".into(),
@@ -91,6 +97,8 @@ impl TargetConfig {
             send_zc: file.send_zc,
             io_queue_size: file.io_queue_size,
             control_socket: file.control_socket,
+            idle_teardown: (file.idle_teardown_secs != 0)
+                .then(|| Duration::from_secs(file.idle_teardown_secs)),
             subsystems: file.subsystems,
         })
     }
@@ -119,7 +127,13 @@ type StatsRequest = tokio::sync::oneshot::Sender<serde_json::Value>;
 /// Messages to an IO queue thread.
 enum IoMsg {
     Conn(Conn),
-    Stats { reply: StatsRequest, clear: bool },
+    Stats {
+        reply: StatsRequest,
+        clear: bool,
+    },
+    /// Exit the mailbox loop so the thread (and its io_uring ring) is torn
+    /// down. Sent only when the pool is idle (zero active connections).
+    Shutdown,
 }
 
 /// Messages to the admin queue thread.
@@ -131,6 +145,9 @@ enum AdminMsg {
         reply: StatsRequest,
         clear: bool,
     },
+    /// Exit the mailbox loop so the thread (and its io_uring ring) is torn
+    /// down. Sent only when the pool is idle (zero active connections).
+    Shutdown,
 }
 
 /// Zero everything a queue thread counts: every live queue's counters,
@@ -237,6 +254,7 @@ fn make_io_thread(
                                 clear_thread_stats(&queues, &mut retired);
                             }
                         }
+                        Ok(IoMsg::Shutdown) => return,
                         Err(err) => {
                             warn!("io mailbox failed: {err}");
                             return;
@@ -299,6 +317,7 @@ fn make_admin_thread(name: String) -> io::Result<(MailboxSender<AdminMsg>, Pendi
                                 clear_thread_stats(&queues, &mut retired);
                             }
                         }
+                        Ok(AdminMsg::Shutdown) => return,
                         Err(err) => {
                             warn!("admin mailbox failed: {err}");
                             return;
@@ -412,8 +431,80 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
     }))
 }
 
-/// Start every thread of a target; returns the bound address (for
-/// ephemeral-port tests). Runs until the process exits.
+/// The live mailbox senders for a spawned queue-thread pool: the admin
+/// thread plus one per IO thread. Held behind `Mutex<Option<_>>` in
+/// [`control_loop`] — `None` means the pool is currently down (before the
+/// first connection, or after an idle teardown).
+struct PoolSenders {
+    admin: MailboxSender<AdminMsg>,
+    io: Vec<MailboxSender<IoMsg>>,
+}
+
+/// Build the pool's mailboxes: returns the senders plus the deferred
+/// spawn closures (admin first, then one per IO thread). The OS threads /
+/// io_uring rings are created only when the closures run.
+fn build_pool(io_cpus: &[Option<usize>]) -> io::Result<(PoolSenders, Vec<PendingThread>)> {
+    let (admin, admin_pending) = make_admin_thread("ioutgt-admin".into())?;
+    let mut io = Vec::with_capacity(io_cpus.len());
+    let mut pending: Vec<PendingThread> = Vec::with_capacity(io_cpus.len() + 1);
+    pending.push(admin_pending);
+    for (i, core_id) in io_cpus.iter().enumerate() {
+        let (tx, io_pending) = make_io_thread(format!("ioutgt-io{i}"), *core_id)?;
+        io.push(tx);
+        pending.push(io_pending);
+    }
+    Ok((PoolSenders { admin, io }, pending))
+}
+
+/// Spawn the queue-thread pool if it is currently down — the first
+/// connection ever, or the first after an idle teardown. Idempotent;
+/// runs the deferred spawn closures and publishes the senders.
+fn ensure_pool_up(senders: &Mutex<Option<PoolSenders>>, io_cpus: &[Option<usize>]) {
+    let mut guard = senders.lock().expect("pool senders mutex");
+    if guard.is_some() {
+        return;
+    }
+    match build_pool(io_cpus) {
+        Ok((pool, pending)) => {
+            for spawn in pending {
+                if let Err(err) = spawn() {
+                    error!("queue thread spawn failed: {err}");
+                }
+            }
+            *guard = Some(pool);
+            info!("queue-thread pool spawned");
+        }
+        Err(err) => error!("queue-thread pool build failed: {err}"),
+    }
+}
+
+/// Tear the idle pool down: signal every thread to exit its mailbox loop,
+/// then drop the senders. Each thread returns from `block_on`, dropping
+/// its `QueueRuntime` (io_uring ring); the mailbox eventfds close once the
+/// last sender clone is gone. Only called with zero active connections, so
+/// no thread is mid-`run_queue` and no op-slab drain is needed.
+///
+/// Exit is fire-and-forget: this returns before the threads have actually
+/// died, and a respawn ([`ensure_pool_up`]) does not wait for them — a
+/// teardown immediately followed by a reconnect can briefly run the old
+/// and new pools side by side. That is harmless (independent threads,
+/// rings, and fresh mailboxes), just transiently more threads.
+fn teardown_pool(senders: &Mutex<Option<PoolSenders>>) {
+    let Some(pool) = senders.lock().expect("pool senders mutex").take() else {
+        return;
+    };
+    for io_tx in &pool.io {
+        io_tx.send(IoMsg::Shutdown);
+    }
+    pool.admin.send(AdminMsg::Shutdown);
+    info!("queue-thread pool torn down after idle");
+    // `pool` (the last sender clones) drops here.
+}
+
+/// Start a target's control thread; returns the bound address (for
+/// ephemeral-port tests). The queue-thread pool is spawned lazily on the
+/// first connection and reclaimed after an idle grace period. Runs until
+/// the process exits.
 pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
     if config.send_zc {
         // Opt-in experiment: refuse to start rather than silently
@@ -424,24 +515,6 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
                 "--send-zc requested but the kernel lacks IORING_OP_SENDMSG_ZC (need >= 6.1)",
             ));
         }
-    }
-    // Build each queue thread's mailbox (and sender) now, but defer the
-    // OS thread / io_uring ring / runtime until the first client connects
-    // (spawned by `control_loop`). The senders are live immediately, so
-    // control-socket wiring and qid routing are unchanged.
-    let (admin_tx, admin_pending) = make_admin_thread("ioutgt-admin".into())?;
-    let io_cpus = if config.pin_threads {
-        io_thread_cpus(config.io_threads)
-    } else {
-        vec![None; config.io_threads]
-    };
-    let mut io_txs: Vec<MailboxSender<IoMsg>> = Vec::with_capacity(config.io_threads);
-    let mut pending: Vec<PendingThread> = Vec::with_capacity(config.io_threads + 1);
-    pending.push(admin_pending);
-    for (i, core_id) in io_cpus.into_iter().enumerate() {
-        let (tx, io_pending) = make_io_thread(format!("ioutgt-io{i}"), core_id)?;
-        io_txs.push(tx);
-        pending.push(io_pending);
     }
 
     // The control thread reports the bound address back synchronously.
@@ -460,29 +533,30 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
                 }
             };
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(control_loop(config, admin_tx, io_txs, pending, addr_tx)));
+            rt.block_on(local.run_until(control_loop(config, addr_tx)));
         })?;
     addr_rx
         .recv()
         .map_err(|_| io::Error::other("control thread died during bind"))?
 }
 
-async fn control_loop(
-    config: TargetConfig,
-    admin_tx: MailboxSender<AdminMsg>,
-    io_txs: Vec<MailboxSender<IoMsg>>,
-    pending: Vec<PendingThread>,
-    addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
-) {
+async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<SocketAddr>>) {
     let registry = Registry::new();
 
-    // The queue-thread pool is spawned lazily on the first accepted
-    // connection (`pending`, taken below). `pool_started` lets the
-    // control-socket stats sources answer a query that arrives before
-    // any client has connected without waiting on a thread that does not
-    // exist yet — they reply with a zeroed snapshot instead.
-    let mut pending = Some(pending);
-    let pool_started = Arc::new(AtomicBool::new(false));
+    // The queue-thread pool is spawned lazily on the first connection and
+    // torn down after an idle grace period; `senders` is the single source
+    // of truth for whether it is up. `None` = down (pre-first-connect or
+    // post-teardown) → control-socket stats reply with a zeroed snapshot
+    // and namespace-change nudges no-op (no live controllers). Control-
+    // plane only — never locked on the IO path, never held across an await.
+    let senders: Arc<Mutex<Option<PoolSenders>>> = Arc::new(Mutex::new(None));
+    // Per-IO-thread CPU assignment is fixed for the process (topology is
+    // stable), so compute it once and reuse it for every (re)spawn.
+    let io_cpus = if config.pin_threads {
+        io_thread_cpus(config.io_threads)
+    } else {
+        vec![None; config.io_threads]
+    };
 
     // Bind before building the port so the model carries the actual
     // bound address (ephemeral ports resolve to the real one).
@@ -521,42 +595,57 @@ async fn control_loop(
                     let _ = addr_tx.send(Err(err));
                     return;
                 }
-                let nudge_tx = admin_tx.clone();
+                // Stats/nudge closures read the current senders through the
+                // shared cell, so they keep working across teardown/respawn.
                 let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
-                    Vec::with_capacity(1 + io_txs.len());
-                let stats_admin = admin_tx.clone();
-                let admin_started = Arc::clone(&pool_started);
+                    Vec::with_capacity(1 + config.io_threads);
+                let stats_admin = Arc::clone(&senders);
                 stats_sources.push(Box::new(move |clear, reply| {
-                    if !admin_started.load(Ordering::Relaxed) {
-                        let _ = reply.send(thread_stats_json(
-                            "ioutgt-admin",
-                            &[],
-                            &QueueStatsSnapshot::default(),
-                        ));
-                        return;
-                    }
-                    stats_admin.send(AdminMsg::Stats { reply, clear });
-                }));
-                for (i, io_tx) in io_txs.iter().enumerate() {
-                    let io_tx = io_tx.clone();
-                    let io_started = Arc::clone(&pool_started);
-                    let name = format!("ioutgt-io{i}");
-                    stats_sources.push(Box::new(move |clear, reply| {
-                        if !io_started.load(Ordering::Relaxed) {
+                    match stats_admin.lock().expect("pool senders mutex").as_ref() {
+                        Some(pool) => pool.admin.send(AdminMsg::Stats { reply, clear }),
+                        // Pool down: no thread to ask — reply zeroed.
+                        None => {
                             let _ = reply.send(thread_stats_json(
-                                &name,
+                                "ioutgt-admin",
                                 &[],
                                 &QueueStatsSnapshot::default(),
                             ));
-                            return;
                         }
-                        io_tx.send(IoMsg::Stats { reply, clear });
+                    }
+                }));
+                for i in 0..config.io_threads {
+                    let stats_io = Arc::clone(&senders);
+                    let name = format!("ioutgt-io{i}");
+                    stats_sources.push(Box::new(move |clear, reply| {
+                        match stats_io
+                            .lock()
+                            .expect("pool senders mutex")
+                            .as_ref()
+                            .and_then(|pool| pool.io.get(i))
+                        {
+                            Some(io_tx) => io_tx.send(IoMsg::Stats { reply, clear }),
+                            None => {
+                                let _ = reply.send(thread_stats_json(
+                                    &name,
+                                    &[],
+                                    &QueueStatsSnapshot::default(),
+                                ));
+                            }
+                        }
                     }));
                 }
+                let nudge = Arc::clone(&senders);
                 let state = Arc::new(CtlState {
                     port: Arc::clone(&port),
                     registry: Arc::clone(&registry),
-                    notify_ns_changed: Box::new(move || nudge_tx.send(AdminMsg::NsChanged)),
+                    notify_ns_changed: Box::new(move || {
+                        // Pool down → no live controllers to AER; the
+                        // namespace edit still lands in the port model and
+                        // shows up on the next connect.
+                        if let Some(pool) = nudge.lock().expect("pool senders mutex").as_ref() {
+                            pool.admin.send(AdminMsg::NsChanged);
+                        }
+                    }),
                     stats_sources,
                 });
                 info!(path = %path.display(), "control socket listening");
@@ -574,58 +663,88 @@ async fn control_loop(
 
     // Bounds total preallocated queue memory across all queue threads.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Idle-teardown bookkeeping: poll the active count on a coarse tick and
+    // tear the pool down once it has been zero for the whole grace period.
+    let mut idle_since: Option<Instant> = None;
+    let tick_period = config
+        .idle_teardown
+        .map(|grace| (grace / 4).clamp(Duration::from_millis(100), Duration::from_secs(5)))
+        .unwrap_or_else(|| Duration::from_secs(3600));
+    let mut idle_tick = tokio::time::interval(tick_period);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(err) => {
-                warn!("accept failed: {err}");
-                continue;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        warn!("accept failed: {err}");
+                        continue;
+                    }
+                };
+                // Any activity resets the idle clock; bring the pool up if
+                // it is down (first connect or post-teardown respawn).
+                idle_since = None;
+                ensure_pool_up(&senders, &io_cpus);
+                // Clone the live senders for routing, then drop the lock
+                // before the async setup task (never hold it across await).
+                let (admin_tx, io_txs) = {
+                    let guard = senders.lock().expect("pool senders mutex");
+                    match guard.as_ref() {
+                        Some(pool) => (pool.admin.clone(), pool.io.clone()),
+                        None => {
+                            warn!(%peer, "queue-thread pool unavailable; dropping connection");
+                            continue;
+                        }
+                    }
+                };
+                let count = active.fetch_add(1, Ordering::Relaxed) + 1;
+                if count > MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    warn!(%peer, "connection limit {MAX_CONNECTIONS} reached; rejecting");
+                    continue; // stream drops here, closing the connection
+                }
+                let permit = ConnPermit::new(Arc::clone(&active));
+                let allow_hdgst = config.allow_hdgst;
+                let allow_ddgst = config.allow_ddgst;
+                let send_zc = config.send_zc;
+                let registry = Arc::clone(&registry);
+                let port = Arc::clone(&port);
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = setup_connection(
+                        stream,
+                        allow_hdgst,
+                        allow_ddgst,
+                        send_zc,
+                        &admin_tx,
+                        &io_txs,
+                        port,
+                        registry,
+                        permit,
+                    )
+                    .await
+                    {
+                        warn!(%peer, "connection setup failed: {err}");
+                    }
+                });
             }
-        };
-        // First client to reach the port spawns the whole queue-thread
-        // pool (admin + every IO thread). Done before the per-connection
-        // task is spawned, so the drainer exists by the time this
-        // connection's `Conn` is routed; subsequent accepts skip this.
-        if let Some(threads) = pending.take() {
-            for spawn in threads {
-                if let Err(err) = spawn() {
-                    error!("queue thread spawn failed: {err}");
+            _ = idle_tick.tick() => {
+                let Some(grace) = config.idle_teardown else {
+                    continue; // teardown disabled
+                };
+                let up = senders.lock().expect("pool senders mutex").is_some();
+                if up && active.load(Ordering::Relaxed) == 0 {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= grace {
+                        teardown_pool(&senders);
+                        idle_since = None;
+                    }
+                } else {
+                    idle_since = None;
                 }
             }
-            pool_started.store(true, Ordering::Relaxed);
-            info!("queue-thread pool started on first connection");
         }
-        let count = active.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if count > MAX_CONNECTIONS {
-            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            warn!(%peer, "connection limit {MAX_CONNECTIONS} reached; rejecting");
-            continue; // stream drops here, closing the connection
-        }
-        let permit = ConnPermit::new(Arc::clone(&active));
-        let admin_tx = admin_tx.clone();
-        let io_txs = io_txs.clone();
-        let allow_hdgst = config.allow_hdgst;
-        let allow_ddgst = config.allow_ddgst;
-        let send_zc = config.send_zc;
-        let registry = Arc::clone(&registry);
-        let port = Arc::clone(&port);
-        tokio::task::spawn_local(async move {
-            if let Err(err) = setup_connection(
-                stream,
-                allow_hdgst,
-                allow_ddgst,
-                send_zc,
-                &admin_tx,
-                &io_txs,
-                port,
-                registry,
-                permit,
-            )
-            .await
-            {
-                warn!(%peer, "connection setup failed: {err}");
-            }
-        });
     }
 }
 

@@ -43,6 +43,12 @@ struct Args {
     #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(2..=256))]
     io_queue_size: u16,
 
+    /// Tear the queue-thread pool down after this many seconds with zero
+    /// active connections, respawning it on the next connect; 0 keeps the
+    /// pool alive for the process lifetime once spawned.
+    #[arg(long, default_value_t = 30)]
+    idle_teardown_secs: u64,
+
     /// NVM subsystem NQN.
     #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
     subsys_nqn: String,
@@ -494,6 +500,8 @@ fn main() -> std::io::Result<()> {
             config.pin_threads = !args.no_pin;
             config.send_zc = args.send_zc;
             config.io_queue_size = args.io_queue_size;
+            config.idle_teardown = (args.idle_teardown_secs != 0)
+                .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
             config.control_socket = Some(args.control_socket);
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {
