@@ -789,7 +789,11 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                idle.reset();
+                // An accepted socket is activity — restart the idle clock.
+                // An accept *error* is not (and must not defer teardown).
+                if accepted.is_ok() {
+                    idle.reset();
+                }
                 accept_connection(accepted, &config, &senders, &io_cpus, &active, &registry, &port);
             }
             _ = idle.tick() => idle.maybe_teardown(&senders, &active),
