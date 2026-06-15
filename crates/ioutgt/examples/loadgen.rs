@@ -33,6 +33,7 @@ struct Args {
     addr: String,
     conns: usize,
     qd: usize,
+    sqsize: u16,
     bs: u32,
     secs: u64,
     write: bool,
@@ -43,6 +44,7 @@ fn parse_args() -> Args {
         addr: "127.0.0.1:4420".into(),
         conns: 4,
         qd: 32,
+        sqsize: 0, // 0 = auto: just fits the queue depth (qd + 1)
         bs: 4096,
         secs: 10,
         write: false,
@@ -54,6 +56,7 @@ fn parse_args() -> Args {
             "--addr" => args.addr = value(),
             "--conns" => args.conns = value().parse().unwrap(),
             "--qd" => args.qd = value().parse().unwrap(),
+            "--sqsize" => args.sqsize = value().parse().unwrap(),
             "--bs" => args.bs = value().parse().unwrap(),
             "--secs" => args.secs = value().parse().unwrap(),
             "--rw" => args.write = value() == "randwrite",
@@ -78,20 +81,20 @@ fn read_pdu(
     stream: &mut TcpStream,
     decoder: &mut PduDecoder,
     scratch: &mut [u8],
-) -> pdu::DecodedPdu {
+) -> std::io::Result<pdu::DecodedPdu> {
     let mut byte = [0u8; 1];
     loop {
-        stream.read_exact(&mut byte).expect("pdu byte");
+        stream.read_exact(&mut byte)?;
         decoder.feed(&byte).expect("decode");
         if decoder.is_complete() {
             let decoded = decoder.take().expect("take");
             let mut left = decoded.data_len as usize + if decoded.ddgst { 4 } else { 0 };
             while left > 0 {
                 let take = left.min(scratch.len());
-                stream.read_exact(&mut scratch[..take]).expect("payload");
+                stream.read_exact(&mut scratch[..take])?;
                 left -= take;
             }
-            return decoded;
+            return Ok(decoded);
         }
     }
 }
@@ -121,7 +124,14 @@ fn nvme_connect(stream: &mut TcpStream, qid: u16, sqsize: u16, cntlid: u16) -> u
 
     let mut decoder = PduDecoder::new(false);
     let mut scratch = [0u8; 4096];
-    let decoded = read_pdu(stream, &mut decoder, &mut scratch);
+    let decoded = read_pdu(stream, &mut decoder, &mut scratch).unwrap_or_else(|e| {
+        panic!(
+            "connect qid={qid} sqsize={sqsize}: target closed the connection ({e}). \
+             The negotiated sqsize most likely exceeds the target's advertised \
+             --io-queue-size (MAXCMD); lower --qd / --sqsize, or raise the target's \
+             --io-queue-size."
+        )
+    });
     let PduKind::CapsuleResp(cqe) = decoded.kind else {
         panic!("expected connect resp")
     };
@@ -167,6 +177,7 @@ fn worker(
     qid: u16,
     cntlid: u16,
     qd: usize,
+    sqsize: u16,
     bs: u32,
     write: bool,
     stop: Arc<AtomicBool>,
@@ -174,7 +185,7 @@ fn worker(
     seed: u64,
 ) -> Vec<u64> {
     let mut stream = handshake(&addr);
-    nvme_connect(&mut stream, qid, 64, cntlid);
+    nvme_connect(&mut stream, qid, sqsize, cntlid);
     eprintln!("# worker qid={qid} connected");
     let mut rx = stream.try_clone().expect("clone");
 
@@ -385,10 +396,21 @@ fn worker(
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
+    // Default sqsize auto-fits the depth: the target allocates one slot per
+    // negotiated entry and all are usable, so qd outstanding needs sqsize ==
+    // qd (this matches the kernel, where nr_tags == MAXCMD). The common case
+    // then works against any target whose --io-queue-size (MAXCMD) >= qd,
+    // instead of a fixed 64 that a small-MAXCMD target would reject.
+    // --sqsize overrides (e.g. a large slot count with a shallow qd).
+    if args.sqsize == 0 {
+        args.sqsize = u16::try_from(args.qd).expect("qd too large for an NVMe sqsize");
+    }
     assert!(
-        args.qd <= 60,
-        "qd must fit the negotiated sqsize (64) minus headroom"
+        args.qd <= args.sqsize as usize && args.sqsize >= 2,
+        "qd ({}) must fit the negotiated sqsize ({})",
+        args.qd,
+        args.sqsize
     );
 
     // Admin connection holds the controller open.
@@ -405,13 +427,14 @@ fn main() {
             let addr = args.addr.clone();
             let stop = Arc::clone(&stop);
             let total_ops = Arc::clone(&total_ops);
-            let (qd, bs, write) = (args.qd, args.bs, args.write);
+            let (qd, sqsize, bs, write) = (args.qd, args.sqsize, args.bs, args.write);
             std::thread::spawn(move || {
                 worker(
                     addr,
                     u16::try_from(i + 1).unwrap(),
                     cntlid,
                     qd,
+                    sqsize,
                     bs,
                     write,
                     stop,

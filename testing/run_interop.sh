@@ -76,7 +76,7 @@ echo "$TOP" > "$MARKER_DIR/ioutgt_top"
 [ -n "${IOUTGT_SOAK_ONLY:-}" ] && echo "$IOUTGT_SOAK_ONLY" > "$MARKER_DIR/ioutgt_soak_only"
 
 start_target() {
-    "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads 2 \
+    "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads "${IOUTGT_IO_THREADS:-2}" \
         --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" "${IOQS_ARGS[@]}" >>"$LOG" 2>&1 &
     echo $! >"$PID_FILE"
 }
