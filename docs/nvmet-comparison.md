@@ -218,6 +218,25 @@ namespace table is the one shared read-mostly structure, versioned
 behind a generation counter so the per-command cost is a single
 atomic load. Everything else on the data path is `Cell`/`RefCell`.
 
+**Multiple subsystems share one pool — there is no pool-per-subsystem.**
+A port may serve several subsystems, but they are all served by a single
+fixed per-port pool: 1 admin thread + N IO threads (`build_pool` in
+`crates/ioutgt/src/lib.rs`), lazily spawned on the first connection and
+reclaimed after an idle grace period. Connections hash onto it by qid
+(`(qid−1) % N`); the subsystem is resolved **per connection** from the
+Connect capsule's `subsysnqn` (`fabrics_exec.rs` → `PortConfig::subsystem`)
+and carried on the controller, never on the thread. So two controllers on
+different subsystems of the same port can land on the same IO thread, and
+a `Subsystem` owns no execution context — only namespaces, serial/model,
+and its host-allow flag. This mirrors nvmet exactly: `nvmet_subsys` is a
+logical config object (namespaces, ACLs, `ctrls` list) with no kthread or
+workqueue of its own; TCP I/O is per-queue `io_work` on one shared global
+`nvmet_tcp_wq`, and the controller's subsystem is chosen at Connect via
+`nvmet_find_get_subsys`. The one divergence is placement policy, not
+granularity: nvmet steers each queue's `io_work` to the socket's RX CPU
+(`sk_incoming_cpu`) dynamically, whereas ioutgt uses a fixed `group_cpus_evenly`
+pinning with deterministic qid→thread hashing.
+
 **Benefits.** The "no locks on the hot path" claim is checkable by
 construction (`!Send` types make violations compile errors). CPU
 accounting is exact: a queue's cycles are its thread's cycles.
