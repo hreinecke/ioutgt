@@ -75,6 +75,26 @@ ioutgt_fio_verify() {
     [ -n "$dev" ] || { dmesg | tail -30; vt_die "namespace device missing"; }
     vt_log "fio target: $dev"
 
+    # The per-controller path device nvmeXcYnZ is built only when the host
+    # has CONFIG_NVME_MULTIPATH (which exposes the nvme_core.multipath param)
+    # AND the target advertises CMIC multi-controller. It is a hidden gendisk
+    # (GENHD_FL_HIDDEN) — registers in /sys/block, gets no /dev node — so its
+    # presence there is the end-to-end proof of our CMIC/NMIC advertisement.
+    # Skipped on kernels that lack multipath.
+    local mp_param=/sys/module/nvme_core/parameters/multipath
+    if [ -r "$mp_param" ] && [ "$(cat "$mp_param")" != "N" ]; then
+        local paths
+        paths=$(ls /sys/block/ 2>/dev/null | grep -E '^nvme[0-9]+c[0-9]+n[0-9]+' || true)
+        [ -n "$paths" ] || {
+            nvme list-subsys 2>/dev/null || true
+            ls /sys/block/ 2>/dev/null | grep nvme || true
+            vt_die "multipath on but no nvmeXcYnZ path gendisk — CMIC not honored"
+        }
+        vt_log "multipath path gendisk(s): $(echo $paths | tr '\n' ' ')"
+    else
+        vt_log "kernel without CONFIG_NVME_MULTIPATH; no nvmeXcYnZ path to check"
+    fi
+
     fio --name=v4k --filename="$dev" --rw=randwrite --bs=4k --size=16M \
         --verify=crc32c --verify_fatal=1 --direct=1 --ioengine=libaio \
         --iodepth=32 --output-format=terse >/dev/null ||
@@ -159,22 +179,34 @@ ioutgt_run_m7() {
 
     : > "${VMTEST_DATA_DIR:?}/tmp/ioutgt_want_ns2"
 
-    local have=0
+    # Wait for nsid 2 to materialize, and resolve the block device
+    # userspace uses for it. Under native multipath the per-controller
+    # node is the hidden ${ctrl}cYn2 (no /dev node); the usable device is
+    # the head nvmeXnZ, whose name has no 'c'. Without multipath it is just
+    # nvmeXn2. Match by the nsid sysfs attribute (head instance need not
+    # equal nsid), skipping the hidden c-path gendisks.
+    local dev2=""
     for i in $(seq 60); do
-        have=$(ls "/sys/class/nvme/$ctrl/" 2>/dev/null | grep -c "^${ctrl}n[0-9]")
-        [ "$have" -ge 2 ] && break
+        for d in /sys/block/nvme*; do
+            case "${d##*/}" in *c*) continue ;; esac
+            [ "$(cat "$d/nsid" 2>/dev/null)" = "2" ] || continue
+            dev2="/dev/${d##*/}"
+            break
+        done
+        [ -n "$dev2" ] && [ -b "$dev2" ] && break
+        dev2=""
         sleep 0.5
     done
-    if [ "$have" -lt 2 ]; then
+    [ -n "$dev2" ] || {
         dmesg | tail -20
         vt_die "second namespace did not appear after AEN"
-    fi
-    vt_log "namespace 2 appeared without reconnect"
+    }
+    vt_log "namespace 2 appeared as $dev2 (no reconnect)"
 
     # Sanity IO on the hot-added namespace.
-    dd if=/dev/urandom "of=/dev/${ctrl}n2" bs=4k count=4 oflag=direct status=none ||
+    dd if=/dev/urandom "of=$dev2" bs=4k count=4 oflag=direct status=none ||
         vt_die "write to hot-added namespace failed"
-    dd "if=/dev/${ctrl}n2" of=/dev/null bs=4k count=4 iflag=direct status=none ||
+    dd "if=$dev2" of=/dev/null bs=4k count=4 iflag=direct status=none ||
         vt_die "read from hot-added namespace failed"
 
     nvme disconnect -n "$NQN" >/dev/null || vt_die "m7 disconnect failed"

@@ -159,12 +159,20 @@ complete one with the NS_ATTR notice; teardown fails parked AERs
 (`ConnCtx::close`, the analog of `nvmet_async_events_failall`) — the
 omission of which was a 389 KB-per-disconnect leak caught by the M8
 RSS gate. Changed-NS log reports the 0xFFFFFFFF sentinel and clears
-on read (RAE is not yet honored).
+on read (RAE is not yet honored). Like nvmet, it advertises multi-path
+capability — Identify Controller **CMIC** multi-controller (bit 1) and
+Identify Namespace **NMIC** shared (bit 0) — so the host's NVMe-multipath
+layer (`nvme_mpath_alloc_disk`, gated on `CMIC_MULTI_CTRL`) folds each
+connection's path into one namespace head and exposes a per-controller
+path device (`/dev/nvmeXcYnZ`); the namespace UUID from CNS 0x03 gives
+that head its identity.
 
 **Differences/Risks.** Log pages are minimal (zeroed error/SMART/FW);
 RAE handling, SMART data, and multi-page error logs are future work.
 Discovery log windowing (LPO) is implemented; generation-counter
-churn protection is simplistic (static genctr).
+churn protection is simplistic (static genctr). Unlike nvmet, **ANA is
+not advertised** (CMIC bit 3 clear): ioutgt serves no ANA log page, so
+the host runs plain (non-ANA) multipath — paths are all optimized.
 
 ## 5. IO backends
 

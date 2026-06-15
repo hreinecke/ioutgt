@@ -96,6 +96,22 @@ pub mod oncs {
     pub const WRITE_ZEROES: u16 = 1 << 3;
 }
 
+/// CMIC bits (Identify Controller: multi-path I/O & namespace sharing).
+pub mod cmic {
+    /// The NVM subsystem may contain two or more controllers. Setting it
+    /// makes the host's NVMe-multipath layer build a namespace head plus a
+    /// per-controller path device (`/dev/nvmeXcYnZ`) — see the host gate
+    /// `nvme_mpath_alloc_disk` (`NVME_CTRL_CMIC_MULTI_CTRL`).
+    pub const MULTI_CTRL: u8 = 1 << 1;
+}
+
+/// NMIC bits (Identify Namespace: multi-path I/O & namespace sharing).
+pub mod nmic {
+    /// The namespace may be attached to two or more controllers at once
+    /// (shared namespace; `NVME_NS_NMIC_SHARED`).
+    pub const SHARED: u8 = 1 << 0;
+}
+
 /// SGLS bits: byte-aligned SGL support (value 1 in bits 1:0).
 pub const SGLS_BYTE_ALIGNED: u32 = 1;
 

@@ -6,7 +6,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ioutgt_nvme::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
-use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, oncs};
+use ioutgt_nvme::identify::{
+    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, cmic, nmic, oncs,
+};
 use ioutgt_nvme::spec::{Sqe, admin_opcode, cns, feat, log_page};
 use ioutgt_nvme::status;
 use tracing::debug;
@@ -173,6 +175,15 @@ fn build_id_ctrl<B: Backend>(
     // bit it never enables namespace-change notices.
     id.oaes.set(crate::AEN_CFG_NS_ATTR);
     id.cntrltype = if discovery { 2 } else { 1 };
+    if !discovery {
+        // Advertise multi-controller capability so the host's NVMe-multipath
+        // layer builds a namespace head plus a per-controller path device
+        // (/dev/nvmeXcYnZ), as it does for kernel nvmet. ANA (CMIC bit 3) is
+        // deliberately left clear — we serve no ANA log page. Discovery
+        // controllers have no namespaces, so (like nvmet) they advertise no
+        // CMIC.
+        id.cmic = cmic::MULTI_CTRL;
+    }
     id.kas.set(KAS_UNITS);
     id.sqes = 0x66;
     id.cqes = 0x44;
@@ -215,6 +226,10 @@ fn build_id_ns<B: Backend>(backend: &B) -> Box<IdentifyNamespace> {
     id.nuse.set(blocks);
     id.nlbaf = 0;
     id.flbas = 0;
+    // Shared namespace: it may be attached to multiple controllers at once
+    // (every ioutgt connection is its own controller serving this backend),
+    // so the host folds the paths into one multipath head.
+    id.nmic = nmic::SHARED;
     id.dlfeat = 0x01; // deallocated blocks read zeroes
     id.lbaf[0].lbads = backend.block_shift();
     id.lbaf[0].ms.set(0);
