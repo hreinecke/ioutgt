@@ -4,16 +4,57 @@
 //!
 //! fio through the VM rides slirp (userspace NAT) and bottlenecks long
 //! before the target does; this client speaks the wire format directly
-//! through the sans-io codec, pipelines a fixed queue depth per
-//! connection, and reports IOPS plus latency percentiles.
+//! through the sans-io codec, opens an admin queue plus `--conns` IO
+//! queues, pipelines a fixed depth on each, and reports aggregate IOPS,
+//! bandwidth, and latency percentiles.
 //!
-//! `--rw randwrite` covers both write paths: blocks ≤ 16 KiB go
-//! in-capsule; larger blocks use a transport SGL and answer the
-//! target's R2T with a single H2CData PDU (the target solicits the
-//! whole transfer at once — MAXH2CDATA is 16 MiB, far above MDTS).
+//! # Flags — and the load each shapes
 //!
+//! - `--addr <ip:port>`  target NVMe/TCP address. Default 127.0.0.1:4420.
+//! - `--conns N`  the *width*: N parallel connections, each its own TCP
+//!   socket and NVMe IO queue. The target routes qid n to IO thread
+//!   `(n-1) % io_threads`, so up to `io_threads` connections run on
+//!   distinct threads/CPUs; throughput scales with N until the target's
+//!   threads saturate. Default 4. (`--conns 1` isolates one queue / one
+//!   IO thread — the per-queue ceiling.)
+//! - `--qd N`  the *depth*: N commands kept in flight (pipelined) on each
+//!   connection at all times. Total outstanding = `conns × qd`.
+//!   Default 32.
+//! - `--sqsize N`  the negotiated NVMe queue size (SQSIZE) = the target's
+//!   per-queue slot count. Default `0` = auto (= `qd`, one slot per
+//!   in-flight command). Must satisfy `qd <= sqsize <= the target's
+//!   --io-queue-size` (MAXCMD); a Connect above MAXCMD is rejected. Set
+//!   it above `qd` to exercise a large slot allocation under a shallow
+//!   in-flight depth.
+//! - `--bs N`  block size in bytes per IO. Default 4096 (4 KiB). Served
+//!   as: read -> one C2HData PDU; write <= 16 KiB -> in-capsule data;
+//!   write > 16 KiB -> transport SGL answered by a single R2T/H2CData
+//!   round trip (MAXH2CDATA 16 MiB >> MDTS, so the whole transfer is
+//!   solicited at once).
+//! - `--secs N`  run duration in seconds. Default 10.
+//! - `--rw randread|randwrite`  read or write workload; LBAs are random
+//!   within the namespace. Default randread.
+//!
+//! Net: `conns` connections each pipeline `qd` random `bs`-sized `rw`
+//! ops for `secs` seconds.
+//!
+//! # Examples
+//!
+//!   # default shape: 4 conns, depth 32, 4 KiB random reads, 10 s
 //!   cargo run --release --example loadgen -- \
 //!       --addr 127.0.0.1:4420 --conns 4 --qd 32 --bs 4096 --secs 10 --rw randread
+//!
+//!   # one queue / one IO thread at depth 32 — the single-queue ceiling
+//!   cargo run --release --example loadgen -- --conns 1 --qd 32
+//!
+//!   # deep single queue: 128 in flight (needs target --io-queue-size >= 128)
+//!   cargo run --release --example loadgen -- --conns 1 --qd 128
+//!
+//!   # wide: 16 connections (up to 16 IO threads), depth 32 each
+//!   cargo run --release --example loadgen -- --conns 16 --qd 32
+//!
+//!   # 128 KiB random writes — the large-transfer R2T/H2CData path
+//!   cargo run --release --example loadgen -- --bs 131072 --rw randwrite
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -29,13 +70,21 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 const NQN: &str = "nqn.2026-06.io.ioutgt:test";
 const HOSTNQN: &str = "nqn.2014-08.org.nvmexpress:uuid:feedface-0000-4000-8000-000000000001";
 
+/// Parsed CLI; see the module docs for what each field shapes.
 struct Args {
+    /// Target `ip:port`.
     addr: String,
+    /// Parallel connections / NVMe IO queues (load width).
     conns: usize,
+    /// In-flight commands per connection (load depth).
     qd: usize,
+    /// Negotiated queue size (slots); `0` = auto (`= qd`).
     sqsize: u16,
+    /// Block size in bytes per IO.
     bs: u32,
+    /// Run duration in seconds.
     secs: u64,
+    /// `true` = randwrite, `false` = randread.
     write: bool,
 }
 
@@ -44,7 +93,7 @@ fn parse_args() -> Args {
         addr: "127.0.0.1:4420".into(),
         conns: 4,
         qd: 32,
-        sqsize: 0, // 0 = auto: just fits the queue depth (qd + 1)
+        sqsize: 0, // 0 = auto: one slot per in-flight command (= qd)
         bs: 4096,
         secs: 10,
         write: false,
