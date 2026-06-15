@@ -46,10 +46,11 @@ fn zc_mixed_batch_real_and_fallback_notifs() {
     config.send_zc = true;
     let addr = ioutgt::spawn_target(config).expect("target start");
 
-    // Cap only after the rings exist: pinned-page accounting happens
-    // per ZC send against the limit current at send time.
-    cap_memlock();
-
+    // The queue-thread pool (and its io_uring rings) spawns lazily on the
+    // first connection, so open both queues first to force the rings into
+    // existence under the normal rlimit. Capping before they exist would
+    // run ring creation — and the admin queue's serving thread — under the
+    // 256K limit and hang the admin connect (which has no read timeout).
     let mut admin = Client::handshake(addr, false, false);
     let cntlid = admin.connect(0, 32, 0xFFFF, 1);
     let mut io = Client::handshake(addr, false, false);
@@ -57,6 +58,10 @@ fn zc_mixed_batch_real_and_fallback_notifs() {
     io.stream()
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+
+    // Cap only after the rings exist: pinned-page accounting happens
+    // per ZC send against the limit current at send time.
+    cap_memlock();
 
     // Seed data.
     let mut data = vec![0u8; BIG as usize];

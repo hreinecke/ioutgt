@@ -152,11 +152,12 @@ meet:
 
 ```text
 spawn_target(config)                                   [ioutgt]
-  ├─ spawn_admin_thread() ─┐  each queue thread:
-  ├─ spawn_io_thread() × N ┤   QueueRuntime::new()     [ioutgt-uring]
-  │                        │   mailbox()               [ioutgt-uring]
-  │                        └─  block_on: loop { conn = mailbox.recv()
-  │                               → spawn run_queue(conn) }   [ioutgt-nvme-tcp]
+  ├─ make_admin_thread() ─┐  per queue thread, NOW: mailbox()  [ioutgt-uring]
+  ├─ make_io_thread() × N ┤  (sender live; ring/runtime/thread deferred)
+  │                       └─ pending spawn closure, each:
+  │                            QueueRuntime::new()             [ioutgt-uring]
+  │                            block_on: loop { conn = mailbox.recv()
+  │                               → spawn run_queue(conn) }    [ioutgt-nvme-tcp]
   └─ control thread (plain Tokio): control_loop()
        ├─ Registry::new()                              [ioutgt-core]
        ├─ build_port(): per namespace
@@ -166,6 +167,7 @@ spawn_target(config)                                   [ioutgt]
        │    └─ notify_ns_changed ──► admin mailbox ──► ctx.fire_ns_changed()
        │       (UDS ADD/REMOVE_NAMESPACE → AER NS_CHANGED on live ctrls)
        └─ TCP accept loop → setup_connection() per socket
+            ├─ FIRST accept: run pending closures → spawn the whole pool
             ├─ accept_handshake()  ICReq/ICResp        [ioutgt-nvme-tcp]
             ├─ read_connect()      first capsule       [ioutgt-nvme-tcp]
             └─ MailboxSender::send(QueueConn)          [ioutgt-uring mailbox]
@@ -176,6 +178,20 @@ The mailbox (`ioutgt-uring::mailbox`) is the only cross-thread channel: an
 MPSC queue plus eventfd doorbell that the queue thread watches with a
 persistent ring read, so handing off a connection never touches the queue
 thread's hot path.
+
+**Lazy pool spawn.** `make_admin_thread`/`make_io_thread` create each
+queue thread's mailbox (and eventfd) up front — so the senders, the
+control socket's stats sources, and qid routing are all wired at startup —
+but return the OS-thread/io_uring/runtime construction as a *pending*
+closure. The whole pool (admin + every IO thread) is spawned by the first
+accepted TCP connection, synchronously in the accept loop before that
+connection's `QueueConn` is routed, so a freshly-started but unconnected
+target holds only the control thread. The pool then persists for the
+process lifetime; reconnect/kill-recovery opens fresh TCP connections that
+route through the same threads. A control-socket stats query that races
+ahead of the first client (before the pool exists) is answered with a
+zeroed snapshot via a `pool_started` flag, so it neither blocks nor
+mis-reports threads as unresponsive.
 
 ### 4.2 Queue thread: who calls whom inside `run_queue()`
 

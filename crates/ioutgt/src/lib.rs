@@ -1,5 +1,6 @@
-//! Target assembly: spawns the control thread, the admin queue thread,
-//! and the IO queue threads, and wires connection handoff between them.
+//! Target assembly: spawns the control thread and wires connection
+//! handoff into the queue-thread pool (admin thread + N IO threads),
+//! which is itself spawned lazily on the first accepted connection.
 //!
 //! Exposed as a library so integration tests can start a full target
 //! in-process on an ephemeral port.
@@ -10,6 +11,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use ioutgt_backend::AnyBackend;
@@ -24,7 +26,7 @@ use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue};
 use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Target configuration. Built from CLI flags, a JSON file
 /// ([`TargetConfig::from_file`]), or [`TargetConfig::single_memory`] in
@@ -103,6 +105,12 @@ const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
 const MAX_CONNECTIONS: usize = 256;
 
 type Conn = QueueConn<AnyBackend>;
+
+/// A queue thread whose mailbox (and sender) already exist but whose OS
+/// thread, io_uring ring, and runtime are not yet created. Calling it
+/// spawns the thread; the pool is deferred until the first client
+/// connects (see [`control_loop`]).
+type PendingThread = Box<dyn FnOnce() -> io::Result<()> + Send>;
 
 /// Reply channel for a stats request: the queue thread builds its JSON
 /// on-thread (control-plane rate) and sends it back.
@@ -188,107 +196,119 @@ fn thread_stats_json(
     })
 }
 
-/// IO queue threads receive connections and stats requests.
-fn spawn_io_thread(name: String, core_id: Option<usize>) -> io::Result<MailboxSender<IoMsg>> {
+/// Create an IO queue thread's mailbox and return its sender plus a
+/// deferred spawn closure (the ring/runtime/OS thread are built only when
+/// the closure runs). IO queue threads receive connections and stats
+/// requests.
+fn make_io_thread(
+    name: String,
+    core_id: Option<usize>,
+) -> io::Result<(MailboxSender<IoMsg>, PendingThread)> {
     let (tx, mut rx): (MailboxSender<IoMsg>, Mailbox<IoMsg>) = mailbox()?;
-    spawn_pinned(name.clone(), core_id, move || {
-        let rt = match QueueRuntime::new(RingConfig::default()) {
-            Ok(rt) => rt,
-            Err(err) => {
-                warn!(thread = %name, "queue runtime failed: {err}");
-                return;
-            }
-        };
-        rt.block_on(async move {
-            let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
-            let mut retired = QueueStatsSnapshot::default();
-            loop {
-                match rx.recv().await {
-                    Ok(IoMsg::Conn(conn)) => {
-                        prune_dead_queues(&queues, &mut retired);
-                        let queues = Rc::clone(&queues);
-                        tokio::task::spawn_local(async move {
-                            run_queue(conn, |ctx| {
-                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
-                            })
-                            .await;
-                        });
-                    }
-                    Ok(IoMsg::Stats { reply, clear }) => {
-                        prune_dead_queues(&queues, &mut retired);
-                        let queues = queues.borrow();
-                        let _ = reply.send(thread_stats_json(&name, &queues, &retired));
-                        if clear {
-                            clear_thread_stats(&queues, &mut retired);
+    let spawn: PendingThread = Box::new(move || {
+        spawn_pinned(name.clone(), core_id, move || {
+            let rt = match QueueRuntime::new(RingConfig::default()) {
+                Ok(rt) => rt,
+                Err(err) => {
+                    warn!(thread = %name, "queue runtime failed: {err}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
+                let mut retired = QueueStatsSnapshot::default();
+                loop {
+                    match rx.recv().await {
+                        Ok(IoMsg::Conn(conn)) => {
+                            prune_dead_queues(&queues, &mut retired);
+                            let queues = Rc::clone(&queues);
+                            tokio::task::spawn_local(async move {
+                                run_queue(conn, |ctx| {
+                                    queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
+                                })
+                                .await;
+                            });
+                        }
+                        Ok(IoMsg::Stats { reply, clear }) => {
+                            prune_dead_queues(&queues, &mut retired);
+                            let queues = queues.borrow();
+                            let _ = reply.send(thread_stats_json(&name, &queues, &retired));
+                            if clear {
+                                clear_thread_stats(&queues, &mut retired);
+                            }
+                        }
+                        Err(err) => {
+                            warn!("io mailbox failed: {err}");
+                            return;
                         }
                     }
-                    Err(err) => {
-                        warn!("io mailbox failed: {err}");
-                        return;
-                    }
                 }
-            }
-        });
-    })?;
-    Ok(tx)
+            });
+        })
+    });
+    Ok((tx, spawn))
 }
 
-/// The admin thread additionally tracks live controllers for AER nudges.
-fn spawn_admin_thread(name: String) -> io::Result<MailboxSender<AdminMsg>> {
+/// Create the admin queue thread's mailbox and return its sender plus a
+/// deferred spawn closure. The admin thread additionally tracks live
+/// controllers for AER nudges.
+fn make_admin_thread(name: String) -> io::Result<(MailboxSender<AdminMsg>, PendingThread)> {
     let (tx, mut rx): (MailboxSender<AdminMsg>, Mailbox<AdminMsg>) = mailbox()?;
-    spawn_pinned(name.clone(), None, move || {
-        let rt = match QueueRuntime::new(RingConfig::default()) {
-            Ok(rt) => rt,
-            Err(err) => {
-                warn!(thread = %name, "queue runtime failed: {err}");
-                return;
-            }
-        };
-        rt.block_on(async move {
-            let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
-                Rc::new(RefCell::new(Vec::new()));
-            let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
-            let mut retired = QueueStatsSnapshot::default();
-            loop {
-                match rx.recv().await {
-                    Ok(AdminMsg::Conn(conn)) => {
-                        live.borrow_mut().retain(|weak| weak.strong_count() > 0);
-                        prune_dead_queues(&queues, &mut retired);
-                        let live = Rc::clone(&live);
-                        let queues = Rc::clone(&queues);
-                        tokio::task::spawn_local(async move {
-                            run_queue(conn, |ctx| {
-                                live.borrow_mut().push(Rc::downgrade(ctx));
-                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
-                            })
-                            .await;
-                        });
-                    }
-                    Ok(AdminMsg::NsChanged) => {
-                        live.borrow_mut().retain(|weak| {
-                            weak.upgrade().is_some_and(|ctx| {
-                                ctx.fire_ns_changed();
-                                true
-                            })
-                        });
-                    }
-                    Ok(AdminMsg::Stats { reply, clear }) => {
-                        prune_dead_queues(&queues, &mut retired);
-                        let queues = queues.borrow();
-                        let _ = reply.send(thread_stats_json(&name, &queues, &retired));
-                        if clear {
-                            clear_thread_stats(&queues, &mut retired);
+    let spawn: PendingThread = Box::new(move || {
+        spawn_pinned(name.clone(), None, move || {
+            let rt = match QueueRuntime::new(RingConfig::default()) {
+                Ok(rt) => rt,
+                Err(err) => {
+                    warn!(thread = %name, "queue runtime failed: {err}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
+                let mut retired = QueueStatsSnapshot::default();
+                loop {
+                    match rx.recv().await {
+                        Ok(AdminMsg::Conn(conn)) => {
+                            live.borrow_mut().retain(|weak| weak.strong_count() > 0);
+                            prune_dead_queues(&queues, &mut retired);
+                            let live = Rc::clone(&live);
+                            let queues = Rc::clone(&queues);
+                            tokio::task::spawn_local(async move {
+                                run_queue(conn, |ctx| {
+                                    live.borrow_mut().push(Rc::downgrade(ctx));
+                                    queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
+                                })
+                                .await;
+                            });
+                        }
+                        Ok(AdminMsg::NsChanged) => {
+                            live.borrow_mut().retain(|weak| {
+                                weak.upgrade().is_some_and(|ctx| {
+                                    ctx.fire_ns_changed();
+                                    true
+                                })
+                            });
+                        }
+                        Ok(AdminMsg::Stats { reply, clear }) => {
+                            prune_dead_queues(&queues, &mut retired);
+                            let queues = queues.borrow();
+                            let _ = reply.send(thread_stats_json(&name, &queues, &retired));
+                            if clear {
+                                clear_thread_stats(&queues, &mut retired);
+                            }
+                        }
+                        Err(err) => {
+                            warn!("admin mailbox failed: {err}");
+                            return;
                         }
                     }
-                    Err(err) => {
-                        warn!("admin mailbox failed: {err}");
-                        return;
-                    }
                 }
-            }
-        });
-    })?;
-    Ok(tx)
+            });
+        })
+    });
+    Ok((tx, spawn))
 }
 
 /// Pick the CPU each IO queue thread is pinned to: group all CPUs
@@ -405,15 +425,24 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
             ));
         }
     }
-    let admin_tx = spawn_admin_thread("ioutgt-admin".into())?;
+    // Build each queue thread's mailbox (and sender) now, but defer the
+    // OS thread / io_uring ring / runtime until the first client connects
+    // (spawned by `control_loop`). The senders are live immediately, so
+    // control-socket wiring and qid routing are unchanged.
+    let (admin_tx, admin_pending) = make_admin_thread("ioutgt-admin".into())?;
     let io_cpus = if config.pin_threads {
         io_thread_cpus(config.io_threads)
     } else {
         vec![None; config.io_threads]
     };
-    let io_txs: Vec<MailboxSender<IoMsg>> = (0..config.io_threads)
-        .map(|i| spawn_io_thread(format!("ioutgt-io{i}"), io_cpus[i]))
-        .collect::<io::Result<_>>()?;
+    let mut io_txs: Vec<MailboxSender<IoMsg>> = Vec::with_capacity(config.io_threads);
+    let mut pending: Vec<PendingThread> = Vec::with_capacity(config.io_threads + 1);
+    pending.push(admin_pending);
+    for (i, core_id) in io_cpus.into_iter().enumerate() {
+        let (tx, io_pending) = make_io_thread(format!("ioutgt-io{i}"), core_id)?;
+        io_txs.push(tx);
+        pending.push(io_pending);
+    }
 
     // The control thread reports the bound address back synchronously.
     let (addr_tx, addr_rx) = mpsc::channel::<io::Result<SocketAddr>>();
@@ -431,7 +460,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
                 }
             };
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(control_loop(config, admin_tx, io_txs, addr_tx)));
+            rt.block_on(local.run_until(control_loop(config, admin_tx, io_txs, pending, addr_tx)));
         })?;
     addr_rx
         .recv()
@@ -442,9 +471,18 @@ async fn control_loop(
     config: TargetConfig,
     admin_tx: MailboxSender<AdminMsg>,
     io_txs: Vec<MailboxSender<IoMsg>>,
+    pending: Vec<PendingThread>,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
     let registry = Registry::new();
+
+    // The queue-thread pool is spawned lazily on the first accepted
+    // connection (`pending`, taken below). `pool_started` lets the
+    // control-socket stats sources answer a query that arrives before
+    // any client has connected without waiting on a thread that does not
+    // exist yet — they reply with a zeroed snapshot instead.
+    let mut pending = Some(pending);
+    let pool_started = Arc::new(AtomicBool::new(false));
 
     // Bind before building the port so the model carries the actual
     // bound address (ephemeral ports resolve to the real one).
@@ -487,12 +525,31 @@ async fn control_loop(
                 let mut stats_sources: Vec<ioutgt_control::server::StatsSource> =
                     Vec::with_capacity(1 + io_txs.len());
                 let stats_admin = admin_tx.clone();
+                let admin_started = Arc::clone(&pool_started);
                 stats_sources.push(Box::new(move |clear, reply| {
+                    if !admin_started.load(Ordering::Relaxed) {
+                        let _ = reply.send(thread_stats_json(
+                            "ioutgt-admin",
+                            &[],
+                            &QueueStatsSnapshot::default(),
+                        ));
+                        return;
+                    }
                     stats_admin.send(AdminMsg::Stats { reply, clear });
                 }));
-                for io_tx in &io_txs {
+                for (i, io_tx) in io_txs.iter().enumerate() {
                     let io_tx = io_tx.clone();
+                    let io_started = Arc::clone(&pool_started);
+                    let name = format!("ioutgt-io{i}");
                     stats_sources.push(Box::new(move |clear, reply| {
+                        if !io_started.load(Ordering::Relaxed) {
+                            let _ = reply.send(thread_stats_json(
+                                &name,
+                                &[],
+                                &QueueStatsSnapshot::default(),
+                            ));
+                            return;
+                        }
                         io_tx.send(IoMsg::Stats { reply, clear });
                     }));
                 }
@@ -525,6 +582,19 @@ async fn control_loop(
                 continue;
             }
         };
+        // First client to reach the port spawns the whole queue-thread
+        // pool (admin + every IO thread). Done before the per-connection
+        // task is spawned, so the drainer exists by the time this
+        // connection's `Conn` is routed; subsequent accepts skip this.
+        if let Some(threads) = pending.take() {
+            for spawn in threads {
+                if let Err(err) = spawn() {
+                    error!("queue thread spawn failed: {err}");
+                }
+            }
+            pool_started.store(true, Ordering::Relaxed);
+            info!("queue-thread pool started on first connection");
+        }
         let count = active.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if count > MAX_CONNECTIONS {
             active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
