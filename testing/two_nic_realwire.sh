@@ -69,57 +69,38 @@ IOUTGT_PORT=14420
 IOUTGT_NQN="nqn.2026-06.io.realwire:ioutgt"
 NVMET_PORT=24420
 NVMET_NQN="nqn.2026-06.io.realwire:nvmet"
+# shellcheck disable=SC2034  # HOSTNQN consumed by common.sh's connect/discover
 HOSTNQN="nqn.2026-06.io.realwire:host"
 
-# Map a target kind ('nvmet' | 'ioutgt') to its "PORT NQN" pair.
-target_params() {
-    case "${1:-}" in
-        ioutgt) echo "$IOUTGT_PORT $IOUTGT_NQN" ;;
-        nvmet) echo "$NVMET_PORT $NVMET_NQN" ;;
-        *) echo "specify target: nvmet | ioutgt" >&2; return 1 ;;
-    esac
-}
+# Transport context consumed by common.sh: the target listens on IP_T and
+# the initiator's nvme-cli runs inside NS_I (so its socket egresses NIC_I).
+# shellcheck disable=SC2034  # TARGET_IP consumed by common.sh's verbs
+TARGET_IP="$IP_T"
+ini_exec() { ip netns exec "$NS_I" "$@"; }
 
-# Run a per-target function $1 for the selected target $2, or for BOTH
-# targets (ioutgt then nvmet) when no selector is given. Every selector verb
-# (start/stop/discover/connect/disconnect/fio) dispatches through this.
-run_for_targets() {
-    local fn="$1"
-    case "${2:-}" in
-        ioutgt|nvmet) "$fn" "$2" ;;
-        "")           "$fn" ioutgt; "$fn" nvmet ;;
-        *) echo "specify target: nvmet | ioutgt (or omit for both)" >&2; exit 1 ;;
-    esac
-}
+# Shared helpers + knob defaults: target_params, run_for_targets,
+# ensure_backing, find_dev/find_ctrl/wait_dev, the discover/connect/
+# disconnect/fio verbs, plus NR_QUEUES, QUEUE_SIZE, BACKEND_GB, IOUTGT_BIN,
+# IOUTGT_SENDZC and the FIO_* knobs.
+. "$(dirname "$0")/common.sh"
 
 # Per-target backing (file backing only — a regular file or block device).
 # Each target has its OWN, so a single env setup drives both at once. A
 # missing non-/dev path is auto-created at BACKEND_GB; a /dev/* path must
 # already exist. Each is validated only when its target is started.
 NVMET_BACKEND="${NVMET_BACKEND:-}"   # nvmet device_path
-IOUTGT_BACKEND="${IOUTGT_BACKEND:-}"   # ioutgt --backend
-BACKEND_GB="${BACKEND_GB:-2}"          # size of an auto-created backing file
+IOUTGT_BACKEND="${IOUTGT_BACKEND:-}"   # ioutgt --backend (BACKEND_GB from common.sh)
 
-# Queueing, capped TARGET-side on both targets and also requested by the
+# Queueing is capped TARGET-side on both targets and also requested by the
 # initiator, so each side grants min(host request, target cap):
 #   ioutgt : --io-threads / --io-queue-size
 #   nvmet  : subsystem attr_qid_max / port param_max_queue_size
-#   connect: --nr-io-queues / --queue-size (so the host asks for that many)
-NR_QUEUES="${NR_QUEUES:-4}"       # IO queues
-QUEUE_SIZE="${QUEUE_SIZE:-128}"   # IO qdepth
+#   connect: --nr-io-queues / --queue-size
+# NR_QUEUES / QUEUE_SIZE come from common.sh.
 
-# ioutgt target-process knobs
-IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
-IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = --send-zc (zero-copy send; raises ulimit -l so ZC engages); default off
+# ioutgt target-process knobs (IOUTGT_BIN / IOUTGT_SENDZC from common.sh).
 IOUTGT_PIDFILE="${IOUTGT_PIDFILE:-/tmp/ioutgt-realwire.pid}"
 IOUTGT_LOG="${IOUTGT_LOG:-/tmp/ioutgt-realwire.log}"
-
-# fio knobs
-FIO_RW="${FIO_RW:-randread}"
-FIO_BS="${FIO_BS:-4k}"
-FIO_QD="${FIO_QD:-32}"
-FIO_JOBS="${FIO_JOBS:-4}"
-FIO_SECS="${FIO_SECS:-30}"
 
 usage() {
     cat <<EOF
@@ -220,19 +201,6 @@ cmd_down() {
     ip netns del "$NS_T" 2>/dev/null || true
     ip netns del "$NS_I" 2>/dev/null || true
     echo "   namespaces removed; NICs returned to root (reconfigure addresses as needed)."
-}
-
-# Ensure $BACKEND exists; both targets use it verbatim (nvmet auto-detects
-# file vs block device; ioutgt opens it, never creates it). A missing
-# non-/dev path is auto-created at BACKEND_GB; a missing /dev/* is an error.
-ensure_backing() {
-    case "$BACKEND" in
-        /dev/*) [ -e "$BACKEND" ] || { echo "block device $BACKEND does not exist" >&2; return 1; } ;;
-        /*)     [ -e "$BACKEND" ] || { echo "   creating backing file $BACKEND (${BACKEND_GB}G)" >&2
-                                       truncate -s "${BACKEND_GB}G" "$BACKEND" \
-                                         || { echo "failed to create $BACKEND" >&2; return 1; }; } ;;
-        *)      echo "BACKEND must be an absolute file or block-device path" >&2; return 1 ;;
-    esac
 }
 
 # ---- targets: 'start'/'stop [SELECTOR]' route to one (or both) of these
@@ -364,107 +332,10 @@ cmd_ioutgt_target_down() {
     echo ">> ioutgt stopped"
 }
 
-# ---- initiator (runs in NS_I) — each takes a 'nvmet'|'ioutgt' target ----
-discover_one() {
-    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    modprobe nvme-tcp
-    ip netns exec "$NS_I" nvme discover -t tcp -a "$IP_T" -s "$port" --hostnqn "$HOSTNQN"
-}
-
-connect_one() {
-    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    modprobe nvme-tcp
-    echo ">> connecting $1 from $NS_I -> $IP_T:$port (request ${NR_QUEUES}q x $QUEUE_SIZE)"
-    # The host TCP socket is created in NS_I (current netns), so the data
-    # path egresses NIC_I, crosses the wire, and reaches NIC_T in NS_T. The
-    # kernel keeps using that socket afterward regardless of which netns I/O
-    # is later submitted from.
-    #
-    # -i/-q make the host REQUEST this many queues / this depth; the target
-    # (ioutgt flags or nvmet attr_qid_max/param_max_queue_size) caps it, so
-    # the granted values are min(host request, target cap).
-    ip netns exec "$NS_I" nvme connect -t tcp -a "$IP_T" -s "$port" \
-        -n "$nqn" --hostnqn "$HOSTNQN" \
-        --nr-io-queues "$NR_QUEUES" --queue-size "$QUEUE_SIZE"
-    local dev
-    if dev=$(wait_dev "$nqn"); then
-        echo "   block device: $dev (controller $(find_ctrl "$nqn"), nqn $nqn)"
-    else
-        echo "   connected ($nqn) but no namespace block device appeared after 10s"
-        echo "   controller: $(find_ctrl "$nqn" || echo '?'); check 'nvme list' / target namespace config"
-    fi
-}
-
-disconnect_one() {
-    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    ip netns exec "$NS_I" nvme disconnect -n "$nqn" 2>/dev/null || true
-    echo ">> disconnected $1 ($nqn)"
-}
-
-# Find the namespace block device for an NQN via sysfs (the device node is
-# global; only the connection lived in NS_I). Resolve through
-# /sys/block/*/device/subsysnqn — schema-independent and multipath-safe:
-# with native NVMe multipath (default-on) the head device nvmeXnZ is NOT
-# under the controller's sysfs dir (only the per-path node nvmeXcYnZ is), so
-# the old /sys/class/nvme/nvmeN walk found nothing even when the device
-# existed. A block dev's device/subsysnqn resolves to its controller or
-# subsystem in either layout.
-find_dev() {
-    local nqn="$1" blk name head
-    for blk in /sys/block/nvme*n*; do
-        [ -e "$blk" ] || continue
-        name=$(basename "$blk")
-        case "$name" in *p[0-9]*) continue ;; esac      # skip partitions
-        [ -r "$blk/device/subsysnqn" ] || continue
-        [ "$(cat "$blk/device/subsysnqn")" = "$nqn" ] || continue
-        # A match may be a per-path node nvmeXcYnZ (no /dev entry) — map it
-        # to its head nvmeXnZ; head names pass through unchanged.
-        if [[ $name =~ ^(nvme[0-9]+)c[0-9]+(n[0-9]+)$ ]]; then
-            head="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
-        else
-            head="$name"
-        fi
-        [ -b "/dev/$head" ] && { echo "/dev/$head"; return 0; }
-    done
-    return 1
-}
-
-# Controller node (/dev/nvmeN) for an NQN, on stdout.
-find_ctrl() {
-    local nqn="$1" c
-    for c in /sys/class/nvme/nvme*; do
-        [ -r "$c/subsysnqn" ] || continue
-        [ "$(cat "$c/subsysnqn")" = "$nqn" ] && { echo "/dev/$(basename "$c")"; return 0; }
-    done
-    return 1
-}
-
-# Poll up to ~10s for the namespace block device of $nqn, nudging a rescan
-# each tick: namespace enumeration can lag the connect (more so on large
-# devices), so a single check right after connect races and misses it.
-wait_dev() {
-    local nqn="$1" dev ctrl
-    local deadline=$(( SECONDS + 10 ))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        dev=$(find_dev "$nqn") && { echo "$dev"; return 0; }
-        # Nudge a namespace rescan on the matching controller. The `|| true`
-        # is load-bearing: under `set -e` a non-zero ns-rescan would abort.
-        ctrl=$(find_ctrl "$nqn") && nvme ns-rescan "$ctrl" 2>/dev/null || true
-        sleep 0.5
-    done
-    return 1
-}
-
-fio_one() {
-    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    local dev; dev=$(find_dev "$nqn") || { echo "no connected device for $1 ($nqn); run 'connect $1' first"; exit 1; }
-    echo ">> fio on $dev [$1]  ($FIO_RW bs=$FIO_BS qd=$FIO_QD jobs=$FIO_JOBS ${FIO_SECS}s)"
-    # fio can run in root: once connected, I/O rides the kernel socket in
-    # NS_I across the wire no matter where fio submits from.
-    fio --name=realwire --filename="$dev" --rw="$FIO_RW" --bs="$FIO_BS" \
-        --iodepth="$FIO_QD" --numjobs="$FIO_JOBS" --ioengine=io_uring \
-        --direct=1 --runtime="$FIO_SECS" --time_based --group_reporting
-}
+# The discover / connect / disconnect / fio verbs and the sysfs device
+# resolvers (find_dev / find_ctrl / wait_dev) come from common.sh; they run
+# the initiator's nvme-cli through ini_exec (defined above as
+# 'ip netns exec NS_I') and dial TARGET_IP (= IP_T).
 
 cmd_status() {
     echo "== namespaces =="; ip netns list | grep -E "$NS_T|$NS_I" || echo "(none)"
