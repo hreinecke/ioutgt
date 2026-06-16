@@ -2,18 +2,37 @@
 # Capture a real kernel-host <-> kernel-nvmet NVMe/TCP session on loopback
 # for byte-exact codec fixtures (docs/fixtures/). Run as root:
 #
-#   sudo testing/capture-nvmet-fixtures.sh [backing-file-size-MB]
+#   sudo testing/capture-nvmet-fixtures.sh
+#   sudo BACKING=/dev/nvme0n1 NR_QUEUES=8 testing/capture-nvmet-fixtures.sh
 #
-# Produces docs/fixtures/nvmet-session.pcap. Requires: nvmet-tcp and
-# nvme-tcp modules, nvme-cli, tcpdump.
+# Knobs are env vars (set them before the command; sudo passes them on):
+#   BACKING     backing file/bdev; default a fresh /tmp temp file we own
+#   SIZE_MB     temp backing size, MB (default 64; ignored when BACKING set)
+#   NR_QUEUES   nvmet subsystem attr_qid_max           (default 16)
+#   QUEUE_SIZE  nvmet port param_max_queue_size        (default 128)
+#
+# The file backend is opened O_DIRECT. Produces
+# docs/fixtures/nvmet-session.pcap. Requires: nvmet-tcp and nvme-tcp
+# modules, nvme-cli, tcpdump.
 set -euo pipefail
 
-SIZE_MB=${1:-64}
+SIZE_MB=${SIZE_MB:-64}
+NR_QUEUES=${NR_QUEUES:-16}
+QUEUE_SIZE=${QUEUE_SIZE:-128}
 NQN="nqn.2026-06.io.ioutgt:fixture"
 PORT=4420
 CFG=/sys/kernel/config/nvmet
 OUT="$(dirname "$0")/../docs/fixtures"
-BACKING=$(mktemp /tmp/ioutgt-fixture-XXXX.img)
+
+# A caller-supplied BACKING is used as-is (SIZE_MB ignored); otherwise a
+# fresh temp file we own and delete on exit.
+if [ -n "${BACKING:-}" ]; then
+    OWN_BACKING=0
+else
+    BACKING=$(mktemp /tmp/ioutgt-fixture-XXXX.img)
+    OWN_BACKING=1
+    truncate -s "${SIZE_MB}M" "$BACKING"
+fi
 
 cleanup() {
     set +e
@@ -23,7 +42,7 @@ cleanup() {
     rmdir "$CFG/ports/1" 2>/dev/null
     rmdir "$CFG/subsystems/$NQN/namespaces/1" 2>/dev/null
     rmdir "$CFG/subsystems/$NQN" 2>/dev/null
-    rm -f "$BACKING"
+    [ "$OWN_BACKING" = 1 ] && rm -f "$BACKING"
 }
 trap cleanup EXIT
 
@@ -31,19 +50,25 @@ modprobe nvmet-tcp
 modprobe nvme-tcp
 mkdir -p "$OUT"
 
-truncate -s "${SIZE_MB}M" "$BACKING"
-
 # nvmet subsystem + namespace + TCP port on loopback.
 mkdir -p "$CFG/subsystems/$NQN"
 echo 1 > "$CFG/subsystems/$NQN/attr_allow_any_host"
+# nr-io-queues: nvmet's per-subsystem max queue id (qid 1..N).
+echo "$NR_QUEUES" > "$CFG/subsystems/$NQN/attr_qid_max"
 mkdir -p "$CFG/subsystems/$NQN/namespaces/1"
 echo "$BACKING" > "$CFG/subsystems/$NQN/namespaces/1/device_path"
+# Force O_DIRECT on the file backend (buffered_io=0; must precede enable).
+echo 0 > "$CFG/subsystems/$NQN/namespaces/1/buffered_io"
 echo 1 > "$CFG/subsystems/$NQN/namespaces/1/enable"
 mkdir -p "$CFG/ports/1"
 echo tcp > "$CFG/ports/1/addr_trtype"
 echo ipv4 > "$CFG/ports/1/addr_adrfam"
 echo 127.0.0.1 > "$CFG/ports/1/addr_traddr"
 echo $PORT > "$CFG/ports/1/addr_trsvcid"
+# queue-size: nvmet's advertised per-queue depth (SQSIZE/MAXCMD). Must be
+# set before the port is enabled (the symlink below) or the kernel
+# returns -EACCES.
+echo "$QUEUE_SIZE" > "$CFG/ports/1/param_max_queue_size"
 ln -sf "$CFG/subsystems/$NQN" "$CFG/ports/1/subsystems/$NQN"
 
 tcpdump -i lo "port $PORT" -w "$OUT/nvmet-session.pcap" &
