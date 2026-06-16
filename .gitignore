@@ -7,4 +7,5 @@ flamegraph*.svg
 /.codegraph/
 /docs/superpowers/
 *.swp
+*.conf
 *~
