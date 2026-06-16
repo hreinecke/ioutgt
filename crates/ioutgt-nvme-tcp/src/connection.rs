@@ -276,7 +276,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     queue.submit(tag, conn.connect_sqe);
 
     // Receive path (this task).
-    if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest, conn.send_zc).await {
+    if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest).await {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 
@@ -507,9 +507,8 @@ async fn recv_loop(
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
-    send_zc: bool,
 ) -> std::io::Result<()> {
-    match drive_recv(queue, fd, hdr_digest, data_digest, send_zc).await {
+    match drive_recv(queue, fd, hdr_digest, data_digest).await {
         Ok(()) | Err(RecvEnd::Closed) => Ok(()),
         Err(RecvEnd::Io(err)) => Err(err),
         Err(RecvEnd::Term(err)) => {
@@ -531,7 +530,6 @@ async fn drive_recv(
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
-    send_zc: bool,
 ) -> Result<(), RecvEnd> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
@@ -558,7 +556,7 @@ async fn drive_recv(
         while !slice.is_empty() {
             let next = match &mut phase {
                 RecvPhase::Header => {
-                    feed_header(queue, &mut decoder, &mut slice, data_digest, send_zc).await?
+                    feed_header(queue, &mut decoder, &mut slice, data_digest).await?
                 }
                 RecvPhase::Data(data) => data.advance(queue, &mut slice)?,
                 RecvPhase::Ddgst(ddgst) => ddgst.advance(queue, &mut slice)?,
@@ -595,7 +593,6 @@ async fn feed_header(
     decoder: &mut PduDecoder,
     slice: &mut &[u8],
     data_digest: bool,
-    send_zc: bool,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
     let consumed = decoder.feed(slice)?;
     *slice = &slice[consumed..];
@@ -603,7 +600,7 @@ async fn feed_header(
         return Ok(None);
     }
     let decoded = decoder.take()?;
-    handle_pdu(queue, decoded, data_digest, send_zc).await
+    handle_pdu(queue, decoded, data_digest).await
 }
 
 /// Receive a payload tail straight into the slot buffer at the
@@ -666,19 +663,17 @@ async fn recv_tail_direct(
 }
 
 /// Route one decoded PDU header. Returns the next recv phase if payload
-/// follows on the stream. Async only for the ZC-mode tag wait; every
-/// other path resolves immediately.
+/// follows on the stream. Async for the command-slot tag wait (recv
+/// backpressure when the freelist is momentarily empty); every other path
+/// resolves immediately.
 async fn handle_pdu(
     queue: &Rc<NvmeTcpQueue>,
     decoded: pdu::DecodedPdu,
     data_digest: bool,
-    send_zc: bool,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
     let ddgst = decoded.ddgst && data_digest;
     match decoded.kind {
-        PduKind::CapsuleCmd(sqe) => {
-            handle_capsule_cmd(queue, sqe, decoded.data_len, ddgst, send_zc).await
-        }
+        PduKind::CapsuleCmd(sqe) => handle_capsule_cmd(queue, sqe, decoded.data_len, ddgst).await,
         PduKind::H2CData {
             cid,
             ttag,
@@ -712,22 +707,18 @@ async fn handle_capsule_cmd(
     sqe: Sqe,
     data_len: u32,
     ddgst: bool,
-    send_zc: bool,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
-    // ZC mode: payload tags release on the send notification
-    // (≈ the peer's ACK), racing the host's next command — an
-    // empty freelist is an expected transient; park (TCP
-    // backpressure) instead of terminating. Non-ZC keeps the
-    // strict depth-violation term.
-    let tag = if send_zc {
-        queue.await_tag().await
-    } else {
-        // An empty freelist means the host exceeded the negotiated
-        // queue depth.
-        queue
-            .claim_tag()
-            .ok_or_else(|| RecvEnd::term(pdu::fes::PDU_SEQ_ERR))?
-    };
+    // An empty freelist is a transient, NOT a depth violation, so park
+    // (TCP backpressure) rather than terminating. A tag releases only when
+    // its response's send *batch* completes (retire -> release_tag), so on
+    // a real NIC the host — receiving responses as the batch streams out —
+    // frees SQ slots and submits new commands faster than we release the
+    // batched tags, briefly emptying the freelist while the host is still
+    // within the negotiated depth (max outstanding <= sqsize < tag count).
+    // await_tag cannot deadlock (release never depends on the recv path);
+    // even a genuinely over-submitting host is correctly flow-controlled,
+    // not killed. This mirrors kernel nvmet, which never terms on depth.
+    let tag = queue.await_tag().await;
     let slot = queue.slot(tag);
     if data_len > 0 {
         // In-capsule payload follows the capsule on the wire.
