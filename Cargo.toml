@@ -19,6 +19,9 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/io-target/ioutgt"
 authors = ["Ming Lei <tom.leiming@gmail.com>"]
+description = "Userspace NVMe/TCP storage target built on io_uring"
+keywords = ["nvme", "nvme-tcp", "io-uring", "storage", "target"]
+categories = ["network-programming", "asynchronous", "os::linux-apis"]
 
 [workspace.dependencies]
 # intra-workspace
