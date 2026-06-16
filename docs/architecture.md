@@ -423,11 +423,18 @@ The transport's userspace copy budget:
 | C2H payload                              | 0 (②)  | slot referenced by the iovec  |
 
 Backends add their own: file adds **none** when the open gets O_DIRECT
-(the device DMAs against the slot pages; where the filesystem refuses
-— e.g. tmpfs — it falls back to buffered IO and the kernel copies
-through the page cache, `FileBackend::is_direct`); memory adds one per
-direction (chunk-wise across its 2 MiB chunks); null adds none (reads
-memset the slot — visible when measuring protocol overhead with it).
+— and **O_DIRECT is the default**: `FileBackend::open` opens
+`O_RDWR | O_DIRECT` unconditionally, with no buffered-mode knob (the
+device DMAs against the slot pages). It falls back to buffered IO only
+when the open fails with `EINVAL`/`EOPNOTSUPP` — i.e. the filesystem
+refuses O_DIRECT (e.g. tmpfs) — and then the kernel copies through the
+page cache; any other open error is reported, not silently degraded.
+The mode that took effect is observable via `FileBackend::is_direct`.
+Memory adds one copy per direction (chunk-wise across its 2 MiB
+chunks); null adds none (reads memset the slot — visible when measuring
+protocol overhead with it). The binary's default backend, though, is
+`memory` (`--backend`, `main.rs`); O_DIRECT only matters once you select
+`--backend file`.
 
 Two principles behind the budget:
 
