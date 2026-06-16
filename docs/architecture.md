@@ -384,6 +384,32 @@ one `SENDMSG`; submission batching coalesces many SQEs into one
 `io_uring_enter`; the per-connection rule only bounds how many send
 SQEs *one socket* adds to that syscall (≤ 1).
 
+**Why `SENDMSG_ZC`, not `MSG_SPLICE_PAGES`.** The in-kernel nvmet target
+sends read payloads with `MSG_SPLICE_PAGES` (`drivers/nvme/target/tcp.c`)
+— true splice, no completion, no memlock charge; ioutgt cannot, for the
+dual of the `release_tag` rule above. `MSG_SPLICE_PAGES` *donates* the
+source pages to the skb (`skb_splice_from_iter` → `iov_iter_extract_pages`
+→ frags) and reclaims them by ref/pin drop when the skb frees post-ACK —
+it signals the sender *nothing*. That works only for a sender that does
+not reuse its source memory and whose pages the stack can truly reclaim:
+nvmet hands over fresh per-command **kernel** pages and lets the last skb
+ref `put_page` them. A userspace target can only *lend* — its slot pool
+is preallocated, reused, mmap'd memory the stack merely *unpins* on
+skb-free (the pages stay mapped in the process, never freed), and the slot
+must be refilled for the next command. Lending needs a transmit-completion
+signal, exactly what `MSG_SPLICE_PAGES` omits and `MSG_ZEROCOPY` supplies
+(a `ubuf_info` callback when the last referencing skb frees —
+`__msg_zerocopy_callback`); `SENDMSG_ZC` is that, delivered by io_uring as
+the notification CQE (`io_uring/notif.c`). So the notif-gated
+`release_tag` is not avoidable overhead but the irreducible price of zero
+copy from a *reusable userspace* buffer — and the choice is moot at the
+ABI: io_uring strips `MSG_INTERNAL_SENDMSG_FLAGS` (⊇ `MSG_SPLICE_PAGES`)
+from user `msg_flags` (`io_uring/net.c`). The *separable* cost is the
+per-send page pin charged to `RLIMIT_MEMLOCK` (`mm_account_pinned_pages`),
+a property of `MSG_ZEROCOPY`'s pinning, not of zero copy itself;
+registered slot buffers (§9, Phase 2) would pin once and amortize it,
+leaving only the notification.
+
 #### 4.2.3 Data copies: one slot, one visible budget
 
 The slot buffer (preallocated per tag: 8 KiB admin, 128 KiB = MDTS io)
