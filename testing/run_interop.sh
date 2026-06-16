@@ -7,6 +7,10 @@ set -eu
 TOP="$(cd "$(dirname "$0")/.." && pwd)"
 VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
 VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
+# t/io_uring throughput probe for the ioutgt_bench guest test; published to
+# the guest via the 9p marker dir below (env does not cross into the VM).
+# Other tests ignore it; override for a different fio build.
+T_IO_URING="${T_IO_URING:-$HOME/git/fio/t/io_uring}"
 TEST_NAME="${1:-ioutgt_nvme_tcp}"
 # Dedicated port: 4420 is the canonical NVMe port and may be owned by
 # other targets on a dev box (kernel nvmet, etc.).
@@ -55,7 +59,7 @@ cleanup() {
     [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
     # Drop the checkout marker so a later manual vmtest run cannot pick
     # up a stale path (run_affinity.sh does the same).
-    rm -f "$PID_FILE" "$MARKER_DIR/ioutgt_top"
+    rm -f "$PID_FILE" "$MARKER_DIR/ioutgt_top" "$MARKER_DIR/ioutgt_tiou"
 }
 trap cleanup EXIT
 # Fatal signals bypass the EXIT trap unless turned into an exit.
@@ -69,6 +73,8 @@ echo "$PORT" > "$MARKER_DIR/ioutgt_port"
 # Publish this checkout to the guest test wrappers (same 9p marker
 # mechanism as run_affinity.sh) so they never need a hardcoded path.
 echo "$TOP" > "$MARKER_DIR/ioutgt_top"
+# Publish the t/io_uring probe path the same way (only ioutgt_bench reads it).
+echo "$T_IO_URING" > "$MARKER_DIR/ioutgt_tiou"
 # Fresh log: the startup gate below greps it for the listener line.
 : > "$LOG"
 # IOUTGT_SOAK_ONLY=N: reconnect-leak mode — the guest only runs N
