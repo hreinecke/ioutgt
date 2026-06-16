@@ -222,3 +222,122 @@ What the numbers mean on loopback:
 
 Verdict: keep `--send-zc` experimental/default-off; the honest
 evaluation needs a real NIC **and a raised memlock limit** (roadmap).
+
+## Tracing DRAM read/write bandwidth on AMD Zen4 (2026-06-16)
+
+Why this is here: the payload **copy** on the send path (slot → skb,
+`_copy_from_iter`) is invisible at the syscall/throughput layer but loud
+at the memory controller — it is one DRAM read of the slot plus one DRAM
+write into the skb, on top of the NIC's DMA. So DRAM read/write counters
+are how you *see* `--send-zc` work: zero-copy makes the NIC DMA straight
+from the slot pages and that copy traffic disappears. This is the runbook
+for an EPYC 9004 (Genoa, Zen4) box; the technique generalizes.
+
+There are two relevant PMUs. Prefer the first.
+
+### 1. `amd_umc` — the memory-controller CAS counters (gold standard)
+
+Each Unified Memory Controller (UMC) channel counts DRAM column-access
+(CAS) commands, split into read/write. One CAS moves one 64-byte cache
+line, so `bytes = CAS × 64`. The kernel exposes **one `amd_umc_N` PMU per
+active channel** — on a sparsely-populated box that may be just two
+(`amd_umc_0`, `amd_umc_1`); that is also how many channels actually carry
+traffic, so summing them is complete, not a sample of a larger set.
+
+```sh
+# discover how many channels the kernel exposes
+ls -d /sys/bus/event_source/devices/amd_umc_* ; perf list | grep umc_cas_cmd
+
+# measure read+write across every exposed channel for 8 s, system-wide.
+# NOTE the dots: umc_cas_cmd.rd / .wr (not underscores).
+EV=$(for p in /sys/bus/event_source/devices/amd_umc_*; do n=$(basename "$p")
+       printf '%s/umc_cas_cmd.rd/,%s/umc_cas_cmd.wr/,' "$n" "$n"; done | sed 's/,$//')
+perf stat -a -e "$EV" -- sleep 8 2>perf.txt
+
+rd=$(grep umc_cas_cmd.rd perf.txt | awk '{gsub(/,/,"",$1); s+=$1} END{print s}')
+wr=$(grep umc_cas_cmd.wr perf.txt | awk '{gsub(/,/,"",$1); s+=$1} END{print s}')
+awk -v r=$rd -v w=$wr 'BEGIN{printf "DRAM read %.1f, write %.1f, total %.1f GB/s\n",
+  r*64/8/1e9, w*64/8/1e9, (r+w)*64/8/1e9}'
+```
+
+This is **4 events for 2 channels → no multiplexing**, separate read vs
+write, no derived-metric formula. It is the most trustworthy method on
+this hardware. Run as root.
+
+### 2. `likwid-perfctr -g MEM` — convenient but caveated here
+
+likwid's `MEM` group reads the same UMC CAS counters and prints
+`Memory read/write bandwidth [MBytes/s]` (decimal MB/s; ÷1000 → GB/s).
+Stethoscope mode measures a window while a *separate* process (the target)
+runs:
+
+```sh
+likwid-perfctr -c S0:0@S1:0 -g MEM -S 8s     # one thread per socket
+likwid-perfctr -c M0:0@M1:0@M2:0@M3:0@M4:0@M5:0@M6:0@M7:0 -g MEM -S 8s   # per NUMA domain
+```
+
+`-c` here is not "measure these cores' work" — uncore counters are
+per-domain, so it means "use a thread in each domain to *reach* the local
+memory controllers." One thread per memory domain is needed to touch
+every channel.
+
+Two Zen4 gotchas that cost real time:
+- With the **perf_event** backend (likwid default here) only `amd_umc_0`
+  returned data; other channels read `-`/`inf`. So likwid measured one
+  channel and its Zen4 `MEM` formula reported read==write (suspiciously
+  exact) — treat single-channel likwid totals as unreliable.
+- Rebuilding likwid with **`ACCESSMODE=direct` does NOT fix it**: the
+  Zen4 UMC counters sit behind a DF/PCI interface, not the MSRs likwid's
+  direct path reads, so every UMC came back `-`. Conclusion: on this
+  kernel, plain `perf -e amd_umc_*/...` (method 1) beats likwid for UMC.
+
+### 3. `amd_df` — Data Fabric data beats (fallback / cross-check)
+
+If `amd_umc` is unavailable, the Data Fabric counts data **beats** of
+**32 bytes** each, per coherent station (channel): `bytes = beats × 32`.
+
+```sh
+EV=$(perf list | grep -oE 'amd_df/local_processor_(read|write)_data_beats_cs[0-9]+/' | paste -sd,)
+perf stat -a -e "$EV" -- sleep 8 2>df.txt   # sum *_read_*/ *_write_* beats, ×32
+```
+
+Caveats that make it only a cross-check: `local_processor_*` counts
+**socket-local** traffic only (add `remote_*` for full coverage), and the
+DF PMU has ~4 counters so 24 channel events **multiplex** (perf scales by
+the printed `(NN%)` enabled fraction). Good for a 2× effect, not for
+absolute GB/s.
+
+### Reading the result
+
+Worked example, ioutgt 64K/QD128 reads over a real NIC, method 1
+(both UMC channels), copy vs `--send-zc`:
+
+| | copy | zero-copy |
+|---|---|---|
+| IO throughput | 989 MiB/s | 1073 MiB/s |
+| DRAM read / write / total | 7.7 / 3.2 / 10.9 GB/s | 5.3 / 2.1 / 7.4 GB/s |
+
+- **Normalize by throughput** when the two runs differ (they will — the
+  copy is itself a bottleneck): copy moved ≈10.5 B of DRAM per IO byte,
+  ZC ≈6.6 — about **−37% DRAM per byte served**, the savings concentrated
+  on the **read** side (the slot read the copy did and ZC skips).
+- ZC was also *faster* (989 → 1073 MiB/s): with the copy gone the io
+  thread stopped capping throughput. A throughput win and a memory-traffic
+  win are separate effects; report both.
+- Confirm qualitatively with `perf record -g -p $(pgrep -f 'ioutgt --listen')
+  -- sleep 8; perf report`: copy mode shows `tcp_sendmsg_locked →
+  _copy_from_iter`; ZC mode replaces it with `skb_zerocopy_iter_stream →
+  __zerocopy_sg_from_iter → iov_iter_get_pages2` (page pinning), and
+  ioutgt cycles drop ~24%.
+
+### Pitfalls
+
+- **Loopback always copies** (the kernel copies for `lo`), so ZC shows
+  zero DRAM benefit there — measure over a real NIC.
+- **Raise `RLIMIT_MEMLOCK`** (`ulimit -l unlimited`) before starting the
+  ZC target, or SENDMSG_ZC hits ENOMEM and silently falls back to a copy —
+  you would measure "no difference" (see the SENDMSG_ZC note above).
+- **`#PMUs == #measurable channels`**: if only `amd_umc_0/_1` exist, that
+  *is* the whole story on this box; do not assume a 12-channel socket.
+- Counter access needs root; `perf` uncore wants
+  `perf_event_paranoid <= 0` (or root).
