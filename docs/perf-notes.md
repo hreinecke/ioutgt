@@ -341,3 +341,70 @@ Worked example, ioutgt 64K/QD128 reads over a real NIC, method 1
   *is* the whole story on this box; do not assume a 12-channel socket.
 - Counter access needs root; `perf` uncore wants
   `perf_event_paranoid <= 0` (or root).
+
+## Loopback C2HData gap vs nvmet is `init_on_alloc` page zeroing (2026-06-16)
+
+Symptom (reported by Ming): on one host, two namespaces with *identical*
+config — block-device backend (Samsung 9100 PRO each), 16 IO threads × 128
+qd — one from ioutgt, one from kernel nvmet, driven by
+`t/io_uring -p0 -b65536` (64 KiB QD128 randread, single thread). ioutgt
+reached **only ~1/2–1/3** of nvmet's IOPS. `--send-zc` did **not** help.
+
+Reproduced on the AMD Zen4 box (kernel 7.1.0, both backends bdev, single
+fio thread `taskset -c 4` → one blk-mq hctx → one NVMe/TCP queue → one
+ioutgt io-thread, so this is *single-connection* C2HData send throughput):
+
+| config | IOPS | BW | io-thread CPU goes to |
+|---|---|---|---|
+| nvmet | 64.6K | 4.04 GiB/s | send `skb_splice_from_iter` ~1%, **no zeroing** |
+| ioutgt copy | 35K | 2.2 GiB/s | **50% `kernel_init_pages`** ← `skb_page_frag_refill` ← `tcp_sendmsg` |
+| ioutgt `--send-zc` | 18.5K | 1.15 GiB/s | **37% `kernel_init_pages`** ← `skb_copy_ubufs` (loopback **RX**) |
+
+The ioutgt io-thread sits at ~90% of one core; fio's submitter is ~8%, the
+host nvme_tcp kworker ~33% — the *target's send thread* is the ceiling.
+
+Mechanism (perf `-g`, this kernel has **`init_on_alloc` on**):
+
+- **Copy path.** A 64 KiB C2HData payload is copied through `tcp_sendmsg`
+  into the socket's `sk_frag`. On **loopback there is no DMA**: the sent
+  skb sits in the *local* receive queue still referencing those frag pages
+  until the host nvme_tcp kworker drains it, so the frag can't be reused —
+  every send **refills**, and `init_on_alloc` zeroes each fresh page
+  (`kernel_init_pages`) right before the copy overwrites it. Half the
+  thread's CPU is spent zeroing pages it is about to clobber.
+- **`--send-zc` is worse, not better.** With no DMA engine on `lo`, the RX
+  path must `skb_copy_ubufs()` the pinned user pages into fresh (again
+  zeroed) kernel pages to release them for the ZC notification. ZC merely
+  *relocates* the copy from TX to RX and adds page pinning + a second CQE +
+  notif-gated tag reuse — hence the further drop to 18.5K.
+- **nvmet avoids all of it** with `MSG_SPLICE_PAGES`: it donates the
+  backend's own bio pages by refcount — no frag allocation, no zeroing, no
+  copy (`skb_splice_from_iter` ~1%). The one big `memcpy` in nvmet's trace
+  (`_copy_to_iter` ← `__tcp_read_sock`) is the **initiator-side** receive
+  copy, identical for both targets. ioutgt can't take this path: its
+  payload buffers are reused preallocated slots (zero-steady-state-alloc
+  invariant) that need a TX-completion signal `MSG_SPLICE_PAGES` doesn't
+  give — see architecture.md §4.2.2.
+
+**Why a real NIC doesn't show this** (confirmed by Ming: real-NIC A/B copy
+shows no gap). Two loopback-only effects compound exactly here:
+
+1. *Frag lifetime.* On a real NIC the `sk_frag` pages are freed when the
+   NIC DMA-completes the TX (µs), so `tcp_sendmsg` reuses the frag and
+   rarely refills → little `kernel_init_pages`. Loopback pins the frag in
+   the local RX queue → constant refill + zeroing.
+2. *No wire ceiling.* On a real NIC both targets are link-bound (the
+   two-NIC run was ~1.1 GiB/s wire-bound), so they hit the same IOPS and
+   ioutgt's extra send-side CPU is absorbed by spare cores — invisible.
+   Loopback has no link to hide behind, so the zeroing cost translates
+   directly into the IOPS gap.
+
+Verdict: **a loopback microbenchmark artifact, not an ioutgt deficiency on
+the intended real-wire path.** There is no clean ioutgt-side fix that keeps
+the zero-allocation invariant — copy is the cost on loopback,
+`MSG_SPLICE_PAGES` is unavailable, and `MSG_ZEROCOPY` is counterproductive
+on `lo`. Do not chase loopback C2HData throughput; evaluate the send path
+over a real NIC (where `--send-zc` becomes a win — see the DRAM section
+above). If you want to *quantify* the hardening artifact rather than the
+transport, boot the host `init_on_alloc=0`: the ioutgt copy number should
+jump substantially while nvmet (which never allocates the frag) stays put.
