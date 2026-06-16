@@ -462,6 +462,23 @@ protocol overhead with it). The binary's default backend, though, is
 `memory` (`--backend`, `main.rs`); O_DIRECT only matters once you select
 `--backend file`.
 
+This mirrors the kernel nvmet target, where direct IO is also the
+default — but split across two backends keyed by the per-namespace
+`buffered_io` configfs attribute (default `false`,
+`drivers/nvme/target/core.c`). A **block-device** namespace uses
+`nvmet-bdev`, which `submit_bio()`s straight to the device — direct *by
+construction*, below the page cache (no O_DIRECT flag needed, and **no
+buffered mode at all**). A **file** namespace uses `nvmet-file`, which
+opens the backing file `O_RDWR | O_DIRECT` unless `buffered_io` is set
+(`io-cmd-file.c`) — the same default-direct-with-an-opt-out as ioutgt's
+`FileBackend`. On nvmet, `buffered_io=1` is really a backend *selector*:
+`nvmet_bdev_ns_enable` returns `-ENOTBLK`, so a block device falls back to
+the file backend opened as a buffered file (`core.c`: bdev-enable, then
+file-enable on `-ENOTBLK`) — "buffered block device" quietly means "file
+backend over the bdev." ioutgt collapses this to one `FileBackend` that
+serves both a regular file and a block device (the geometry probe differs;
+the O_DIRECT path is identical), with no buffered opt-in.
+
 Two principles behind the budget:
 
 - **The one write-side copy (①) is the product, not waste**: it lets a
