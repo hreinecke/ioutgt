@@ -50,6 +50,7 @@
 #   BACKEND_GB=2        size of an auto-created backing file
 #   NR_QUEUES=4         IO queues   (ioutgt --io-threads;    connect -i)
 #   QUEUE_SIZE=128      IO qdepth    (ioutgt --io-queue-size; connect -q)
+#   IOUTGT_SENDZC=0     ioutgt zero-copy send (--send-zc); 1 to enable
 #
 set -euo pipefail
 
@@ -109,6 +110,7 @@ QUEUE_SIZE="${QUEUE_SIZE:-128}"   # IO qdepth
 
 # ioutgt target-process knobs
 IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
+IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = --send-zc (zero-copy send; raises ulimit -l so ZC engages); default off
 IOUTGT_PIDFILE="${IOUTGT_PIDFILE:-/tmp/ioutgt-realwire.pid}"
 IOUTGT_LOG="${IOUTGT_LOG:-/tmp/ioutgt-realwire.log}"
 
@@ -144,7 +146,7 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
 
 Required env: NIC_T, NIC_I (two dedicated NICs cabled back-to-back) and the
 started target's backend (IOUTGT_BACKEND / NVMET_BACKEND, a file or bdev).
-Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE
+Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC
   IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX  FIO_RW/BS/QD/JOBS/SECS
 
 Example:
@@ -323,7 +325,19 @@ cmd_ioutgt_target() {
     local BACKEND=${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}
     [ -x "$IOUTGT_BIN" ] || { echo "build first: cargo build --release -p ioutgt (or set IOUTGT_BIN)"; exit 1; }
     ensure_backing || exit 1
-    echo ">> starting ioutgt in $NS_T on $IP_T:$PORT (backend $BACKEND, ${NR_QUEUES}q x $QUEUE_SIZE)"
+    local zc=() zclabel=
+    if [ "$IOUTGT_SENDZC" != 0 ]; then
+        zc=(--send-zc); zclabel=", send-zc"
+        # --send-zc uses SENDMSG_ZC, which pins payload pages against
+        # RLIMIT_MEMLOCK. Under the default 8 MiB limit two in-flight batches
+        # alone can exceed it; the kernel then returns ENOMEM/ENOBUFS and
+        # ioutgt silently falls back to a copying send (correct, but no ZC
+        # benefit). Raise the limit (inherited by the ioutgt child below) so
+        # ZC actually engages. Best-effort: we already require root, but keep
+        # going if it cannot be raised.
+        ulimit -l unlimited 2>/dev/null || true
+    fi
+    echo ">> starting ioutgt in $NS_T on $IP_T:$PORT (backend $BACKEND, ${NR_QUEUES}q x $QUEUE_SIZE$zclabel)"
     # ioutgt is pure userspace: ip netns exec is fine (no configfs), and its
     # bind() lands in NS_T so the listener is on the wire-facing NIC.
     ip netns exec "$NS_T" "$IOUTGT_BIN" \
@@ -331,6 +345,7 @@ cmd_ioutgt_target() {
         --backend "$BACKEND" \
         --io-threads "$NR_QUEUES" \
         --io-queue-size "$QUEUE_SIZE" \
+        "${zc[@]}" \
         --subsys-nqn "$NQN" \
         --control-socket /tmp/ioutgt-realwire.sock \
         >"$IOUTGT_LOG" 2>&1 &
