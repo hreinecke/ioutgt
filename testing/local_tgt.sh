@@ -25,6 +25,7 @@
 #   NR_QUEUES=4      IO queues   (ioutgt --io-threads;    connect -i)
 #   QUEUE_SIZE=128   IO qdepth    (ioutgt --io-queue-size; connect -q)
 #   IOUTGT_SENDZC=0  ioutgt zero-copy send (--send-zc); 1 to enable
+#   HDGST=0 DDGST=0  negotiate TCP header/data digest (CRC32C); 1 to enable
 #   TARGET_IP        loopback address to bind/dial (default 127.0.0.1)
 #
 set -euo pipefail
@@ -81,7 +82,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   help                          this message
 
 Knobs: IOUTGT_BACKEND NVMET_BACKEND BACKEND_GB=$BACKEND_GB
-  NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC FIO_RW/BS/QD/JOBS/SECS
+  NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC
+  HDGST=$HDGST DDGST=$DDGST FIO_RW/BS/QD/JOBS/SECS
 
 Example:
   sudo $0 start && sudo $0 connect && sudo $0 fio
@@ -114,6 +116,7 @@ ioutgt_start() {
         --io-threads "$NR_QUEUES" \
         --io-queue-size "$QUEUE_SIZE" \
         "${zc[@]}" \
+        "${IOUTGT_DGST[@]}" \
         --subsys-nqn "$NQN" \
         --control-socket "$IOUTGT_SOCK" \
         >"$IOUTGT_LOG" 2>&1 &

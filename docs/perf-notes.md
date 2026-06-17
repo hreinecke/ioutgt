@@ -69,7 +69,10 @@ Rig for this A/B: memory backend, 4 IO threads, loadgen
 `--conns 4 --qd 32 --rw randread`, loopback, same machine both
 binaries (baseline = the commit immediately before the gather
 rewire). loadgen does not negotiate digests, so the digest-on
-config is covered functionally by the interop fio matrix only.
+config is covered functionally by the interop fio matrix, and for an
+ioutgt-vs-nvmet A/B by the two-target driver scripts' `HDGST=1`/`DDGST=1`
+knob (`testing/common.sh`), which negotiates the digest identically on
+both targets (host requests it; ioutgt accepts, nvmet always honours it).
 
 | config | 4K IOPS (repeat mean, range) | 4K CPU µs/IOP | 128K BW¹ | 128K CPU µs/IOP | 128K p50 |
 |---|---|---|---|---|---|

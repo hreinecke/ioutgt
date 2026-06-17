@@ -29,6 +29,21 @@ BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file
 IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
 IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = ioutgt --send-zc (zero-copy send)
 
+# TCP digest negotiation (CRC32C), coupled across both ends so the two
+# targets stay aligned: =1 asks the host to negotiate it (nvme connect
+# --hdr-digest / --data-digest) and lets ioutgt accept it; =0 keeps it off
+# and makes ioutgt refuse it (--no-hdgst / --no-ddgst). nvmet has no target
+# knob — it just honours the host request — so coupling the host request and
+# the ioutgt stance here is what keeps nvmet and ioutgt identical.
+HDGST="${HDGST:-0}"   # header digest
+DDGST="${DDGST:-0}"   # data digest
+# Host-side request flags (used by connect/discover) and the matching ioutgt
+# target refuse flags (used by each driver's ioutgt start).
+CONNECT_DGST=()
+IOUTGT_DGST=()
+if [ "$HDGST" = 1 ]; then CONNECT_DGST+=(--hdr-digest);  else IOUTGT_DGST+=(--no-hdgst); fi
+if [ "$DDGST" = 1 ]; then CONNECT_DGST+=(--data-digest); else IOUTGT_DGST+=(--no-ddgst); fi
+
 # fio knobs
 FIO_RW="${FIO_RW:-randread}"
 FIO_BS="${FIO_BS:-4k}"
@@ -126,7 +141,7 @@ discover_one() {
     local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
     modprobe nvme-tcp
     ini_exec nvme discover -t tcp -a "$TARGET_IP" -s "$port" \
-        --hostnqn "$HOSTNQN" --hostid "$HOSTID"
+        --hostnqn "$HOSTNQN" --hostid "$HOSTID" "${CONNECT_DGST[@]}"
 }
 
 connect_one() {
@@ -137,7 +152,8 @@ connect_one() {
     # caps it, so the granted values are min(host request, target cap).
     ini_exec nvme connect -t tcp -a "$TARGET_IP" -s "$port" \
         -n "$nqn" --hostnqn "$HOSTNQN" --hostid "$HOSTID" \
-        --nr-io-queues "$NR_QUEUES" --queue-size "$QUEUE_SIZE"
+        --nr-io-queues "$NR_QUEUES" --queue-size "$QUEUE_SIZE" \
+        "${CONNECT_DGST[@]}"
     local dev
     if dev=$(wait_dev "$nqn"); then
         echo "   block device: $dev (controller $(find_ctrl "$nqn"), nqn $nqn)"

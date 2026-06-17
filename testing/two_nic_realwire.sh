@@ -51,6 +51,7 @@
 #   NR_QUEUES=4         IO queues   (ioutgt --io-threads;    connect -i)
 #   QUEUE_SIZE=128      IO qdepth    (ioutgt --io-queue-size; connect -q)
 #   IOUTGT_SENDZC=0     ioutgt zero-copy send (--send-zc); 1 to enable
+#   HDGST=0 / DDGST=0   negotiate TCP header/data digest (CRC32C); 1 to enable
 #
 set -euo pipefail
 
@@ -128,6 +129,7 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
 Required env: NIC_T, NIC_I (two dedicated NICs cabled back-to-back) and the
 started target's backend (IOUTGT_BACKEND / NVMET_BACKEND, a file or bdev).
 Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC
+  HDGST=$HDGST DDGST=$DDGST
   IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX  FIO_RW/BS/QD/JOBS/SECS
 
 Example:
@@ -314,6 +316,7 @@ cmd_ioutgt_target() {
         --io-threads "$NR_QUEUES" \
         --io-queue-size "$QUEUE_SIZE" \
         "${zc[@]}" \
+        "${IOUTGT_DGST[@]}" \
         --subsys-nqn "$NQN" \
         --control-socket /tmp/ioutgt-realwire.sock \
         >"$IOUTGT_LOG" 2>&1 &
