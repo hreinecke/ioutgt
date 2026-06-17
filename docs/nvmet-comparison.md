@@ -71,8 +71,8 @@ buffers with incremental CRC32C, while large H2C payload tails land
 nvmet's no-second-copy property (`kernel_recvmsg` into the command's
 SG list after the header) for the bytes that dominate large writes.
 Send: the loop drains *all* pending completions/R2Ts into one gather
-batch (headers/digests in a small arena, payload iovecs pointing into
-slot buffers) and ships a single sendmsg op — ordering on the socket
+batch (each command's headers/digests in its own per-slot header scratch,
+payload iovecs pointing into slot buffers) and ships a single sendmsg op — ordering on the socket
 is preserved by construction, and the queue thread parks once per
 batch instead of once per response (the M9 finding: the naive
 one-op-per-response loop cost a full park/`io_uring_enter` cycle per

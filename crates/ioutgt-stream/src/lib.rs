@@ -1,9 +1,10 @@
 //! Protocol-neutral ZC-aware gather-send harness for stream transports.
 //!
 //! A stream transport (NVMe/TCP today, NBD next) drains an ordered
-//! [`SendList<W>`] of completed work, packs each item's headers into a
-//! per-batch arena and references its payload in place from the slot
-//! buffers, and ships the whole batch as one vectored `sendmsg` — or
+//! [`SendList<W>`] of completed work, encodes each item's headers into
+//! that command's per-slot header scratch and references its payload in
+//! place from the slot buffers, and ships the whole batch as one vectored
+//! `sendmsg` — or
 //! `SENDMSG_ZC` under zero-copy mode, gating slot reuse on the kernel's
 //! zero-copy notification. All of that machinery — the double-buffered
 //! batches, short-send resume, the ZC pin-budget fallback to copying,
@@ -63,14 +64,13 @@ pub struct ZcStats {
 }
 
 /// One batch's gather state: a [`GatherBatch`] for the protocol-free
-/// arena/iovec/msghdr mechanics, plus tag-accounting and ZC notification
+/// iovec/msghdr mechanics, plus tag-accounting and ZC notification
 /// vectors. Exactly one batch ships at a time; `reset()` recycles
 /// everything. All memory is preallocated at construction.
 struct GatherSendBatch {
     gather: GatherBatch,
-    /// Worst-case header bytes / iovec entries per item, for the
-    /// headroom check (mirrors the args the transport sized `new` with).
-    arena_per_item: usize,
+    /// Worst-case iovec entries per item, for the headroom check
+    /// (mirrors the arg the transport sized `new` with).
     iovs_per_item: usize,
     /// Tags safe to release at the send CQE: their slot memory the op
     /// never references.
@@ -84,11 +84,10 @@ struct GatherSendBatch {
 }
 
 impl GatherSendBatch {
-    fn new(sqsize: u16, arena_per_item: usize, iovs_per_item: usize) -> GatherSendBatch {
+    fn new(sqsize: u16, iovs_per_item: usize) -> GatherSendBatch {
         let n = usize::from(sqsize);
         GatherSendBatch {
-            gather: GatherBatch::new(n * arena_per_item, n * iovs_per_item + iovs_per_item),
-            arena_per_item,
+            gather: GatherBatch::new(n * iovs_per_item + iovs_per_item),
             iovs_per_item,
             tags_at_cqe: Vec::with_capacity(n),
             tags_at_notif: Vec::with_capacity(n),
@@ -109,7 +108,7 @@ impl GatherSendBatch {
     /// Headroom for one more worst-case item?
     #[inline]
     fn fits(&self) -> bool {
-        self.gather.fits(self.arena_per_item, self.iovs_per_item)
+        self.gather.fits(self.iovs_per_item)
     }
 
     /// Release the notif-gated tags and recycle the batch for staging.
@@ -137,14 +136,15 @@ pub struct StreamSender {
 }
 
 impl StreamSender {
-    /// A sender for a queue of `sqsize` slots. `arena_per_item` /
-    /// `iovs_per_item` are the transport's worst-case per-item sizings
-    /// (they bound the preallocated arena and iovec list).
-    pub fn new(sqsize: u16, arena_per_item: usize, iovs_per_item: usize) -> StreamSender {
+    /// A sender for a queue of `sqsize` slots. `iovs_per_item` is the
+    /// transport's worst-case iovec count per item (it bounds the
+    /// preallocated iovec list). Headers now live in caller storage (a
+    /// slot's header scratch), so the sender owns no header arena.
+    pub fn new(sqsize: u16, iovs_per_item: usize) -> StreamSender {
         StreamSender {
             batches: [
-                GatherSendBatch::new(sqsize, arena_per_item, iovs_per_item),
-                GatherSendBatch::new(sqsize, arena_per_item, iovs_per_item),
+                GatherSendBatch::new(sqsize, iovs_per_item),
+                GatherSendBatch::new(sqsize, iovs_per_item),
             ],
             inflight: VecDeque::with_capacity(2),
             zc_batches: 0,
@@ -175,8 +175,8 @@ impl StreamSender {
         let result = self
             .send_batches(fd, send_zc, slots, work, &mut stage)
             .await;
-        // The kernel may still hold page references (arena + slot
-        // buffers) that the caller frees right after joining this task.
+        // The kernel may still hold page references (slot data + header
+        // tail) that the caller frees right after joining this task.
         self.drain(slots).await;
         result
     }
@@ -254,7 +254,7 @@ impl StreamSender {
 
     /// Drain every outstanding notification. [`Self::run`] runs this on
     /// every send-path exit: the kernel may still hold page references
-    /// (arena + slot buffers) that the caller frees right after joining
+    /// (slot data + header tail) that the caller frees right after joining
     /// the send task. Covers the in-flight list AND the batch a send
     /// error abandoned mid-ship — that one is not on the list but may
     /// hold notifs from its earlier ZC ops.
@@ -383,8 +383,8 @@ async fn ship_batch(
     let mut use_zc = send_zc;
     loop {
         let n = if use_zc {
-            // SAFETY: msghdr, iovecs, arena, and referenced slot buffers
-            // stay allocated until this batch's notifs are reaped
+            // SAFETY: msghdr, iovecs, and the referenced slot buffers
+            // (data + header tail) stay allocated until this batch's notifs are reaped
             // (reap_oldest/drain precede reset, and the caller joins this
             // task — or leaks the queue — before freeing anything). The
             // kernel snapshots the iovec array at issue, so advance()
@@ -411,8 +411,8 @@ async fn ship_batch(
                 Err(err) => return Err(err),
             }
         } else {
-            // SAFETY: the msghdr, iovec array, arena, and referenced slot
-            // buffers all outlive the await — the batch is owned by this
+            // SAFETY: the msghdr, iovec array, and referenced slot buffers
+            // (data + header tail) all outlive the await — the batch is owned by this
             // task, slots release only after the batch completes, and the
             // caller joins this task (or leaks the queue) before freeing
             // anything.
@@ -461,8 +461,10 @@ mod tests {
     /// A synthetic staging closure: writes a fixed 2-byte header so the
     /// batch has content, and classifies by work variant.
     fn stage(gather: &mut GatherBatch, work: &TestWork) -> Staged {
-        gather.arena_tail()[..2].copy_from_slice(b"hi");
-        gather.push_arena(2);
+        // Synthetic 2-byte header from static storage (real transports
+        // encode into a slot's header scratch and push that).
+        static HDR: [u8; 2] = *b"hi";
+        gather.push_raw(HDR.as_ptr(), 2);
         match *work {
             TestWork::Payload(tag) => Staged::AtNotif(tag),
             TestWork::Header(tag) => Staged::AtCqe(tag),
@@ -475,7 +477,7 @@ mod tests {
         let work: SendList<TestWork> = SendList::new(4);
         work.push(TestWork::Header(2)); // greedily drained after `first`
         work.push(TestWork::Solicit);
-        let mut batch = GatherSendBatch::new(4, 8, 4);
+        let mut batch = GatherSendBatch::new(4, 4);
 
         let carry = stage_batch(&mut batch, TestWork::Payload(1), &work, &mut stage);
 
@@ -491,7 +493,7 @@ mod tests {
         let tag = slots.claim_tag().unwrap();
         slots.respond_receiving(tag);
 
-        let mut batch = GatherSendBatch::new(4, 8, 4);
+        let mut batch = GatherSendBatch::new(4, 4);
         batch.tags_at_notif.push(tag);
         batch.recycle(&slots);
 

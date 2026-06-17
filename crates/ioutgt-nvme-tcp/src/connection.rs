@@ -418,7 +418,7 @@ async fn teardown<B: Backend>(
         // Leaking the tasks keeps every such future — and its buffer —
         // alive for the process's remaining lifetime. The same applies
         // to the send task: its in-flight gather op references slot
-        // buffers and the batch arena.
+        // buffers (data and header tail).
         warn!(
             qid = queue.qid,
             executing = queue.executing(),
@@ -789,16 +789,22 @@ fn validate_h2c(
     Ok(ttag)
 }
 
-/// Worst-case arena bytes per staged item: C2HData header (24+4
-/// HDGST) + DDGST trailer (4) + response capsule (24+4).
-const ARENA_PER_ITEM: usize = 64;
-/// Worst-case iovec entries per staged item (header, payload, digest,
-/// capsule). Adjacent arena chunks merge; this is the unmerged bound.
+/// Worst-case iovec entries per staged item (data-PDU header, payload,
+/// digest, capsule). Adjacent header pieces in the slot tail merge; this
+/// is the unmerged bound.
 const IOVS_PER_ITEM: usize = 4;
 
-/// Stage one work item: header pieces into the arena (sans-IO encoders
-/// unchanged), payload referenced in place from the slot buffer, DDGST
-/// computed over the slot and trailed in the arena.
+/// Disjoint sub-ranges of a slot's header scratch (`SLOT_TAIL` bytes). The
+/// R2T and the response capsule live in different ranges so a write
+/// command's capsule never overwrites its R2T while that R2T may still be
+/// ZC-pinned (R2T and response are sent in separate batches).
+const TAIL_R2T: usize = 0;
+const TAIL_RSP: usize = 32;
+
+/// Stage one work item: header pieces encoded into the slot's own header
+/// scratch (sans-IO encoders unchanged), payload referenced in place from
+/// the slot data buffer, DDGST computed over the slot and trailed in the
+/// scratch. Every iovec points into the command's slot — no shared arena.
 fn stage_send_work(
     gather: &mut GatherBatch,
     queue: &Rc<NvmeTcpQueue>,
@@ -813,16 +819,22 @@ fn stage_send_work(
             offset,
             length,
         } => {
-            let n = pdu::encode_r2t(gather.arena_tail(), cid, tag, offset, length, hdr_digest);
-            gather.push_arena(n);
+            let mut tail = queue.slot(tag).tail();
+            let n = pdu::encode_r2t(&mut tail[TAIL_R2T..], cid, tag, offset, length, hdr_digest);
+            // The slot stays claimed (Receiving) until the transfer
+            // finishes, so this pointer outlives the borrow.
+            gather.push_raw(tail[TAIL_R2T..].as_ptr(), n);
         }
         SendWork::Response(completion) => {
             let success_elide =
                 completion.data_len > 0 && queue.sqhd_disabled && completion.cqe.status.get() == 0;
+            let slot = queue.slot(completion.tag);
+            let mut tail = slot.tail();
+            let mut off = TAIL_RSP;
             if completion.data_len > 0 {
                 let data_len = completion.data_len as usize;
-                let n = pdu::encode_c2h_data(
-                    gather.arena_tail(),
+                let c2h_n = pdu::encode_c2h_data(
+                    &mut tail[off..],
                     completion.cqe.cid.get(),
                     0,
                     completion.data_len,
@@ -831,33 +843,45 @@ fn stage_send_work(
                     hdr_digest,
                     data_digest,
                 );
-                gather.push_arena(n);
-                let slot_data = queue.slot(completion.tag).data();
-                // The payload rides in place: the slot stays claimed
-                // until release_tag after the batch send completes.
-                gather.push_raw(slot_data.as_ptr(), data_len);
-                if data_digest {
+                let c2h_ptr = tail[off..].as_ptr();
+                off += c2h_n;
+
+                // Payload rides in place from the slot data buffer; the
+                // slot stays claimed until release_tag after the send.
+                let slot_data = slot.data();
+                let ddgst_ptr = if data_digest {
                     let crc = digest::crc32c(&slot_data[..data_len]);
-                    gather.arena_tail()[..4].copy_from_slice(&crc.to_le_bytes());
-                    gather.push_arena(4);
+                    tail[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+                    let p = tail[off..].as_ptr();
+                    off += 4;
+                    Some(p)
+                } else {
+                    None
+                };
+
+                // Wire order: C2HData header, payload, DDGST.
+                gather.push_raw(c2h_ptr, c2h_n);
+                gather.push_raw(slot_data.as_ptr(), data_len);
+                if let Some(p) = ddgst_ptr {
+                    gather.push_raw(p, 4);
                 }
             }
             if !success_elide {
-                let n = pdu::encode_capsule_resp(gather.arena_tail(), &completion.cqe, hdr_digest);
-                gather.push_arena(n);
+                let n = pdu::encode_capsule_resp(&mut tail[off..], &completion.cqe, hdr_digest);
+                gather.push_raw(tail[off..].as_ptr(), n);
             }
         }
     }
 }
 
-/// Tag-release class for a send work item: payload-carrying responses
-/// gate on the batch's ZC notification (the op references the slot
-/// buffer), capsule-only responses release at the send CQE, R2Ts
-/// release nothing.
+/// Tag-release class for a send work item. Every response now carries its
+/// capsule/header in the slot's header scratch, so the send op references
+/// slot memory: responses gate on the batch's ZC notification (and in the
+/// copy path that resolves at the send CQE via immediate recycle). R2Ts
+/// release nothing (the slot stays `Receiving`).
 fn release_class(work: &SendWork) -> Staged {
     match *work {
-        SendWork::Response(c) if c.data_len > 0 => Staged::AtNotif(c.tag),
-        SendWork::Response(c) => Staged::AtCqe(c.tag),
+        SendWork::Response(c) => Staged::AtNotif(c.tag),
         SendWork::R2t { .. } => Staged::NoRelease,
     }
 }
@@ -875,7 +899,7 @@ async fn send_loop(
     data_digest: bool,
     send_zc: bool,
 ) -> std::io::Result<()> {
-    let mut sender = StreamSender::new(queue.sqsize, ARENA_PER_ITEM, IOVS_PER_ITEM);
+    let mut sender = StreamSender::new(queue.sqsize, IOVS_PER_ITEM);
     let result = sender
         .run(
             fd,
@@ -907,18 +931,18 @@ mod gather_tests {
 
     use super::*;
 
-    /// Sizing a test gather arena as the send path does for `sqsize`.
+    /// Sizing a test gather list as the send path does for `sqsize`.
     fn gather_for(sqsize: u16) -> GatherBatch {
         let n = usize::from(sqsize);
-        GatherBatch::new(n * ARENA_PER_ITEM, n * IOVS_PER_ITEM + IOVS_PER_ITEM)
+        GatherBatch::new(n * IOVS_PER_ITEM + IOVS_PER_ITEM)
     }
 
     /// Linearize the staged iovecs (what the kernel would put on the wire).
     fn gather(g: &GatherBatch) -> Vec<u8> {
         let mut out = Vec::new();
         for e in g.iovs() {
-            // SAFETY: entries reference the gather arena and slot
-            // buffers owned by the test, sized by construction.
+            // SAFETY: entries reference the slot data and header-tail
+            // buffers owned by the test queue, sized by construction.
             let s = unsafe { std::slice::from_raw_parts(e.iov_base.cast::<u8>(), e.iov_len) };
             out.extend_from_slice(s);
         }
@@ -948,7 +972,7 @@ mod gather_tests {
             }),
         ];
         for item in &items {
-            assert!(g.fits(ARENA_PER_ITEM, IOVS_PER_ITEM));
+            assert!(g.fits(IOVS_PER_ITEM));
             stage_send_work(&mut g, &queue, item, true, true);
         }
 
@@ -966,8 +990,11 @@ mod gather_tests {
         expect.truncate(off);
 
         assert_eq!(gather(&g), expect);
-        // Arena-contiguous chunks merge: [R2T+C2H hdr][payload][DDGST+capsule].
-        assert_eq!(g.iovs().len(), 3);
+        // Headers live in each command's own slot tail, so the R2T (tag 3)
+        // and the C2HData header (tag 2) no longer share a buffer and don't
+        // merge: [R2T][C2H hdr][payload][DDGST+capsule]. The DDGST and
+        // capsule are contiguous in tag 2's tail, so they still merge.
+        assert_eq!(g.iovs().len(), 4);
     }
 
     #[test]
@@ -996,7 +1023,7 @@ mod gather_tests {
             }),
         ];
         for item in &items {
-            assert!(g.fits(ARENA_PER_ITEM, IOVS_PER_ITEM));
+            assert!(g.fits(IOVS_PER_ITEM));
             stage_send_work(&mut g, &queue, item, false, false);
         }
 
@@ -1026,14 +1053,16 @@ mod gather_tests {
             })),
             Staged::AtNotif(1),
         );
-        // Capsule-only: arena bytes only → released at the send CQE.
+        // Capsule-only: the capsule now rides in the slot's header scratch,
+        // so the op references slot memory → notif-gated like any response
+        // (the copy path resolves it at the send CQE via immediate recycle).
         assert_eq!(
             release_class(&SendWork::Response(Completion {
                 tag: 2,
                 cqe: flush_cqe,
                 data_len: 0,
             })),
-            Staged::AtCqe(2),
+            Staged::AtNotif(2),
         );
         // R2T: no tag to release at all.
         assert_eq!(
