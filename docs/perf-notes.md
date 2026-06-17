@@ -222,3 +222,189 @@ What the numbers mean on loopback:
 
 Verdict: keep `--send-zc` experimental/default-off; the honest
 evaluation needs a real NIC **and a raised memlock limit** (roadmap).
+
+## Tracing DRAM read/write bandwidth on AMD Zen4 (2026-06-16)
+
+Why this is here: the payload **copy** on the send path (slot → skb,
+`_copy_from_iter`) is invisible at the syscall/throughput layer but loud
+at the memory controller — it is one DRAM read of the slot plus one DRAM
+write into the skb, on top of the NIC's DMA. So DRAM read/write counters
+are how you *see* `--send-zc` work: zero-copy makes the NIC DMA straight
+from the slot pages and that copy traffic disappears. This is the runbook
+for an EPYC 9004 (Genoa, Zen4) box; the technique generalizes.
+
+There are two relevant PMUs. Prefer the first.
+
+### 1. `amd_umc` — the memory-controller CAS counters (gold standard)
+
+Each Unified Memory Controller (UMC) channel counts DRAM column-access
+(CAS) commands, split into read/write. One CAS moves one 64-byte cache
+line, so `bytes = CAS × 64`. The kernel exposes **one `amd_umc_N` PMU per
+active channel** — on a sparsely-populated box that may be just two
+(`amd_umc_0`, `amd_umc_1`); that is also how many channels actually carry
+traffic, so summing them is complete, not a sample of a larger set.
+
+```sh
+# discover how many channels the kernel exposes
+ls -d /sys/bus/event_source/devices/amd_umc_* ; perf list | grep umc_cas_cmd
+
+# measure read+write across every exposed channel for 8 s, system-wide.
+# NOTE the dots: umc_cas_cmd.rd / .wr (not underscores).
+EV=$(for p in /sys/bus/event_source/devices/amd_umc_*; do n=$(basename "$p")
+       printf '%s/umc_cas_cmd.rd/,%s/umc_cas_cmd.wr/,' "$n" "$n"; done | sed 's/,$//')
+perf stat -a -e "$EV" -- sleep 8 2>perf.txt
+
+rd=$(grep umc_cas_cmd.rd perf.txt | awk '{gsub(/,/,"",$1); s+=$1} END{print s}')
+wr=$(grep umc_cas_cmd.wr perf.txt | awk '{gsub(/,/,"",$1); s+=$1} END{print s}')
+awk -v r=$rd -v w=$wr 'BEGIN{printf "DRAM read %.1f, write %.1f, total %.1f GB/s\n",
+  r*64/8/1e9, w*64/8/1e9, (r+w)*64/8/1e9}'
+```
+
+This is **4 events for 2 channels → no multiplexing**, separate read vs
+write, no derived-metric formula. It is the most trustworthy method on
+this hardware. Run as root.
+
+### 2. `likwid-perfctr -g MEM` — convenient but caveated here
+
+likwid's `MEM` group reads the same UMC CAS counters and prints
+`Memory read/write bandwidth [MBytes/s]` (decimal MB/s; ÷1000 → GB/s).
+Stethoscope mode measures a window while a *separate* process (the target)
+runs:
+
+```sh
+likwid-perfctr -c S0:0@S1:0 -g MEM -S 8s     # one thread per socket
+likwid-perfctr -c M0:0@M1:0@M2:0@M3:0@M4:0@M5:0@M6:0@M7:0 -g MEM -S 8s   # per NUMA domain
+```
+
+`-c` here is not "measure these cores' work" — uncore counters are
+per-domain, so it means "use a thread in each domain to *reach* the local
+memory controllers." One thread per memory domain is needed to touch
+every channel.
+
+Two Zen4 gotchas that cost real time:
+- With the **perf_event** backend (likwid default here) only `amd_umc_0`
+  returned data; other channels read `-`/`inf`. So likwid measured one
+  channel and its Zen4 `MEM` formula reported read==write (suspiciously
+  exact) — treat single-channel likwid totals as unreliable.
+- Rebuilding likwid with **`ACCESSMODE=direct` does NOT fix it**: the
+  Zen4 UMC counters sit behind a DF/PCI interface, not the MSRs likwid's
+  direct path reads, so every UMC came back `-`. Conclusion: on this
+  kernel, plain `perf -e amd_umc_*/...` (method 1) beats likwid for UMC.
+
+### 3. `amd_df` — Data Fabric data beats (fallback / cross-check)
+
+If `amd_umc` is unavailable, the Data Fabric counts data **beats** of
+**32 bytes** each, per coherent station (channel): `bytes = beats × 32`.
+
+```sh
+EV=$(perf list | grep -oE 'amd_df/local_processor_(read|write)_data_beats_cs[0-9]+/' | paste -sd,)
+perf stat -a -e "$EV" -- sleep 8 2>df.txt   # sum *_read_*/ *_write_* beats, ×32
+```
+
+Caveats that make it only a cross-check: `local_processor_*` counts
+**socket-local** traffic only (add `remote_*` for full coverage), and the
+DF PMU has ~4 counters so 24 channel events **multiplex** (perf scales by
+the printed `(NN%)` enabled fraction). Good for a 2× effect, not for
+absolute GB/s.
+
+### Reading the result
+
+Worked example, ioutgt 64K/QD128 reads over a real NIC, method 1
+(both UMC channels), copy vs `--send-zc`:
+
+| | copy | zero-copy |
+|---|---|---|
+| IO throughput | 989 MiB/s | 1073 MiB/s |
+| DRAM read / write / total | 7.7 / 3.2 / 10.9 GB/s | 5.3 / 2.1 / 7.4 GB/s |
+
+- **Normalize by throughput** when the two runs differ (they will — the
+  copy is itself a bottleneck): copy moved ≈10.5 B of DRAM per IO byte,
+  ZC ≈6.6 — about **−37% DRAM per byte served**, the savings concentrated
+  on the **read** side (the slot read the copy did and ZC skips).
+- ZC was also *faster* (989 → 1073 MiB/s): with the copy gone the io
+  thread stopped capping throughput. A throughput win and a memory-traffic
+  win are separate effects; report both.
+- Confirm qualitatively with `perf record -g -p $(pgrep -f 'ioutgt --listen')
+  -- sleep 8; perf report`: copy mode shows `tcp_sendmsg_locked →
+  _copy_from_iter`; ZC mode replaces it with `skb_zerocopy_iter_stream →
+  __zerocopy_sg_from_iter → iov_iter_get_pages2` (page pinning), and
+  ioutgt cycles drop ~24%.
+
+### Pitfalls
+
+- **Loopback always copies** (the kernel copies for `lo`), so ZC shows
+  zero DRAM benefit there — measure over a real NIC.
+- **Raise `RLIMIT_MEMLOCK`** (`ulimit -l unlimited`) before starting the
+  ZC target, or SENDMSG_ZC hits ENOMEM and silently falls back to a copy —
+  you would measure "no difference" (see the SENDMSG_ZC note above).
+- **`#PMUs == #measurable channels`**: if only `amd_umc_0/_1` exist, that
+  *is* the whole story on this box; do not assume a 12-channel socket.
+- Counter access needs root; `perf` uncore wants
+  `perf_event_paranoid <= 0` (or root).
+
+## Loopback C2HData gap vs nvmet is `init_on_alloc` page zeroing (2026-06-16)
+
+Symptom (reported by Ming): on one host, two namespaces with *identical*
+config — block-device backend (Samsung 9100 PRO each), 16 IO threads × 128
+qd — one from ioutgt, one from kernel nvmet, driven by
+`t/io_uring -p0 -b65536` (64 KiB QD128 randread, single thread). ioutgt
+reached **only ~1/2–1/3** of nvmet's IOPS. `--send-zc` did **not** help.
+
+Reproduced on the AMD Zen4 box (kernel 7.1.0, both backends bdev, single
+fio thread `taskset -c 4` → one blk-mq hctx → one NVMe/TCP queue → one
+ioutgt io-thread, so this is *single-connection* C2HData send throughput):
+
+| config | IOPS | BW | io-thread CPU goes to |
+|---|---|---|---|
+| nvmet | 64.6K | 4.04 GiB/s | send `skb_splice_from_iter` ~1%, **no zeroing** |
+| ioutgt copy | 35K | 2.2 GiB/s | **50% `kernel_init_pages`** ← `skb_page_frag_refill` ← `tcp_sendmsg` |
+| ioutgt `--send-zc` | 18.5K | 1.15 GiB/s | **37% `kernel_init_pages`** ← `skb_copy_ubufs` (loopback **RX**) |
+
+The ioutgt io-thread sits at ~90% of one core; fio's submitter is ~8%, the
+host nvme_tcp kworker ~33% — the *target's send thread* is the ceiling.
+
+Mechanism (perf `-g`, this kernel has **`init_on_alloc` on**):
+
+- **Copy path.** A 64 KiB C2HData payload is copied through `tcp_sendmsg`
+  into the socket's `sk_frag`. On **loopback there is no DMA**: the sent
+  skb sits in the *local* receive queue still referencing those frag pages
+  until the host nvme_tcp kworker drains it, so the frag can't be reused —
+  every send **refills**, and `init_on_alloc` zeroes each fresh page
+  (`kernel_init_pages`) right before the copy overwrites it. Half the
+  thread's CPU is spent zeroing pages it is about to clobber.
+- **`--send-zc` is worse, not better.** With no DMA engine on `lo`, the RX
+  path must `skb_copy_ubufs()` the pinned user pages into fresh (again
+  zeroed) kernel pages to release them for the ZC notification. ZC merely
+  *relocates* the copy from TX to RX and adds page pinning + a second CQE +
+  notif-gated tag reuse — hence the further drop to 18.5K.
+- **nvmet avoids all of it** with `MSG_SPLICE_PAGES`: it donates the
+  backend's own bio pages by refcount — no frag allocation, no zeroing, no
+  copy (`skb_splice_from_iter` ~1%). The one big `memcpy` in nvmet's trace
+  (`_copy_to_iter` ← `__tcp_read_sock`) is the **initiator-side** receive
+  copy, identical for both targets. ioutgt can't take this path: its
+  payload buffers are reused preallocated slots (zero-steady-state-alloc
+  invariant) that need a TX-completion signal `MSG_SPLICE_PAGES` doesn't
+  give — see architecture.md §4.2.2.
+
+**Why a real NIC doesn't show this** (confirmed by Ming: real-NIC A/B copy
+shows no gap). Two loopback-only effects compound exactly here:
+
+1. *Frag lifetime.* On a real NIC the `sk_frag` pages are freed when the
+   NIC DMA-completes the TX (µs), so `tcp_sendmsg` reuses the frag and
+   rarely refills → little `kernel_init_pages`. Loopback pins the frag in
+   the local RX queue → constant refill + zeroing.
+2. *No wire ceiling.* On a real NIC both targets are link-bound (the
+   two-NIC run was ~1.1 GiB/s wire-bound), so they hit the same IOPS and
+   ioutgt's extra send-side CPU is absorbed by spare cores — invisible.
+   Loopback has no link to hide behind, so the zeroing cost translates
+   directly into the IOPS gap.
+
+Verdict: **a loopback microbenchmark artifact, not an ioutgt deficiency on
+the intended real-wire path.** There is no clean ioutgt-side fix that keeps
+the zero-allocation invariant — copy is the cost on loopback,
+`MSG_SPLICE_PAGES` is unavailable, and `MSG_ZEROCOPY` is counterproductive
+on `lo`. Do not chase loopback C2HData throughput; evaluate the send path
+over a real NIC (where `--send-zc` becomes a win — see the DRAM section
+above). If you want to *quantify* the hardening artifact rather than the
+transport, boot the host `init_on_alloc=0`: the ioutgt copy number should
+jump substantially while nvmet (which never allocates the frag) stays put.
