@@ -411,3 +411,85 @@ over a real NIC (where `--send-zc` becomes a win — see the DRAM section
 above). If you want to *quantify* the hardening artifact rather than the
 transport, boot the host `init_on_alloc=0`: the ioutgt copy number should
 jump substantially while nvmet (which never allocates the frag) stays put.
+
+
+## Root cause: why send-zc loses to plain at small IO — the IOMMU (2026-06-18)
+
+Symptom (reported by Ming, reproduced): on the two-NIC 10GbE rig, single
+`t/io_uring -p0 -b4096` against ioutgt, **send-zc ~170–210K IOPS vs plain
+~220–260K** — reliable direction, ~−20%, noisy magnitude. Holds with the
+notif/gather decoupling (8924f94) and barely moves with FIXED_BUF. The
+paradox: send-zc's **io-thread CPU is *lower*** yet throughput is worse —
+so it's not the io-thread that's the bottleneck.
+
+Box: AMD EPYC 9004, kernel 7.1.0_master, `iommu: Default domain type:
+Translated` (DMA remapping ON, `DMA-FQ` lazy-unmap; no `iommu=pt` in
+cmdline). Real NIC (`bnxt_en`), so `skb_copy_ubufs` = 0 (the loopback
+artifact is absent — see the loopback section above).
+
+### 360° trace (system-wide perf + CPU-by-context + io_uring counts)
+
+System-wide `perf record -a` self-time, 4K randread, real NIC:
+
+| | top self-time |
+|---|---|
+| PLAIN | `_copy_from_iter` 6.2% (the payload copy), IOMMU minor |
+| send-ZC | **`amdv1_map_range` 5.9% + `iommu_dma_alloc_iova` 5.4% + `__unmap_range`/`amdv1_unmap_range` 5.5% ≈ 16% in IOMMU**, `zerocopy_fill_skb` 1.9% |
+
+CPU split (% of one core): ZC pushes **+13% into softirq** (51→64%) — the
+NIC TX-completion doing the IOMMU unmap + posting the notif CQE.
+
+### The smoking gun: IOMMU map ops per IO
+
+`kprobe:amdv1_map_range` count + size histogram under load:
+
+| | maps/s | **maps per IO** | map sizes |
+|---|---|---|---|
+| PLAIN | 542K | **~2.15** | mostly 4K, real tail at **8K–36K** |
+| send-ZC | 1.05M | **~5.05** | **100% 4K** (6,315,134 / 6,315,141 in [4K,8K)) |
+
+### Mechanism (measured, not inferred)
+
+Both paths DMA to the NIC and pay the IOMMU, but **plain is ~2.3× cheaper
+because the copy lets the kernel coalesce; ZC can't:**
+
+- **Plain's copy enables coalescing.** `_copy_from_iter` packs many small
+  responses contiguously into the socket `page_frag` (order-3) buffers, so
+  one DMA map covers a larger packed region — the 8K–36K tail in plain's
+  histogram. Those frag pages are reused, so mappings stay warm.
+- **ZC sends in place** from each command's own separate 4K slot page, so
+  there is nothing to pack: **every map is exactly 4K**, one per page, plus
+  separate maps for the header/DDGST page and the same slot is mapped again
+  for the backend NVMe read. No coalescing is possible — that is precisely
+  what "zero-copy from scattered preallocated slot buffers" costs.
+
+So under IOMMU translation mode, in-place small-IO ZC does ~2.3× the
+`iommu_dma_alloc_iova`/`amdv1_map_range`/unmap operations at the minimum
+4K granularity, and that map/unmap CPU (much of it in softirq) outweighs
+the copy ZC eliminated. The io-thread looks *less* busy because the work
+moved off it (into softirq + the device DMA path) — the bottleneck is the
+per-send IOMMU mapping, not the send loop.
+
+### Size dependence and FIXED_BUF, explained
+
+- **128K: ZC wins** (line rate at −35% CPU) — a big payload maps 32
+  contiguous pages *once* per send, so the per-byte map cost is negligible.
+  **4K: ZC loses** — one map per page, maximal overhead. ZC is a
+  *large-IO* optimization on an IOMMU-translating box.
+- **FIXED_BUF only bought +5%**: it removes the per-send `get_user_pages`
+  pinning (`gup_fast`) but **not** the per-send IOMMU IOVA map/unmap, which
+  is the dominant cost. Registering the buffers does not pre-DMA-map them.
+
+### Fix / next steps
+
+- **`iommu=pt`** (or `amd_iommu=off`): static identity DMA mappings → zero
+  per-send map cost. Expected to flip small-IO ZC to a win; this is the
+  direct lever on the root cause and how production NVMe/TCP targets are
+  usually run. (Confirming A/B needs a reboot with the kernel param — not
+  yet run.)
+- **Kernel-side proper fix**: pre-DMA-mapped registered buffers (io_uring
+  keeping FIXED_BUF regions IOMMU-mapped once), which would make in-place
+  ZC cheap *without* giving up IOMMU isolation. Not something ioutgt
+  controls.
+- This is a **system/IOMMU-config effect, not an ioutgt deficiency** —
+  evaluate `--send-zc` on `iommu=pt`/off, or for large IO.
