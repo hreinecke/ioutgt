@@ -8,5 +8,6 @@
 //! through their mailboxes (namespace changes propagate via the
 //! versioned table + an AER nudge).
 
+pub mod affinity;
 pub mod config;
 pub mod server;

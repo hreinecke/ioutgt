@@ -52,6 +52,10 @@ pub enum Request {
     },
     #[serde(rename = "LIST_CONTROLLER")]
     ListController,
+    /// Sync NIC rx/tx queue IRQ affinity with the io-thread CPU
+    /// assignment (see [`crate::affinity`]).
+    #[serde(rename = "SET_AFFINITY")]
+    SetAffinity { nic: String },
 }
 
 /// Control response (one JSON object per line).
@@ -98,6 +102,11 @@ pub struct CtlState {
     /// One per queue thread (admin first, then io threads), for
     /// GET_STATS aggregation.
     pub stats_sources: Vec<StatsSource>,
+    /// Per-IO-thread CPU assignment (index = io-thread = NIC queue index),
+    /// shared with the control loop's lazy pool spawn. `SET_AFFINITY` reads
+    /// it (NIC follows ioutgt) or rewrites it for managed IRQs (ioutgt
+    /// follows NIC; takes effect when the pool spawns on the next connect).
+    pub io_cpus: Arc<std::sync::Mutex<Vec<Option<usize>>>>,
 }
 
 /// Serve the control API until the listener fails. Spawn on the control
@@ -334,5 +343,12 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 "controllers": controllers,
             })))
         }
+        Request::SetAffinity { nic } => match crate::affinity::sync(&nic, &state.io_cpus) {
+            Ok(report) => {
+                info!(%nic, "set_affinity synced NIC IRQ ↔ io-thread CPU");
+                Response::ok(Some(report))
+            }
+            Err(err) => Response::err(err),
+        },
     }
 }
