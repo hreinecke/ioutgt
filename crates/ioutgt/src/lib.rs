@@ -332,42 +332,49 @@ fn make_admin_thread(name: String) -> io::Result<(MailboxSender<AdminMsg>, Pendi
     Ok((tx, spawn))
 }
 
-/// Pick the CPU each IO queue thread is pinned to: group all CPUs
-/// evenly per NUMA/cluster/SMT locality (the kernel `group_cpus_evenly`
-/// spread, i.e. what nvme-tcp queues see on the host side), one group
-/// per IO thread, then select the group's first online CPU.
-fn io_thread_cpus(io_threads: usize) -> Vec<Option<usize>> {
+/// For each IO queue thread, the CPU it is pinned to and the full online CPU
+/// group it belongs to. CPUs are grouped evenly per NUMA/cluster/SMT locality
+/// (the kernel `group_cpus_evenly` spread, i.e. what nvme-tcp queues see on the
+/// host side), one group per IO thread; the thread is pinned to (and reported
+/// as "active" on) the group's first online CPU, while the whole group is
+/// surfaced (as a kernel cpulist, e.g. `"0-1,32-33"`) so the harness can steer
+/// NIC IRQ affinity across it. Returns `(active_cpu, group_cpulist)` per thread
+/// — `group` is `"*"` when the topology is unavailable or the group is empty.
+fn io_thread_cpus(io_threads: usize) -> (Vec<Option<usize>>, Vec<String>) {
     let topo = match CpuTopology::from_sysfs() {
         Ok(topo) => topo,
         Err(err) => {
             warn!("cpu topology unavailable, io threads not pinned: {err}");
-            return vec![None; io_threads];
+            return (vec![None; io_threads], vec!["*".to_owned(); io_threads]);
         }
     };
     let groups = group_cpus_evenly(io_threads, &topo);
-    (0..io_threads)
-        .map(|i| {
-            // groups can run out when io_threads > possible CPUs; a
-            // group of only-offline CPUs yields no pinnable CPU.
-            let group = groups.get(i);
-            let cpu = group.and_then(|g| g.and(&topo.online).first());
-            match (cpu, group) {
-                (Some(cpu), Some(group)) => {
-                    info!(thread = i, cpus = %group, cpu, "io queue affinity");
-                }
-                (None, Some(group)) => {
-                    warn!(thread = i, cpus = %group, "no online cpu in group, thread not pinned");
-                }
-                (_, None) => {
-                    warn!(
-                        thread = i,
-                        "more io threads than possible cpus, thread not pinned"
-                    );
-                }
+    let mut cpus = Vec::with_capacity(io_threads);
+    let mut group_lists = Vec::with_capacity(io_threads);
+    for i in 0..io_threads {
+        // groups can run out when io_threads > possible CPUs; a group of
+        // only-offline CPUs yields no pinnable CPU.
+        let group = groups.get(i);
+        let online = group.map(|g| g.and(&topo.online));
+        let cpu = online.as_ref().and_then(|g| g.first());
+        let list = match &online {
+            Some(g) if g.first().is_some() => g.to_string(),
+            _ => "*".to_owned(),
+        };
+        match (cpu, group) {
+            (Some(cpu), Some(group)) => info!(thread = i, cpus = %group, cpu, "io queue affinity"),
+            (None, Some(group)) => {
+                warn!(thread = i, cpus = %group, "no online cpu in group, thread not pinned");
             }
-            cpu
-        })
-        .collect()
+            (_, None) => warn!(
+                thread = i,
+                "more io threads than possible cpus, thread not pinned"
+            ),
+        }
+        cpus.push(cpu);
+        group_lists.push(list);
+    }
+    (cpus, group_lists)
 }
 
 fn spawn_pinned(
@@ -593,6 +600,7 @@ fn spawn_control_api(
     port: &Arc<PortConfig<AnyBackend>>,
     registry: &Arc<Registry>,
     senders: &Arc<Mutex<Option<PoolSenders>>>,
+    io_groups: &[String],
     io_threads: usize,
 ) -> io::Result<()> {
     // The API mutates served storage (ADD/REMOVE_NAMESPACE): owner-only.
@@ -615,6 +623,7 @@ fn spawn_control_api(
             }
         }),
         stats_sources: build_stats_sources(senders, io_threads),
+        io_thread_groups: io_groups.to_vec(),
     });
     info!(path = %path.display(), "control socket listening");
     tokio::task::spawn_local(ioutgt_control::server::serve(listener, state));
@@ -748,11 +757,16 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     // plane only — never locked on the IO path, never held across an await.
     let senders: Arc<Mutex<Option<PoolSenders>>> = Arc::new(Mutex::new(None));
     // Per-IO-thread CPU assignment is fixed for the process (topology is
-    // stable), so compute it once and reuse it for every (re)spawn.
-    let io_cpus = if config.pin_threads {
+    // stable), so compute it once and reuse it for every (re)spawn. `io_cpus`
+    // is the pinned (active) CPU per thread; `io_groups` is each thread's full
+    // online CPU group, surfaced via `list` so the harness can steer NIC IRQs.
+    let (io_cpus, io_groups) = if config.pin_threads {
         io_thread_cpus(config.io_threads)
     } else {
-        vec![None; config.io_threads]
+        (
+            vec![None; config.io_threads],
+            vec!["*".to_owned(); config.io_threads],
+        )
     };
 
     // Bind before building the port so the model carries the actual bound
@@ -776,7 +790,14 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
         }
     };
     if let Some(path) = &config.control_socket {
-        if let Err(err) = spawn_control_api(path, &port, &registry, &senders, config.io_threads) {
+        if let Err(err) = spawn_control_api(
+            path,
+            &port,
+            &registry,
+            &senders,
+            &io_groups,
+            config.io_threads,
+        ) {
             let _ = addr_tx.send(Err(err));
             return;
         }

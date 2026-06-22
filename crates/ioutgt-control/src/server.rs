@@ -98,6 +98,11 @@ pub struct CtlState {
     /// One per queue thread (admin first, then io threads), for
     /// GET_STATS aggregation.
     pub stats_sources: Vec<StatsSource>,
+    /// Full online CPU group (kernel cpulist) for each IO thread, indexed by
+    /// io-thread number (qid n maps to io thread `(n-1) % len`). The thread is
+    /// pinned to the group's first CPU; `LIST_CONTROLLER` reports the whole
+    /// group so the harness can steer NIC IRQ affinity across it.
+    pub io_thread_groups: Vec<String>,
 }
 
 /// Serve the control API until the listener fails. Spawn on the control
@@ -291,12 +296,24 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                         .subsystem(&entry.subsys_nqn)
                         .map(|subsys| subsys.snapshot().values().map(|ns| ns_json(ns)).collect())
                         .unwrap_or_default();
+                    let n = state.io_thread_groups.len();
                     let queues: Vec<_> = entry
                         .queues
                         .iter()
                         .map(|q| {
+                            // qid 0 is the admin thread (unpinned); io qid n is
+                            // served by io thread (n-1) % n_io_threads.
+                            let group = if q.qid == 0 || n == 0 {
+                                "*"
+                            } else {
+                                &state.io_thread_groups[(usize::from(q.qid) - 1) % n]
+                            };
+                            // Live affinity (re-read by tid), so it reflects
+                            // any post-connect re-pinning -- not the snapshot
+                            // taken at Connect (q.cpus).
+                            let cpus = ioutgt_core::controller::cpus_of(q.tid);
                             json!({ "qid": q.qid, "depth": q.sqsize, "tid": q.tid,
-                                    "cpus": q.cpus })
+                                    "cpus": cpus, "group_cpus": group })
                         })
                         .collect();
                     json!({

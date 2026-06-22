@@ -110,16 +110,23 @@ pub fn current_tid() -> i32 {
     unsafe { libc::gettid() }
 }
 
-/// Current thread's CPU affinity as a kernel cpulist ("3", "0-3,8"),
-/// "*" when the mask covers every online CPU, "?" if the query fails.
+/// Current thread's CPU affinity (see [`cpus_of`]).
 pub fn current_cpus() -> String {
+    cpus_of(0)
+}
+
+/// CPU affinity of thread `tid` (0 = calling thread) as a kernel cpulist
+/// ("3", "0-3,8"), "*" when the mask covers every online CPU, "?" if the
+/// query fails. Reads the *live* affinity, so it reflects any re-pinning
+/// done after the thread started.
+pub fn cpus_of(tid: i32) -> String {
     // SAFETY: a zeroed cpu_set_t is a valid value for the call to
     // overwrite; sched_getaffinity writes within size_of::<cpu_set_t>().
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: pid 0 = calling thread; the buffer is a real cpu_set_t
-    // and the size passed matches it.
+    // SAFETY: `tid` names a thread in this process (0 = calling thread);
+    // the buffer is a real cpu_set_t and the size passed matches it.
     let rc =
-        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        unsafe { libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
     if rc != 0 {
         return "?".to_owned();
     }

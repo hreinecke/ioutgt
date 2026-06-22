@@ -83,7 +83,21 @@ ini_exec() { ip netns exec "$NS_I" "$@"; }
 # ensure_backing, find_dev/find_ctrl/wait_dev, the discover/connect/
 # disconnect/fio verbs, plus NR_QUEUES, QUEUE_SIZE, BACKEND_GB, IOUTGT_BIN,
 # IOUTGT_SENDZC and the FIO_* knobs.
+
+# Was NR_QUEUES set in the environment? Captured BEFORE common.sh applies its
+# :-4 default, so 'up' may auto-size it from the NIC only when the user did not.
+NRQ_USER_SET="${NR_QUEUES+1}"
+
 . "$(dirname "$0")/common.sh"
+
+# Persisted auto-sized NR_QUEUES (so the separate up/start/connect/status
+# invocations agree) and the control socket the ioutgt target binds (queried
+# by the post-connect IRQ-affinity sync via `ioutgt list`).
+NRQ_STATE="${NRQ_STATE:-/tmp/ioutgt-realwire.nrq}"
+IOUTGT_SOCK="${IOUTGT_SOCK:-/tmp/ioutgt-realwire.sock}"
+if [ -z "$NRQ_USER_SET" ] && [ -f "$NRQ_STATE" ]; then
+    NR_QUEUES="$(cat "$NRQ_STATE")"
+fi
 
 # Per-target backing (file backing only — a regular file or block device).
 # Each target has its OWN, so a single env setup drives both at once. A
@@ -159,6 +173,33 @@ require_nics() {
 # creates its listener in the *current* process's netns), so we use nsenter.
 in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
 
+# Auto-size IO queues from NIC_T (inside NS_T): min(rx, tx, nproc). rx/tx are
+# RX+Combined / TX+Combined from `ethtool -l`; falls back to counting the
+# sysfs rx-*/tx-* queue dirs. Used by 'up' to default NR_QUEUES so ioutgt's
+# --io-threads matches the NIC channel count (1:1 IRQ <-> io-thread mapping).
+nic_default_queues() {
+    local nic="$1" out comb rx tx ncpu m
+    out="$(ip netns exec "$NS_T" ethtool -l "$nic" 2>/dev/null \
+        | sed -n '/Current hardware settings/,$p' || true)"
+    comb="$(printf '%s\n' "$out" | awk '/^Combined:/{print $2; exit}')"
+    rx="$(printf '%s\n' "$out" | awk '/^RX:/{print $2; exit}')"
+    tx="$(printf '%s\n' "$out" | awk '/^TX:/{print $2; exit}')"
+    rx=$(( ${rx:-0} + ${comb:-0} ))
+    tx=$(( ${tx:-0} + ${comb:-0} ))
+    if [ "$rx" -eq 0 ]; then
+        rx="$(ip netns exec "$NS_T" bash -c "ls -d /sys/class/net/$nic/queues/rx-* 2>/dev/null | wc -l" || echo 0)"
+    fi
+    if [ "$tx" -eq 0 ]; then
+        tx="$(ip netns exec "$NS_T" bash -c "ls -d /sys/class/net/$nic/queues/tx-* 2>/dev/null | wc -l" || echo 0)"
+    fi
+    ncpu="$(nproc 2>/dev/null || echo 1)"
+    m="$rx"
+    if [ "$tx" -lt "$m" ]; then m="$tx"; fi
+    if [ "$ncpu" -lt "$m" ]; then m="$ncpu"; fi
+    if [ "${m:-0}" -lt 1 ]; then m=1; fi
+    printf '%s\n' "$m"
+}
+
 # =====================================================================
 cmd_up() {
     require_nics
@@ -178,6 +219,20 @@ cmd_up() {
     ip netns exec "$NS_T" ip link set "$NIC_T" up
     ip netns exec "$NS_I" ip link set "$NIC_I" up
 
+    # GRO (rx coalescing — relieves the recv-bound path) and GSO, both NICs.
+    ip netns exec "$NS_T" ethtool -K "$NIC_T" gro on gso on 2>/dev/null \
+        || echo "   note: could not toggle gro/gso on $NIC_T"
+    ip netns exec "$NS_I" ethtool -K "$NIC_I" gro on gso on 2>/dev/null \
+        || echo "   note: could not toggle gro/gso on $NIC_I"
+
+    # Auto-size NR_QUEUES from NIC_T unless the user set it, so ioutgt's
+    # --io-threads matches the NIC channel count. Persisted for 'start' etc.
+    if [ -z "$NRQ_USER_SET" ]; then
+        NR_QUEUES="$(nic_default_queues "$NIC_T")"
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+        echo "   NR_QUEUES defaulted to $NR_QUEUES (min rx/tx of $NIC_T, capped at nproc)"
+    fi
+
     echo ">> waiting for link/carrier, then proving the wire with ping"
     sleep 2
     if ip netns exec "$NS_I" ping -c 3 -W 2 "$IP_T" >/dev/null; then
@@ -196,6 +251,10 @@ cmd_down() {
     # Stop the targets first with 'stop' — the nvmet configfs teardown must
     # nsenter into NS_T while it still exists. (We do not stop them here; the
     # nvmet port would otherwise leak in the now-deleted netns.)
+    # Undo the gro/gso 'up' enabled, while the NICs are still in their netns
+    # (best-effort; the settings are per-netdev and survive the netns move).
+    [ -n "${NIC_T:-}" ] && ip netns exec "$NS_T" ethtool -K "$NIC_T" gro off gso off 2>/dev/null || true
+    [ -n "${NIC_I:-}" ] && ip netns exec "$NS_I" ethtool -K "$NIC_I" gro off gso off 2>/dev/null || true
     # Return NICs to root if we know their names; deleting the netns also
     # auto-returns physical NICs, so this is best-effort and env-tolerant.
     [ -n "${NIC_T:-}" ] && in_net "$NS_T" ip link set "$NIC_T" netns 1 2>/dev/null || true
@@ -318,7 +377,7 @@ cmd_ioutgt_target() {
         "${zc[@]}" \
         "${IOUTGT_DGST[@]}" \
         --subsys-nqn "$NQN" \
-        --control-socket /tmp/ioutgt-realwire.sock \
+        --control-socket "$IOUTGT_SOCK" \
         >"$IOUTGT_LOG" 2>&1 &
     echo $! > "$IOUTGT_PIDFILE"
     sleep 1
@@ -326,6 +385,87 @@ cmd_ioutgt_target() {
         echo "   pid $(cat "$IOUTGT_PIDFILE"), log $IOUTGT_LOG"
     else
         echo "   ioutgt exited immediately; log follows:"; cat "$IOUTGT_LOG"; exit 1
+    fi
+}
+
+# IRQ serving NIC queue index $2 of nic $1: combined "TxRx" else "rx", from the
+# global /proc/interrupts (the NIC sits in NS_T but its IRQ labels persist).
+# Distinct IRQs serving NIC queue index $2 of nic $1: combined "TxRx", or split
+# "rx"/"tx" (one or two IRQs). From the global /proc/interrupts (the NIC sits in
+# NS_T but its IRQ action labels persist).
+nic_queue_irqs() {
+    awk -v n="$1" -v q="$2" '
+        $NF ~ ("^" n "-TxRx-" q "$") || $NF ~ ("^" n "-rx-" q "$") || $NF ~ ("^" n "-tx-" q "$") {
+            irq=$1; sub(/:/,"",irq); print irq
+        }' /proc/interrupts | sort -nu
+}
+
+# Converge NIC_T's rx/tx queue IRQs and ioutgt's io-thread CPUs. Run AFTER
+# connect: the queue-thread pool spawns lazily on the first connection and
+# `ioutgt list` reports each IO queue's pthread tid + full online CPU group
+# (all CPUs in its group_cpus_evenly group) only once it is connected. Per NIC
+# queue i (== qid i+1 == io-thread i):
+#   1. push the io-thread's whole CPU group onto the queue's rx/tx IRQ
+#      smp_affinity (NIC follows ioutgt -- a no-op on a managed/read-only IRQ);
+#   2. read the rx/tx IRQ *effective* affinity, combine it, and taskset the
+#      io-thread (by tid) to that combination (io-thread follows where the IRQ
+#      softirq actually lands -- the only direction available for managed IRQs).
+# ALL privileged work runs here in the (root) harness, so the target needs no
+# privileges. irqbalance would fight the pinning, so stop it. ARFS=1 also turns
+# on accelerated RFS for per-flow co-location (IRQ affinity aligns CPU sets,
+# not individual flows).
+ioutgt_sync_affinity() {
+    [ -n "${NIC_T:-}" ] || { echo "   (NIC_T unset; skipping IRQ affinity sync)"; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
+    local json rows
+    json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"
+    # qid, tid, active CPU, and the full online CPU group (a cpulist; no spaces).
+    rows="$(printf '%s' "$json" \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus)"' \
+            2>/dev/null | sort -n -u || true)"
+    if [ -z "$rows" ]; then
+        echo "   (no connected IO queues; run 'connect' first)"; return 0
+    fi
+    systemctl stop irqbalance 2>/dev/null || true
+    echo ">> converging $NIC_T queue IRQ affinity <-> ioutgt io-threads"
+    local qid tid cpus group nicq irqs irq combo eff pushed
+    while read -r qid tid cpus group; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1))
+        irqs="$(nic_queue_irqs "$NIC_T" "$nicq")"
+        if [ -z "$irqs" ]; then
+            echo "   q$nicq (qid $qid): no NIC IRQ found; skipped"; continue
+        fi
+        combo=""; pushed=""
+        for irq in $irqs; do
+            # 1. push the io-thread's whole CPU group onto the (unmanaged) IRQ,
+            #    giving the kernel the full group to place the IRQ within. A
+            #    valid cpulist only -- "*"/"?" (unpinned/unknown) can't be set.
+            case "$group" in
+                ''|'*'|'?'|*[!0-9,-]*) ;;
+                *) if echo "$group" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null; then
+                       pushed="${pushed:+$pushed,}$irq"
+                   fi ;;
+            esac
+            # 2. collect this IRQ's effective affinity for the combination.
+            eff="$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || true)"
+            [ -n "$eff" ] && combo="${combo:+$combo,}$eff"
+        done
+        if [ -n "$combo" ] && taskset -cp "$combo" "$tid" >/dev/null 2>&1; then
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}] -> io-thread tid $tid affinity=$combo (was cpu $cpus)"
+        else
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '$combo' failed"
+        fi
+    done <<EOF
+$rows
+EOF
+    if [ "${ARFS:-0}" = 1 ]; then
+        echo ">> enabling aRFS on $NIC_T (per-flow steering)"
+        ip netns exec "$NS_T" ethtool -K "$NIC_T" ntuple on 2>/dev/null || true
+        echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+        ip netns exec "$NS_T" bash -c \
+            'for q in /sys/class/net/'"$NIC_T"'/queues/rx-*/rps_flow_cnt; do echo 2048 > "$q"; done' \
+            2>/dev/null || true
     fi
 }
 
@@ -348,6 +488,27 @@ cmd_status() {
     echo "== connected devices =="
     echo "  ioutgt ($IOUTGT_NQN): $(find_dev "$IOUTGT_NQN" || echo none)"
     echo "  nvmet ($NVMET_NQN): $(find_dev "$NVMET_NQN" || echo none)"
+    if [ -n "${NIC_T:-}" ]; then
+        echo "== $NIC_T IRQ affinity vs ioutgt io-threads =="
+        # `is-active` exits non-zero (and still prints the state) when not
+        # running, so swallow the status rather than appending "unknown".
+        echo "  irqbalance: $(systemctl is-active irqbalance 2>/dev/null || true)"
+        # Strip the log's ANSI color codes before pulling thread->cpu.
+        grep "io queue affinity" "$IOUTGT_LOG" 2>/dev/null \
+            | sed -E 's/\x1b\[[0-9;]*m//g; s/.*thread=([0-9]+).*cpu=([0-9]+).*/  io-thread \1 -> cpu \2/' \
+            || true
+        # NIC queue IRQ effective affinity (from the global /proc/interrupts;
+        # the NIC sits in NS_T but its IRQ action labels stay visible).
+        awk -v N="$NIC_T" '
+            index($0, N"-TxRx-") || index($0, N"-rx-") || index($0, N"-tx-") {
+                irq=$1; sub(/:/,"",irq)
+                for (c=1;c<=NF;c++) if ($c ~ N"-(TxRx|rx|tx)-") print irq, $c
+            }' /proc/interrupts \
+            | while read -r irq lbl; do
+                  printf "  %-22s irq=%-4s eff=%s\n" "$lbl" "$irq" \
+                      "$(cat /proc/irq/$irq/effective_affinity_list 2>/dev/null || echo '?')"
+              done
+    fi
 }
 
 # Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH.
@@ -357,7 +518,10 @@ case "${1:-}" in
     start)               run_for_targets start_one      "${2:-}" ;;
     stop)                run_for_targets stop_one       "${2:-}" ;;
     discover)            run_for_targets discover_one   "${2:-}" ;;
-    connect)             run_for_targets connect_one    "${2:-}" ;;
+    connect)             run_for_targets connect_one    "${2:-}"
+                         # IRQ affinity sync needs the IO queues connected
+                         # (their pthread tids appear in `ioutgt list`).
+                         case "${2:-}" in ioutgt|"") ioutgt_sync_affinity ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
     status)              cmd_status ;;

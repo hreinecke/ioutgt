@@ -404,6 +404,47 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
 }
 
 /// One block per controller; NQNs are too long for fixed columns.
+/// Expand a kernel cpulist (`"0-1,32-33"`) into individual CPU ids.
+fn expand_cpulist(s: &str) -> Vec<u32> {
+    let mut cpus = Vec::new();
+    for part in s.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                    cpus.extend(a..=b);
+                }
+            }
+            None => {
+                if let Ok(c) = part.trim().parse::<u32>() {
+                    cpus.push(c);
+                }
+            }
+        }
+    }
+    cpus
+}
+
+/// Render a queue thread's CPU placement: the full online `group` (all CPUs the
+/// thread may use), with the `active` (pinned) CPU bracketed. Falls back to just
+/// `active` when the group is unknown/unpinned (`"*"`).
+fn render_cpu_group(group: &str, active: &str) -> String {
+    if group == "*" || group.is_empty() {
+        return active.to_owned();
+    }
+    let act = active.parse::<u32>().ok();
+    expand_cpulist(group)
+        .into_iter()
+        .map(|c| {
+            if Some(c) == act {
+                format!("[{c}]")
+            } else {
+                c.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -465,12 +506,14 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
             .into_iter()
             .flatten()
             .map(|q| {
+                let active = q["cpus"].as_str().unwrap_or("?");
+                let group = q["group_cpus"].as_str().unwrap_or("*");
                 format!(
                     "{}:{}@{} cpus {}",
                     q["qid"],
                     q["depth"],
                     q["tid"],
-                    q["cpus"].as_str().unwrap_or("?")
+                    render_cpu_group(group, active),
                 )
             })
             .collect::<Vec<_>>()
@@ -567,6 +610,16 @@ mod tests {
     const PORT_HEADER: &str = "port 0.0.0.0:14420\n\
          \x20 subsystem nqn.2026-06.io.ioutgt:test\n\
          \x20   ns 1: 64 MiB (512B blocks)\n";
+
+    #[test]
+    fn render_cpu_group_marks_active() {
+        // Full group dumped, active CPU bracketed.
+        assert_eq!(super::render_cpu_group("0-1,32-33", "32"), "0,1,[32],33");
+        assert_eq!(super::render_cpu_group("12", "12"), "[12]");
+        // Unknown/unpinned group falls back to just the active CPU.
+        assert_eq!(super::render_cpu_group("*", "3"), "3");
+        assert_eq!(super::render_cpu_group("*", "*"), "*");
+    }
 
     #[test]
     fn render_ctrl_list_formats_controllers() {
