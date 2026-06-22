@@ -402,6 +402,19 @@ nic_queue_irqs() {
         }' /proc/interrupts | sort -nu
 }
 
+# Hex CPU mask for one CPU as .../xps_cpus expects: comma-separated 32-bit
+# words, high word first (cpu 4 -> "00000010", cpu 24 -> "01000000",
+# cpu 32 -> "00000001,00000000", cpu 62 -> "40000000,00000000").
+cpu_xps_mask() {
+    local cpu="$1"
+    local word=$((cpu / 32)) bit=$((cpu % 32)) i w out=""
+    for ((i = word; i >= 0; i--)); do
+        if [ "$i" -eq "$word" ]; then printf -v w '%08x' $((1 << bit)); else w='00000000'; fi
+        out="${out:+$out,}$w"
+    done
+    printf '%s' "$out"
+}
+
 # Converge NIC_T's rx/tx queue IRQs and ioutgt's io-thread CPUs. Run AFTER
 # connect: the queue-thread pool spawns lazily on the first connection and
 # `ioutgt list` reports each IO queue's pthread tid + full online CPU group
@@ -412,10 +425,18 @@ nic_queue_irqs() {
 #   2. read the rx/tx IRQ *effective* affinity, combine it, and taskset the
 #      io-thread (by tid) to that combination (io-thread follows where the IRQ
 #      softirq actually lands -- the only direction available for managed IRQs).
-# ALL privileged work runs here in the (root) harness, so the target needs no
-# privileges. irqbalance would fight the pinning, so stop it. ARFS=1 also turns
-# on accelerated RFS for per-flow co-location (IRQ affinity aligns CPU sets,
-# not individual flows).
+#   3. XPS: map the io-thread's CPU -> this queue's tx ring (xps_cpus), so the
+#      thread's sends egress here and the TX completion IRQ lands on the same
+#      CPU (the heavy direction for reads).
+# Steps 1-3 only align queue<->thread CPUs; they do NOT decide which queue a
+# *flow* uses (RSS picks the RX queue, decoupled from the qid->io-thread route);
+# per-flow RX co-location is added separately via hardware ntuple rules.
+# We deliberately DISABLE software RPS/RFS: it relocates RX softirqs to the
+# consumer CPU with smp_call_function IPIs (net_rps_send_ipi) -- measured as a
+# ~33k/s Function-call-interrupt storm for no throughput gain -- and its knobs
+# persist across runs (a prior aRFS run poisons later ones), so the sync clears
+# them every time. ALL privileged work runs here in the (root) harness, so the
+# target needs no privileges. irqbalance would fight the pinning, so stop it.
 ioutgt_sync_affinity() {
     [ -n "${NIC_T:-}" ] || { echo "   (NIC_T unset; skipping IRQ affinity sync)"; return 0; }
     command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
@@ -430,7 +451,7 @@ ioutgt_sync_affinity() {
     fi
     systemctl stop irqbalance 2>/dev/null || true
     echo ">> converging $NIC_T queue IRQ affinity <-> ioutgt io-threads"
-    local qid tid cpus group nicq irqs irq combo eff pushed
+    local qid tid cpus group nicq irqs irq combo eff pushed xcpu xps
     while read -r qid tid cpus group; do
         [ -n "$qid" ] || continue
         nicq=$((qid - 1))
@@ -454,21 +475,33 @@ ioutgt_sync_affinity() {
             [ -n "$eff" ] && combo="${combo:+$combo,}$eff"
         done
         if [ -n "$combo" ] && taskset -cp "$combo" "$tid" >/dev/null 2>&1; then
-            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}] -> io-thread tid $tid affinity=$combo (was cpu $cpus)"
+            # 3. XPS: a send from this io-thread's CPU egresses tx-$nicq, so the
+            #    TX completion IRQ lands on the same CPU. xps_cpus is netdev
+            #    sysfs (the NIC is in NS_T), and wants a hex CPU bitmask.
+            xcpu="${combo%%[,-]*}"; xps=skip
+            case "$xcpu" in
+                ''|*[!0-9]*) ;;
+                *) if ip netns exec "$NS_T" bash -c \
+                        "echo $(cpu_xps_mask "$xcpu") > /sys/class/net/$NIC_T/queues/tx-$nicq/xps_cpus" \
+                        2>/dev/null; then xps="cpu $xcpu"; fi ;;
+            esac
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}] -> io-thread tid $tid aff=$combo, xps tx-$nicq=$xps (was cpu $cpus)"
         else
             echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '$combo' failed"
         fi
     done <<EOF
 $rows
 EOF
-    if [ "${ARFS:-0}" = 1 ]; then
-        echo ">> enabling aRFS on $NIC_T (per-flow steering)"
-        ip netns exec "$NS_T" ethtool -K "$NIC_T" ntuple on 2>/dev/null || true
-        echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-        ip netns exec "$NS_T" bash -c \
-            'for q in /sys/class/net/'"$NIC_T"'/queues/rx-*/rps_flow_cnt; do echo 2048 > "$q"; done' \
-            2>/dev/null || true
-    fi
+    # Disable software RPS/RFS (the net_rps_send_ipi storm). These knobs persist
+    # across runs, so clear them every sync: the global flow table and, on each
+    # NIC_T rx queue, rps_flow_cnt (RFS) and rps_cpus (plain RPS).
+    echo 0 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+    ip netns exec "$NS_T" bash -c '
+        for q in /sys/class/net/'"$NIC_T"'/queues/rx-*; do
+            echo 0 > "$q/rps_flow_cnt" 2>/dev/null
+            echo 0 > "$q/rps_cpus" 2>/dev/null
+        done' 2>/dev/null || true
+    echo "   RPS/RFS disabled (RX softirqs stay on their queue CPU; no relocation IPIs)"
 }
 
 cmd_ioutgt_target_down() {
@@ -510,7 +543,8 @@ cmd_status() {
             # co-located: the NIC steers a flow to a queue by RSS/tx-hash,
             # independent of which qid (io-thread) serves it -- so a flow on
             # io-thread T may ride a different NIC queue whose IRQ is elsewhere.
-            # True per-flow co-location needs aRFS (rx) + XPS (tx) (ARFS=1).
+            # True per-flow co-location needs hardware ntuple steering (rx) +
+            # XPS (tx) -- not software RPS/RFS, which co-locates via IPI storm.
             local qid tid cpus group nicq irqs irq eff verdict mism=0
             while read -r qid tid cpus group; do
                 [ -n "$qid" ] || continue
