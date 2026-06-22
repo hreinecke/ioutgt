@@ -37,9 +37,8 @@ That is three problems at once on a saturated 100G link:
    independent `sendmsg` SQEs on one socket have *no* ordering
    guarantee, so you cannot just pipeline two of them.
 
-The send path that solves all three is intricate: **iovec gather** over
-per-slot header scratch + in-place payloads (one syscall, zero payload
-copy), `SENDMSG_ZC` for true
+The send path that solves all three is intricate: a header **arena** +
+**iovec gather** (one syscall, zero payload copy), `SENDMSG_ZC` for true
 zero-copy with a **pin-budget fallback**, **short-send resume**,
 **notification reaping**, and a **double-buffer** so the kernel's
 zero-copy notification (≈ one RTT) overlaps the next batch's staging
@@ -72,7 +71,7 @@ leaves without making them depend on each other:
    uses    │           │   uses
            ▼           ▼
   ioutgt-core      ioutgt-uring
-  · SendList<W>    · GatherBatch   (iovec gather mechanics)
+  · SendList<W>    · GatherBatch   (arena + iovec mechanics)
   · SlotArray<C>   · ops::sendmsg* (io_uring send ops)
   (slot engine)    · ZcNotif       (reactor)
 ```
@@ -124,7 +123,7 @@ The ownership/reference map:
       └─ zc_* counters  → ZcStats                    │ │        │
                                                      │ │        │
   ioutgt-uring  (pure IO) ◄───────────────────────── │ ┘        │
-    GatherBatch   iovec list + msghdr                │          │
+    GatherBatch   arena + iovec + msghdr             │          │
     SendZcOp ──into_notif──► ZcNotif  ◄──────────────┘          │
     RawOp     (plain sendmsg)                                   │
                                                                 │
@@ -146,14 +145,15 @@ duration of `run()`. Walking bottom up:
 
 ### 3.1 `GatherBatch` — protocol-free gather mechanics (`ioutgt-uring`)
 
-The lowest layer: an **iovec list** plus a short-send resume cursor. It
-owns no buffer — callers encode their PDU headers into their own storage
-(each command's per-slot `Slot::tail` scratch) and hand it pointers. It
-knows nothing about tags, work, or async — pure byte/pointer plumbing.
+The lowest layer: a header **arena** and an **iovec list**, plus a
+short-send resume cursor. It knows nothing about tags, work, or async —
+pure byte/pointer plumbing.
 
 ```rust
 pub struct GatherBatch {
-    iovs: Vec<libc::iovec>,  // gather list: pointers into caller storage
+    arena: Box<[u8]>,        // headers/digests packed linearly
+    arena_used: usize,
+    iovs: Vec<libc::iovec>,  // gather list: arena chunks + payload refs
     iov_cap: usize,          // hard cap (≤ UIO_MAXIOV = 1024)
     live: usize,             // first not-yet-fully-sent iovec
     msghdr: Box<libc::msghdr>,
@@ -164,25 +164,26 @@ Key methods (all `#[inline]`, hot path):
 
 | Method | Does |
 |--------|------|
-| `push_raw(ptr, n)` | append a chunk **in place** (header or payload); merges if byte-contiguous with the previous entry |
-| `fits(i)` | headroom for one more worst-case item's iovecs? |
+| `arena_tail()` | mutable slice to encode the next header into |
+| `push_arena(n)` | publish `n` bytes at the tail + append an iovec |
+| `push_raw(ptr, n)` | append a payload ref **in place**; merges if byte-contiguous with the previous entry |
+| `fits(a, i)` | headroom for one more worst-case item? |
 | `msghdr()` | build the `msghdr` over the unsent suffix `iovs[live..]` |
 | `advance(n)` | consume `n` sent bytes; `true` when the batch is fully sent |
 | `reset()` | recycle for the next round |
 
-The merge in `push_raw` collapses byte-contiguous chunks in the same
-buffer to one iovec — so a command's adjacent header pieces in its slot
-tail (e.g. DDGST + response capsule) become a single entry:
+The merge in `push_raw` is what makes a header-only batch collapse to a
+**single** iovec:
 
 ```text
- push_raw(tail+DDGST_off, 4)   ┐ byte-contiguous in the slot tail
- push_raw(tail+rsp_off, 28)    ┘ → ONE iovec entry, iov_len grows
+ push_arena("R2T#1")   ┐ byte-contiguous in the arena
+ push_arena("R2T#2")   ┘ → ONE iovec entry, iov_len grows
 ```
 
 The two kernel structs it manages are raw libc types:
 
 - **`libc::iovec`** `{ iov_base: *mut c_void, iov_len: usize }` — one
-  gather entry (a pointer + length into a slot's tail or data buffer).
+  gather entry (a pointer + length into the arena or a slot buffer).
 - **`libc::msghdr`** — the `sendmsg(2)` descriptor; `msghdr()` points its
   `msg_iov`/`msg_iovlen` at the unsent suffix `iovs[live..]` before each
   submit.
@@ -230,7 +231,8 @@ release tags at the right time:
 ```rust
 struct GatherSendBatch {
     gather: GatherBatch,
-    iovs_per_item: usize,       // worst-case iovec count, for fits()
+    arena_per_item: usize,      // worst-case sizings, for fits()
+    iovs_per_item: usize,
     tags_at_cqe: Vec<u16>,      // release at the send CQE (no slot ref)
     tags_at_notif: Vec<u16>,    // release only after ZC notifs reaped
     pending_notifs: Vec<ZcNotif>, // one per ZC op issued for this batch
@@ -423,8 +425,8 @@ where F: FnMut(&mut GatherBatch, &W) -> Staged
 ```
 
 > **Why drain on every exit?** Orderly close, send error, or `WriteZero`
-> all land here. The kernel may still hold page references to the slot
-> buffers (payload and header tail); the caller frees that memory right after joining the
+> all land here. The kernel may still hold page references to the arena
+> and slot buffers; the caller frees that memory right after joining the
 > send task, so we must wait out every ZC notification first.
 
 ### 4.2 The core: `send_batches()`
@@ -487,27 +489,24 @@ fn stage_batch<W, F>(batch, first, work, stage) -> Option<W> {
 }
 ```
 
-The closure encodes headers into the command's own slot tail and
-references the payload in place. Here is what one read response with data
-looks like in the batch — every iovec points into the *same* slot:
+The closure encodes headers into the arena and references payloads in
+place. Here is what one read response with data looks like in the batch:
 
 ```text
-  slot (one command's buffer)            iovec gather list (what the kernel sends)
-  ┌─────────────┬───────────────┐        ┌───────────────────────────────┐
-  │ data buffer │ tail scratch  │        │ 1: → C2HData hdr (slot tail)   │
-  │ (read data) │ C2H hdr·DDGST │        │ 2: → slot data payload    ◄────┼─ IN PLACE,
-  │             │ ·capsule      │        │ 3: → DDGST (slot tail)         │   zero copy
-  └──────┬──────┴───────┬───────┘        │ 4: → capsule (slot tail)       │
-         └──────────────┘ (CRC32C)       └───────────────────────────────┘
-   payload referenced, not copied        DDGST+capsule are contiguous in
-                                         the tail, so 3,4 merge → 3 iovecs
+  arena (headers/digests, packed)        iovec gather list (what the kernel sends)
+  ┌──────────────────────────────┐       ┌───────────────────────────────┐
+  │ C2HData hdr │ DDGST │ capsule │       │ 1: → C2HData hdr (in arena)    │
+  └─────┬───────┴───┬───┴────┬────┘       │ 2: → slot buffer payload  ◄────┼─ IN PLACE,
+        │           │        │            │ 3: → DDGST (in arena)          │   zero copy
+        ▼           │        ▼            │ 4: → capsule (in arena)        │
+   slot buffer ─────┘   (CRC32C)          └───────────────────────────────┘
+   (read data,                            entries 1,3,4 are arena chunks;
+    referenced not copied)                only 2 points at the slot
 ```
 
-Only headers and digests are written (into the slot's tail scratch).
-**Payload bytes never move** — `push_raw` adds an iovec pointing straight
-at the slot data buffer. The R2T (for writes) and the response capsule use
-disjoint tail sub-ranges so a write's capsule never overwrites an R2T that
-may still be ZC-pinned.
+Only headers and digests are copied (into the arena). **Payload bytes
+never move** — `push_raw` adds an iovec pointing straight at the slot
+buffer.
 
 ---
 
@@ -673,9 +672,8 @@ mean a path shipped ZC ops without draining, i.e. a use-after-free risk.
 
 ## 9. Invariants
 
-1. **Zero steady-state allocation.** Both batches' iovec lists and tag
-   vectors are preallocated in `new()` (the header bytes live in the
-   preallocated per-slot tails); the loop only `reset()`s
+1. **Zero steady-state allocation.** Both batches' arenas, iovec lists,
+   and tag vectors are preallocated in `new()`; the loop only `reset()`s
    and recycles. (The notif vector is sized for the common ≤1-notif case
    and would only grow under repeated short sends — never in steady
    state.)
@@ -717,23 +715,18 @@ The closure is the entire NVMe-specific surface:
 ```rust
 fn release_class(work: &SendWork) -> Staged {
     match *work {
-        // Every response's capsule/headers ride in the slot tail, so the op
-        // references slot memory → notif-gated (copy path: send CQE via recycle).
-        SendWork::Response(c) => Staged::AtNotif(c.tag),
-        SendWork::R2t { .. }  => Staged::NoRelease, // slot still Receiving
+        SendWork::Response(c) if c.data_len > 0 => Staged::AtNotif(c.tag), // payload in iovecs
+        SendWork::Response(c)                   => Staged::AtCqe(c.tag),   // capsule only
+        SendWork::R2t { .. }                    => Staged::NoRelease,      // slot still Receiving
     }
 }
 ```
 
-(A transport whose headers live outside slot memory — its own arena — would
-still use `AtCqe` for slot-free responses; NVMe/TCP no longer can, since the
-capsule now rides in the slot tail.)
-
 `stage_send_work` encodes R2T / C2HData / response-capsule PDUs (with
 optional header & data digests, and the SUCCESS-elision optimization
-when SQ flow control is off) via the sans-IO `ioutgt-nvme` codec into the
-command's slot tail, then `gather.push_raw()`s each header piece and the
-slot payload in place.
+when SQ flow control is off) via the sans-IO `ioutgt-nvme` codec,
+calling `gather.push_arena()` for headers and `gather.push_raw()` to
+reference the slot payload in place.
 
 **That is the full extent of NVMe knowledge in the send path.** Swap the
 closure and the sizings, and the same `StreamSender` drives NBD.
@@ -743,7 +736,7 @@ closure and the sizings, and the same `StreamSender` drives NBD.
 ## In one sentence
 
 `StreamSender` is a serial, double-buffered send-path state machine that
-gathers each command's headers from its slot tail and payloads in place, ships one
+gathers headers into an arena and payloads in place, ships one
 `sendmsg`/`SENDMSG_ZC` at a time, and gates slot reuse on zero-copy
 notifications — with all protocol specifics delegated to a one-line
 staging closure.

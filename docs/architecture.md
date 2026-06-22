@@ -338,14 +338,13 @@ the split raw-pointer safety argument, with diagrams — is in
 The send path is the protocol-neutral `StreamSender` (`ioutgt-stream`),
 reused by every stream transport. Each turn it blocks for one work item,
 greedily drains the rest of the `SendList`, and ships the whole batch as
-a single gather `sendmsg` (`--send-zc`: `SENDMSG_ZC`): each command's PDU
-headers and digests encoded into its own per-slot header scratch
-(`Slot::tail`), read payloads referenced in place from the slot buffers
-(zero copy), byte-contiguous chunks merged. `GatherBatch` owns no buffer —
-it is a pure iovec list. The NVMe/TCP transport supplies only a *staging
-closure* (`stage_send_work` + `release_class`, `connection.rs`): given one
-`SendWork` item, encode its PDUs into that slot's tail and return its
-tag-release class
+a single gather `sendmsg` (`--send-zc`: `SENDMSG_ZC`): PDU headers and
+digests packed into a per-batch arena, read payloads referenced in place
+from the slot buffers (zero copy), byte-contiguous chunks merged so a
+payload-free batch collapses to one iovec. The NVMe/TCP transport
+supplies only a *staging closure* (`stage_send_work` + `release_class`,
+`connection.rs`): given one `SendWork` item, encode its PDUs into the
+arena and return its tag-release class
 (`Staged::{NoRelease, AtCqe, AtNotif}`). The harness drives the loop,
 owns the batches and the ZC-notification lifetime, and never inspects
 the work type — so a future NBD transport reuses it unchanged.
@@ -364,12 +363,10 @@ architecturally load-bearing:
   notifications (`next_work_reaping`), so tag release never depends on
   new send work arriving (the anti-deadlock invariant).
 - **`release_tag` timing is the memory-safety line**, not bookkeeping.
-  The kernel reads slot pages for the whole send — payload *and* the slot
-  tail that now holds the headers — so a tag is released only once the
-  kernel provably no longer references the slot: at the send CQE in the
-  copying path, at the ZC notification (≈ the peer's ACK) under
-  `--send-zc` (every response, since its capsule rides in the slot tail).
-  Teardown
+  The kernel reads slot pages for the whole send, so a tag — and with it
+  the slot buffer — is released only once the kernel provably no longer
+  references it: at the send CQE for capsule-only responses, at the ZC
+  notification (≈ the peer's ACK) for payload-carrying ones. Teardown
   joins the send task, draining pending ZC notifications, before the
   queue is freed.
 
@@ -496,7 +493,7 @@ Two principles behind the budget:
 
 Everything else on the path is bounded per PDU: header assembly in the
 decoder, the 64-byte SQE stash, and header/digest encoding into the
-per-slot header scratch (`Slot::tail`).
+send arena.
 
 ### 4.3 One IO command end to end
 
@@ -522,10 +519,10 @@ A host `Read` crosses every crate boundary exactly once per hop:
    `SendWork::Response` onto `NvmeTcpQueue`'s send list [tcp]; the
    `StreamSender` send loop [stream] drains the whole list, invokes the
    transport's staging closure to encode C2HData/response headers [nvme]
-   into the slot's header scratch with payloads referenced from the slot
-   buffer, ships one gather `ops::sendmsg_raw` [uring], then
-   `release_tag()` returns the slot to the freelist (under `--send-zc`
-   tags wait for the ZC notification instead — §4.2.2).
+   into the arena with payloads referenced from slot buffers, ships one
+   gather `ops::sendmsg_raw` [uring], then `release_tag()` returns the
+   slot to the freelist (under `--send-zc`, payload-carrying tags wait
+   for the ZC notification instead — §4.2.2).
 
 Boundary summary: **bin→tcp** is the two handshake calls plus
 `run_queue()` itself — the queue threads' entry point, with the
@@ -606,8 +603,8 @@ send (per command, items on an ordered queue-local send list):
   table copied from nvmet semantics (`io::nvme_status`, a free function —
   not a `Backend`-trait method, since the trait is transport-neutral).
 - **Send batching (M9) + gather**: the send task drains the entire
-  completion/R2T queue into one gather SENDMSG — each command's headers in
-  its own per-slot scratch, payloads referenced from slot buffers — because send SQEs on
+  completion/R2T queue into one gather SENDMSG — headers in a small
+  arena, payloads referenced from slot buffers — because send SQEs on
   one socket have no ordering guarantee, so batching (not op
   pipelining) is how the per-response park cycle was removed (one
   `io_uring_enter` per batch in each direction; 4.2× on 4K reads, then
@@ -629,8 +626,8 @@ and future transports slot in without touching protocol logic:
   the per-connection sender ships vectored `SENDMSG` gather batches
   (as built). With `--send-zc`, batches go out as `SENDMSG_ZC` over
   the same iovecs: double-buffered batches keep staging through the
-  notification RTT, response tags release on the notif (every response's
-  capsule rides in the slot tail), the idle park polls the oldest batch's
+  notification RTT, payload tags release on the notif (capsule-only
+  tags still at the send CQE), the idle park polls the oldest batch's
   notifs alongside the send-list drain so tag release never depends on
   new work arriving, and pin-budget failures (per-user
   `RLIMIT_MEMLOCK`) fall back to the copying SENDMSG per batch (as
@@ -699,8 +696,7 @@ Depth is server-chosen, so `await_tag` parks the recv loop as backpressure.
 Write payload always follows the 28-byte request header inline (no R2T);
 large tails use the direct-to-slot `MSG_WAITALL` path shared with NVMe/TCP.
 Read responses use `GatherBatch` (`ioutgt-uring::sendbatch`) — the same
-iovec/short-send gather logic — with a 16-byte simple-reply header encoded
-into the slot's header scratch. Setup is
+arena/iovec/short-send logic — with a 16-byte simple-reply header. Setup is
 fixed-newstyle option haggling on the control thread, routed round-robin.
 
 ### 6.1.2 NVMe/RDMA on the refactored base
@@ -784,7 +780,7 @@ IOPOLL ring is a measured-later roadmap item.
 
 | Stage | Recv | Send | Disk |
 |-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (per-slot header scratch + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC per batch, slot reuse gated on the notification CQE, RLIMIT_MEMLOCK pin failures fall back to copy (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
+| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC per batch, slot reuse gated on the notification CQE, RLIMIT_MEMLOCK pin failures fall back to copy (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
 | Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | — (SEND_ZC landed opt-in, above) | READ_FIXED/WRITE_FIXED on registered slot buffers |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
 

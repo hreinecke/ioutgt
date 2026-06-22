@@ -1,16 +1,18 @@
-//! Gather-send staging: an iovec list referencing caller-owned bytes in
-//! place (PDU headers and payload alike), shipped as one vectored send
-//! and resumed in place after short sends. Pure byte/pointer plumbing —
-//! no protocol knowledge and no owned buffer; callers encode their own
-//! headers into their own storage (a slot's header scratch) and hand us
-//! pointers. Any stream transport reuses this (NVMe/TCP today, NBD next).
+//! Gather-send staging: a header arena plus an iovec list referencing
+//! payload bytes in place, shipped as one vectored send and resumed
+//! in place after short sends. Pure byte/pointer plumbing — no
+//! protocol knowledge; callers encode their own headers into the
+//! arena. Any stream transport reuses this (NVMe/TCP today, NBD
+//! next).
 
 /// Kernel cap on `msg_iovlen`.
 pub const UIO_MAXIOV: usize = libc::UIO_MAXIOV as usize;
 
-/// One batch's gather state. The iovec list is preallocated at
-/// construction; `reset()` recycles it.
+/// One batch's gather state. All memory is preallocated at
+/// construction; `reset()` recycles everything.
 pub struct GatherBatch {
+    arena: Box<[u8]>,
+    arena_used: usize,
     iovs: Vec<libc::iovec>,
     /// Hard entry cap (≤ UIO_MAXIOV). `Vec::with_capacity` may
     /// over-allocate, so the fit check must not use `capacity()`.
@@ -21,11 +23,13 @@ pub struct GatherBatch {
 }
 
 impl GatherBatch {
-    /// Preallocate up to `iov_cap` iovec entries (clamped to
-    /// [`UIO_MAXIOV`]).
-    pub fn new(iov_cap: usize) -> GatherBatch {
+    /// Preallocate `arena_bytes` (≥ 4 KiB) of header arena and up to
+    /// `iov_cap` iovec entries (clamped to [`UIO_MAXIOV`]).
+    pub fn new(arena_bytes: usize, iov_cap: usize) -> GatherBatch {
         let iov_cap = iov_cap.min(UIO_MAXIOV);
         GatherBatch {
+            arena: vec![0u8; arena_bytes.max(4096)].into_boxed_slice(),
+            arena_used: 0,
             iovs: Vec::with_capacity(iov_cap),
             iov_cap,
             live: 0,
@@ -37,20 +41,37 @@ impl GatherBatch {
 
     /// Recycle for the next staging round.
     pub fn reset(&mut self) {
+        self.arena_used = 0;
         self.iovs.clear();
         self.live = 0;
     }
 
-    /// Headroom for one more item of `iovs_need` (unmerged) iovec
-    /// entries?
+    /// Headroom for one more item of `arena_need` header bytes and
+    /// `iovs_need` (unmerged) iovec entries?
     #[inline]
-    pub fn fits(&self, iovs_need: usize) -> bool {
-        self.iovs.len() + iovs_need <= self.iov_cap
+    pub fn fits(&self, arena_need: usize, iovs_need: usize) -> bool {
+        self.arena_used + arena_need <= self.arena.len()
+            && self.iovs.len() + iovs_need <= self.iov_cap
     }
 
-    /// Append a wire chunk (a pointer into caller-owned storage); merges
-    /// with the previous entry when byte-contiguous, so adjacent header
-    /// pieces in the same scratch collapse to one entry.
+    /// Unused arena to encode the next header piece into.
+    #[inline]
+    pub fn arena_tail(&mut self) -> &mut [u8] {
+        &mut self.arena[self.arena_used..]
+    }
+
+    /// Publish `len` bytes just written at the arena tail.
+    #[inline]
+    pub fn push_arena(&mut self, len: usize) {
+        let start = self.arena_used;
+        self.arena_used += len;
+        let ptr = self.arena[start..].as_ptr();
+        self.push_raw(ptr, len);
+    }
+
+    /// Append a wire chunk; merges with the previous entry when
+    /// byte-contiguous (consecutive arena pieces collapse, so pure
+    /// header batches degenerate to a single entry).
     #[inline]
     pub fn push_raw(&mut self, ptr: *const u8, len: usize) {
         if len == 0 {
@@ -120,24 +141,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contiguous_chunks_merge() {
-        let mut b = GatherBatch::new(8);
-        let buf: Box<[u8]> = vec![0u8; 6].into_boxed_slice();
-        b.push_raw(buf.as_ptr(), 4);
-        // SAFETY: same allocation, one-past the first 4 bytes.
-        b.push_raw(unsafe { buf.as_ptr().add(4) }, 2);
-        // Two byte-contiguous pushes collapse to one iovec entry.
+    fn contiguous_arena_chunks_merge() {
+        let mut b = GatherBatch::new(4096, 8);
+        b.arena_tail()[..4].copy_from_slice(b"abcd");
+        b.push_arena(4);
+        b.arena_tail()[..2].copy_from_slice(b"ef");
+        b.push_arena(2);
+        // Two arena pushes, byte-contiguous: one iovec entry.
         assert_eq!(b.iovs.len(), 1);
         assert_eq!(b.iovs[0].iov_len, 6);
     }
 
     #[test]
     fn short_send_advances_in_place() {
-        let mut b = GatherBatch::new(8);
-        // Distinct heap allocations so the two chunks never merge.
-        let hdr: Box<[u8]> = vec![0u8; 8].into_boxed_slice();
-        let payload: Box<[u8]> = vec![9u8; 16].into_boxed_slice();
-        b.push_raw(hdr.as_ptr(), 8);
+        let mut b = GatherBatch::new(4096, 8);
+        b.arena_tail()[..8].copy_from_slice(b"01234567");
+        b.push_arena(8);
+        let payload = [9u8; 16];
         b.push_raw(payload.as_ptr(), 16);
         assert_eq!(b.iovs.len(), 2);
 
@@ -152,7 +172,7 @@ mod tests {
         // Two non-contiguous chunks; advancing nibbles the second
         // entry across multiple short sends. Heap buffers keep them
         // from merging.
-        let mut b = GatherBatch::new(8);
+        let mut b = GatherBatch::new(4096, 8);
         let a_data: Box<[u8]> = vec![1u8, 2, 3, 4].into_boxed_slice();
         let b_data: Box<[u8]> = vec![5u8, 6, 7].into_boxed_slice();
         b.push_raw(a_data.as_ptr(), 4);

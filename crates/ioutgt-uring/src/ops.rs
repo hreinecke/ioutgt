@@ -378,7 +378,7 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp>
 }
 
 /// Vectored send described by a caller-managed `msghdr` — the batched
-/// gather-send primitive (caller-owned header + payload iovecs).
+/// gather-send primitive (header arena + slot-payload iovecs).
 ///
 /// # Safety
 ///

@@ -88,7 +88,7 @@ fn zc_read_write_verify() {
 }
 
 /// As above with both digests on: the DDGST trailer rides the ZC
-/// batch from the slot's header tail.
+/// batch from the arena.
 #[test]
 fn zc_read_write_verify_digests() {
     let addr = spawn_zc_target();

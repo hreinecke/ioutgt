@@ -12,20 +12,11 @@
 //! (`Cell`/`RefCell`, no atomics); the wire transfer tag *is* the
 //! slot index, so no lookup structure exists.
 
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::task::{Poll, Waker};
 
 use crate::buf::AlignedBuf;
-
-/// Per-slot scratch for the response/solicitation PDU **headers** a
-/// transport's send loop emits (response capsule, R2T, data-PDU header,
-/// digests). Replaces the old shared per-batch arena: each command's
-/// headers now live with its own slot, so the slot buffer is the only
-/// memory a send op references. 256 B comfortably covers NVMe/TCP's
-/// worst case (data-PDU header 28 + DDGST 4 + capsule 28, plus a disjoint
-/// R2T slot) and any near-term transport.
-pub const SLOT_TAIL: usize = 256;
 
 /// Slot lifecycle. Transitions are all same-thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +43,6 @@ pub struct Slot<C: Copy> {
     /// Data buffer: write payload in, read payload out. Sized at queue
     /// creation; 4K-aligned for O_DIRECT backends.
     data: RefCell<AlignedBuf>,
-    /// Per-slot header scratch for this command's outgoing PDU headers
-    /// (see [`SLOT_TAIL`]). Disjoint from `data`, so the send loop can
-    /// reference a header and the payload in the same gather without
-    /// borrowing one buffer twice.
-    tail: RefCell<[u8; SLOT_TAIL]>,
     /// Valid bytes in `data` (received payload or response data).
     data_len: Cell<u32>,
     /// Reassembly cursor for multi-step payload receives.
@@ -71,7 +57,6 @@ impl<C: Copy> Slot<C> {
             cmd: Cell::new(init),
             waker: Cell::new(None),
             data: RefCell::new(AlignedBuf::zeroed(buf_size)),
-            tail: RefCell::new([0u8; SLOT_TAIL]),
             data_len: Cell::new(0),
             recv_offset: Cell::new(0),
         }
@@ -89,13 +74,6 @@ impl<C: Copy> Slot<C> {
     /// held across a backend await while the slot is `Executing`).
     pub fn data(&self) -> std::cell::RefMut<'_, AlignedBuf> {
         self.data.borrow_mut()
-    }
-
-    /// Borrow the per-slot header scratch ([`SLOT_TAIL`] bytes). The send
-    /// loop encodes this command's outgoing PDU headers here and gathers
-    /// them alongside the in-place payload from `data()`.
-    pub fn tail(&self) -> RefMut<'_, [u8; SLOT_TAIL]> {
-        self.tail.borrow_mut()
     }
 
     pub fn data_len(&self) -> u32 {
