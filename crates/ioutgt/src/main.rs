@@ -111,20 +111,6 @@ enum Command {
         #[arg(long, conflicts_with = "interval")]
         clear: bool,
     },
-    /// Sync a NIC's rx/tx queue IRQ affinity with this target's io-thread
-    /// CPUs (unmanaged IRQ: NIC follows ioutgt; managed: ioutgt's per-thread
-    /// CPU assignment follows the NIC, taking effect on the next connect).
-    /// Run before connecting an initiator. Requires root.
-    #[command(name = "set_affinity", alias = "set-affinity")]
-    SetAffinity {
-        /// Control socket path.
-        #[arg(long, default_value_os_t = default_control_socket())]
-        socket: std::path::PathBuf,
-        /// NIC whose rx/tx queue IRQs to align (must be visible in this
-        /// process's net namespace).
-        #[arg(long)]
-        nic: String,
-    },
 }
 
 /// Send one request line over the control socket; return the raw
@@ -166,70 +152,6 @@ fn list_target(socket: &std::path::Path) -> std::io::Result<()> {
     }
     print!("{}", render_ctrl_list(&response["data"]));
     Ok(())
-}
-
-/// `ioutgt set_affinity`: sync a NIC's rx/tx queue IRQs with io-thread CPUs.
-fn set_affinity_target(socket: &std::path::Path, nic: &str) -> std::io::Result<()> {
-    let request = serde_json::json!({ "op": "SET_AFFINITY", "nic": nic }).to_string();
-    let raw = ctl_request(socket, &request)?;
-    let response = serde_json::from_str::<serde_json::Value>(&raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        eprintln!(
-            "{}",
-            response
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(&raw)
-        );
-        std::process::exit(1);
-    }
-    print!("{}", render_set_affinity(&response["data"]));
-    Ok(())
-}
-
-/// Render SET_AFFINITY `data`: one line per NIC queue with its rx/tx IRQ and
-/// the action taken (NIC-follows-iothread / iothread-follows-nic / skipped).
-fn render_set_affinity(data: &serde_json::Value) -> String {
-    use std::fmt::Write;
-    let irq = |v: &serde_json::Value| -> String {
-        v.as_u64().map_or_else(|| "-".to_owned(), |n| n.to_string())
-    };
-    // Join an array-of-cpulist-strings into "47" / "12,44".
-    let eff = |v: &serde_json::Value| -> String {
-        v.as_array().map_or_else(
-            || "-".to_owned(),
-            |a| {
-                a.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            },
-        )
-    };
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "nic {}: {} io-threads, {} nic queues",
-        data["nic"].as_str().unwrap_or("?"),
-        data["io_threads"].as_u64().unwrap_or(0),
-        data["nic_queues"].as_u64().unwrap_or(0),
-    );
-    if let Some(rows) = data["queues"].as_array() {
-        for q in rows {
-            let _ = writeln!(
-                out,
-                "  q{:<2} rx_irq={:<4} tx_irq={:<4} eff {}->{}  {}",
-                q["queue"].as_u64().unwrap_or(0),
-                irq(&q["rx_irq"]),
-                irq(&q["tx_irq"]),
-                eff(&q["nic_eff_before"]),
-                eff(&q["nic_eff_after"]),
-                q["action"].as_str().unwrap_or(""),
-            );
-        }
-    }
-    out
 }
 
 /// `ioutgt stat`: one snapshot, or `-i N` for iostat-style rates
@@ -591,7 +513,6 @@ fn main() -> std::io::Result<()> {
                 interval,
                 clear,
             } => return stat_target(socket, *interval, *clear),
-            Command::SetAffinity { socket, nic } => return set_affinity_target(socket, nic),
         }
     }
 

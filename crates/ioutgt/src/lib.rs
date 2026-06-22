@@ -461,14 +461,12 @@ fn build_pool(io_cpus: &[Option<usize>]) -> io::Result<(PoolSenders, Vec<Pending
 /// Spawn the queue-thread pool if it is currently down — the first
 /// connection ever, or the first after an idle teardown. Idempotent;
 /// runs the deferred spawn closures and publishes the senders.
-fn ensure_pool_up(senders: &Mutex<Option<PoolSenders>>, io_cpus: &Mutex<Vec<Option<usize>>>) {
+fn ensure_pool_up(senders: &Mutex<Option<PoolSenders>>, io_cpus: &[Option<usize>]) {
     let mut guard = senders.lock().expect("pool senders mutex");
     if guard.is_some() {
         return;
     }
-    // Snapshot the (possibly SET_AFFINITY-rewritten) assignment for this spawn.
-    let cpus = io_cpus.lock().expect("io_cpus mutex").clone();
-    match build_pool(&cpus) {
+    match build_pool(io_cpus) {
         Ok((pool, pending)) => {
             for spawn in pending {
                 if let Err(err) = spawn() {
@@ -595,7 +593,6 @@ fn spawn_control_api(
     port: &Arc<PortConfig<AnyBackend>>,
     registry: &Arc<Registry>,
     senders: &Arc<Mutex<Option<PoolSenders>>>,
-    io_cpus: &Arc<Mutex<Vec<Option<usize>>>>,
     io_threads: usize,
 ) -> io::Result<()> {
     // The API mutates served storage (ADD/REMOVE_NAMESPACE): owner-only.
@@ -618,7 +615,6 @@ fn spawn_control_api(
             }
         }),
         stats_sources: build_stats_sources(senders, io_threads),
-        io_cpus: Arc::clone(io_cpus),
     });
     info!(path = %path.display(), "control socket listening");
     tokio::task::spawn_local(ioutgt_control::server::serve(listener, state));
@@ -687,7 +683,7 @@ fn accept_connection(
     accepted: io::Result<(tokio::net::TcpStream, SocketAddr)>,
     config: &TargetConfig,
     senders: &Arc<Mutex<Option<PoolSenders>>>,
-    io_cpus: &Arc<Mutex<Vec<Option<usize>>>>,
+    io_cpus: &[Option<usize>],
     active: &Arc<AtomicUsize>,
     registry: &Arc<Registry>,
     port: &Arc<PortConfig<AnyBackend>>,
@@ -751,15 +747,13 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     // and namespace-change nudges no-op (no live controllers). Control-
     // plane only — never locked on the IO path, never held across an await.
     let senders: Arc<Mutex<Option<PoolSenders>>> = Arc::new(Mutex::new(None));
-    // Per-IO-thread CPU assignment, computed once and reused for every
-    // (re)spawn. Shared (Mutex) so the SET_AFFINITY control op can rewrite an
-    // entry for a managed NIC IRQ before the pool spawns lazily on first
-    // connect (the io-thread then pins to the NIC's CPU on birth).
-    let io_cpus: Arc<Mutex<Vec<Option<usize>>>> = Arc::new(Mutex::new(if config.pin_threads {
+    // Per-IO-thread CPU assignment is fixed for the process (topology is
+    // stable), so compute it once and reuse it for every (re)spawn.
+    let io_cpus = if config.pin_threads {
         io_thread_cpus(config.io_threads)
     } else {
         vec![None; config.io_threads]
-    }));
+    };
 
     // Bind before building the port so the model carries the actual bound
     // address (ephemeral ports resolve to the real one). On any setup
@@ -782,14 +776,7 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
         }
     };
     if let Some(path) = &config.control_socket {
-        if let Err(err) = spawn_control_api(
-            path,
-            &port,
-            &registry,
-            &senders,
-            &io_cpus,
-            config.io_threads,
-        ) {
+        if let Err(err) = spawn_control_api(path, &port, &registry, &senders, config.io_threads) {
             let _ = addr_tx.send(Err(err));
             return;
         }
