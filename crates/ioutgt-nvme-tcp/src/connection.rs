@@ -126,7 +126,13 @@ impl DataPhase {
             let dest = (self.base + (total - self.remaining)) as usize;
             slot.data()[dest..dest + take].copy_from_slice(&slice[..take]);
         }
-        self.crc.update(&slice[..take]);
+        // Only fold bytes into the digest when one was negotiated; with the
+        // data digest off the result is discarded, so the CRC pass is pure
+        // waste over every received byte (the direct-recv tail path and kernel
+        // nvmet both gate it the same way).
+        if self.ddgst {
+            self.crc.update(&slice[..take]);
+        }
         *slice = &slice[take..];
         self.remaining -= u32::try_from(take).expect("take <= remaining: u32");
         if self.remaining > 0 {
