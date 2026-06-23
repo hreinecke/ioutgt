@@ -173,6 +173,14 @@ require_nics() {
 # creates its listener in the *current* process's netns), so we use nsenter.
 in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
 
+# Target context for common.sh's nvmet_setup/ioutgt_start. nvmet's configfs
+# script runs via in_net (nsenter --net, keeping the mount ns so configfs stays
+# visible) so the listener socket is born in NS_T. ioutgt is pure userspace (no
+# configfs), so plain `ip netns exec` is enough for its launch prefix.
+nvmet_exec() { in_net "$NS_T" bash -c "$1"; }
+# shellcheck disable=SC2034  # consumed by common.sh's ioutgt_start
+IOUTGT_NETNS=(ip netns exec "$NS_T")
+
 # Auto-size IO queues from NIC_T (inside NS_T): min(rx, tx, nproc). rx/tx are
 # RX+Combined / TX+Combined from `ethtool -l`; falls back to counting the
 # sysfs rx-*/tx-* queue dirs. Used by 'up' to default NR_QUEUES so ioutgt's
@@ -266,128 +274,27 @@ cmd_down() {
     echo "   namespaces removed; NICs returned to root (reconfigure addresses as needed)."
 }
 
-# ---- targets: 'start'/'stop [SELECTOR]' route to one (or both) of these
+# ---- targets: 'start'/'stop [SELECTOR]' route to one (or both) of these.
+# The setup/teardown live in common.sh (nvmet_setup/nvmet_teardown,
+# ioutgt_start/ioutgt_stop); realwire only supplies the NS_T addressing and the
+# nvmet_exec/IOUTGT_NETNS context hooks (above). The post-connect affinity sync
+# (ioutgt_sync_affinity) is realwire-specific and stays here.
+# realwire's backends have no default (unlike local_tgt's /tmp files), so the
+# `:?` expansion keeps the friendly "set NVMET_BACKEND..." abort.
 start_one() {
     case "$1" in
-        nvmet)  cmd_nvmet_target ;;
-        ioutgt) cmd_ioutgt_target ;;
+        nvmet)  nvmet_setup  "$NVMET_NQN"  "$NVMET_PORT"  "$IP_T" \
+                    "${NVMET_BACKEND:?set NVMET_BACKEND to the nvmet target backing file or block device}" ;;
+        ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$IP_T" \
+                    "${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}" ;;
     esac
 }
 
 stop_one() {
     case "$1" in
-        nvmet)  cmd_nvmet_target_down ;;
-        ioutgt) cmd_ioutgt_target_down ;;
+        nvmet)  nvmet_teardown "$NVMET_NQN" ;;
+        ioutgt) ioutgt_stop ;;
     esac
-}
-
-# ---- nvmet-tcp target (Linux in-kernel; runs in NS_T) ----------------
-cmd_nvmet_target() {
-    local NQN=$NVMET_NQN PORT=$NVMET_PORT
-    local BACKEND=${NVMET_BACKEND:?set NVMET_BACKEND to the nvmet target backing file or block device}
-    echo ">> setting up nvmet-tcp target in $NS_T (backend $BACKEND)"
-    modprobe nvmet
-    modprobe nvmet-tcp
-    ensure_backing || exit 1
-
-    local cfg=/sys/kernel/config/nvmet
-    # All configfs writes run via nsenter so the port's listener socket is
-    # created inside NS_T (see in_net comment). configfs is a global
-    # singleton, so the tree we write is the same one the kernel uses.
-    in_net "$NS_T" bash -euc "
-        cfg=$cfg
-        sub=\$cfg/subsystems/$NQN
-        mkdir -p \$sub
-        echo 1 > \$sub/attr_allow_any_host
-        # nr_queues -> nvmet's per-subsystem max queue id (qid 1..N).
-        echo $NR_QUEUES > \$sub/attr_qid_max
-        mkdir -p \$sub/namespaces/1
-        echo -n $BACKEND > \$sub/namespaces/1/device_path
-        # Force O_DIRECT on a file backend (parity with ioutgt's default);
-        # must precede enable. Ignored for a block device.
-        echo 0 > \$sub/namespaces/1/buffered_io 2>/dev/null || true
-        echo 1 > \$sub/namespaces/1/enable
-
-        # Claim a FREE configfs port id; the port tree is global (the netns
-        # only scopes the listener SOCKET), so hardcoding port 1 would hijack
-        # an existing nvmet port on the host ('Disable port before changing
-        # attribute'). Never touch a port we did not create.
-        pid=1; while [ -e \"\$cfg/ports/\$pid\" ]; do pid=\$((pid + 1)); done
-        portdir=\$cfg/ports/\$pid
-        mkdir \"\$portdir\"
-        echo ipv4 > \"\$portdir/addr_adrfam\"
-        echo $IP_T > \"\$portdir/addr_traddr\"
-        echo $PORT > \"\$portdir/addr_trsvcid\"
-        echo tcp  > \"\$portdir/addr_trtype\"
-        # queue_size -> advertised per-queue depth (SQSIZE/MAXCMD); must be
-        # set BEFORE the port is enabled (the symlink) or the kernel -EACCES.
-        echo $QUEUE_SIZE > \"\$portdir/param_max_queue_size\"
-        # Linking the subsystem ENABLES the port -> creates the listener
-        # socket, in THIS process's netns (NS_T). That is the whole point.
-        ln -sf \$sub \"\$portdir/subsystems/$NQN\"
-        echo \"   configfs port id \$pid (qid_max=$NR_QUEUES, max_queue_size=$QUEUE_SIZE)\"
-    "
-    echo "   listening on $IP_T:$PORT, subsystem $NQN, backend $BACKEND"
-}
-
-cmd_nvmet_target_down() {
-    local NQN=$NVMET_NQN
-    local cfg=/sys/kernel/config/nvmet
-    echo ">> removing nvmet-tcp target"
-    # The port id was claimed dynamically, so find OUR port by its NQN
-    # symlink and remove only that one — never another target's port.
-    in_net "$NS_T" bash -c "
-        cfg=$cfg
-        for link in \"\$cfg\"/ports/*/subsystems/$NQN; do
-            [ -e \"\$link\" ] || continue
-            portdir=\$(dirname \"\$(dirname \"\$link\")\")
-            rm -f \"\$link\"
-            rmdir \"\$portdir\" 2>/dev/null || true
-        done
-        echo 0 > \$cfg/subsystems/$NQN/namespaces/1/enable 2>/dev/null || true
-        rmdir  \$cfg/subsystems/$NQN/namespaces/1 2>/dev/null || true
-        rmdir  \$cfg/subsystems/$NQN 2>/dev/null || true
-    " || true
-}
-
-# ---- ioutgt target (runs in NS_T) ------------------------------------
-cmd_ioutgt_target() {
-    local NQN=$IOUTGT_NQN PORT=$IOUTGT_PORT
-    local BACKEND=${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}
-    [ -x "$IOUTGT_BIN" ] || { echo "build first: cargo build --release -p ioutgt (or set IOUTGT_BIN)"; exit 1; }
-    ensure_backing || exit 1
-    local zc=() zclabel=
-    if [ "$IOUTGT_SENDZC" != 0 ]; then
-        zc=(--send-zc); zclabel=", send-zc"
-        # --send-zc uses SENDMSG_ZC, which pins payload pages against
-        # RLIMIT_MEMLOCK. Under the default 8 MiB limit two in-flight batches
-        # alone can exceed it; the kernel then returns ENOMEM/ENOBUFS and
-        # ioutgt silently falls back to a copying send (correct, but no ZC
-        # benefit). Raise the limit (inherited by the ioutgt child below) so
-        # ZC actually engages. Best-effort: we already require root, but keep
-        # going if it cannot be raised.
-        ulimit -l unlimited 2>/dev/null || true
-    fi
-    echo ">> starting ioutgt in $NS_T on $IP_T:$PORT (backend $BACKEND, ${NR_QUEUES}q x $QUEUE_SIZE$zclabel)"
-    # ioutgt is pure userspace: ip netns exec is fine (no configfs), and its
-    # bind() lands in NS_T so the listener is on the wire-facing NIC.
-    ip netns exec "$NS_T" "$IOUTGT_BIN" \
-        --listen "$IP_T:$PORT" \
-        --backend "$BACKEND" \
-        --io-threads "$NR_QUEUES" \
-        --io-queue-size "$QUEUE_SIZE" \
-        "${zc[@]}" \
-        "${IOUTGT_DGST[@]}" \
-        --subsys-nqn "$NQN" \
-        --control-socket "$IOUTGT_SOCK" \
-        >"$IOUTGT_LOG" 2>&1 &
-    echo $! > "$IOUTGT_PIDFILE"
-    sleep 1
-    if kill -0 "$(cat "$IOUTGT_PIDFILE")" 2>/dev/null; then
-        echo "   pid $(cat "$IOUTGT_PIDFILE"), log $IOUTGT_LOG"
-    else
-        echo "   ioutgt exited immediately; log follows:"; cat "$IOUTGT_LOG"; exit 1
-    fi
 }
 
 # IRQ serving NIC queue index $2 of nic $1: combined "TxRx" else "rx", from the
@@ -527,12 +434,6 @@ EOF
     done <<EOF
 $rows
 EOF
-}
-
-cmd_ioutgt_target_down() {
-    [ -f "$IOUTGT_PIDFILE" ] && kill "$(cat "$IOUTGT_PIDFILE")" 2>/dev/null || true
-    rm -f "$IOUTGT_PIDFILE"
-    echo ">> ioutgt stopped"
 }
 
 # The discover / connect / disconnect / fio verbs and the sysfs device

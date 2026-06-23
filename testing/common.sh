@@ -10,6 +10,15 @@
 #   ini_exec <cmd...>     run an nvme-cli command in the initiator context
 #                         (`ip netns exec NS_I ...` for realwire; a direct
 #                         passthrough for local_tgt)
+#   nvmet_exec <script>   run a configfs shell snippet in the TARGET's network
+#                         context, so the nvmet listener socket is born there
+#                         (`in_net NS_T bash -c ...` for realwire; a direct
+#                         `bash -c ...` for local_tgt). Used by nvmet_setup/
+#                         nvmet_teardown; configfs itself is a global singleton,
+#                         only the enabling step is netns-sensitive.
+#   IOUTGT_NETNS          array launch-prefix for the ioutgt target process
+#                         (`(ip netns exec NS_T)` for realwire; `()` for
+#                         local_tgt). Used by ioutgt_start.
 #   IOUTGT_PORT/_NQN, NVMET_PORT/_NQN, HOSTNQN   per-target addressing
 #
 # The target-start functions additionally set a caller-local BACKEND that
@@ -83,6 +92,118 @@ ensure_backing() {
                                          || { echo "failed to create $BACKEND" >&2; return 1; }; } ;;
         *)      echo "BACKEND must be an absolute file or block-device path" >&2; return 1 ;;
     esac
+}
+
+# ---- nvmet-tcp target (Linux in-kernel; configfs) --------------------
+# nvmet_setup NQN PORT IP BACKEND — create + enable an nvmet-tcp subsystem and
+# a dynamically-claimed port. configfs is a global singleton, but the listener
+# SOCKET is created in the netns of whatever process writes the enabling
+# symlink, so the whole configfs script runs through the caller-supplied
+# nvmet_exec (direct for local_tgt; inside NS_T for realwire). modprobe and the
+# backing file are done in the current (global) mount ns first.
+#
+# Per-target values are interpolated by THIS (outer) shell; the script's own
+# loop vars ($cfg/$sub/$pid/$portdir) are escaped (\$) so they evaluate in the
+# target context.
+nvmet_setup() {
+    local nqn="$1" port="$2" ip="$3" backend="$4"
+    modprobe nvmet; modprobe nvmet-tcp
+    BACKEND="$backend" ensure_backing || return 1
+    echo ">> setting up nvmet-tcp on $ip:$port (backend $backend)"
+    nvmet_exec "
+        set -euo pipefail
+        cfg=/sys/kernel/config/nvmet; sub=\$cfg/subsystems/$nqn
+        mkdir -p \$sub
+        echo 1 > \$sub/attr_allow_any_host
+        # nr_queues -> nvmet's per-subsystem max queue id (qid 1..N).
+        echo $NR_QUEUES > \$sub/attr_qid_max
+        mkdir -p \$sub/namespaces/1
+        echo -n $backend > \$sub/namespaces/1/device_path
+        # Force O_DIRECT on a file backend (parity with ioutgt's default); must
+        # precede enable. Ignored for a block device.
+        echo 0 > \$sub/namespaces/1/buffered_io 2>/dev/null || true
+        echo 1 > \$sub/namespaces/1/enable
+        # Claim a FREE configfs port id; the port tree is a global singleton, so
+        # hardcoding port 1 would hijack an existing nvmet port on the host
+        # ('Disable port before changing attribute'). Never touch a port we did
+        # not create.
+        pid=1; while [ -e \"\$cfg/ports/\$pid\" ]; do pid=\$((pid + 1)); done
+        portdir=\$cfg/ports/\$pid; mkdir \"\$portdir\"
+        echo ipv4 > \"\$portdir/addr_adrfam\"
+        echo $ip   > \"\$portdir/addr_traddr\"
+        echo $port > \"\$portdir/addr_trsvcid\"
+        echo tcp   > \"\$portdir/addr_trtype\"
+        # queue_size -> advertised per-queue depth (SQSIZE/MAXCMD); must be set
+        # BEFORE the port is enabled (the symlink) or the kernel returns -EACCES.
+        echo $QUEUE_SIZE > \"\$portdir/param_max_queue_size\"
+        # Linking the subsystem ENABLES the port -> creates the listener socket,
+        # in the nvmet_exec context's netns.
+        ln -sf \$sub \"\$portdir/subsystems/$nqn\"
+        echo \"   listening on $ip:$port, subsystem $nqn (configfs port \$pid, qid_max=$NR_QUEUES, max_queue_size=$QUEUE_SIZE)\"
+    "
+}
+
+# nvmet_teardown NQN — remove only the port WE created (found by its NQN
+# symlink, never another target's) and the subsystem. Best-effort (no set -e).
+nvmet_teardown() {
+    local nqn="$1"
+    echo ">> removing nvmet-tcp target ($nqn)"
+    nvmet_exec "
+        cfg=/sys/kernel/config/nvmet
+        for link in \"\$cfg\"/ports/*/subsystems/$nqn; do
+            [ -e \"\$link\" ] || continue
+            portdir=\$(dirname \"\$(dirname \"\$link\")\")
+            rm -f \"\$link\"
+            rmdir \"\$portdir\" 2>/dev/null || true
+        done
+        echo 0 > \$cfg/subsystems/$nqn/namespaces/1/enable 2>/dev/null || true
+        rmdir \$cfg/subsystems/$nqn/namespaces/1 2>/dev/null || true
+        rmdir \$cfg/subsystems/$nqn 2>/dev/null || true
+    " || true
+}
+
+# ---- ioutgt target (userspace) ---------------------------------------
+# ioutgt_start NQN PORT IP BACKEND — launch the ioutgt target as a background
+# process and record its pid. The caller supplies IOUTGT_NETNS, an array launch
+# prefix (`(ip netns exec NS_T)` for realwire; `()` for local_tgt); ioutgt is
+# pure userspace (no configfs), so plain `ip netns exec` suffices. IOUTGT_BIN,
+# IOUTGT_SENDZC, IOUTGT_DGST, IOUTGT_SOCK/_LOG/_PIDFILE come from the env/common.
+ioutgt_start() {
+    local nqn="$1" port="$2" ip="$3" backend="$4"
+    [ -x "$IOUTGT_BIN" ] || { echo "build first: cargo build --release -p ioutgt (or set IOUTGT_BIN)"; exit 1; }
+    BACKEND="$backend" ensure_backing || exit 1
+    local zc=() zclabel=
+    if [ "$IOUTGT_SENDZC" != 0 ]; then
+        zc=(--send-zc); zclabel=", send-zc"
+        # --send-zc pins payload pages against RLIMIT_MEMLOCK; raise it so ZC
+        # engages instead of silently falling back to a copying send.
+        ulimit -l unlimited 2>/dev/null || true
+    fi
+    echo ">> starting ioutgt on $ip:$port (backend $backend, ${NR_QUEUES}q x $QUEUE_SIZE$zclabel)"
+    "${IOUTGT_NETNS[@]}" "$IOUTGT_BIN" \
+        --listen "$ip:$port" \
+        --backend "$backend" \
+        --io-threads "$NR_QUEUES" \
+        --io-queue-size "$QUEUE_SIZE" \
+        "${zc[@]}" \
+        "${IOUTGT_DGST[@]}" \
+        --subsys-nqn "$nqn" \
+        --control-socket "$IOUTGT_SOCK" \
+        >"$IOUTGT_LOG" 2>&1 &
+    echo $! > "$IOUTGT_PIDFILE"
+    sleep 1
+    if kill -0 "$(cat "$IOUTGT_PIDFILE")" 2>/dev/null; then
+        echo "   pid $(cat "$IOUTGT_PIDFILE"), log $IOUTGT_LOG"
+    else
+        echo "   ioutgt exited immediately; log follows:"; cat "$IOUTGT_LOG"; exit 1
+    fi
+}
+
+# ioutgt_stop — kill the ioutgt target by its recorded pid (best-effort).
+ioutgt_stop() {
+    [ -f "$IOUTGT_PIDFILE" ] && kill "$(cat "$IOUTGT_PIDFILE")" 2>/dev/null || true
+    rm -f "$IOUTGT_PIDFILE"
+    echo ">> ioutgt stopped"
 }
 
 # Namespace block device for an NQN via sysfs (/sys/block/*/device/subsysnqn)
