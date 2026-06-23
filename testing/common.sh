@@ -298,3 +298,88 @@ fio_one() {
         --iodepth="$FIO_QD" --numjobs="$FIO_JOBS" --ioengine=io_uring \
         --direct=1 --runtime="$FIO_SECS" --time_based --group_reporting
 }
+
+# fio terse v4 field indices (1-based, ';'-separated); see fio HOWTO and
+# tools/test/func/hfio. Each fio run here is pure read OR pure write, so only
+# the matching direction's iops/bw is non-zero.
+FIO_T_RIOPS=8; FIO_T_RBW=7      # read iops, read bandwidth (KiB/s)
+FIO_T_WIOPS=49; FIO_T_WBW=48    # write iops, write bandwidth (KiB/s)
+FIO_T_UCPU=129; FIO_T_SCPU=130  # fio user / system CPU (%)
+
+# "tid utime stime comm" for each ioutgt queue (io) thread, in clock ticks from
+# /proc. Two cheap snapshots bracket an fio run (no polling *during* the run),
+# so the active queue thread's user/system CPU can be sampled without
+# perturbing it.
+_ioutgt_io_ticks() {
+    local pid="$1" tid comm stat rest
+    [ -n "$pid" ] && [ -d "/proc/$pid/task" ] || return 0
+    for tid in "/proc/$pid/task"/*; do
+        tid="${tid##*/}"
+        read -r comm < "/proc/$pid/task/$tid/comm" 2>/dev/null || continue
+        case "$comm" in ioutgt-io*) ;; *) continue ;; esac
+        read -r stat < "/proc/$pid/task/$tid/stat" 2>/dev/null || continue
+        rest="${stat#*) }"          # drop "pid (comm) "; now state=$1 ...
+        # shellcheck disable=SC2086  # deliberate split of the stat fields
+        set -- $rest                # utime=field14=$12, stime=field15=$13
+        printf '%s %s %s %s\n' "$tid" "${12}" "${13}" "$comm"
+    done
+}
+
+# Perf sweep: randread/randwrite x bs={4k,64k}, one compact line per combo
+# (rw / iops / BW / fio_cpu), honoring FIO_JOBS/FIO_QD/FIO_SECS. Numbers come
+# from fio's terse output (parsed, not scraped). Modeled on
+# tools/test/func/hfio's _fio_perf. For the ioutgt target each line also ends
+# with the busiest (active) queue thread and its user/system CPU%, sampled by
+# bracketing the run with two /proc reads so it does not affect the result.
+fio_perf_one() {
+    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
+    local dev; dev=$(find_dev "$nqn") || { echo "no connected device for $1 ($nqn); run 'connect $1' first"; exit 1; }
+    echo ">> fio_perf on $dev [$1]  (jobs=$FIO_JOBS qd=$FIO_QD ${FIO_SECS}s/run)"
+    local out; out="$(mktemp)"
+    local hz; hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+    # Only ioutgt exposes user-space queue threads to sample; nvmet is in-kernel.
+    local pid=""; [ "$1" = ioutgt ] && pid="$(cat "${IOUTGT_PIDFILE:-}" 2>/dev/null || true)"
+    local bs rw line iops bw ucpu scpu before after t0 t1 iothr lineout
+    for bs in 4k 64k; do
+        for rw in randread randwrite; do
+            before="$(_ioutgt_io_ticks "$pid")"; t0="$(date +%s.%N)"
+            # `|| true`: a failed fio must fall through to the "no terse output"
+            # guard below, not abort the whole sweep under set -e.
+            fio --name=perf --filename="$dev" --rw="$rw" --bs="$bs" \
+                --iodepth="$FIO_QD" --numjobs="$FIO_JOBS" --ioengine=io_uring \
+                --direct=1 --runtime="$FIO_SECS" --time_based --group_reporting \
+                --output-format=terse --terse-version=4 >"$out" 2>/dev/null || true
+            t1="$(date +%s.%N)"; after="$(_ioutgt_io_ticks "$pid")"
+            # The group line begins with the terse version ("4;"); ignore any
+            # stray output. `|| true`: no match must fall through to the
+            # "no terse output" guard below, not abort the sweep under set -e.
+            line="$(grep '^4;' "$out" | tail -1 || true)"
+            if [ -z "$line" ]; then
+                printf "   %-9s bs=%-4s  (fio produced no terse output)\n" "$rw" "$bs"
+                continue
+            fi
+            case "$rw" in
+                *read*)  iops="$(echo "$line" | cut -d';' -f"$FIO_T_RIOPS")"; bw="$(echo "$line" | cut -d';' -f"$FIO_T_RBW")" ;;
+                *)       iops="$(echo "$line" | cut -d';' -f"$FIO_T_WIOPS")"; bw="$(echo "$line" | cut -d';' -f"$FIO_T_WBW")" ;;
+            esac
+            ucpu="$(echo "$line" | cut -d';' -f"$FIO_T_UCPU")"
+            scpu="$(echo "$line" | cut -d';' -f"$FIO_T_SCPU")"
+            lineout="$(awk -v rw="$rw" -v bs="$bs" -v iops="${iops:-0}" -v bw="${bw:-0}" -v u="${ucpu:-0}" -v s="${scpu:-0}" \
+                'BEGIN{printf "   %-9s bs=%-4s  iops=%8.1fk  BW=%9.2f MiB/s  fio_cpu(usr=%5.1f%% sys=%5.1f%%)", rw, bs, iops/1000, bw/1024, u, s}')"
+            # ioutgt only: append the busiest queue thread (by delta utime+stime
+            # over the run) and its user/system CPU%, from the two snapshots.
+            iothr=""
+            if [ -n "$pid" ] && [ -n "$before" ]; then
+                iothr="$(awk -v t0="$t0" -v t1="$t1" -v hz="$hz" '
+                    NR==FNR { bu[$1]=$2; bs[$1]=$3; next }
+                    { du=$2-bu[$1]; ds=$3-bs[$1]; tot=du+ds
+                      if (tot>mt) { mt=tot; mu=du; ms=ds; mn=$4 } }
+                    END { dt=t1-t0; if (dt<=0) dt=1
+                          if (mn!="") printf "  io_thr=%s(usr=%.1f%% sys=%.1f%%)", mn, 100*mu/(dt*hz), 100*ms/(dt*hz) }
+                ' <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
+            fi
+            printf '%s%s\n' "$lineout" "$iothr"
+        done
+    done
+    rm -f "$out"
+}

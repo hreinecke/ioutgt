@@ -137,6 +137,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   connect       [nvmet|ioutgt]  nvme connect; wait for the namespace device
   disconnect    [nvmet|ioutgt]  nvme disconnect
   fio           [nvmet|ioutgt]  fio on the connected device(s)
+  fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k},
+                                one line per combo (iops/BW/fio_cpu)
   status                        netns, addresses, listeners, connected devices
   help                          this message
 
@@ -558,6 +560,7 @@ case "${1:-}" in
                          case "${2:-}" in ioutgt|"") ioutgt_sync_affinity ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
+    fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
     status)              cmd_status ;;
     help|usage)          usage ;;
     *) usage >&2; exit 1 ;;
