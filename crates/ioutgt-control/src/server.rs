@@ -313,7 +313,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                             // taken at Connect (q.cpus).
                             let cpus = ioutgt_core::controller::cpus_of(q.tid);
                             json!({ "qid": q.qid, "depth": q.sqsize, "tid": q.tid,
-                                    "cpus": cpus, "group_cpus": group })
+                                    "cpus": cpus, "group_cpus": group, "peer": q.peer })
                         })
                         .collect();
                     json!({

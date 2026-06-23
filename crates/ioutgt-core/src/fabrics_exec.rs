@@ -28,6 +28,7 @@ fn queue_info<B: Backend>(ctx: &ConnCtx<B>) -> QueueInfo {
         sqsize: ctx.queue.sqsize,
         tid: current_tid(),
         cpus: current_cpus(),
+        peer: ctx.peer.clone(),
     }
 }
 

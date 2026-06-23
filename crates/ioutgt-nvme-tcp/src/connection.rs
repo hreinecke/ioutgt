@@ -240,12 +240,14 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     };
     let queue = NvmeTcpQueue::new(conn.qid, conn.sqsize, slot_buf, conn.sqhd_disabled);
     let fd = conn.fd.as_raw_fd();
+    let peer = ioutgt_core::controller::peer_of(fd);
     let ctx = if conn.qid == 0 {
         ConnCtx::new_admin(
             Rc::clone(&queue.nvme),
             Arc::clone(&conn.port),
             Arc::clone(&conn.registry),
             conn.connect_data,
+            peer,
         )
     } else {
         ConnCtx::new_io(
@@ -253,6 +255,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
             Arc::clone(&conn.port),
             Arc::clone(&conn.registry),
             conn.connect_data,
+            peer,
         )
     };
 

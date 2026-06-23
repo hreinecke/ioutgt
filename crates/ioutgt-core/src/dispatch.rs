@@ -27,6 +27,8 @@ pub struct ConnCtx<B> {
     pub registry: Arc<Registry>,
     /// Connect data of this queue's Connect command.
     pub connect_data: Box<ConnectData>,
+    /// Peer "ip:port" of this queue's TCP connection (for `LIST_CONTROLLER`).
+    pub peer: String,
     pub role: Role<B>,
 }
 
@@ -85,12 +87,14 @@ impl<B: Backend> ConnCtx<B> {
         port: Arc<PortConfig<B>>,
         registry: Arc<Registry>,
         connect_data: Box<ConnectData>,
+        peer: String,
     ) -> Rc<Self> {
         Rc::new(ConnCtx {
             queue,
             port,
             registry,
             connect_data,
+            peer,
             role: Role::Admin(AdminState {
                 regs: RefCell::new(RegisterState::new(crate::MAX_QUEUE_ENTRIES)),
                 cntlid: Cell::new(0),
@@ -115,12 +119,14 @@ impl<B: Backend> ConnCtx<B> {
         port: Arc<PortConfig<B>>,
         registry: Arc<Registry>,
         connect_data: Box<ConnectData>,
+        peer: String,
     ) -> Rc<Self> {
         Rc::new(ConnCtx {
             queue,
             port,
             registry,
             connect_data,
+            peer,
             role: Role::Io(IoState {
                 cntlid: Cell::new(0),
                 subsys: std::cell::OnceCell::new(),
