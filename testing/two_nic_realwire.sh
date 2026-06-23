@@ -322,6 +322,45 @@ cpu_xps_mask() {
     printf '%s' "$out"
 }
 
+# Expand a kernel cpulist ("12-13,44-47") to space-separated cpu ids.
+expand_cpus() {
+    local part a b c
+    # Only real cpulists; reject ''/'*'/'?'/unknown so the unquoted split below
+    # can never glob filenames against the cwd.
+    case "$1" in ''|*[!0-9,-]*) return 0 ;; esac
+    for part in ${1//,/ }; do
+        if [[ $part == *-* ]]; then
+            a=${part%-*}; b=${part#*-}
+            for ((c = a; c <= b; c++)); do printf '%s ' "$c"; done
+        else
+            printf '%s ' "$part"
+        fi
+    done
+}
+
+# Pick the HT sibling of the NIC RX-IRQ CPU $2 -- the other logical CPU on the
+# SAME physical core. Co-locating the io-thread on its own RX-IRQ CPU serializes
+# the NIC RX softirq and the recv/copy on one logical CPU, capping a single fast
+# connection ~20% (measured on bnxt_en 10GbE: 888 vs ~1040 MiB/s, 64K randwrite,
+# beating nvmet). The sibling runs them on two logical CPUs (no serialization)
+# while sharing the core's L1/L2, so the data the softirq just landed is still
+# warm for the io-thread's copy. Falls back, when SMT is off (no sibling), to a
+# different physical core in group $1, then to irqcpu itself.
+iothread_cpu() {
+    local group="$1" irqcpu="$2" sib cpu
+    # The IRQ CPU's HT sibling (the thread_siblings entry that is not itself).
+    for cpu in $(expand_cpus "$(cat "/sys/devices/system/cpu/cpu$irqcpu/topology/thread_siblings_list" 2>/dev/null)"); do
+        [ "$cpu" != "$irqcpu" ] && { echo "$cpu"; return 0; }
+    done
+    # SMT off: no sibling -- use a different physical core in the NUMA group.
+    sib=" $(expand_cpus "$(cat "/sys/devices/system/cpu/cpu$irqcpu/topology/thread_siblings_list" 2>/dev/null)") "
+    for cpu in $(expand_cpus "$group"); do
+        case "$sib" in *" $cpu "*) continue ;; esac
+        echo "$cpu"; return 0
+    done
+    echo "$irqcpu"
+}
+
 # Converge NIC_T's rx/tx queue IRQs and ioutgt's io-thread CPUs. Run AFTER
 # connect: the queue-thread pool spawns lazily on the first connection and
 # `ioutgt list` reports each IO queue's pthread tid + full online CPU group
@@ -329,12 +368,15 @@ cpu_xps_mask() {
 # queue i (== qid i+1 == io-thread i):
 #   1. push the io-thread's whole CPU group onto the queue's rx/tx IRQ
 #      smp_affinity (NIC follows ioutgt -- a no-op on a managed/read-only IRQ);
-#   2. read the rx/tx IRQ *effective* affinity, combine it, and taskset the
-#      io-thread (by tid) to that combination (io-thread follows where the IRQ
-#      softirq actually lands -- the only direction available for managed IRQs).
+#   2. read the rx/tx IRQ *effective* affinity, then taskset the io-thread (by
+#      tid) to the IRQ CPU's HT SIBLING -- a different logical CPU on the same
+#      physical core, NOT the IRQ CPU itself. Co-locating the io-thread on its
+#      RX-IRQ CPU serializes the NIC RX softirq and the recv/copy on one logical
+#      CPU and caps a single fast connection ~20% (measured 888 vs ~1040 MiB/s,
+#      64K randwrite, the latter beating nvmet); the sibling runs them on two
+#      logical CPUs that share L1/L2 (cache-warm). See iothread_cpu().
 #   3. XPS: map the io-thread's CPU -> this queue's tx ring (xps_cpus), so the
-#      thread's sends egress here and the TX completion IRQ lands on the same
-#      CPU (the heavy direction for reads).
+#      thread's sends egress here.
 # Steps 1-3 only align queue<->thread CPUs; they do NOT decide which queue a
 # *flow* uses (RSS picks the RX queue, decoupled from the qid->io-thread route);
 # per-flow RX co-location is added separately via hardware ntuple rules.
@@ -359,7 +401,7 @@ ioutgt_sync_affinity() {
     fi
     systemctl stop irqbalance 2>/dev/null || true
     echo ">> converging $NIC_T queue IRQ affinity <-> ioutgt io-threads"
-    local qid tid cpus group peer sport nicq irqs irq combo eff pushed xcpu xps
+    local qid tid cpus group peer sport nicq irqs irq combo eff pushed xcpu xps irqcpu iocpu
     while read -r qid tid cpus group peer; do
         [ -n "$qid" ] || continue
         nicq=$((qid - 1))
@@ -382,20 +424,25 @@ ioutgt_sync_affinity() {
             eff="$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || true)"
             [ -n "$eff" ] && combo="${combo:+$combo,}$eff"
         done
-        if [ -n "$combo" ] && taskset -cp "$combo" "$tid" >/dev/null 2>&1; then
-            # 3. XPS: a send from this io-thread's CPU egresses tx-$nicq, so the
-            #    TX completion IRQ lands on the same CPU. xps_cpus is netdev
-            #    sysfs (the NIC is in NS_T), and wants a hex CPU bitmask.
-            xcpu="${combo%%[,-]*}"; xps=skip
+        # Place the io-thread on the IRQ CPU's HT sibling (same physical core,
+        # different logical CPU; falls back to a different core when SMT is off)
+        # so the NIC RX softirq and the recv/copy pipeline on two logical CPUs
+        # instead of serializing on one (the single-connection write cap).
+        irqcpu="${combo%%[,-]*}"
+        iocpu="$(iothread_cpu "$group" "$irqcpu")"
+        if [ -n "$iocpu" ] && taskset -cp "$iocpu" "$tid" >/dev/null 2>&1; then
+            # 3. XPS: a send from this io-thread's CPU egresses tx-$nicq.
+            #    xps_cpus is netdev sysfs (the NIC is in NS_T), hex CPU bitmask.
+            xcpu="$iocpu"; xps=skip
             case "$xcpu" in
                 ''|*[!0-9]*) ;;
                 *) if ip netns exec "$NS_T" bash -c \
                         "echo $(cpu_xps_mask "$xcpu") > /sys/class/net/$NIC_T/queues/tx-$nicq/xps_cpus" \
                         2>/dev/null; then xps="cpu $xcpu"; fi ;;
             esac
-            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}] -> io-thread tid $tid aff=$combo, xps tx-$nicq=$xps (was cpu $cpus)"
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] eff=$combo group=$group -> io-thread tid $tid cpu $iocpu (off irq cpu $irqcpu), xps tx-$nicq=$xps (was cpu $cpus)"
         else
-            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '$combo' failed"
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '${iocpu:-?}' (irq cpu $irqcpu) failed"
         fi
     done <<EOF
 $rows
@@ -464,14 +511,12 @@ cmd_status() {
         if [ -z "$rows" ]; then
             echo "  (no connected IO queues)"
         else
-            # Note: this verifies the SYNC INVARIANT (io-thread CPU == its
-            # NIC-queue IRQ effective CPU). It does NOT prove a given flow is
-            # co-located: the NIC steers a flow to a queue by RSS/tx-hash,
-            # independent of which qid (io-thread) serves it -- so a flow on
-            # io-thread T may ride a different NIC queue whose IRQ is elsewhere.
-            # True per-flow co-location needs hardware ntuple steering (rx) +
-            # XPS (tx) -- not software RPS/RFS, which co-locates via IPI storm.
-            local qid tid cpus group nicq irqs irq eff verdict mism=0
+            # Verify the SEPARATION invariant: each io-thread runs on a
+            # different logical CPU than its NIC-queue RX IRQ (the sync places
+            # it on the IRQ CPU's HT sibling), so the RX softirq and the
+            # recv/copy don't serialize on one logical CPU (the single-
+            # connection write cap). OK = different CPU; SAME-CPU = co-located.
+            local qid tid cpus group nicq irqs irq eff verdict mism=0 ircpu
             while read -r qid tid cpus group; do
                 [ -n "$qid" ] || continue
                 nicq=$((qid - 1))
@@ -480,20 +525,21 @@ cmd_status() {
                 for irq in $irqs; do
                     eff="${eff:+$eff,}$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || echo '?')"
                 done
-                if [ "$cpus" = "$eff" ]; then
-                    verdict=OK
-                else
-                    verdict=MISMATCH; mism=$((mism + 1))
-                fi
+                ircpu="${eff%%,*}"
+                case "$cpus" in
+                    *[!0-9]*)  verdict='?' ;;          # unpinned/unknown io-thread
+                    "$ircpu")  verdict=SAME-CPU; mism=$((mism + 1)) ;;
+                    *)         verdict=OK ;;
+                esac
                 printf "  q%-2s io-thread(tid %s) aff=%-10s group=%-12s | irq[%s] eff=%-10s %s\n" \
                     "$nicq" "$tid" "$cpus" "$group" "$(echo $irqs | tr '\n' ' ' | sed 's/ $//')" "${eff:-?}" "$verdict"
             done <<EOF
 $rows
 EOF
             if [ "$mism" -eq 0 ]; then
-                echo "  sync invariant: OK (every io-thread CPU == its NIC queue IRQ effective)"
+                echo "  separation: OK (every io-thread on a different CPU than its NIC RX IRQ)"
             else
-                echo "  sync invariant: $mism queue(s) MISMATCHED -- re-run 'connect' (or irqbalance restarted?)"
+                echo "  separation: $mism queue(s) SAME-CPU as their RX IRQ -- re-run 'connect' (or irqbalance restarted?)"
             fi
         fi
     fi

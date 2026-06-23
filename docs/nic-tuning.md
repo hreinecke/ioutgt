@@ -351,8 +351,34 @@ whole flow on *C* with no IPIs:
 
 `testing/two_nic_realwire.sh` automates 1–5 for the ioutgt target NIC: it
 reads each io-thread's CPU and its connection's peer port from `ioutgt list`,
-pins/aligns the queue IRQs, sets XPS, disables RPS/RFS, and installs one
-ntuple rule per connection (`its src-port → its io-thread's queue`).
+aligns the queue IRQs to each io-thread's NUMA group, sets XPS, disables
+RPS/RFS, and installs one ntuple rule per connection (`its src-port → its
+io-thread's queue`).
+
+### 14.1. Caveat — don't share one core between the RX softirq and the consumer
+
+Step 2 above ("IRQ → CPU *C*", with the app thread also on *C*) minimizes IPIs
+and cache-line bouncing, which is the right trade when **many** flows share each
+core. But for a **single throughput-bound connection per core** it backfires:
+the NIC RX softirq (GRO, TCP receive, copy into the socket buffer) and the
+consumer's recv/copy are *both* heavy, and forcing them onto one core
+**serializes** them — the core saturates and caps the flow.
+
+Measured on bnxt_en 10GbE (one connection, 64K randwrite, qd128), within one
+ioutgt instance, moving only the io-thread:
+
+| io-thread placement vs its RX IRQ | throughput |
+|-----------------------------------|------------|
+| same core (co-located)            | 888 MiB/s  |
+| different physical core, same NUMA group | ~1040 MiB/s (beats nvmet) |
+
+So for the recv-heavy single-flow case, place the consumer thread on a
+**different physical core than its RX IRQ** (same NUMA node for cache warmth):
+softirq-receive on one core, app-process on its neighbour, pipelined. NUMA
+locality is secondary here — a far node measured just as fast; the **separation**
+is what matters. `two_nic_realwire.sh` does this (`iothread_cpu()` skips the IRQ
+CPU and its HT siblings when picking the io-thread's core); `status` reports
+`separation: OK` when every io-thread is off its RX-IRQ core.
 
 ## 15. Quick command reference
 
