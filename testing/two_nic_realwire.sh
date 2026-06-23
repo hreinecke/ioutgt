@@ -442,17 +442,18 @@ ioutgt_sync_affinity() {
     command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
     local json rows
     json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"
-    # qid, tid, active CPU, and the full online CPU group (a cpulist; no spaces).
+    # qid, tid, active CPU, full online CPU group (cpulist), peer ip:port -- all
+    # single whitespace-free tokens.
     rows="$(printf '%s' "$json" \
-        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus)"' \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus) \(.peer)"' \
             2>/dev/null | sort -n -u || true)"
     if [ -z "$rows" ]; then
         echo "   (no connected IO queues; run 'connect' first)"; return 0
     fi
     systemctl stop irqbalance 2>/dev/null || true
     echo ">> converging $NIC_T queue IRQ affinity <-> ioutgt io-threads"
-    local qid tid cpus group nicq irqs irq combo eff pushed xcpu xps
-    while read -r qid tid cpus group; do
+    local qid tid cpus group peer sport nicq irqs irq combo eff pushed xcpu xps
+    while read -r qid tid cpus group peer; do
         [ -n "$qid" ] || continue
         nicq=$((qid - 1))
         irqs="$(nic_queue_irqs "$NIC_T" "$nicq")"
@@ -502,6 +503,30 @@ EOF
             echo 0 > "$q/rps_cpus" 2>/dev/null
         done' 2>/dev/null || true
     echo "   RPS/RFS disabled (RX softirqs stay on their queue CPU; no relocation IPIs)"
+
+    # Hardware ntuple RX steering: have the NIC deliver each connection's RX
+    # directly to its io-thread's queue (qid-1) -- no software RFS, no IPI, and
+    # stable (a fixed rule, not an adaptive guess). Match the inbound flow by the
+    # host's ephemeral source port (unique per connection) + our listen port.
+    # The combined channel shares the CPU with tx (and XPS steers tx there too).
+    ip netns exec "$NS_T" ethtool -K "$NIC_T" ntuple on >/dev/null 2>&1 || true
+    # Clear stale rules (previous runs' source ports) for a clean slate.
+    ip netns exec "$NS_T" bash -c 'ethtool -n '"$NIC_T"' 2>/dev/null | awk "/Filter:/{print \$2}" \
+        | while read -r id; do ethtool -N '"$NIC_T"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
+    echo ">> steering each flow to its io-thread queue via NIC ntuple (no IPI)"
+    while read -r qid tid cpus group peer; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1)); sport="${peer##*:}"
+        case "$sport" in ''|*[!0-9]*) echo "   q$nicq: no peer port ($peer); skipped"; continue ;; esac
+        if ip netns exec "$NS_T" ethtool -N "$NIC_T" flow-type tcp4 \
+                src-port "$sport" dst-port "$IOUTGT_PORT" action "$nicq" >/dev/null 2>&1; then
+            echo "   q$nicq: src-port $sport -> rx queue $nicq (hardware)"
+        else
+            echo "   q$nicq: ntuple rule (src-port $sport) rejected"
+        fi
+    done <<EOF
+$rows
+EOF
 }
 
 cmd_ioutgt_target_down() {
