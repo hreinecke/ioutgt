@@ -355,30 +355,40 @@ aligns the queue IRQs to each io-thread's NUMA group, sets XPS, disables
 RPS/RFS, and installs one ntuple rule per connection (`its src-port → its
 io-thread's queue`).
 
-### 14.1. Caveat — don't share one core between the RX softirq and the consumer
+### 14.1. Caveat — don't share one *logical CPU* between the RX softirq and the consumer
 
 Step 2 above ("IRQ → CPU *C*", with the app thread also on *C*) minimizes IPIs
 and cache-line bouncing, which is the right trade when **many** flows share each
 core. But for a **single throughput-bound connection per core** it backfires:
 the NIC RX softirq (GRO, TCP receive, copy into the socket buffer) and the
-consumer's recv/copy are *both* heavy, and forcing them onto one core
-**serializes** them — the core saturates and caps the flow.
+consumer's recv/copy are *both* heavy, and forcing them onto one logical CPU
+**serializes** them — the CPU saturates and caps the flow.
 
-Measured on bnxt_en 10GbE (one connection, 64K randwrite, qd128), within one
-ioutgt instance, moving only the io-thread:
+The cure is to run them on **two logical CPUs** so they pipeline. Best is the
+RX-IRQ CPU's **HT sibling** — a separate logical CPU on the *same physical core*,
+so the consumer shares L1/L2 with the softirq that just landed the data
+(cache-warm) without serializing on one CPU.
 
-| io-thread placement vs its RX IRQ | throughput |
-|-----------------------------------|------------|
-| same core (co-located)            | 888 MiB/s  |
-| different physical core, same NUMA group | ~1040 MiB/s (beats nvmet) |
+Measured on bnxt_en 10GbE (one connection, 64K, qd128), within one ioutgt
+instance, moving only the io-thread:
 
-So for the recv-heavy single-flow case, place the consumer thread on a
-**different physical core than its RX IRQ** (same NUMA node for cache warmth):
-softirq-receive on one core, app-process on its neighbour, pipelined. NUMA
-locality is secondary here — a far node measured just as fast; the **separation**
-is what matters. `two_nic_realwire.sh` does this (`iothread_cpu()` skips the IRQ
-CPU and its HT siblings when picking the io-thread's core); `status` reports
-`separation: OK` when every io-thread is off its RX-IRQ core.
+| io-thread placement vs its RX IRQ | 64K randwrite | 64K randread |
+|-----------------------------------|---------------|--------------|
+| same logical CPU (co-located)     | 888 MiB/s     | — |
+| different physical core, same node | ~1040 MiB/s  | — |
+| **HT sibling (same core)**        | **~1075 MiB/s** | **~1107 MiB/s** |
+
+The sibling is the fastest and most consistent (writes 1041–1092, beating nvmet
+~825–1070; reads ~1107 ≈ nvmet ~1116, both near 10 GbE line rate). Reads — which
+are send-heavy on the target — are unaffected by the choice. nvmet shows the
+*same* lottery (it does no pinning, so its `io_work` lands on its own IRQ CPU at
+random), which is why its write number swings widely run to run.
+
+`two_nic_realwire.sh` does this: `iothread_cpu()` pins each io-thread to its
+RX-IRQ CPU's HT sibling (falling back to a different physical core when SMT is
+off); `status` reports `separation: OK` when every io-thread is on a different
+CPU than its RX IRQ. NUMA locality is secondary — a far node measured just as
+fast; the **CPU-level separation** is what matters.
 
 ## 15. Quick command reference
 
