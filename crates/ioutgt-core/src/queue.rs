@@ -185,17 +185,17 @@ impl<C: Copy> std::ops::Deref for QueueCore<C> {
 }
 
 impl<C: Copy> QueueCore<C> {
-    /// Allocate a queue: `sqsize` slots each with a `slot_buf_size`
-    /// data buffer, every slot's command stash initialized to `init`.
+    /// Allocate a queue: `sqsize` slots sharing a `pool_bytes` data-buffer
+    /// pool, every slot's command stash initialized to `init`.
     pub fn new(
         qid: u16,
         sqsize: u16,
-        slot_buf_size: usize,
+        pool_bytes: usize,
         sqhd_disabled: bool,
         init: C,
     ) -> Rc<QueueCore<C>> {
         Rc::new(QueueCore {
-            slots: SlotArray::new(sqsize, slot_buf_size, init),
+            slots: SlotArray::new(sqsize, pool_bytes, init),
             sqsize,
             qid,
             sqhd: Cell::new(0),

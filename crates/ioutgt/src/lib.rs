@@ -49,6 +49,8 @@ pub struct TargetConfig {
     /// Advertised IO MAXCMD ceiling (entries): the maximum IO queue
     /// depth the host may use. The admin queue is unaffected.
     pub io_queue_size: u16,
+    /// Per-IO-queue data-buffer pool size in bytes (slots lease on demand).
+    pub queue_buf_bytes: usize,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
     /// Tear the queue-thread pool down after this long with zero active
@@ -70,6 +72,7 @@ impl TargetConfig {
             pin_threads: false,
             send_zc: false,
             io_queue_size: 128,
+            queue_buf_bytes: ioutgt_core::pool::DEFAULT_POOL_BYTES,
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
             subsystems: vec![SubsystemConfig {
@@ -96,6 +99,7 @@ impl TargetConfig {
             pin_threads: file.pin_threads,
             send_zc: file.send_zc,
             io_queue_size: file.io_queue_size,
+            queue_buf_bytes: file.queue_buf_bytes,
             control_socket: file.control_socket,
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),
@@ -436,6 +440,7 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
         trsvcid: bound.port().to_string(),
         trtype: TransportType::Tcp,
         io_queue_size: config.io_queue_size,
+        queue_buf_bytes: config.queue_buf_bytes,
         subsystems,
     }))
 }

@@ -65,13 +65,13 @@ pub async fn execute<B: Backend>(
     }
 }
 
-/// Copy `data` into the slot buffer, honoring the host's transfer
-/// length implied by the identify/log structure size.
+/// Copy `data` into a freshly leased slot buffer, capped at the admin
+/// data limit (the admin pool is sized so this lease never blocks).
 fn fill_slot<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, data: &[u8]) -> u32 {
+    let n = data.len().min(crate::ADMIN_DATA_MAX);
+    ctx.queue.lease_or_owned(tag, n.max(1));
     let slot = ctx.queue.slot(tag);
-    let mut buf = slot.data();
-    let n = data.len().min(buf.len());
-    buf.write_at(0, &data[..n]);
+    slot.data().write_at(0, &data[..n]);
     u32::try_from(n).expect("slot buffers < 4G")
 }
 
@@ -328,8 +328,9 @@ fn get_log_page<B: Backend>(
         log_page::ERROR | log_page::SMART | log_page::FW_SLOT => {
             // Zero-filled pages: nothing to report yet.
             let n = len.min(4096);
-            let slot = ctx.queue.slot(tag);
-            slot.data().as_mut_slice()[..usize::try_from(n).expect("<=4096")].fill(0);
+            let take = usize::try_from(n).expect("<=4096");
+            ctx.queue.lease_or_owned(tag, take.max(1));
+            ctx.queue.slot(tag).data().as_mut_slice()[..take].fill(0);
             #[allow(clippy::cast_possible_truncation)]
             Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n as u32)
         }

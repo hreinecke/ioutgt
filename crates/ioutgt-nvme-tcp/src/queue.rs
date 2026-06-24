@@ -55,15 +55,11 @@ impl std::ops::Deref for NvmeTcpQueue {
 }
 
 impl NvmeTcpQueue {
-    /// Allocate the queue pair for one connection.
-    pub fn new(
-        qid: u16,
-        sqsize: u16,
-        slot_buf_size: usize,
-        sqhd_disabled: bool,
-    ) -> Rc<NvmeTcpQueue> {
+    /// Allocate the queue pair for one connection. `pool_bytes` sizes the
+    /// shared data-buffer pool slots lease from.
+    pub fn new(qid: u16, sqsize: u16, pool_bytes: usize, sqhd_disabled: bool) -> Rc<NvmeTcpQueue> {
         Rc::new(NvmeTcpQueue {
-            nvme: QueueCore::new(qid, sqsize, slot_buf_size, sqhd_disabled, Sqe::zeroed()),
+            nvme: QueueCore::new(qid, sqsize, pool_bytes, sqhd_disabled, Sqe::zeroed()),
             send: SendList::new(sqsize),
         })
     }

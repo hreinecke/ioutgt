@@ -12,7 +12,17 @@
 //! never-block write fallback), and `Pool` (pages leased from a [`BufPool`],
 //! returned on drop).
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::task::{Poll, Waker};
+
 use crate::buf::AlignedBuf;
+
+/// Allocation granule and minimum segment size.
+pub const PAGE: usize = 4096;
+
+/// Default per-IO-queue data-buffer pool.
+pub const DEFAULT_POOL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Max physical segments a single command buffer can span: MDTS
 /// (128 KiB) divided by the 4 KiB page granule.
@@ -32,19 +42,23 @@ pub struct Seg {
 }
 
 /// A command's data buffer, as a (possibly scattered) segment list.
+///
+/// The `segs` are the view every consumer uses; `owner` keeps the backing
+/// alive and, for a pool lease, returns the pages on drop.
 pub struct SlotData {
-    /// Owns the backing allocation; the `segs` point into it.
-    #[allow(dead_code)]
-    inner: Inner,
     segs: [Seg; MAX_SEGS],
     nsegs: u8,
     len: usize,
+    owner: Owner,
 }
 
-enum Inner {
-    /// A single owned page-aligned allocation, held for the slot's life
-    /// (the `Seg` points into it; the field exists only to own the drop).
+enum Owner {
+    /// No buffer leased (the resting state between commands).
+    Empty,
+    /// A single owned page-aligned allocation (drops itself).
     Owned(#[allow(dead_code)] AlignedBuf),
+    /// Pages leased from a [`BufPool`]; returned on drop.
+    Pool(Rc<BufPool>),
 }
 
 const NULL_SEG: Seg = Seg {
@@ -52,8 +66,27 @@ const NULL_SEG: Seg = Seg {
     len: 0,
 };
 
+impl Drop for SlotData {
+    fn drop(&mut self) {
+        if let Owner::Pool(pool) = &self.owner {
+            pool.free_segs(&self.segs[..self.nsegs as usize]);
+        }
+    }
+}
+
 #[allow(missing_docs)] // accessor names mirror the field semantics
 impl SlotData {
+    /// No buffer leased. Accessors that need bytes panic until a lease
+    /// replaces this (the recv path / dispatch lease before use).
+    pub fn empty() -> SlotData {
+        SlotData {
+            segs: [NULL_SEG; MAX_SEGS],
+            nsegs: 0,
+            len: 0,
+            owner: Owner::Empty,
+        }
+    }
+
     /// A single owned buffer of `len` bytes (rounded up to a page).
     pub fn owned(len: usize) -> SlotData {
         let buf = AlignedBuf::zeroed(len);
@@ -62,10 +95,10 @@ impl SlotData {
         let mut segs = [NULL_SEG; MAX_SEGS];
         segs[0] = Seg { ptr, len: n };
         SlotData {
-            inner: Inner::Owned(buf),
             segs,
             nsegs: 1,
             len: n,
+            owner: Owner::Owned(buf),
         }
     }
 
@@ -150,6 +183,184 @@ impl SlotData {
     }
 }
 
+/// A free run of contiguous pages (page units, not bytes).
+#[derive(Clone, Copy)]
+struct Run {
+    start: u32,
+    len: u32,
+}
+
+/// A per-queue contiguous data-buffer arena with a coalescing free-run
+/// allocator. Hands out [`SlotData`] leases — contiguous when a single
+/// run fits, otherwise a scatter list of up to [`MAX_SEGS`] runs. Single
+/// threaded (`Cell`/`RefCell`, no atomics), like the rest of core.
+pub struct BufPool {
+    base: AlignedBuf,
+    npages: u32,
+    /// Free runs, kept sorted by `start` and coalesced.
+    free: RefCell<Vec<Run>>,
+    free_pages: Cell<u32>,
+    /// Tasks parked waiting for pages; woken on any free.
+    waiters: RefCell<Vec<Waker>>,
+}
+
+/// Insert `run` into the sorted free list, coalescing with neighbors.
+fn insert_run(free: &mut Vec<Run>, run: Run) {
+    let pos = free.partition_point(|r| r.start < run.start);
+    free.insert(pos, run);
+    // Merge with the following run, then the preceding one.
+    if pos + 1 < free.len() && free[pos].start + free[pos].len == free[pos + 1].start {
+        free[pos].len += free[pos + 1].len;
+        free.remove(pos + 1);
+    }
+    if pos > 0 && free[pos - 1].start + free[pos - 1].len == free[pos].start {
+        free[pos - 1].len += free[pos].len;
+        free.remove(pos);
+    }
+}
+
+#[allow(missing_docs)] // method names mirror the semantics
+impl BufPool {
+    /// A pool of `bytes` rounded up to a whole number of pages (min 1).
+    pub fn new(bytes: usize) -> Rc<BufPool> {
+        let npages = u32::try_from(bytes.div_ceil(PAGE).max(1)).expect("pool page count fits u32");
+        let base = AlignedBuf::zeroed(npages as usize * PAGE);
+        Rc::new(BufPool {
+            base,
+            npages,
+            free: RefCell::new(vec![Run {
+                start: 0,
+                len: npages,
+            }]),
+            free_pages: Cell::new(npages),
+            waiters: RefCell::new(Vec::new()),
+        })
+    }
+
+    pub fn capacity_pages(&self) -> u32 {
+        self.npages
+    }
+
+    pub fn free_pages(&self) -> u32 {
+        self.free_pages.get()
+    }
+
+    fn page_ptr(&self, page: u32) -> *mut u8 {
+        // SAFETY: `page < npages`; the result stays within the slab.
+        unsafe { self.base.as_ptr().cast_mut().add(page as usize * PAGE) }
+    }
+
+    fn make_lease(self: &Rc<Self>, segs: [Seg; MAX_SEGS], nsegs: u8, pages: u32) -> SlotData {
+        self.free_pages.set(self.free_pages.get() - pages);
+        SlotData {
+            segs,
+            nsegs,
+            len: pages as usize * PAGE,
+            owner: Owner::Pool(Rc::clone(self)),
+        }
+    }
+
+    /// Lease `len` bytes (rounded up to whole pages): a contiguous run if
+    /// one is free, else a scatter list, else `None` (insufficient free
+    /// space, or the request would need more than [`MAX_SEGS`] runs).
+    pub fn alloc(self: &Rc<Self>, len: usize) -> Option<SlotData> {
+        let pages = u32::try_from(len.div_ceil(PAGE).max(1)).ok()?;
+        if self.free_pages.get() < pages {
+            return None;
+        }
+        let mut free = self.free.borrow_mut();
+        let mut segs = [NULL_SEG; MAX_SEGS];
+
+        // Fast path: a single run that fits (keeps the buffer contiguous).
+        if let Some(i) = free.iter().position(|r| r.len >= pages) {
+            let start = free[i].start;
+            free[i].start += pages;
+            free[i].len -= pages;
+            if free[i].len == 0 {
+                free.remove(i);
+            }
+            segs[0] = Seg {
+                ptr: self.page_ptr(start),
+                len: pages as usize * PAGE,
+            };
+            drop(free);
+            return Some(self.make_lease(segs, 1, pages));
+        }
+
+        // Scatter path: confirm it fits in ≤ MAX_SEGS runs before mutating.
+        let mut need = pages;
+        let mut count = 0;
+        for r in free.iter() {
+            if need == 0 {
+                break;
+            }
+            count += 1;
+            if count > MAX_SEGS {
+                return None;
+            }
+            need = need.saturating_sub(r.len);
+        }
+        if need > 0 {
+            return None; // (unreachable given the free_pages check)
+        }
+
+        // Carve from the front; every taken run is whole except the last.
+        let mut need = pages;
+        let mut nsegs = 0usize;
+        while need > 0 {
+            let take = need.min(free[0].len);
+            segs[nsegs] = Seg {
+                ptr: self.page_ptr(free[0].start),
+                len: take as usize * PAGE,
+            };
+            nsegs += 1;
+            free[0].start += take;
+            free[0].len -= take;
+            need -= take;
+            if free[0].len == 0 {
+                free.remove(0);
+            }
+        }
+        drop(free);
+        #[allow(clippy::cast_possible_truncation)] // nsegs <= MAX_SEGS (32)
+        Some(self.make_lease(segs, nsegs as u8, pages))
+    }
+
+    /// Lease `len` bytes, parking until enough pages free up. Backpressure
+    /// for an oversubscribed pool; never deadlocks because frees never
+    /// depend on the parked task.
+    pub async fn alloc_await(self: &Rc<Self>, len: usize) -> SlotData {
+        std::future::poll_fn(|cx| match self.alloc(len) {
+            Some(d) => Poll::Ready(d),
+            None => {
+                self.waiters.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Return leased pages to the free list (called from `SlotData::drop`).
+    fn free_segs(&self, segs: &[Seg]) {
+        let base = self.base.as_ptr() as usize;
+        let mut free = self.free.borrow_mut();
+        let mut freed = 0u32;
+        for seg in segs {
+            let start = u32::try_from((seg.ptr as usize - base) / PAGE).expect("page index");
+            let len = u32::try_from(seg.len / PAGE).expect("page count");
+            freed += len;
+            insert_run(&mut free, Run { start, len });
+        }
+        drop(free);
+        self.free_pages.set(self.free_pages.get() + freed);
+        // Wake everyone parked; they re-contend (bounded by queue depth).
+        let woken: Vec<Waker> = self.waiters.borrow_mut().drain(..).collect();
+        for w in woken {
+            w.wake();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +408,97 @@ mod tests {
         d.for_each_seg(0, 5, |c| viaseg.extend_from_slice(c));
         assert_eq!(&viaseg, b"hello");
         assert_eq!(&d.as_slice()[..5], b"hello");
+    }
+
+    fn poll<T>(fut: std::pin::Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+        let waker = Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        fut.poll(&mut cx)
+    }
+    use std::future::Future;
+
+    #[test]
+    fn pool_rounds_to_pages() {
+        let p = BufPool::new(4 * 1024 * 1024);
+        assert_eq!(p.capacity_pages(), 1024);
+        assert_eq!(p.free_pages(), 1024);
+        let p2 = BufPool::new(100);
+        assert_eq!(p2.capacity_pages(), 1);
+    }
+
+    #[test]
+    fn alloc_contiguous_then_free_coalesces() {
+        let p = BufPool::new(4 * PAGE);
+        {
+            let d = p.alloc(2 * PAGE).unwrap();
+            assert!(d.is_contiguous());
+            assert_eq!(d.len(), 2 * PAGE);
+            assert_eq!(p.free_pages(), 2);
+        }
+        // Drop returned the pages and coalesced back to one full run.
+        assert_eq!(p.free_pages(), 4);
+        let d = p.alloc(4 * PAGE).unwrap();
+        assert!(d.is_contiguous(), "fully coalesced run is contiguous again");
+    }
+
+    #[test]
+    fn alloc_returns_scatter_when_fragmented() {
+        let p = BufPool::new(4 * PAGE);
+        let a = p.alloc(PAGE).unwrap(); // page 0
+        let b = p.alloc(PAGE).unwrap(); // page 1
+        let c = p.alloc(PAGE).unwrap(); // page 2
+        let _d = p.alloc(PAGE).unwrap(); // page 3
+        assert_eq!(p.free_pages(), 0);
+        // Free pages 0 and 2 → two 1-page holes, non-adjacent.
+        drop(a);
+        drop(c);
+        let _ = b; // keep page 1 held so the holes stay split
+        assert_eq!(p.free_pages(), 2);
+        let scattered = p.alloc(2 * PAGE).unwrap();
+        assert!(!scattered.is_contiguous());
+        assert_eq!(scattered.segs().len(), 2);
+        assert_eq!(scattered.len(), 2 * PAGE);
+    }
+
+    #[test]
+    fn alloc_none_when_exhausted() {
+        let p = BufPool::new(2 * PAGE);
+        let _a = p.alloc(2 * PAGE).unwrap();
+        assert!(p.alloc(PAGE).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // i % 256 fits u8
+    fn scatter_roundtrips_bytes_across_segments() {
+        let p = BufPool::new(4 * PAGE);
+        let a = p.alloc(PAGE).unwrap();
+        let b = p.alloc(PAGE).unwrap();
+        let c = p.alloc(PAGE).unwrap();
+        let _d = p.alloc(PAGE).unwrap();
+        drop(a);
+        drop(c);
+        let _ = b;
+        let mut s = p.alloc(2 * PAGE).unwrap();
+        assert!(!s.is_contiguous());
+        // Write a pattern spanning the seam and read it back.
+        let src: Vec<u8> = (0..2 * PAGE).map(|i| (i % 256) as u8).collect();
+        s.write_at(0, &src);
+        let mut back = Vec::new();
+        s.for_each_seg(0, 2 * PAGE, |chunk| back.extend_from_slice(chunk));
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn alloc_await_wakes_on_free() {
+        let p = BufPool::new(PAGE);
+        let held = p.alloc(PAGE).unwrap();
+        assert_eq!(p.free_pages(), 0);
+
+        let fut = p.alloc_await(PAGE);
+        let mut fut = std::pin::pin!(fut);
+        assert!(poll(fut.as_mut()).is_pending());
+
+        drop(held); // frees the page and wakes waiters
+        assert!(matches!(poll(fut.as_mut()), Poll::Ready(d) if d.len() == PAGE));
     }
 }

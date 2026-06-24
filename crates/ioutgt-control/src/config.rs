@@ -33,6 +33,10 @@ pub struct FileConfig {
     /// host may use. Admin queue unaffected. Default 128.
     #[serde(default = "default_io_queue_size")]
     pub io_queue_size: u16,
+    /// Per-IO-queue data-buffer pool size in bytes (slots lease on
+    /// demand). Default 4 MiB.
+    #[serde(default = "default_queue_buf_bytes")]
+    pub queue_buf_bytes: usize,
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,
@@ -51,6 +55,10 @@ fn default_io_threads() -> usize {
 
 fn default_io_queue_size() -> u16 {
     128
+}
+
+fn default_queue_buf_bytes() -> usize {
+    ioutgt_core::pool::DEFAULT_POOL_BYTES
 }
 
 fn default_idle_teardown_secs() -> u64 {
@@ -130,6 +138,16 @@ impl FileConfig {
                 "io_queue_size {} out of range (2..={})",
                 self.io_queue_size,
                 ioutgt_core::MAX_QUEUE_ENTRIES
+            ));
+        }
+        // The pool must hold at least one max-size transfer (MDTS); cap it
+        // so a typo can't reserve absurd amounts of RAM per IO queue.
+        const MAX_POOL_BYTES: usize = 1 << 30; // 1 GiB
+        if !(ioutgt_core::MDTS_BYTES as usize..=MAX_POOL_BYTES).contains(&self.queue_buf_bytes) {
+            return Err(format!(
+                "queue_buf_bytes {} out of range ({}..={MAX_POOL_BYTES})",
+                self.queue_buf_bytes,
+                ioutgt_core::MDTS_BYTES,
             ));
         }
         if self.subsystems.is_empty() {
@@ -222,6 +240,16 @@ mod tests {
             )
             .unwrap_err()
             .contains("reserved")
+        );
+        // queue_buf_bytes below one MDTS is rejected (can't hold a max IO).
+        assert!(
+            parse(
+                r#"{ "listen": "127.0.0.1:4420", "queue_buf_bytes": 4096,
+                 "subsystems": [ { "nqn": "nqn.x", "namespaces": [
+                   { "nsid": 1, "backend": { "type": "memory", "size_mb": 1 } } ] } ] }"#
+            )
+            .unwrap_err()
+            .contains("queue_buf_bytes")
         );
     }
 }

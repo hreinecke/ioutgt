@@ -171,6 +171,9 @@ pub struct PortConfig<B> {
     /// IO queue to `min(its queue-size, this)`; the admin queue is
     /// unaffected. Bounded by `MAX_QUEUE_ENTRIES`.
     pub io_queue_size: u16,
+    /// Per-IO-queue data-buffer pool size in bytes. Slots lease their
+    /// read/write buffers from this shared arena on demand.
+    pub queue_buf_bytes: usize,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }

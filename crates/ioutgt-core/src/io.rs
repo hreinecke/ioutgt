@@ -95,19 +95,13 @@ pub async fn execute<B: Backend>(
     }
 }
 
-/// Transfer length from the LBA count, validated against MDTS (the slot
-/// buffer) and the SGL-declared length.
-fn checked_len<B: Backend>(
-    ctx: &Rc<ConnCtx<B>>,
-    backend: &B,
-    tag: u16,
-    sqe: &Sqe,
-) -> Result<(RwCommand, u32), u16> {
+/// Transfer length from the LBA count, validated against MDTS and the
+/// SGL-declared length.
+fn checked_len<B: Backend>(backend: &B, sqe: &Sqe) -> Result<(RwCommand, u32), u16> {
     let rw = RwCommand::parse(sqe);
     let nlb = u64::from(rw.nlb) + 1;
     let len = nlb << backend.block_shift();
-    let slot_capacity = ctx.queue.slot(tag).data().len() as u64;
-    if len > slot_capacity {
+    if len > u64::from(crate::MDTS_BYTES) {
         return Err(status::INVALID_FIELD | status::DNR);
     }
     if u64::from(sqe.dptr.length.get()) != len {
@@ -124,15 +118,18 @@ fn checked_len<B: Backend>(
 #[allow(clippy::await_holding_refcell_ref)]
 async fn read<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe: &Sqe) -> Outcome {
     let cid = sqe.cid.get();
-    let (rw, len) = match checked_len(ctx, ns.backend.as_ref(), tag, sqe) {
+    let (rw, len) = match checked_len(ns.backend.as_ref(), sqe) {
         Ok(v) => v,
         Err(code) => return err_outcome(ctx, cid, code),
     };
+    // Lease the read buffer on demand (parks if the pool is momentarily
+    // full — backpressure, never a deadlock).
+    ctx.queue.lease_await(tag, len as usize).await;
     let slot = ctx.queue.slot(tag);
-    let mut buf = slot.data();
+    let buf = slot.data();
     let result = ns
         .backend
-        .read(rw.slba, &mut buf.as_mut_slice()[..len as usize])
+        .read_segs(rw.slba, buf.segs(), len as usize)
         .await;
     drop(buf);
     if result.is_ok() {
@@ -150,19 +147,20 @@ async fn write<B: Backend>(
     sqe: &Sqe,
 ) -> Outcome {
     let cid = sqe.cid.get();
-    let (rw, len) = match checked_len(ctx, ns.backend.as_ref(), tag, sqe) {
+    let (rw, len) = match checked_len(ns.backend.as_ref(), sqe) {
         Ok(v) => v,
         Err(code) => return err_outcome(ctx, cid, code),
     };
     let slot = ctx.queue.slot(tag);
-    // The transport must have delivered exactly the SGL-declared bytes.
+    // The transport must have delivered exactly the SGL-declared bytes
+    // into the buffer it leased while receiving.
     if slot.data_len() != len {
         return err_outcome(ctx, cid, status::DATA_XFER_ERROR | status::DNR);
     }
     let buf = slot.data();
     let result = ns
         .backend
-        .write(rw.slba, &buf.as_slice()[..len as usize])
+        .write_segs(rw.slba, buf.segs(), len as usize)
         .await;
     drop(buf);
     // FUA on a memory/file backend: flush after write.
@@ -190,9 +188,15 @@ async fn dsm<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe:
     if !deallocate {
         return Outcome::status(ctx.cqe(0, cid, status::SUCCESS));
     }
+    // The range list may span pool segments; gather it contiguous first
+    // (DSM is cold, so the copy is cheap).
     let ranges: Vec<LbaRange> = {
-        let buf = slot.data();
-        let bytes = buf.as_slice();
+        let mut bytes = vec![0u8; needed];
+        let mut off = 0;
+        slot.data().for_each_seg(0, needed, |chunk| {
+            bytes[off..off + chunk.len()].copy_from_slice(chunk);
+            off += chunk.len();
+        });
         (0..nr)
             .map(|i| {
                 let raw = DsmRange::read_from_bytes(&bytes[i * 16..i * 16 + 16])

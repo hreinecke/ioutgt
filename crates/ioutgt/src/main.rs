@@ -43,6 +43,12 @@ struct Args {
     #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(2..=256))]
     io_queue_size: u16,
 
+    /// Per-IO-queue data-buffer pool size in bytes. Slots lease their
+    /// read/write buffers from this shared arena on demand (4 KiB grain);
+    /// deliberately smaller than depth × MDTS. Default 4 MiB.
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    queue_buf_bytes: usize,
+
     /// Tear the queue-thread pool down after this many seconds with zero
     /// active connections, respawning it on the next connect; 0 keeps the
     /// pool alive for the process lifetime once spawned.
@@ -571,6 +577,7 @@ fn main() -> std::io::Result<()> {
             config.pin_threads = !args.no_pin;
             config.send_zc = args.send_zc;
             config.io_queue_size = args.io_queue_size;
+            config.queue_buf_bytes = args.queue_buf_bytes;
             config.idle_teardown = (args.idle_teardown_secs != 0)
                 .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
             config.control_socket = Some(args.control_socket);

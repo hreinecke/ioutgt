@@ -28,11 +28,6 @@ use ioutgt_uring::sendbatch::GatherBatch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-/// Admin-queue slot buffers: identify/log pages (4 KiB) plus margin.
-pub const ADMIN_SLOT_BUF: usize = 8 * 1024;
-/// IO-queue slot buffers: MDTS.
-pub const IO_SLOT_BUF: usize = 128 * 1024;
-
 pub use ioutgt_core::permit::ConnPermit;
 
 /// Everything a queue thread receives to run one connection.
@@ -239,12 +234,15 @@ impl From<PduError> for RecvEnd {
 /// `on_ctx` runs once the dispatch context exists — the binary's admin
 /// thread uses it to register live controllers for AER nudges.
 pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<ConnCtx<B>>)) {
-    let slot_buf = if conn.qid == 0 {
-        ADMIN_SLOT_BUF
+    // Admin: a pool sized so its (synchronous) data leases never block.
+    // IO: a shared pool deliberately smaller than depth × MDTS — slots
+    // lease on demand and park / fall back under pressure.
+    let pool_bytes = if conn.qid == 0 {
+        usize::from(conn.sqsize).max(1) * ioutgt_core::ADMIN_DATA_MAX
     } else {
-        IO_SLOT_BUF
+        conn.port.queue_buf_bytes
     };
-    let queue = NvmeTcpQueue::new(conn.qid, conn.sqsize, slot_buf, conn.sqhd_disabled);
+    let queue = NvmeTcpQueue::new(conn.qid, conn.sqsize, pool_bytes, conn.sqhd_disabled);
     let fd = conn.fd.as_raw_fd();
     let peer = ioutgt_core::controller::peer_of(fd);
     let ctx = if conn.qid == 0 {
@@ -586,9 +584,13 @@ async fn drive_recv(
         // falls through with `phase`, including its
         // partially-accumulated CRC, untouched for the normal copy
         // path.
+        // The direct path writes one contiguous range into the slot; skip
+        // it when the leased buffer is scattered (the copy path handles
+        // any layout). Contiguous is the common case for a fresh pool.
         if let &RecvPhase::Data(data) = &phase
             && matches!(data.kind, PayloadKind::H2c { .. })
             && data.remaining >= H2C_DIRECT_MIN
+            && queue.slot(data.tag).data().is_contiguous()
         {
             phase = recv_tail_direct(queue, &mut reader, data).await?;
         }
@@ -731,9 +733,12 @@ async fn handle_capsule_cmd(
     let slot = queue.slot(tag);
     if data_len > 0 {
         // In-capsule payload follows the capsule on the wire.
-        if data_len as usize > slot.data().len() {
+        if data_len > ioutgt_core::MDTS_BYTES {
             return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
         }
+        // Lease the landing buffer (deadlock-free: the serial recv loop
+        // never blocks, falling back to a private buffer under pressure).
+        queue.lease_or_owned(tag, data_len as usize);
         slot.set_data_len(data_len);
         slot.stash_sqe(sqe);
         Ok(Some(RecvPhase::Data(DataPhase {
@@ -746,9 +751,10 @@ async fn handle_capsule_cmd(
         })))
     } else if needs_r2t(&sqe) {
         let length = sqe.dptr.length.get();
-        if length as usize > slot.data().len() {
+        if length > ioutgt_core::MDTS_BYTES {
             return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
         }
+        queue.lease_or_owned(tag, length as usize);
         slot.set_data_len(length);
         slot.set_recv_offset(0);
         slot.stash_sqe(sqe);
@@ -946,9 +952,10 @@ mod gather_tests {
 
     #[test]
     fn batch_matches_linear_encoding() {
-        let queue = NvmeTcpQueue::new(1, 4, 4096, false);
+        let queue = NvmeTcpQueue::new(1, 4, 128 * 1024, false);
         #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        queue.lease_or_owned(2, 1000);
         queue.slot(2).data().write_at(0, &payload);
 
         let mut g = gather_for(queue.sqsize);
@@ -993,8 +1000,9 @@ mod gather_tests {
     fn batch_elides_and_merges_without_digests() {
         // sqhd_disabled queue: a successful read elides the response
         // capsule; digests off exercises the bare-header layout.
-        let queue = NvmeTcpQueue::new(1, 4, 4096, true);
+        let queue = NvmeTcpQueue::new(1, 4, 128 * 1024, true);
         let payload = [0xa5u8; 512];
+        queue.lease_or_owned(1, 512);
         queue.slot(1).data().write_at(0, &payload);
 
         let mut g = gather_for(queue.sqsize);

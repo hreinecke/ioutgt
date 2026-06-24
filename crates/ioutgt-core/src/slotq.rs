@@ -14,9 +14,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use crate::pool::SlotData;
+use crate::pool::{BufPool, SlotData};
 
 /// Slot lifecycle. Transitions are all same-thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,8 @@ pub struct Slot<C: Copy> {
     /// Slot task doorbell.
     waker: Cell<Option<Waker>>,
     /// Data buffer: write payload in, read payload out, viewed as one
-    /// or more page-aligned segments. Sized at queue creation.
+    /// or more page-aligned segments. Leased from the queue pool when the
+    /// transfer length is known; `empty` between commands.
     data: RefCell<SlotData>,
     /// Valid bytes in `data` (received payload or response data).
     data_len: Cell<u32>,
@@ -51,12 +53,12 @@ pub struct Slot<C: Copy> {
 
 #[allow(missing_docs)] // accessor naming mirrors the field semantics above
 impl<C: Copy> Slot<C> {
-    fn new(init: C, buf_size: usize) -> Self {
+    fn new(init: C) -> Self {
         Slot {
             state: Cell::new(SlotState::Free),
             cmd: Cell::new(init),
             waker: Cell::new(None),
-            data: RefCell::new(SlotData::owned(buf_size)),
+            data: RefCell::new(SlotData::empty()),
             data_len: Cell::new(0),
             recv_offset: Cell::new(0),
         }
@@ -74,6 +76,17 @@ impl<C: Copy> Slot<C> {
     /// held across a backend await while the slot is `Executing`).
     pub fn data(&self) -> std::cell::RefMut<'_, SlotData> {
         self.data.borrow_mut()
+    }
+
+    /// Install a leased data buffer for the command about to use it.
+    pub fn set_data(&self, data: SlotData) {
+        *self.data.borrow_mut() = data;
+    }
+
+    /// Drop the data buffer (returning a pool lease to its pool). Called
+    /// when the tag is released back to the freelist.
+    pub fn release_data(&self) {
+        *self.data.borrow_mut() = SlotData::empty();
     }
 
     pub fn data_len(&self) -> u32 {
@@ -116,15 +129,17 @@ pub struct SlotArray<C: Copy> {
     /// `release_tag` so a parked claim retries. Single waiter — the
     /// recv loop is the only claimer.
     tag_waiter: Cell<Option<Waker>>,
+    /// Shared data-buffer arena. Slots lease from it on demand and the
+    /// lease is returned at `release_tag`. Declared last so it outlives
+    /// the slots during drop (their leases reference it).
+    pool: Rc<BufPool>,
 }
 
 impl<C: Copy> SlotArray<C> {
-    /// Allocate `nslots` slots, each with a `slot_buf_size` data
-    /// buffer, command stash initialized to `init`.
-    pub fn new(nslots: u16, slot_buf_size: usize, init: C) -> SlotArray<C> {
-        let slots: Vec<Slot<C>> = (0..nslots)
-            .map(|_| Slot::new(init, slot_buf_size))
-            .collect();
+    /// Allocate `nslots` slots (each with no data buffer until it leases
+    /// one) plus a shared `pool_bytes` data-buffer pool.
+    pub fn new(nslots: u16, pool_bytes: usize, init: C) -> SlotArray<C> {
+        let slots: Vec<Slot<C>> = (0..nslots).map(|_| Slot::new(init)).collect();
         // LIFO freelist: hot slots stay cache-warm.
         let free_tags: Vec<u16> = (0..nslots).rev().collect();
         SlotArray {
@@ -133,7 +148,37 @@ impl<C: Copy> SlotArray<C> {
             free_tags: RefCell::new(free_tags),
             executing: Cell::new(0),
             tag_waiter: Cell::new(None),
+            pool: BufPool::new(pool_bytes),
         }
+    }
+
+    /// The shared data-buffer pool.
+    pub fn pool(&self) -> &Rc<BufPool> {
+        &self.pool
+    }
+
+    /// Lease a `len`-byte data buffer into `tag`'s slot, parking until the
+    /// pool can satisfy it (backpressure for an oversubscribed pool).
+    ///
+    /// Park-safe only for an *independent* leaser (a read slot task): the
+    /// serial recv loop must not park here, or pipelined writes deadlock —
+    /// it uses [`Self::lease_or_owned`] instead.
+    pub async fn lease_await(&self, tag: u16, len: usize) {
+        let data = self.pool.alloc_await(len).await;
+        self.slot(tag).set_data(data);
+    }
+
+    /// Lease into `tag`, falling back to a private heap buffer when the
+    /// pool is momentarily exhausted. Never blocks — the deadlock-free
+    /// path for the serial recv loop (write payloads) and admin data. The
+    /// fallback allocation is a degraded-mode transient; the steady state
+    /// (pool not exhausted) allocates nothing.
+    pub fn lease_or_owned(&self, tag: u16, len: usize) {
+        let data = self
+            .pool
+            .alloc(len)
+            .unwrap_or_else(|| SlotData::owned(len.max(1)));
+        self.slot(tag).set_data(data);
     }
 
     /// The slot for `tag` (the wire transfer tag).
@@ -223,6 +268,9 @@ impl<C: Copy> SlotArray<C> {
     pub fn release_tag(&self, tag: u16) {
         let slot = self.slot(tag);
         debug_assert_eq!(slot.state.get(), SlotState::Responding);
+        // Return the data buffer to the pool before the tag is reusable;
+        // this wakes any task parked on pool exhaustion.
+        slot.release_data();
         slot.state.set(SlotState::Free);
         self.free_tags.borrow_mut().push(tag);
         if let Some(waker) = self.tag_waiter.take() {
@@ -317,6 +365,7 @@ impl<W> SendList<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::PAGE;
 
     #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
     struct TestCmd(u64);
@@ -348,6 +397,37 @@ mod tests {
         a.release_tag(tag);
         assert_eq!(a.slot(tag).state(), SlotState::Free);
         assert_eq!(a.free_tags(), 1);
+    }
+
+    #[test]
+    fn lease_returns_to_pool_on_release() {
+        // One-page pool, two slots: leasing the page then releasing the
+        // tag must hand the page back.
+        let a: SlotArray<TestCmd> = SlotArray::new(2, PAGE, TestCmd::default());
+        let full = a.pool().free_pages();
+        assert_eq!(full, 1);
+
+        let tag = a.claim_tag().unwrap();
+        a.lease_or_owned(tag, PAGE);
+        assert_eq!(a.pool().free_pages(), 0, "page leased");
+
+        a.respond_receiving(tag);
+        a.release_tag(tag);
+        assert_eq!(a.pool().free_pages(), full, "page returned on release");
+    }
+
+    #[test]
+    fn over_subscribed_lease_falls_back_to_owned() {
+        // Pool holds one page; a second concurrent lease can't come from
+        // the pool, so it falls back to a private buffer (no panic, no
+        // block) and the pool stays at zero.
+        let a: SlotArray<TestCmd> = SlotArray::new(2, PAGE, TestCmd::default());
+        let t0 = a.claim_tag().unwrap();
+        let t1 = a.claim_tag().unwrap();
+        a.lease_or_owned(t0, PAGE);
+        a.lease_or_owned(t1, PAGE); // pool empty → owned fallback
+        assert_eq!(a.pool().free_pages(), 0);
+        assert_eq!(a.slot(t1).data().len(), PAGE);
     }
 
     #[test]
