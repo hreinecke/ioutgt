@@ -88,9 +88,14 @@ fn verify_region(client: &mut Client, cid: u16, slba: u64, len: u32, generation:
 }
 
 fn run_verify(hdgst: bool, ddgst: bool) {
+    run_verify_cfg(hdgst, ddgst, |_| {});
+}
+
+fn run_verify_cfg(hdgst: bool, ddgst: bool, tweak: impl FnOnce(&mut ioutgt::TargetConfig)) {
     let mut config = ioutgt::TargetConfig::single_memory(NQN, 64);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 2;
+    tweak(&mut config);
     let addr = ioutgt::spawn_target(config).expect("target start");
 
     let mut admin = Client::handshake(addr, hdgst, ddgst);
@@ -153,4 +158,25 @@ fn concurrent_mixed_size_verify() {
 #[test]
 fn concurrent_mixed_size_verify_with_digests() {
     run_verify(true, true);
+}
+
+// Data integrity over the new buffer paths: a tiny per-queue pool forces
+// scattered leases (and owned-buffer fallback) for the up-to-128K
+// transfers — so writes receive into scattered/owned buffers and reads
+// send from scattered segments, all under the cross-connection verify
+// torture.
+#[test]
+fn concurrent_verify_small_pool() {
+    run_verify_cfg(false, false, |c| {
+        c.queue_buf_bytes = 256 * 1024; // < a few max transfers → scatter + fallback
+    });
+}
+
+// Same, with digests on (DDGST folded over scattered segments on both the
+// recv and send sides).
+#[test]
+fn concurrent_verify_small_pool_digests() {
+    run_verify_cfg(true, true, |c| {
+        c.queue_buf_bytes = 256 * 1024;
+    });
 }
