@@ -130,7 +130,10 @@ async fn read<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe
     };
     let slot = ctx.queue.slot(tag);
     let mut buf = slot.data();
-    let result = ns.backend.read(rw.slba, &mut buf[..len as usize]).await;
+    let result = ns
+        .backend
+        .read(rw.slba, &mut buf.as_mut_slice()[..len as usize])
+        .await;
     drop(buf);
     if result.is_ok() {
         stat_add(&ctx.queue.stats.read_bytes, u64::from(len));
@@ -157,7 +160,10 @@ async fn write<B: Backend>(
         return err_outcome(ctx, cid, status::DATA_XFER_ERROR | status::DNR);
     }
     let buf = slot.data();
-    let result = ns.backend.write(rw.slba, &buf[..len as usize]).await;
+    let result = ns
+        .backend
+        .write(rw.slba, &buf.as_slice()[..len as usize])
+        .await;
     drop(buf);
     // FUA on a memory/file backend: flush after write.
     let result = match (result, rw.fua) {
@@ -186,10 +192,11 @@ async fn dsm<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe:
     }
     let ranges: Vec<LbaRange> = {
         let buf = slot.data();
+        let bytes = buf.as_slice();
         (0..nr)
             .map(|i| {
-                let raw =
-                    DsmRange::read_from_bytes(&buf[i * 16..i * 16 + 16]).expect("16 aligned bytes");
+                let raw = DsmRange::read_from_bytes(&bytes[i * 16..i * 16 + 16])
+                    .expect("16 aligned bytes");
                 LbaRange {
                     slba: raw.slba.get(),
                     nlb: raw.nlb.get(),

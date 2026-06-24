@@ -71,7 +71,7 @@ fn fill_slot<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, data: &[u8]) -> u32 {
     let slot = ctx.queue.slot(tag);
     let mut buf = slot.data();
     let n = data.len().min(buf.len());
-    buf[..n].copy_from_slice(&data[..n]);
+    buf.write_at(0, &data[..n]);
     u32::try_from(n).expect("slot buffers < 4G")
 }
 
@@ -329,7 +329,7 @@ fn get_log_page<B: Backend>(
             // Zero-filled pages: nothing to report yet.
             let n = len.min(4096);
             let slot = ctx.queue.slot(tag);
-            slot.data()[..usize::try_from(n).expect("<=4096")].fill(0);
+            slot.data().as_mut_slice()[..usize::try_from(n).expect("<=4096")].fill(0);
             #[allow(clippy::cast_possible_truncation)]
             Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n as u32)
         }

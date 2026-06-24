@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::task::{Poll, Waker};
 
-use crate::buf::AlignedBuf;
+use crate::pool::SlotData;
 
 /// Slot lifecycle. Transitions are all same-thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,9 +40,9 @@ pub struct Slot<C: Copy> {
     cmd: Cell<C>,
     /// Slot task doorbell.
     waker: Cell<Option<Waker>>,
-    /// Data buffer: write payload in, read payload out. Sized at queue
-    /// creation; 4K-aligned for O_DIRECT backends.
-    data: RefCell<AlignedBuf>,
+    /// Data buffer: write payload in, read payload out, viewed as one
+    /// or more page-aligned segments. Sized at queue creation.
+    data: RefCell<SlotData>,
     /// Valid bytes in `data` (received payload or response data).
     data_len: Cell<u32>,
     /// Reassembly cursor for multi-step payload receives.
@@ -56,7 +56,7 @@ impl<C: Copy> Slot<C> {
             state: Cell::new(SlotState::Free),
             cmd: Cell::new(init),
             waker: Cell::new(None),
-            data: RefCell::new(AlignedBuf::zeroed(buf_size)),
+            data: RefCell::new(SlotData::owned(buf_size)),
             data_len: Cell::new(0),
             recv_offset: Cell::new(0),
         }
@@ -72,7 +72,7 @@ impl<C: Copy> Slot<C> {
 
     /// Borrow the slot data buffer (short-lived: one copy in/out, or
     /// held across a backend await while the slot is `Executing`).
-    pub fn data(&self) -> std::cell::RefMut<'_, AlignedBuf> {
+    pub fn data(&self) -> std::cell::RefMut<'_, SlotData> {
         self.data.borrow_mut()
     }
 

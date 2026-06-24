@@ -124,7 +124,7 @@ impl DataPhase {
                 PayloadKind::H2c { length, .. } => length,
             };
             let dest = (self.base + (total - self.remaining)) as usize;
-            slot.data()[dest..dest + take].copy_from_slice(&slice[..take]);
+            slot.data().write_at(dest, &slice[..take]);
         }
         // Only fold bytes into the digest when one was negotiated; with the
         // data digest off the result is discarded, so the CRC pass is pure
@@ -636,7 +636,7 @@ async fn recv_tail_direct(
     let ptr = {
         // Scoped: the RefCell borrow must end before the await below.
         let mut slot_data = queue.slot(data.tag).data();
-        slot_data[dest..dest + data.remaining as usize].as_mut_ptr()
+        slot_data.as_mut_slice()[dest..dest + data.remaining as usize].as_mut_ptr()
     };
     // SAFETY: ptr..ptr+remaining is slot-buffer memory (bounds-checked
     // by the slicing above) owned by NvmeTcpQueue, to which this recv
@@ -842,12 +842,22 @@ fn stage_send_work(
                 );
                 gather.push_arena(n);
                 let slot_data = queue.slot(completion.tag).data();
-                // The payload rides in place: the slot stays claimed
+                // The payload rides in place from the slot buffer's
+                // segments (one when contiguous); the slot stays claimed
                 // until release_tag after the batch send completes.
-                gather.push_raw(slot_data.as_ptr(), data_len);
+                let mut remaining = data_len;
+                for seg in slot_data.segs() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = remaining.min(seg.len);
+                    gather.push_raw(seg.ptr.cast_const(), take);
+                    remaining -= take;
+                }
                 if data_digest {
-                    let crc = digest::crc32c(&slot_data[..data_len]);
-                    gather.arena_tail()[..4].copy_from_slice(&crc.to_le_bytes());
+                    let mut crc = digest::Crc32c::new();
+                    slot_data.for_each_seg(0, data_len, |c| crc.update(c));
+                    gather.arena_tail()[..4].copy_from_slice(&crc.finalize().to_le_bytes());
                     gather.push_arena(4);
                 }
             }
@@ -939,7 +949,7 @@ mod gather_tests {
         let queue = NvmeTcpQueue::new(1, 4, 4096, false);
         #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
-        queue.slot(2).data()[..1000].copy_from_slice(&payload);
+        queue.slot(2).data().write_at(0, &payload);
 
         let mut g = gather_for(queue.sqsize);
         let cqe = Cqe::new(0, 1, 1, 7, 0);
@@ -985,7 +995,7 @@ mod gather_tests {
         // capsule; digests off exercises the bare-header layout.
         let queue = NvmeTcpQueue::new(1, 4, 4096, true);
         let payload = [0xa5u8; 512];
-        queue.slot(1).data()[..512].copy_from_slice(&payload);
+        queue.slot(1).data().write_at(0, &payload);
 
         let mut g = gather_for(queue.sqsize);
         let read_cqe = Cqe::new(0, 1, 1, 5, 0);
