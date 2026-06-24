@@ -37,6 +37,9 @@ QUEUE_SIZE="${QUEUE_SIZE:-128}"      # IO qdepth   (ioutgt --io-queue-size; conn
 BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file
 IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
 IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = ioutgt --send-zc (zero-copy send)
+# Extra ioutgt flags appended verbatim, e.g.
+#   IOUTGT_EXTRA="--queue-buf-bytes 262144"
+IOUTGT_EXTRA="${IOUTGT_EXTRA:-}"
 
 # TCP digest negotiation (CRC32C), coupled across both ends so the two
 # targets stay aligned: =1 asks the host to negotiate it (nvme connect
@@ -179,13 +182,16 @@ ioutgt_start() {
         # engages instead of silently falling back to a copying send.
         ulimit -l unlimited 2>/dev/null || true
     fi
-    echo ">> starting ioutgt on $ip:$port (backend $backend, ${NR_QUEUES}q x $QUEUE_SIZE$zclabel)"
+    local extra=()
+    [ -n "$IOUTGT_EXTRA" ] && read -ra extra <<<"$IOUTGT_EXTRA"
+    echo ">> starting ioutgt on $ip:$port (backend $backend, ${NR_QUEUES}q x $QUEUE_SIZE$zclabel${IOUTGT_EXTRA:+, $IOUTGT_EXTRA})"
     "${IOUTGT_NETNS[@]}" "$IOUTGT_BIN" \
         --listen "$ip:$port" \
         --backend "$backend" \
         --io-threads "$NR_QUEUES" \
         --io-queue-size "$QUEUE_SIZE" \
         "${zc[@]}" \
+        "${extra[@]}" \
         "${IOUTGT_DGST[@]}" \
         --subsys-nqn "$nqn" \
         --control-socket "$IOUTGT_SOCK" \
