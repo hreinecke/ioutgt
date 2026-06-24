@@ -337,19 +337,21 @@ pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
     Ok(RawOp { op })
 }
 
-/// Receive into caller-managed memory, requesting `MSG_WAITALL`: the
-/// kernel holds the op until `len` bytes arrive (best-effort — may still
-/// return short on EOF/error; callers must loop on progress).
+/// Vectored receive into caller-managed iovecs described by a `msghdr`,
+/// requesting `MSG_WAITALL`: the kernel scatters the arriving bytes across
+/// the iovecs and holds the op until they are full (best-effort — may
+/// still return short on EOF/error; callers handle the short return).
 ///
 /// # Safety
 ///
-/// Same contract as [`recv_raw`]: `ptr..ptr+len` must remain valid and
-/// unaliased for writes until this op's terminal CQE has been reaped.
-pub unsafe fn recv_raw_waitall(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
+/// `msg`, its iovec array, and every buffer the iovecs reference must
+/// remain valid and unaliased for writes until this op's terminal CQE has
+/// been reaped — same contract as [`recv_raw`].
+pub unsafe fn recvmsg_raw(fd: RawFd, msg: *mut libc::msghdr) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::Recv::new(types::Fd(fd), ptr, len)
-                .flags(libc::MSG_WAITALL)
+            opcode::RecvMsg::new(types::Fd(fd), msg)
+                .flags(libc::MSG_WAITALL as u32)
                 .build()
                 .user_data(key)
         },

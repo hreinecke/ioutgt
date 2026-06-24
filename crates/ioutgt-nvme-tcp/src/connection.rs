@@ -543,7 +543,7 @@ async fn drive_recv(
     // 64 KiB scratch buffer, allocated once per connection: only headers,
     // in-capsule payloads (≤ 16 KiB inline limit), and payload prefixes
     // pass through it — H2C tails ≥ H2C_DIRECT_MIN bypass it into the
-    // slot via reader.read_direct, and read data never touches it. The
+    // slot via reader.read_direct_vectored, and read data never touches it. The
     // size is the small-IO batching unit (~15 × 4 KiB write capsules per
     // wakeup) and matches the kernel's max GRO/loopback burst (64 KiB),
     // so one recv drains the largest coalesced unit the stack delivers
@@ -584,13 +584,11 @@ async fn drive_recv(
         // falls through with `phase`, including its
         // partially-accumulated CRC, untouched for the normal copy
         // path.
-        // The direct path writes one contiguous range into the slot; skip
-        // it when the leased buffer is scattered (the copy path handles
-        // any layout). Contiguous is the common case for a fresh pool.
+        // The direct path receives straight into the slot's pool segments —
+        // contiguous or scattered — so no contiguity gate is needed.
         if let &RecvPhase::Data(data) = &phase
             && matches!(data.kind, PayloadKind::H2c { .. })
             && data.remaining >= H2C_DIRECT_MIN
-            && queue.slot(data.tag).data().is_contiguous()
         {
             phase = recv_tail_direct(queue, &mut reader, data).await?;
         }
@@ -614,17 +612,47 @@ async fn feed_header(
     handle_pdu(queue, decoded, data_digest).await
 }
 
-/// Receive a payload tail straight into the slot buffer at the
-/// reassembly offset, via [`StreamReader::read_direct`] (the scratch
-/// buffer is bypassed). The tail is by definition the next bytes on the
-/// stream, so no buffered recv is re-armed until it lands — there is
-/// never more than one outstanding recv on the socket. `read_direct`'s
-/// `MSG_WAITALL` loop is best-effort: short-but-nonzero returns resume
-/// in place; a total shorter than `remaining` means an orderly close
-/// mid-payload, as on the buffered path. For a digested transfer the
-/// `on_chunk` callback is the warm-cache CRC pass over each landed
-/// fragment (one pass in the common single-completion case); with the
-/// data digest off no CRC is computed.
+/// Split the slot-buffer segments covering the logical range
+/// `[off, off+len)` into `(ptr, len)` sub-segments, in order. One entry
+/// for a contiguous lease; several for a scattered one. Returns the count.
+fn fill_subsegs(
+    out: &mut [(*mut u8, usize)],
+    segs: &[ioutgt_core::pool::Seg],
+    mut off: usize,
+    mut len: usize,
+) -> usize {
+    let mut n = 0;
+    for seg in segs {
+        if len == 0 {
+            break;
+        }
+        if off >= seg.len {
+            off -= seg.len;
+            continue;
+        }
+        let take = (seg.len - off).min(len);
+        // SAFETY: off < seg.len, so ptr.add(off) is within the segment.
+        out[n] = (unsafe { seg.ptr.add(off) }, take);
+        n += 1;
+        len -= take;
+        off = 0;
+    }
+    n
+}
+
+/// Receive a payload tail straight into the slot buffer at the reassembly
+/// offset, via [`StreamReader::read_direct_vectored`] (the scratch buffer is
+/// bypassed — true zero-copy receive into the pooled slot, DIO- or
+/// buffered-written later per the buffer's alignment). The tail is by
+/// definition the next bytes on the stream, so no buffered recv is
+/// re-armed until it lands — never more than one outstanding recv on the
+/// socket. The slot lease may be contiguous (one sub-segment) or scattered
+/// across pool pages (several); either way it is received with a single
+/// scatter `recvmsg` (`MSG_WAITALL`), the kernel filling all segments in one
+/// syscall. A total shorter than `remaining` means an orderly close
+/// mid-payload. For a digested transfer the landed segments are folded into
+/// the CRC in logical order once received; with the data digest off no CRC
+/// is computed.
 async fn recv_tail_direct(
     queue: &Rc<NvmeTcpQueue>,
     reader: &mut StreamReader,
@@ -635,35 +663,46 @@ async fn recv_tail_direct(
         PayloadKind::H2c { length, .. } => length,
     };
     let dest = (data.base + (total - data.remaining)) as usize;
-    let ptr = {
-        // Scoped: the RefCell borrow must end before the await below.
-        let mut slot_data = queue.slot(data.tag).data();
-        slot_data.as_mut_slice()[dest..dest + data.remaining as usize].as_mut_ptr()
+    let remaining = data.remaining as usize;
+
+    // Snapshot the destination sub-segments up front so the RefCell borrow
+    // ends before the awaits below (the raw ptrs stay valid: pool memory is
+    // stable and the slot is `Receiving`).
+    let mut subs = [(std::ptr::null_mut::<u8>(), 0usize); ioutgt_core::pool::MAX_SEGS];
+    let nsub = {
+        let slot_data = queue.slot(data.tag).data();
+        fill_subsegs(&mut subs, slot_data.segs(), dest, remaining)
     };
-    // SAFETY: ptr..ptr+remaining is slot-buffer memory (bounds-checked
-    // by the slicing above) owned by NvmeTcpQueue, to which this recv
-    // task holds an Rc; the slot's state is Receiving, so nothing else
-    // touches its data. read_direct awaits the recv inline — the recv
-    // path cannot return while it is in flight — and on whole-future
-    // drop (LocalSet teardown) the reactor's orphan protocol holds the
-    // op entry until its terminal CQE, the same accepted envelope as
-    // backend raw ops on slot memory (queue threads run for the process
-    // lifetime; reactor drain/leak is the backstop before anything is
-    // freed). The two arms differ only in the digest seam: the ddgst
-    // path hashes each landed fragment, the plain path computes nothing.
-    let n = unsafe {
-        if data.ddgst {
-            reader
-                .read_direct(ptr, data.remaining, |c| data.crc.update(c))
-                .await?
-        } else {
-            reader.read_direct(ptr, data.remaining, |_| {}).await?
-        }
-    };
-    if n < data.remaining {
-        return Err(RecvEnd::Closed); // orderly close mid-payload
+
+    // One iovec per destination sub-segment: the whole tail is received
+    // with a single scatter `recvmsg` (`MSG_WAITALL`) instead of a recv per
+    // segment — the kernel scatters the payload across the segments.
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; ioutgt_core::pool::MAX_SEGS];
+    for (iov, &(ptr, len)) in iovs.iter_mut().zip(&subs[..nsub]) {
+        iov.iov_base = ptr.cast();
+        iov.iov_len = len;
+    }
+    // SAFETY: every (ptr, len) is a sub-range of the slot's data buffer,
+    // owned by NvmeTcpQueue (this recv task holds an Rc); the slot is
+    // `Receiving`, so nothing else touches it. read_direct_vectored awaits
+    // the recv inline; on whole-future drop the reactor's orphan protocol
+    // holds the op to its terminal CQE — the same envelope as backend raw
+    // ops on slot memory.
+    let got = unsafe { reader.read_direct_vectored(&mut iovs[..nsub]).await? } as usize;
+    if got < remaining {
+        return Err(RecvEnd::Closed);
     }
     if data.ddgst {
+        // The segments are now full (a short transfer returned above); fold
+        // them into the digest in logical order for the warm-cache CRC pass.
+        for &(ptr, len) in &subs[..nsub] {
+            // SAFETY: ptr..ptr+len is the just-filled slot sub-segment,
+            // held exclusively for this transfer.
+            data.crc.update(unsafe { std::slice::from_raw_parts(ptr, len) });
+        }
         // Next recv starts at the 4-byte digest.
         Ok(RecvPhase::ddgst(data.tag, data.crc.finalize(), data.kind))
     } else {
@@ -924,6 +963,34 @@ async fn send_loop(
         );
     }
     result
+}
+
+#[cfg(test)]
+mod subseg_tests {
+    use super::*;
+    use ioutgt_core::pool::Seg;
+
+    #[test]
+    fn fill_subsegs_contiguous_and_scattered() {
+        let mut a = [0u8; 100];
+        let mut b = [0u8; 100];
+        let (pa, pb) = (a.as_mut_ptr(), b.as_mut_ptr());
+        let segs = [Seg { ptr: pa, len: 100 }, Seg { ptr: pb, len: 100 }];
+        let mut out = [(std::ptr::null_mut::<u8>(), 0usize); ioutgt_core::pool::MAX_SEGS];
+
+        // Range fully inside the first segment → one sub-seg.
+        let n = fill_subsegs(&mut out, &segs, 10, 50);
+        assert_eq!(n, 1);
+        // SAFETY: in-bounds offset for the assertion's expected pointer.
+        assert_eq!(out[0], (unsafe { pa.add(10) }, 50));
+
+        // Range straddling the seam → tail of seg0 + head of seg1.
+        let n = fill_subsegs(&mut out, &segs, 80, 40);
+        assert_eq!(n, 2);
+        // SAFETY: in-bounds offset for the assertion's expected pointer.
+        assert_eq!(out[0], (unsafe { pa.add(80) }, 20));
+        assert_eq!(out[1], (pb, 20));
+    }
 }
 
 #[cfg(test)]

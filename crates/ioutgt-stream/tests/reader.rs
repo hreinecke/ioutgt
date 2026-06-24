@@ -1,8 +1,8 @@
 //! Tests for `StreamReader` — the protocol-neutral buffered byte-source.
 //!
 //! Mechanics only: fill/consume windowing, EOF, and the direct-into-caller
-//! `read_direct` path (fragment reassembly, short-on-close, per-completion
-//! `on_chunk`). No protocol knowledge — that lives in the transport crates.
+//! `read_direct_vectored` path (scattered reassembly, short-on-close). No
+//! protocol knowledge — that lives in the transport crates.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -109,16 +109,17 @@ fn fill_refills_after_full_consume() {
     writer.join().unwrap();
 }
 
-/// `read_direct` reassembles N bytes sent as many small fragments, and
-/// `on_chunk` sees exactly those bytes in order.
+/// `read_direct_vectored` scatters N bytes (sent as small fragments) across
+/// several non-adjacent destination buffers in one logical receive; the
+/// concatenated segments reassemble the payload in order.
 #[test]
-fn read_direct_assembles_fragments() {
+fn read_direct_vectored_scatters_into_segments() {
     const N: usize = 64 * 1024;
     const CHUNK: usize = 4 * 1024;
 
     let (client, server) = UnixStream::pair().unwrap();
     #[allow(clippy::cast_possible_truncation)]
-    let expected: Vec<u8> = (0..N).map(|i| (i & 0xFF) as u8).collect();
+    let expected: Vec<u8> = (0..N).map(|i| ((i * 7) & 0xFF) as u8).collect();
 
     let writer = {
         let expected = expected.clone();
@@ -136,24 +137,36 @@ fn read_direct_assembles_fragments() {
 
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
     rt.block_on(async move {
-        // Small scratch buffer: read_direct does not touch it.
+        // Scratch window untouched by the vectored direct path.
         let mut reader = StreamReader::new(server.as_raw_fd(), 64);
-        let mut dst = vec![0u8; N];
-        let mut seen: Vec<u8> = Vec::new();
+        // Three separately-allocated, non-adjacent destination segments.
+        let mut s0 = vec![0u8; 20 * 1024];
+        let mut s1 = vec![0u8; 20 * 1024];
+        let mut s2 = vec![0u8; N - 40 * 1024];
+        let mut iovs = [
+            libc::iovec {
+                iov_base: s0.as_mut_ptr().cast(),
+                iov_len: s0.len(),
+            },
+            libc::iovec {
+                iov_base: s1.as_mut_ptr().cast(),
+                iov_len: s1.len(),
+            },
+            libc::iovec {
+                iov_base: s2.as_mut_ptr().cast(),
+                iov_len: s2.len(),
+            },
+        ];
 
-        // SAFETY: `dst` is valid for N bytes and outlives the awaited op
-        // (it is on this async block's stack; the await resolves first).
-        #[allow(clippy::cast_possible_truncation)]
-        let n = unsafe {
-            reader
-                .read_direct(dst.as_mut_ptr(), N as u32, |c| seen.extend_from_slice(c))
-                .await
-                .unwrap()
-        } as usize;
+        // SAFETY: each segment outlives the awaited op (on this stack frame).
+        let n = unsafe { reader.read_direct_vectored(&mut iovs).await.unwrap() } as usize;
+        assert_eq!(n, N, "vectored recv returned {n} instead of {N}");
 
-        assert_eq!(n, N, "read_direct returned {n} instead of {N}");
-        assert_eq!(dst, expected, "reassembled bytes do not match");
-        assert_eq!(seen, expected, "on_chunk did not see every byte in order");
+        let mut got = Vec::with_capacity(N);
+        got.extend_from_slice(&s0);
+        got.extend_from_slice(&s1);
+        got.extend_from_slice(&s2);
+        assert_eq!(got, expected, "scattered segments did not reassemble");
 
         drop(server);
     });
@@ -161,10 +174,11 @@ fn read_direct_assembles_fragments() {
     writer.join().unwrap();
 }
 
-/// When the writer sends a partial payload then closes, `read_direct`
-/// returns short and `on_chunk` saw exactly the partial bytes.
+/// When the writer sends a partial payload then closes,
+/// `read_direct_vectored` returns short (the received prefix) and the filled
+/// segment holds exactly those bytes, with nothing written past them.
 #[test]
-fn read_direct_short_on_close() {
+fn read_direct_vectored_short_on_close() {
     const N: usize = 64 * 1024;
     const PARTIAL: usize = 3 * 1024;
 
@@ -178,21 +192,32 @@ fn read_direct_short_on_close() {
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
     rt.block_on(async move {
         let mut reader = StreamReader::new(server.as_raw_fd(), 64);
-        let mut dst = vec![0u8; N];
-        let mut seen: Vec<u8> = Vec::new();
+        // Two segments; PARTIAL lands entirely in the first.
+        let mut s0 = vec![0u8; N / 2];
+        let mut s1 = vec![0u8; N / 2];
+        let mut iovs = [
+            libc::iovec {
+                iov_base: s0.as_mut_ptr().cast(),
+                iov_len: s0.len(),
+            },
+            libc::iovec {
+                iov_base: s1.as_mut_ptr().cast(),
+                iov_len: s1.len(),
+            },
+        ];
 
-        // SAFETY: `dst` is valid for N bytes and outlives the awaited op.
-        #[allow(clippy::cast_possible_truncation)]
-        let n = unsafe {
-            reader
-                .read_direct(dst.as_mut_ptr(), N as u32, |c| seen.extend_from_slice(c))
-                .await
-                .unwrap()
-        } as usize;
+        // SAFETY: each segment outlives the awaited op (on this stack frame).
+        let n = unsafe { reader.read_direct_vectored(&mut iovs).await.unwrap() } as usize;
 
         assert_eq!(n, PARTIAL, "expected short return of {PARTIAL}, got {n}");
-        assert_eq!(seen.len(), PARTIAL, "on_chunk saw {} bytes", seen.len());
-        assert!(seen.iter().all(|&b| b == 0xAB), "partial bytes corrupted");
+        assert!(
+            s0[..PARTIAL].iter().all(|&b| b == 0xAB),
+            "partial bytes corrupted"
+        );
+        assert!(
+            s0[PARTIAL..].iter().all(|&b| b == 0),
+            "wrote past the received prefix"
+        );
 
         drop(server);
     });

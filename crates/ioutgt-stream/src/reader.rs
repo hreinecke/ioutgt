@@ -10,10 +10,11 @@
 //! - [`fill`](StreamReader::fill)/[`consume`](StreamReader::consume): a
 //!   buffered window the transport decodes headers and small payloads out
 //!   of. One `recv` refills it; `consume` advances past processed bytes.
-//! - [`read_direct`](StreamReader::read_direct): receive a large payload
-//!   straight into caller memory (a slot buffer), skipping the scratch
-//!   buffer — the bug-prone bit (raw pointer, `MSG_WAITALL` short-read
-//!   resume loop, cancellation/orphan safety) lives here once.
+//! - [`read_direct_vectored`](StreamReader::read_direct_vectored): receive a
+//!   large payload straight into caller memory (one or more slot segments),
+//!   skipping the scratch buffer — the bug-prone bit (raw pointers, scatter
+//!   `recvmsg`/`MSG_WAITALL` short-read resume, cancellation/orphan safety)
+//!   lives here once.
 //!
 //! The reader holds no protocol or slot state: it deals in raw byte
 //! windows and a caller-supplied destination pointer only. It never
@@ -54,7 +55,7 @@ impl StreamReader {
     /// Return the current buffered window, issuing one `recv` first if it
     /// is empty. An empty returned slice means orderly EOF (the peer
     /// closed). The window stays valid until the next
-    /// [`fill`](Self::fill)/[`read_direct`](Self::read_direct);
+    /// [`fill`](Self::fill)/[`read_direct_vectored`](Self::read_direct_vectored);
     /// [`consume`](Self::consume) advances past bytes already processed.
     pub async fn fill(&mut self) -> std::io::Result<&[u8]> {
         if self.pos == self.filled {
@@ -83,57 +84,62 @@ impl StreamReader {
         self.pos += n;
     }
 
-    /// Receive exactly `len` bytes straight into caller memory at `dst`,
-    /// bypassing the scratch buffer (`MSG_WAITALL` with a short-read
-    /// resume loop). `on_chunk` runs once per completed `recv` over the
-    /// bytes just written — the digest seam; pass `|_| {}` to skip it at
-    /// zero cost. Returns the byte count actually received; a value
-    /// `< len` means EOF arrived mid-transfer.
-    ///
-    /// The buffered window must be empty (the direct path is only entered
-    /// once the scratch buffer drained mid-payload).
+    /// Receive the iovecs' total length straight into the caller's
+    /// (possibly scattered)
+    /// segments with a single `recvmsg`/`MSG_WAITALL` — the kernel scatters
+    /// the payload across `iovs`, one syscall instead of one `recv` per
+    /// segment. Returns the bytes received (short only on EOF; the caller
+    /// maps a short return to an orderly mid-payload close). `iovs` is left
+    /// advanced past the received bytes.
     ///
     /// # Safety
     ///
-    /// `dst` must be valid for `len` writable bytes and must remain
-    /// allocated and unaliased for writes until this future resolves. The
-    /// op is awaited inline, so the recv cannot still be in flight once
-    /// this returns; if the whole future is dropped mid-await, the
-    /// reactor's orphan protocol holds the op entry until its terminal
-    /// CQE — the caller must keep `dst` alive until then (queue teardown's
-    /// drain/leak backstop covers this).
-    pub async unsafe fn read_direct(
+    /// Every buffer the iovecs reference must stay valid and exclusively
+    /// borrowed for writes until this future resolves — the op is awaited
+    /// inline; on whole-future drop the reactor holds it to its terminal
+    /// CQE. The reader's scratch window must be empty.
+    #[allow(clippy::cast_possible_truncation)] // total is caller-bounded to MDTS
+    pub async unsafe fn read_direct_vectored(
         &mut self,
-        dst: *mut u8,
-        len: u32,
-        mut on_chunk: impl FnMut(&[u8]),
+        iovs: &mut [libc::iovec],
     ) -> std::io::Result<u32> {
         debug_assert!(
             self.pos == self.filled,
-            "read_direct with buffered bytes pending"
+            "read_direct_vectored with buffered bytes pending"
         );
-        let mut done: u32 = 0;
-        while done < len {
-            // SAFETY: done < len and the caller guarantees `dst` is valid
-            // for `len` bytes, so `dst + done` is in-bounds and the
-            // `len - done` bytes from there stay within the allocation.
-            let ptr = unsafe { dst.add(done as usize) };
-            let want = len - done;
-            // SAFETY: `ptr..ptr+want` is within `dst..dst+len`, which the
-            // caller guarantees is valid for writes until this future
-            // resolves; the op is awaited inline on the next line.
-            let n = unsafe { ops::recv_raw_waitall(self.fd, ptr, want) }?.await?;
+        let total: usize = iovs.iter().map(|v| v.iov_len).sum();
+        let mut done = 0usize;
+        let mut idx = 0usize; // first iovec not yet fully filled
+        while done < total {
+            // A msghdr over the iovecs still awaiting bytes, rebuilt each
+            // iteration so a short (non-EOF) return resumes from the gap.
+            // SAFETY: all-zero is a valid `msghdr`.
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = iovs[idx..].as_mut_ptr();
+            msg.msg_iovlen = iovs.len() - idx;
+            // SAFETY: `msg`, the iovec array, and every buffer they point at
+            // outlive this awaited op (held in this frame); the caller
+            // guarantees the buffers are valid and unaliased for writes.
+            let n = unsafe { ops::recvmsg_raw(self.fd, &raw mut msg) }?.await?;
             if n == 0 {
                 break; // EOF mid-transfer; caller maps the short return.
             }
-            // SAFETY: the kernel just wrote `n` bytes at `ptr`; they are
-            // within the caller's valid `dst` region and nothing else
-            // touches them while this borrow lives (the slot is the
-            // caller's, held exclusively for this transfer).
-            let chunk = unsafe { std::slice::from_raw_parts(ptr, n as usize) };
-            on_chunk(chunk);
-            done += n;
+            done += n as usize;
+            // Advance `idx`/iovecs past the `n` landed bytes for a resume.
+            let mut adv = n as usize;
+            while adv > 0 {
+                let v = &mut iovs[idx];
+                if v.iov_len <= adv {
+                    adv -= v.iov_len;
+                    idx += 1;
+                } else {
+                    // SAFETY: advancing within the current iovec's buffer.
+                    v.iov_base = unsafe { v.iov_base.cast::<u8>().add(adv).cast() };
+                    v.iov_len -= adv;
+                    adv = 0;
+                }
+            }
         }
-        Ok(done)
+        Ok(done as u32)
     }
 }
