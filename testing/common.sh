@@ -383,3 +383,265 @@ fio_perf_one() {
     done
     rm -f "$out"
 }
+
+# ===== NIC perf tuning (target NIC = $TUNE_NIC, in net namespace $TUNE_NS) =====
+# Align a target NIC's RX/TX queue IRQs with ioutgt's io-threads. Reusable by
+# any driver: set TUNE_NIC and TUNE_NS ("" = root netns, e.g. a single-NIC box)
+# plus IOUTGT_BIN / IOUTGT_SOCK / IOUTGT_PORT. /proc/irq, /proc/interrupts,
+# /proc/sys, taskset and `ioutgt ctl` are global; only NIC sysfs/ethtool ops go
+# through the namespace (via nic_exec).
+
+# Run a NIC-side command (ethtool, /sys/class/net writes) in $TUNE_NS.
+nic_exec() { if [ -n "${TUNE_NS:-}" ]; then ip netns exec "$TUNE_NS" "$@"; else "$@"; fi; }
+
+# Toggle gro+gso+tso for NIC $1 to state $2 (on|off) in netns $3 ("" = root).
+# GRO relieves the recv-bound path; hardware TSO offloads TX segmentation (the
+# send-heavy read path); GSO stays on as the software fallback.
+nic_offloads() {
+    local nic="$1" state="$2" ns="${3:-}" pre=()
+    [ -n "$ns" ] && pre=(ip netns exec "$ns")
+    "${pre[@]}" ethtool -K "$nic" gro "$state" gso "$state" tso "$state" 2>/dev/null \
+        || echo "   note: could not toggle gro/gso/tso $state on $nic"
+}
+
+# Auto-size IO queues from NIC $1: min(rx, tx, nproc). rx/tx are RX+Combined /
+# TX+Combined from `ethtool -l`; falls back to counting the sysfs rx-*/tx-*
+# queue dirs. Used to default NR_QUEUES so --io-threads matches the NIC channel
+# count (1:1 IRQ <-> io-thread mapping).
+nic_default_queues() {
+    local nic="$1" out comb rx tx ncpu m
+    out="$(nic_exec ethtool -l "$nic" 2>/dev/null \
+        | sed -n '/Current hardware settings/,$p' || true)"
+    comb="$(printf '%s\n' "$out" | awk '/^Combined:/{print $2; exit}')"
+    rx="$(printf '%s\n' "$out" | awk '/^RX:/{print $2; exit}')"
+    tx="$(printf '%s\n' "$out" | awk '/^TX:/{print $2; exit}')"
+    rx=$(( ${rx:-0} + ${comb:-0} ))
+    tx=$(( ${tx:-0} + ${comb:-0} ))
+    if [ "$rx" -eq 0 ]; then
+        rx="$(nic_exec bash -c "ls -d /sys/class/net/$nic/queues/rx-* 2>/dev/null | wc -l" || echo 0)"
+    fi
+    if [ "$tx" -eq 0 ]; then
+        tx="$(nic_exec bash -c "ls -d /sys/class/net/$nic/queues/tx-* 2>/dev/null | wc -l" || echo 0)"
+    fi
+    ncpu="$(nproc 2>/dev/null || echo 1)"
+    m="$rx"
+    if [ "$tx" -lt "$m" ]; then m="$tx"; fi
+    if [ "$ncpu" -lt "$m" ]; then m="$ncpu"; fi
+    if [ "${m:-0}" -lt 1 ]; then m=1; fi
+    printf '%s\n' "$m"
+}
+
+# Distinct IRQs serving NIC queue index $2 of nic $1: combined "TxRx", or split
+# "rx"/"tx" (one or two IRQs). From the global /proc/interrupts (the NIC sits in
+# a netns but its IRQ action labels persist).
+nic_queue_irqs() {
+    awk -v n="$1" -v q="$2" '
+        $NF ~ ("^" n "-TxRx-" q "$") || $NF ~ ("^" n "-rx-" q "$") || $NF ~ ("^" n "-tx-" q "$") {
+            irq=$1; sub(/:/,"",irq); print irq
+        }' /proc/interrupts | sort -nu
+}
+
+# Hex CPU mask for one CPU as .../xps_cpus expects: comma-separated 32-bit
+# words, high word first (cpu 4 -> "00000010", cpu 24 -> "01000000",
+# cpu 32 -> "00000001,00000000", cpu 62 -> "40000000,00000000").
+cpu_xps_mask() {
+    local cpu="$1"
+    local word=$((cpu / 32)) bit=$((cpu % 32)) i w out=""
+    for ((i = word; i >= 0; i--)); do
+        if [ "$i" -eq "$word" ]; then printf -v w '%08x' $((1 << bit)); else w='00000000'; fi
+        out="${out:+$out,}$w"
+    done
+    printf '%s' "$out"
+}
+
+# Expand a kernel cpulist ("12-13,44-47") to space-separated cpu ids.
+expand_cpus() {
+    local part a b c
+    # Only real cpulists; reject ''/'*'/'?'/unknown so the unquoted split below
+    # can never glob filenames against the cwd.
+    case "$1" in ''|*[!0-9,-]*) return 0 ;; esac
+    for part in ${1//,/ }; do
+        if [[ $part == *-* ]]; then
+            a=${part%-*}; b=${part#*-}
+            for ((c = a; c <= b; c++)); do printf '%s ' "$c"; done
+        else
+            printf '%s ' "$part"
+        fi
+    done
+}
+
+# Pick the HT sibling of the NIC RX-IRQ CPU $2 -- the other logical CPU on the
+# SAME physical core. Co-locating the io-thread on its own RX-IRQ CPU serializes
+# the NIC RX softirq and the recv/copy on one logical CPU, capping a single fast
+# connection ~20% (measured on bnxt_en 10GbE: 888 vs ~1040 MiB/s, 64K randwrite,
+# beating nvmet). The sibling runs them on two logical CPUs (no serialization)
+# while sharing the core's L1/L2, so the data the softirq just landed is still
+# warm for the io-thread's copy. Falls back, when SMT is off (no sibling), to a
+# different physical core in group $1, then to irqcpu itself.
+iothread_cpu() {
+    local group="$1" irqcpu="$2" sib cpu
+    # The IRQ CPU's HT sibling (the thread_siblings entry that is not itself).
+    for cpu in $(expand_cpus "$(cat "/sys/devices/system/cpu/cpu$irqcpu/topology/thread_siblings_list" 2>/dev/null)"); do
+        [ "$cpu" != "$irqcpu" ] && { echo "$cpu"; return 0; }
+    done
+    # SMT off: no sibling -- use a different physical core in the NUMA group.
+    sib=" $(expand_cpus "$(cat "/sys/devices/system/cpu/cpu$irqcpu/topology/thread_siblings_list" 2>/dev/null)") "
+    for cpu in $(expand_cpus "$group"); do
+        case "$sib" in *" $cpu "*) continue ;; esac
+        echo "$cpu"; return 0
+    done
+    echo "$irqcpu"
+}
+
+# Converge $TUNE_NIC's rx/tx queue IRQs and ioutgt's io-thread CPUs. Run AFTER
+# connect: the queue-thread pool spawns lazily on the first connection and
+# `ioutgt list` reports each IO queue's pthread tid + full online CPU group only
+# once it is connected. Per NIC queue i (== qid i+1 == io-thread i):
+#   1. push the io-thread's whole CPU group onto the queue's rx/tx IRQ
+#      smp_affinity (NIC follows ioutgt -- a no-op on a managed/read-only IRQ);
+#   2. read the rx/tx IRQ *effective* affinity, then taskset the io-thread (by
+#      tid) to the IRQ CPU's HT SIBLING -- a different logical CPU on the same
+#      physical core, NOT the IRQ CPU itself: co-locating io-thread and RX
+#      softirq on one logical CPU serializes them and caps a single fast
+#      connection ~20% (888 vs ~1040 MiB/s, 64K randwrite). See iothread_cpu().
+#   3. XPS: map the io-thread's CPU -> this queue's tx ring (xps_cpus).
+# Steps 1-3 only align queue<->thread CPUs; they do NOT decide which queue a
+# *flow* uses (RSS picks the RX queue, decoupled from the qid->io-thread route);
+# per-flow RX co-location is added separately via hardware ntuple rules. We
+# deliberately DISABLE software RPS/RFS: it relocates RX softirqs to the consumer
+# CPU with smp_call_function IPIs (net_rps_send_ipi) -- a Function-call-interrupt
+# storm for no throughput gain -- and its knobs persist across runs, so the sync
+# clears them every time. irqbalance would fight the pinning, so stop it.
+tune_target_nic() {
+    [ -n "${TUNE_NIC:-}" ] || { echo "   (TUNE_NIC unset; skipping IRQ affinity sync)"; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
+    local json rows
+    json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"
+    # qid, tid, active CPU, full online CPU group (cpulist), peer ip:port.
+    rows="$(printf '%s' "$json" \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus) \(.peer)"' \
+            2>/dev/null | sort -n -u || true)"
+    if [ -z "$rows" ]; then
+        echo "   (no connected IO queues; run 'connect' first)"; return 0
+    fi
+    systemctl stop irqbalance 2>/dev/null || true
+    echo ">> converging $TUNE_NIC queue IRQ affinity <-> ioutgt io-threads"
+    local qid tid cpus group peer sport nicq irqs irq combo eff pushed xcpu xps irqcpu iocpu
+    while read -r qid tid cpus group peer; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1))
+        irqs="$(nic_queue_irqs "$TUNE_NIC" "$nicq")"
+        if [ -z "$irqs" ]; then
+            echo "   q$nicq (qid $qid): no NIC IRQ found; skipped"; continue
+        fi
+        combo=""; pushed=""
+        for irq in $irqs; do
+            # 1. push the io-thread's whole CPU group onto the (unmanaged) IRQ.
+            #    A valid cpulist only -- "*"/"?" (unpinned/unknown) can't be set.
+            case "$group" in
+                ''|'*'|'?'|*[!0-9,-]*) ;;
+                *) if echo "$group" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null; then
+                       pushed="${pushed:+$pushed,}$irq"
+                   fi ;;
+            esac
+            # 2. collect this IRQ's effective affinity for the combination.
+            eff="$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || true)"
+            [ -n "$eff" ] && combo="${combo:+$combo,}$eff"
+        done
+        # Place the io-thread on the IRQ CPU's HT sibling (different logical CPU,
+        # same physical core; falls back to a different core when SMT is off).
+        irqcpu="${combo%%[,-]*}"
+        iocpu="$(iothread_cpu "$group" "$irqcpu")"
+        if [ -n "$iocpu" ] && taskset -cp "$iocpu" "$tid" >/dev/null 2>&1; then
+            # 3. XPS: a send from this io-thread's CPU egresses tx-$nicq.
+            xcpu="$iocpu"; xps=skip
+            case "$xcpu" in
+                ''|*[!0-9]*) ;;
+                *) if nic_exec bash -c \
+                        "echo $(cpu_xps_mask "$xcpu") > /sys/class/net/$TUNE_NIC/queues/tx-$nicq/xps_cpus" \
+                        2>/dev/null; then xps="cpu $xcpu"; fi ;;
+            esac
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] eff=$combo group=$group -> io-thread tid $tid cpu $iocpu (off irq cpu $irqcpu), xps tx-$nicq=$xps (was cpu $cpus)"
+        else
+            echo "   q$nicq irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '${iocpu:-?}' (irq cpu $irqcpu) failed"
+        fi
+    done <<EOF
+$rows
+EOF
+    # Disable software RPS/RFS (the net_rps_send_ipi storm). These knobs persist
+    # across runs, so clear them every sync: the global flow table and, on each
+    # rx queue, rps_flow_cnt (RFS) and rps_cpus (plain RPS).
+    echo 0 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+    nic_exec bash -c '
+        for q in /sys/class/net/'"$TUNE_NIC"'/queues/rx-*; do
+            echo 0 > "$q/rps_flow_cnt" 2>/dev/null
+            echo 0 > "$q/rps_cpus" 2>/dev/null
+        done' 2>/dev/null || true
+    echo "   RPS/RFS disabled (RX softirqs stay on their queue CPU; no relocation IPIs)"
+
+    # Hardware ntuple RX steering: have the NIC deliver each connection's RX
+    # directly to its io-thread's queue (qid-1) -- no software RFS, no IPI, and
+    # stable. Match the inbound flow by the host's ephemeral source port (unique
+    # per connection) + our listen port.
+    nic_exec ethtool -K "$TUNE_NIC" ntuple on >/dev/null 2>&1 || true
+    # Clear stale rules (previous runs' source ports) for a clean slate.
+    nic_exec bash -c 'ethtool -n '"$TUNE_NIC"' 2>/dev/null | awk "/Filter:/{print \$2}" \
+        | while read -r id; do ethtool -N '"$TUNE_NIC"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
+    echo ">> steering each flow to its io-thread queue via NIC ntuple (no IPI)"
+    while read -r qid tid cpus group peer; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1)); sport="${peer##*:}"
+        case "$sport" in ''|*[!0-9]*) echo "   q$nicq: no peer port ($peer); skipped"; continue ;; esac
+        if nic_exec ethtool -N "$TUNE_NIC" flow-type tcp4 \
+                src-port "$sport" dst-port "$IOUTGT_PORT" action "$nicq" >/dev/null 2>&1; then
+            echo "   q$nicq: src-port $sport -> rx queue $nicq (hardware)"
+        else
+            echo "   q$nicq: ntuple rule (src-port $sport) rejected"
+        fi
+    done <<EOF
+$rows
+EOF
+}
+
+# Show, per IO queue, the io-thread's LIVE affinity (from `ioutgt list`) beside
+# its $TUNE_NIC RX IRQ effective CPU, with the separation verdict (OK = io-thread
+# on a different logical CPU than its RX IRQ; SAME-CPU = the capping
+# co-location). Reads only globals (/proc/irq, /proc/interrupts, ioutgt ctl).
+tune_status() {
+    [ -n "${TUNE_NIC:-}" ] || return 0
+    echo "== $TUNE_NIC queue IRQ vs ioutgt io-thread (live) affinity =="
+    # `is-active` exits non-zero (and still prints the state) when not running.
+    echo "  irqbalance: $(systemctl is-active irqbalance 2>/dev/null || true)"
+    local rows
+    rows="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus)"' \
+            2>/dev/null | sort -n -u || true)"
+    if [ -z "$rows" ]; then
+        echo "  (no connected IO queues)"; return 0
+    fi
+    local qid tid cpus group nicq irqs irq eff verdict mism=0 ircpu
+    while read -r qid tid cpus group; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1))
+        irqs="$(nic_queue_irqs "$TUNE_NIC" "$nicq")"
+        eff=""
+        for irq in $irqs; do
+            eff="${eff:+$eff,}$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || echo '?')"
+        done
+        ircpu="${eff%%,*}"
+        case "$cpus" in
+            *[!0-9]*)  verdict='?' ;;          # unpinned/unknown io-thread
+            "$ircpu")  verdict=SAME-CPU; mism=$((mism + 1)) ;;
+            *)         verdict=OK ;;
+        esac
+        printf "  q%-2s io-thread(tid %s) aff=%-10s group=%-12s | irq[%s] eff=%-10s %s\n" \
+            "$nicq" "$tid" "$cpus" "$group" "$(echo $irqs | tr '\n' ' ' | sed 's/ $//')" "${eff:-?}" "$verdict"
+    done <<EOF
+$rows
+EOF
+    if [ "$mism" -eq 0 ]; then
+        echo "  separation: OK (every io-thread on a different CPU than its NIC RX IRQ)"
+    else
+        echo "  separation: $mism queue(s) SAME-CPU as their RX IRQ -- re-run 'connect' (or irqbalance restarted?)"
+    fi
+}
