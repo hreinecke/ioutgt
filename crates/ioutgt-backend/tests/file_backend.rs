@@ -6,6 +6,7 @@
 
 use ioutgt_backend::FileBackend;
 use ioutgt_core::buf::AlignedBuf;
+use ioutgt_core::pool::Seg;
 use ioutgt_core::{Backend, BackendError, LbaRange};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 
@@ -59,6 +60,73 @@ fn direct_write_read_roundtrip() {
         let err = be.read(be.nr_blocks(), &mut out[..512]).await.unwrap_err();
         assert_eq!(err, BackendError::OutOfRange);
     });
+}
+
+#[test]
+fn scattered_write_matches_contiguous() {
+    // A two-segment vectored write must land byte-identically to one
+    // contiguous write of the concatenation.
+    let path = scratch_file("fb-scatter", 8 << 20);
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let be = FileBackend::open(&path, 12).unwrap(); // 4K blocks
+
+    rt.block_on(async move {
+        // Two separate page-aligned buffers (non-adjacent in memory).
+        let mut a = AlignedBuf::zeroed(8192);
+        let mut b = AlignedBuf::zeroed(4096);
+        a.iter_mut().for_each(|x| *x = 0xAB);
+        b.iter_mut().for_each(|x| *x = 0xCD);
+        let segs = [
+            Seg {
+                ptr: a.as_ptr().cast_mut(),
+                len: 8192,
+            },
+            Seg {
+                ptr: b.as_ptr().cast_mut(),
+                len: 4096,
+            },
+        ];
+        be.write_segs(0, &segs, 12288).await.unwrap();
+        be.flush().await.unwrap();
+
+        // Read it back vectored into fresh buffers and check the seam.
+        let r = AlignedBuf::zeroed(12288);
+        let rsegs = [Seg {
+            ptr: r.as_ptr().cast_mut(),
+            len: 12288,
+        }];
+        be.read_segs(0, &rsegs, 12288).await.unwrap();
+        assert!(r[..8192].iter().all(|&x| x == 0xAB), "first segment");
+        assert!(r[8192..].iter().all(|&x| x == 0xCD), "second segment");
+    });
+}
+
+#[test]
+fn temp_dir_roundtrip_either_path() {
+    // temp_dir may be tmpfs (no O_DIRECT → buffered/DONTCACHE path) or a
+    // real fs (O_DIRECT path); the backend must open and round-trip on
+    // whichever it is.
+    let dir = std::env::temp_dir().join(format!("ioutgt-fb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("img");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let be = FileBackend::open(&path, 9).unwrap();
+    eprintln!("temp_dir O_DIRECT active: {}", be.is_direct());
+    rt.block_on(async move {
+        let mut buf = AlignedBuf::zeroed(4096);
+        buf.iter_mut().for_each(|x| *x = 0x5A);
+        let pattern = buf.to_vec();
+        be.write(8, &buf[..4096]).await.unwrap();
+        let mut out = AlignedBuf::zeroed(4096);
+        be.read(8, &mut out[..4096]).await.unwrap();
+        assert_eq!(&out[..], &pattern[..]);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

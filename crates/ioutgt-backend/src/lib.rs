@@ -15,6 +15,7 @@ pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
 
+use ioutgt_core::pool::Seg;
 use ioutgt_core::{Backend, BackendError, LbaRange};
 
 /// All compiled-in backends, for heterogeneous namespace maps.
@@ -57,6 +58,22 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.write(slba, buf).await,
             AnyBackend::Memory(b) => b.write(slba, buf).await,
             AnyBackend::File(b) => b.write(slba, buf).await,
+        }
+    }
+
+    async fn read_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Null(b) => b.read_segs(slba, segs, total).await,
+            AnyBackend::Memory(b) => b.read_segs(slba, segs, total).await,
+            AnyBackend::File(b) => b.read_segs(slba, segs, total).await,
+        }
+    }
+
+    async fn write_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+        match self {
+            AnyBackend::Null(b) => b.write_segs(slba, segs, total).await,
+            AnyBackend::Memory(b) => b.write_segs(slba, segs, total).await,
+            AnyBackend::File(b) => b.write_segs(slba, segs, total).await,
         }
     }
 

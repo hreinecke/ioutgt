@@ -7,6 +7,8 @@
 //! dispatch monomorphized (no per-IO boxing) while allowing heterogeneous
 //! namespaces.
 
+use crate::pool::Seg;
+
 /// A contiguous LBA range (discard / write-zeroes).
 #[derive(Debug, Clone, Copy)]
 #[allow(missing_docs)]
@@ -47,6 +49,69 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Write `buf.len()` bytes starting at logical block `slba`.
     fn write(&self, slba: u64, buf: &[u8]) -> impl Future<Output = Result<(), BackendError>>;
+
+    /// Read `total` bytes starting at logical block `slba` into `segs`,
+    /// filling segments in order. Default: one [`Self::read`] per segment;
+    /// backends that support vectored IO override with a single op.
+    ///
+    /// # Safety contract
+    /// Each [`Seg`] must describe a buffer valid and exclusively borrowed
+    /// for the duration of the returned future.
+    fn read_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+    ) -> impl Future<Output = Result<(), BackendError>> {
+        async move {
+            let mut remaining = total;
+            let mut cur = slba;
+            for seg in segs {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(seg.len);
+                // SAFETY: per the method's safety contract, `seg` is a valid
+                // exclusively-borrowed buffer of at least `seg.len` bytes.
+                let s = unsafe { std::slice::from_raw_parts_mut(seg.ptr, take) };
+                self.read(cur, s).await?;
+                cur += (take as u64) >> self.block_shift();
+                remaining -= take;
+            }
+            Ok(())
+        }
+    }
+
+    /// Write `total` bytes drawn from `segs` (in order) starting at logical
+    /// block `slba`. Default: one [`Self::write`] per segment; backends that
+    /// support vectored IO override with a single op.
+    ///
+    /// # Safety contract
+    /// As [`Self::read_segs`] (the buffers are read only).
+    fn write_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+    ) -> impl Future<Output = Result<(), BackendError>> {
+        async move {
+            let mut remaining = total;
+            let mut cur = slba;
+            for seg in segs {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(seg.len);
+                // SAFETY: per the method's safety contract, `seg` is a valid
+                // exclusively-borrowed buffer of at least `seg.len` bytes.
+                let s = unsafe { std::slice::from_raw_parts(seg.ptr, take) };
+                self.write(cur, s).await?;
+                cur += (take as u64) >> self.block_shift();
+                remaining -= take;
+            }
+            Ok(())
+        }
+    }
 
     /// Persist completed writes.
     fn flush(&self) -> impl Future<Output = Result<(), BackendError>>;

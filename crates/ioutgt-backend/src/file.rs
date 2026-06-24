@@ -1,17 +1,33 @@
-//! File and block-device backend: O_DIRECT IO through the queue
-//! thread's io_uring.
+//! File and block-device backend: vectored IO through the queue
+//! thread's io_uring, O_DIRECT on a backing store that supports it,
+//! buffered otherwise (e.g. tmpfs).
 //!
 //! One implementation serves both regular files and block devices
 //! (geometry probing differs; the IO path is identical), mirroring how
 //! little actually differs in userspace — unlike kernel nvmet's
 //! bio-vs-kiocb split.
+//!
+//! A single fd is opened `O_DIRECT`, falling back to a plain buffered fd
+//! when the store refuses it. The choice is fixed at open and needs no
+//! alignment probing: our data buffers come from the page-granular slot
+//! pool and every NVMe transfer is a logical-block multiple, so once an
+//! O_DIRECT fd opens it serves *every* IO. (Sub-page-aligned buffers —
+//! which would need the per-store `statx STATX_DIOALIGN` check and a
+//! buffered fallback — only arise with a zero-copy recv ring, which this
+//! backend does not yet receive into.)
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
+use ioutgt_core::pool::{MAX_SEGS, Seg};
 use ioutgt_core::{Backend, BackendError, LbaRange};
 use ioutgt_uring::ops;
+
+/// `errno` from the most recent failed libc call.
+fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
 
 /// Backing kind, decided by `fstat` at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,25 +36,62 @@ enum Kind {
     Block,
 }
 
-/// O_DIRECT file/bdev backend. See module docs.
+const EMPTY_IOVEC: libc::iovec = libc::iovec {
+    iov_base: std::ptr::null_mut(),
+    iov_len: 0,
+};
+
+/// File/bdev backend issuing vectored IO; O_DIRECT or buffered, fixed at
+/// open. See module docs.
 pub struct FileBackend {
+    /// O_DIRECT when the store allowed it, else a plain buffered fd.
     fd: OwnedFd,
     kind: Kind,
     block_shift: u8,
     nr_blocks: u64,
-    /// O_DIRECT in effect (false: buffered fallback, e.g. tmpfs).
+    /// O_DIRECT is in effect (false ⇒ the store refused it, IO is buffered).
     direct: bool,
 }
 
-fn errno() -> i32 {
-    io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(libc::EIO)
+/// Fill `iovs` from `segs`, clamping the total to `total` bytes; returns
+/// the number of iovec entries used.
+fn fill_iovecs(iovs: &mut [libc::iovec], segs: &[Seg], total: usize) -> usize {
+    let mut remaining = total;
+    let mut n = 0;
+    for seg in segs {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(seg.len);
+        iovs[n] = libc::iovec {
+            iov_base: seg.ptr.cast(),
+            iov_len: take,
+        };
+        n += 1;
+        remaining -= take;
+    }
+    n
+}
+
+/// Advance `iovs[idx..]` past `n` transferred bytes (short-IO resume).
+fn advance_iovecs(iovs: &mut [libc::iovec], idx: &mut usize, mut n: usize) {
+    while n > 0 {
+        let v = &mut iovs[*idx];
+        if v.iov_len <= n {
+            n -= v.iov_len;
+            *idx += 1;
+        } else {
+            // SAFETY: advancing within the current iovec's own buffer.
+            v.iov_base = unsafe { v.iov_base.cast::<u8>().add(n).cast() };
+            v.iov_len -= n;
+            n = 0;
+        }
+    }
 }
 
 impl FileBackend {
-    /// Open `path` (regular file or block device) with O_DIRECT,
-    /// falling back to buffered IO where direct is unsupported.
+    /// Open `path` (regular file or block device) `O_DIRECT`, falling back
+    /// to buffered IO where the store refuses direct.
     pub fn open(path: &Path, block_shift: u8) -> io::Result<FileBackend> {
         use std::os::unix::ffi::OsStrExt;
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -46,17 +99,17 @@ impl FileBackend {
 
         let mut direct = true;
         // SAFETY: valid NUL-terminated path; flags are plain constants.
-        let mut fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
-        if fd < 0 && matches!(errno(), libc::EINVAL | libc::EOPNOTSUPP) {
+        let mut rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+        if rfd < 0 && matches!(errno(), libc::EINVAL | libc::EOPNOTSUPP) {
             direct = false;
             // SAFETY: as above.
-            fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+            rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
         }
-        if fd < 0 {
+        if rfd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: fresh fd, exclusively owned.
-        let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let fd = unsafe { OwnedFd::from_raw_fd(rfd) };
 
         // SAFETY: stat is written by the kernel on success.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -90,6 +143,7 @@ impl FileBackend {
                 "backing store too small",
             ));
         }
+
         Ok(FileBackend {
             fd,
             kind,
@@ -99,8 +153,7 @@ impl FileBackend {
         })
     }
 
-    /// O_DIRECT active (false means the filesystem refused it and IO is
-    /// buffered — correct, just not the performance path).
+    /// O_DIRECT is in effect for this backend's IO (decided at open).
     pub fn is_direct(&self) -> bool {
         self.direct
     }
@@ -109,36 +162,52 @@ impl FileBackend {
         slba << self.block_shift
     }
 
-    async fn rw(
+    /// Issue one vectored read/write on the backend fd (O_DIRECT or
+    /// buffered, fixed at open), resuming across short transfers.
+    async fn rwv(
         &self,
         write: bool,
         slba: u64,
-        ptr: *mut u8,
-        len: usize,
+        iovs: &mut [libc::iovec],
+        total: usize,
     ) -> Result<(), BackendError> {
-        self.check_range(slba, (len as u64) >> self.block_shift)?;
+        if total == 0 {
+            return Ok(());
+        }
+        self.check_range(slba, (total as u64) >> self.block_shift)?;
+        let base_off = self.offset(slba);
+        let fd = self.fd.as_raw_fd();
+
         let mut done = 0usize;
-        while done < len {
-            let off = self.offset(slba) + done as u64;
-            let want = u32::try_from(len - done).map_err(|_| BackendError::Io(libc::EINVAL))?;
-            // SAFETY: ptr..ptr+len is the caller's slot buffer, valid and
-            // exclusively borrowed for the duration of this future; queue
-            // teardown drains executing slots before freeing it.
+        let mut idx = 0usize;
+        while done < total {
+            let off = base_off + done as u64;
+            let ptr = iovs[idx..].as_ptr();
+            #[allow(clippy::cast_possible_truncation)]
+            let cnt = (iovs.len() - idx) as u32;
+            // SAFETY: `iovs` and every buffer they point at outlive this
+            // awaited op — `iovs` lives in the caller's frame (held across
+            // the await) and the segment buffers are the caller's slot
+            // memory, valid while the slot is Executing. The reactor's
+            // orphan protocol holds the op entry to its terminal CQE on
+            // whole-future drop, the same envelope as the other raw ops.
             let res = unsafe {
                 if write {
-                    ops::write_at_raw(self.fd.as_raw_fd(), ptr.add(done), want, off)
+                    ops::writev_at_raw(fd, ptr, cnt, off, 0)
                 } else {
-                    ops::read_at_raw(self.fd.as_raw_fd(), ptr.add(done), want, off)
+                    ops::readv_at_raw(fd, ptr, cnt, off, 0)
                 }
             };
-            let n = res
-                .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
-                .await
-                .map_err(|e| map_errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            if n == 0 {
-                return Err(BackendError::Io(libc::EIO));
+            let op = res.map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            match op.await {
+                Ok(0) => return Err(BackendError::Io(libc::EIO)),
+                Ok(n) => {
+                    let n = n as usize;
+                    advance_iovecs(iovs, &mut idx, n);
+                    done += n;
+                }
+                Err(e) => return Err(map_errno(e.raw_os_error().unwrap_or(libc::EIO))),
             }
-            done += n as usize;
         }
         Ok(())
     }
@@ -162,12 +231,31 @@ impl Backend for FileBackend {
     }
 
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
-        self.rw(false, slba, buf.as_mut_ptr(), buf.len()).await
+        let mut iovs = [libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        }];
+        self.rwv(false, slba, &mut iovs, buf.len()).await
     }
 
     async fn write(&self, slba: u64, buf: &[u8]) -> Result<(), BackendError> {
-        self.rw(true, slba, buf.as_ptr().cast_mut(), buf.len())
-            .await
+        let mut iovs = [libc::iovec {
+            iov_base: buf.as_ptr().cast_mut().cast(),
+            iov_len: buf.len(),
+        }];
+        self.rwv(true, slba, &mut iovs, buf.len()).await
+    }
+
+    async fn read_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+        let mut iovs = [EMPTY_IOVEC; MAX_SEGS];
+        let n = fill_iovecs(&mut iovs, segs, total);
+        self.rwv(false, slba, &mut iovs[..n], total).await
+    }
+
+    async fn write_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+        let mut iovs = [EMPTY_IOVEC; MAX_SEGS];
+        let n = fill_iovecs(&mut iovs, segs, total);
+        self.rwv(true, slba, &mut iovs[..n], total).await
     }
 
     async fn flush(&self) -> Result<(), BackendError> {
@@ -190,8 +278,12 @@ impl Backend for FileBackend {
             }
             let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
             let len = u64::from(range.nlb) << self.block_shift;
-            if let Ok(op) = ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
-            {
+            if let Ok(op) = ops::fallocate(
+                self.fd.as_raw_fd(),
+                mode,
+                self.offset(range.slba),
+                len,
+            ) {
                 let _ = op.await;
             }
         }
@@ -207,9 +299,12 @@ impl Backend for FileBackend {
                 libc::FALLOC_FL_ZERO_RANGE,
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
             ] {
-                if let Ok(op) =
-                    ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
-                {
+                if let Ok(op) = ops::fallocate(
+                    self.fd.as_raw_fd(),
+                    mode,
+                    self.offset(range.slba),
+                    len,
+                ) {
                     if op.await.is_ok() {
                         return Ok(());
                     }
@@ -217,7 +312,7 @@ impl Backend for FileBackend {
             }
         }
         // Fallback (and the block-device path until uring-cmd discard
-        // lands): write zero chunks.
+        // lands): write zero chunks through the buffered fd.
         let chunk = ioutgt_core::buf::AlignedBuf::zeroed(64 * 1024);
         let mut remaining = len;
         let mut off = self.offset(range.slba);
@@ -226,7 +321,7 @@ impl Backend for FileBackend {
             // SAFETY: chunk is alive across the await; read-only for the
             // kernel.
             let n = unsafe {
-                ops::write_at_raw(self.fd.as_raw_fd(), chunk.as_ptr().cast_mut(), want, off)
+                ops::write_at_raw(self.fd.as_raw_fd(), chunk.as_ptr(), want, off)
             }
             .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
             .await

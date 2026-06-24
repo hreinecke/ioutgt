@@ -19,6 +19,8 @@ pub struct Features {
     pub accept_multi: bool,
     pub read: bool,
     pub write: bool,
+    pub readv: bool,
+    pub writev: bool,
     pub fsync: bool,
     pub fallocate: bool,
     pub timeout: bool,
@@ -38,6 +40,8 @@ impl Features {
             && self.accept_multi
             && self.read
             && self.write
+            && self.readv
+            && self.writev
             && self.fsync
             && self.fallocate
             && self.timeout
@@ -70,6 +74,8 @@ pub fn probe() -> io::Result<Features> {
         accept_multi: probe.is_supported(opcode::AcceptMulti::CODE),
         read: probe.is_supported(opcode::Read::CODE),
         write: probe.is_supported(opcode::Write::CODE),
+        readv: probe.is_supported(opcode::Readv::CODE),
+        writev: probe.is_supported(opcode::Writev::CODE),
         fsync: probe.is_supported(opcode::Fsync::CODE),
         fallocate: probe.is_supported(opcode::Fallocate::CODE),
         timeout: probe.is_supported(opcode::Timeout::CODE),

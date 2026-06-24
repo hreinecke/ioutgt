@@ -522,3 +522,59 @@ pub unsafe fn write_at_raw(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> 
     )?;
     Ok(RawOp { op })
 }
+
+/// Positional vectored read into caller-managed iovecs. `rw_flags` is a
+/// `preadv2(2)` flag bitset (e.g. `RWF_DONTCACHE`).
+///
+/// # Safety
+///
+/// Same contract as [`recv_raw`]: the `iovec` array *and* every buffer it
+/// points at must stay valid and exclusively borrowed until the terminal
+/// CQE is reaped.
+pub unsafe fn readv_at_raw(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    n: u32,
+    offset: u64,
+    rw_flags: i32,
+) -> io::Result<RawOp> {
+    let op = Op::submit_classed(
+        |key| {
+            opcode::Readv::new(types::Fd(fd), iov, n)
+                .offset(offset)
+                .rw_flags(rw_flags)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Read,
+    )?;
+    Ok(RawOp { op })
+}
+
+/// Positional vectored write from caller-managed iovecs. `rw_flags` is a
+/// `pwritev2(2)` flag bitset (e.g. `RWF_DONTCACHE`).
+///
+/// # Safety
+///
+/// Same contract as [`readv_at_raw`] (reads the buffers only).
+pub unsafe fn writev_at_raw(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    n: u32,
+    offset: u64,
+    rw_flags: i32,
+) -> io::Result<RawOp> {
+    let op = Op::submit_classed(
+        |key| {
+            opcode::Writev::new(types::Fd(fd), iov, n)
+                .offset(offset)
+                .rw_flags(rw_flags)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Write,
+    )?;
+    Ok(RawOp { op })
+}
