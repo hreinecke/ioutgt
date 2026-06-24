@@ -180,6 +180,14 @@ The merge in `push_raw` is what makes a header-only batch collapse to a
  push_arena("R2T#2")   ┘ → ONE iovec entry, iov_len grows
 ```
 
+A read's C2HData payload rides in place from the slot's pooled data
+buffer. That buffer may be one contiguous run or a scatter list of pool
+pages, so the transport pushes one `push_raw` per segment; non-adjacent
+segments stay as separate iovec entries. The per-item `fits(a, i)` headroom
+therefore reserves `MAX_SEGS + 3` iovecs (header + up to `MAX_SEGS` payload
+segments + DDGST + capsule) so staging a scattered payload can never
+overrun the iovec cap (which itself clamps to `UIO_MAXIOV`).
+
 The two kernel structs it manages are raw libc types:
 
 - **`libc::iovec`** `{ iov_base: *mut c_void, iov_len: usize }` — one

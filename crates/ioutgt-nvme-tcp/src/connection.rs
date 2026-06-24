@@ -846,9 +846,13 @@ fn validate_h2c(
 /// Worst-case arena bytes per staged item: C2HData header (24+4
 /// HDGST) + DDGST trailer (4) + response capsule (24+4).
 const ARENA_PER_ITEM: usize = 64;
-/// Worst-case iovec entries per staged item (header, payload, digest,
-/// capsule). Adjacent arena chunks merge; this is the unmerged bound.
-const IOVS_PER_ITEM: usize = 4;
+/// Worst-case iovec entries per staged item: a C2HData header, the read
+/// payload (up to `MAX_SEGS` segments when the slot lease is scattered),
+/// the DDGST trailer, and the response capsule. Adjacent arena chunks
+/// merge, so the header/digest/capsule collapse; the payload segments do
+/// not. This bounds one item's iovec use so the batch `fits()` check
+/// never lets staging overrun the iovec cap (which clamps to UIO_MAXIOV).
+const IOVS_PER_ITEM: usize = ioutgt_core::pool::MAX_SEGS + 3;
 
 /// Stage one work item: header pieces into the arena (sans-IO encoders
 /// unchanged), payload referenced in place from the slot buffer, DDGST
@@ -1015,6 +1019,57 @@ mod gather_tests {
             out.extend_from_slice(s);
         }
         out
+    }
+
+    #[test]
+    fn scattered_read_payload_linearizes() {
+        use ioutgt_core::pool::PAGE;
+        // Fragment a 4-page pool so a 2-page read lease must scatter.
+        let queue = NvmeTcpQueue::new(1, 8, 4 * PAGE, false);
+        let a = queue.pool().alloc(PAGE).unwrap();
+        let _b = queue.pool().alloc(PAGE).unwrap();
+        let c = queue.pool().alloc(PAGE).unwrap();
+        let _d = queue.pool().alloc(PAGE).unwrap();
+        drop(a);
+        drop(c); // free pages 0 and 2 — two non-adjacent holes
+        queue.lease_or_owned(2, 2 * PAGE);
+        assert!(
+            !queue.slot(2).data().is_contiguous(),
+            "the 2-page lease should be scattered across the holes"
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
+        let payload: Vec<u8> = (0..(2 * PAGE) as u32).map(|i| (i % 251) as u8).collect();
+        queue.slot(2).data().write_at(0, &payload);
+
+        let mut g = gather_for(queue.sqsize);
+        let cqe = Cqe::new(0, 1, 1, 7, 0);
+        #[allow(clippy::cast_possible_truncation)]
+        let item = SendWork::Response(Completion {
+            tag: 2,
+            cqe,
+            data_len: (2 * PAGE) as u32,
+        });
+        assert!(g.fits(ARENA_PER_ITEM, IOVS_PER_ITEM));
+        stage_send_work(&mut g, &queue, &item, true, true);
+
+        // The scattered payload must linearize to the same wire bytes as a
+        // contiguous one: C2HData hdr | payload | DDGST | response capsule.
+        let mut expect = vec![0u8; 4 * PAGE];
+        #[allow(clippy::cast_possible_truncation)]
+        let len = (2 * PAGE) as u32;
+        let mut off = pdu::encode_c2h_data(&mut expect, 7, 0, len, true, false, true, true);
+        expect[off..off + 2 * PAGE].copy_from_slice(&payload);
+        off += 2 * PAGE;
+        let crc = digest::crc32c(&payload);
+        expect[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+        off += 4;
+        off += pdu::encode_capsule_resp(&mut expect[off..], &cqe, true);
+        expect.truncate(off);
+
+        assert_eq!(gather(&g), expect, "scattered payload sends correct bytes");
+        // Payload contributes two (non-merged) iovec entries.
+        assert!(g.iovs().len() >= 4, "header + 2 payload segs + trailer");
     }
 
     #[test]

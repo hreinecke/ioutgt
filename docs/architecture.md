@@ -762,6 +762,10 @@ backend support lands.
 trait Backend {
     async fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), BackendError>;
     async fn write(&self, lba: u64, buf: &[u8]) -> Result<(), BackendError>;
+    // Vectored variants over a command's data segments (default: one
+    // read/write per segment; the file backend overrides with one op).
+    async fn read_segs(&self, lba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError>;
+    async fn write_segs(&self, lba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError>;
     async fn flush(&self) -> Result<(), BackendError>;
     async fn discard(&self, ranges: &[LbaRange]) -> Result<(), BackendError>;
     async fn write_zeroes(&self, range: LbaRange) -> Result<(), BackendError>;
@@ -769,23 +773,33 @@ trait Backend {
 }
 ```
 
-(Signature sketch; exact buffer types are the slot-owned buffers.) Backends:
-`Null`, `Memory` (bring-up + tests), `File` (O_DIRECT via ring `READ`/
-`WRITE`, `FSYNC` flush, `FALLOCATE` punch-hole/zero-range), `Block` (raw
-bdev). Disk ops are issued on the owning queue thread's own ring. IOPOLL is
-not used: a polled ring cannot carry socket ops, and a second per-thread
-IOPOLL ring is a measured-later roadmap item.
+(Signature sketch.) Backends: `Null`, `Memory` (bring-up + tests), `File`
+(regular file or block device), `Block` (raw bdev). Disk ops run on the
+owning queue thread's own ring. The file backend issues vectored
+`READV`/`WRITEV` over a command's data segments (one iovec per pool
+segment — contiguous or scattered). It opens a single fd `O_DIRECT`,
+falling back to buffered only when the store refuses direct (e.g. tmpfs);
+the choice is fixed at open and needs no per-store alignment probing,
+because the slot pool's buffers are page-granular and every transfer is a
+block multiple, so once O_DIRECT opens it serves every IO. (Sub-page
+buffers — which would require a `statx STATX_DIOALIGN` check — only arise
+with a zero-copy recv ring, deferred.) `FSYNC` flush, `FALLOCATE`
+punch-hole/zero-range as before. IOPOLL is not used: a polled ring cannot
+carry socket ops, and a second per-thread IOPOLL ring is a measured-later
+roadmap item.
 
 ## 9. Buffer strategy: staged, measured
 
-| Stage | Recv | Send | Disk |
-|-------|------|------|------|
-| Phase 1+M9 (current) | single-shot RECV → recv buffer → copy into slot; H2C tails ≥ 16 KiB recv direct into the slot (MSG_WAITALL) | batch-drain into one gather SENDMSG (header arena + slot iovecs); opt-in `--send-zc`: SENDMSG_ZC per batch, slot reuse gated on the notification CQE, RLIMIT_MEMLOCK pin failures fall back to copy (loopback copies — real-NIC evaluation pending) | READ/WRITE, O_DIRECT, 4K-aligned slot buffers |
-| Phase 2 (each step benchmarked in isolation) | multishot RECV + provided buffer ring (ENOBUFS → single-shot fallback) | — (SEND_ZC landed opt-in, above) | READ_FIXED/WRITE_FIXED on registered slot buffers |
-| Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split | bundles | second IOPOLL ring |
+| Concern | As built |
+|---------|----------|
+| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 4 MiB, `--queue-buf-bytes`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. |
+| Recv | Classic single-shot RECV → 64 KiB scratch → copy into the slot for headers and small payloads; H2C write tails ≥ 16 KiB are received **straight into the slot's pooled segments** (`MSG_WAITALL`, per-segment — contiguous or scattered), i.e. zero-copy receive, then written by the file backend's vectored `WRITEV`. (A per-thread provided-buffer ring + multishot RECV is a deferred alternative — NVMe/TCP interleaves PDU headers with payload so ring chunks straddle PDU/command boundaries, making chunk-retention into the slot lower-value than receiving straight into the pooled slot.) |
+| Send | Batch-drain into one gather `SENDMSG` (header arena + slot-payload iovecs, contiguous or scattered); opt-in `--send-zc`: `SENDMSG_ZC` per batch, slot reuse gated on the notification CQE, `RLIMIT_MEMLOCK` pin failures fall back to copy. |
+| Disk | Vectored `READV`/`WRITEV` over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §8). |
+| Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split; READ_FIXED/WRITE_FIXED on registered buffers; bundles; second IOPOLL ring. |
 
-Slot data buffers: 128 KiB (= MDTS) on IO queues, 8 KiB on admin queues,
-allocated once at queue install and registered with the ring in phase 2.
+MDTS is 128 KiB on IO queues; the admin queue sizes its pool so its
+synchronous data leases never block.
 
 ## 10. Control plane and configuration
 
