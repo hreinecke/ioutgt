@@ -462,14 +462,42 @@ nic_clear_ntuple() {
         | while read -r id; do ethtool -N '"$nic"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
 }
 
+# PCI bus address (bdf, e.g. 0000:a1:00.0) of NIC $1. Needed to match drivers
+# (mlx5) that label their IRQs by completion vector + bdf rather than the netdev
+# name. Memoized: the bdf is stable for the run and the lookup forks ethtool.
+declare -A _NIC_BDF
+nic_pci_bdf() {
+    local nic="$1"
+    if [ -z "${_NIC_BDF[$nic]:-}" ]; then
+        _NIC_BDF[$nic]="$(nic_exec ethtool -i "$nic" 2>/dev/null \
+            | awk '/^bus-info:/{print $2; exit}')"
+    fi
+    printf '%s\n' "${_NIC_BDF[$nic]}"
+}
+
 # Distinct IRQs serving NIC queue index $2 of nic $1: combined "TxRx", or split
 # "rx"/"tx" (one or two IRQs). From the global /proc/interrupts (the NIC sits in
-# a netns but its IRQ action labels persist).
+# a netns but its IRQ action labels persist). When the netdev-name labels do not
+# match, fall back to mlx5's scheme: per-channel completion IRQs labelled
+# "mlx5_comp<q>@pci:<bdf>" (one combined IRQ per queue), keyed by the NIC's PCI
+# bdf so the right port of a multi-port card is selected.
 nic_queue_irqs() {
-    awk -v n="$1" -v q="$2" '
+    local nic="$1" q="$2" out bdf
+    out="$(awk -v n="$nic" -v q="$q" '
         $NF ~ ("^" n "-TxRx-" q "$") || $NF ~ ("^" n "-rx-" q "$") || $NF ~ ("^" n "-tx-" q "$") {
             irq=$1; sub(/:/,"",irq); print irq
-        }' /proc/interrupts | sort -nu
+        }' /proc/interrupts | sort -nu)"
+    if [ -z "$out" ]; then
+        bdf="$(nic_pci_bdf "$nic")"
+        if [ -n "$bdf" ]; then
+            # The mlx5 label is an exact string ("mlx5_comp<q>@pci:<bdf>"), so
+            # match it with == -- avoids regex-escaping the dots in the bdf.
+            out="$(awk -v label="mlx5_comp${q}@pci:${bdf}" '
+                $NF == label { irq=$1; sub(/:/,"",irq); print irq }' \
+                /proc/interrupts | sort -nu)"
+        fi
+    fi
+    [ -n "$out" ] && printf '%s\n' "$out"
 }
 
 # Hex CPU mask for one CPU as .../xps_cpus expects: comma-separated 32-bit
@@ -649,7 +677,7 @@ tune_status() {
     if [ -z "$rows" ]; then
         echo "  (no connected IO queues)"; return 0
     fi
-    local qid tid cpus group nicq irqs irq eff verdict mism=0 ircpu
+    local qid tid cpus group nicq irqs irq eff verdict mism=0 noirq=0 ircpu
     while read -r qid tid cpus group; do
         [ -n "$qid" ] || continue
         nicq=$((qid - 1))
@@ -658,20 +686,29 @@ tune_status() {
         for irq in $irqs; do
             eff="${eff:+$eff,}$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || echo '?')"
         done
-        ircpu="${eff%%,*}"
-        case "$cpus" in
-            *[!0-9]*)  verdict='?' ;;          # unpinned/unknown io-thread
-            "$ircpu")  verdict=SAME-CPU; mism=$((mism + 1)) ;;
-            *)         verdict=OK ;;
-        esac
+        # No matched IRQ means the separation is UNVERIFIABLE, not OK -- never
+        # let missing data pass as a clean verdict.
+        if [ -z "$irqs" ]; then
+            verdict='NO-IRQ'; noirq=$((noirq + 1))
+        else
+            ircpu="${eff%%,*}"
+            case "$cpus" in
+                *[!0-9]*)  verdict='?' ;;          # unpinned/unknown io-thread
+                "$ircpu")  verdict=SAME-CPU; mism=$((mism + 1)) ;;
+                *)         verdict=OK ;;
+            esac
+        fi
         printf "  q%-2s io-thread(tid %s) aff=%-10s group=%-12s | irq[%s] eff=%-10s %s\n" \
             "$nicq" "$tid" "$cpus" "$group" "$(echo $irqs | tr '\n' ' ' | sed 's/ $//')" "${eff:-?}" "$verdict"
     done <<EOF
 $rows
 EOF
-    if [ "$mism" -eq 0 ]; then
-        echo "  separation: OK (every io-thread on a different CPU than its NIC RX IRQ)"
-    else
+    if [ "$noirq" -gt 0 ]; then
+        echo "  separation: UNKNOWN for $noirq queue(s) -- no NIC IRQ matched in /proc/interrupts (driver IRQ naming not recognised?)"
+    fi
+    if [ "$mism" -gt 0 ]; then
         echo "  separation: $mism queue(s) SAME-CPU as their RX IRQ -- re-run 'connect' (or irqbalance restarted?)"
+    elif [ "$noirq" -eq 0 ]; then
+        echo "  separation: OK (every io-thread on a different CPU than its NIC RX IRQ)"
     fi
 }
