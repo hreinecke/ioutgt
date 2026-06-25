@@ -99,6 +99,12 @@ if [ -z "$NRQ_USER_SET" ] && [ -f "$NRQ_STATE" ]; then
     NR_QUEUES="$(cat "$NRQ_STATE")"
 fi
 
+# Whether to touch any NIC hardware setting. NIC_TUNE=0 makes the harness only
+# create the netns, move the NICs in and address them -- no offloads toggle, no
+# ethtool -L channel retune, no IRQ-affinity/ntuple/XPS/RPS sync. Default on.
+# Defined here (before usage()) so 'help' can print its current value.
+NIC_TUNE="${NIC_TUNE:-1}"
+
 # Per-target backing (file backing only — a regular file or block device).
 # Each target has its OWN, so a single env setup drives both at once. A
 # missing non-/dev path is auto-created at BACKEND_GB; a /dev/* path must
@@ -146,6 +152,7 @@ Required env: NIC_T, NIC_I (two dedicated NICs cabled back-to-back) and the
 started target's backend (IOUTGT_BACKEND / NVMET_BACKEND, a file or bdev).
 Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC
   HDGST=$HDGST DDGST=$DDGST
+  NIC_TUNE=$NIC_TUNE   (0 = netns + addressing only; no offloads/channel/affinity tuning)
   IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX  FIO_RW/BS/QD/JOBS/SECS
 
 Example:
@@ -185,9 +192,13 @@ IOUTGT_NETNS=(ip netns exec "$NS_T")
 
 # Target NIC tuning context for common.sh's nic_default_queues / nic_offloads /
 # tune_target_nic / tune_status: the target NIC and the netns it lives in (the
-# NIC-side ethtool/sysfs ops run there; /proc and taskset stay global).
+# NIC-side ethtool/sysfs ops run there; /proc and taskset stay global). With
+# NIC_TUNE=0 we blank TUNE_NIC, which is exactly the "skip" guard tune_target_nic
+# and tune_status already honor.
 # shellcheck disable=SC2034  # consumed by common.sh's nic_* / tune_* helpers
 TUNE_NIC="${NIC_T:-}"
+# shellcheck disable=SC2034  # blanked so tune_target_nic / tune_status no-op
+[ "$NIC_TUNE" = 1 ] || TUNE_NIC=""
 # shellcheck disable=SC2034  # consumed by common.sh's nic_* / tune_* helpers
 TUNE_NS="$NS_T"
 
@@ -209,6 +220,15 @@ cmd_up() {
     ip netns exec "$NS_I" ip link set lo up
     ip netns exec "$NS_T" ip link set "$NIC_T" up
     ip netns exec "$NS_I" ip link set "$NIC_I" up
+
+    if [ "$NIC_TUNE" != 1 ]; then
+        # Untuned baseline: no offloads toggle, no channel retune, no affinity
+        # sync. Just run with NR_QUEUES as-is (user value or the default).
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+        echo "   NIC_TUNE=0: no NIC hardware tuning; NR_QUEUES=$NR_QUEUES (--io-threads), NIC settings untouched"
+        cmd_up_prove_wire
+        return 0
+    fi
 
     # Offloads (gro/gso/tso) on both NICs; see common.sh:nic_offloads.
     nic_offloads "$NIC_T" on "$NS_T"
@@ -252,6 +272,12 @@ cmd_up() {
         echo "   NR_QUEUES defaulted to $NR_QUEUES (min rx/tx of $NIC_T, capped at nproc)"
     fi
 
+    cmd_up_prove_wire
+}
+
+# Wait for carrier and prove traffic crosses the physical link (the only path
+# between the two namespaces). Shared by the tuned and untuned 'up' paths.
+cmd_up_prove_wire() {
     echo ">> waiting for link/carrier, then proving the wire with ping"
     sleep 2
     if ip netns exec "$NS_I" ping -c 3 -W 2 "$IP_T" >/dev/null; then
@@ -272,8 +298,11 @@ cmd_down() {
     # nvmet port would otherwise leak in the now-deleted netns.)
     # Undo the offloads 'up' enabled, while the NICs are still in their netns
     # (best-effort; the settings are per-netdev and survive the netns move).
-    [ -n "${NIC_T:-}" ] && nic_offloads "$NIC_T" off "$NS_T" || true
-    [ -n "${NIC_I:-}" ] && nic_offloads "$NIC_I" off "$NS_I" || true
+    # Skip when NIC_TUNE=0 -- 'up' never touched them.
+    if [ "$NIC_TUNE" = 1 ]; then
+        [ -n "${NIC_T:-}" ] && nic_offloads "$NIC_T" off "$NS_T" || true
+        [ -n "${NIC_I:-}" ] && nic_offloads "$NIC_I" off "$NS_I" || true
+    fi
     # Return NICs to root if we know their names; deleting the netns also
     # auto-returns physical NICs, so this is best-effort and env-tolerant.
     [ -n "${NIC_T:-}" ] && in_net "$NS_T" ip link set "$NIC_T" netns 1 2>/dev/null || true
