@@ -214,9 +214,39 @@ cmd_up() {
     nic_offloads "$NIC_T" on "$NS_T"
     nic_offloads "$NIC_I" on "$NS_I"
 
-    # Auto-size NR_QUEUES from NIC_T unless the user set it, so ioutgt's
-    # --io-threads matches the NIC channel count. Persisted for 'start' etc.
-    if [ -z "$NRQ_USER_SET" ]; then
+    # Size NR_QUEUES and keep the NIC's Combined channel count aligned with it,
+    # so the post-connect IRQ<->io-thread mapping (nicq = qid-1) stays 1:1.
+    # Persisted for the later 'start'/'connect'/'status' invocations.
+    if [ -n "$NRQ_USER_SET" ]; then
+        # User's NR_QUEUES wins, bounded by what the host/NIC can deliver:
+        # nproc and the NIC's hardware-max Combined. Then retune the NIC's
+        # Combined channels (up OR down) to match, so every io-thread has its
+        # own NIC queue/IRQ. If the NIC has no combined channels, fall back to
+        # capping at the current channel count and leave the NIC untouched.
+        local want="$NR_QUEUES" ncpu maxc
+        ncpu="$(nproc 2>/dev/null || echo 1)"
+        maxc="$(nic_max_combined "$NIC_T")"
+        [ "$ncpu" -lt "$NR_QUEUES" ] && NR_QUEUES="$ncpu"
+        if [ "$maxc" -ge 1 ]; then
+            [ "$maxc" -lt "$NR_QUEUES" ] && NR_QUEUES="$maxc"
+            # Stale ntuple filters from a prior run pin high RX queues and would
+            # reject a Combined reduction; clear them before retuning.
+            nic_clear_ntuple "$NIC_T"
+            if nic_exec ethtool -L "$NIC_T" combined "$NR_QUEUES" 2>/dev/null; then
+                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc); $NIC_T Combined retuned to $NR_QUEUES"
+            else
+                echo "   note: could not set $NIC_T Combined to $NR_QUEUES; affinity sync may skip unmapped queues"
+                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc)"
+            fi
+        else
+            local cur; cur="$(nic_default_queues "$NIC_T")"
+            [ "$cur" -lt "$NR_QUEUES" ] && NR_QUEUES="$cur"
+            echo "   NR_QUEUES=$NR_QUEUES (requested $want; $NIC_T has no combined channels, capped at current/$cur, NIC not retuned)"
+        fi
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+    else
+        # Auto-size from NIC_T's current channels so ioutgt's --io-threads
+        # matches the NIC channel count (no retune; the NIC drives the count).
         NR_QUEUES="$(nic_default_queues "$NIC_T")"
         echo "$NR_QUEUES" > "$NRQ_STATE"
         echo "   NR_QUEUES defaulted to $NR_QUEUES (min rx/tx of $NIC_T, capped at nproc)"

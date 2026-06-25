@@ -438,6 +438,30 @@ nic_default_queues() {
     printf '%s\n' "$m"
 }
 
+# Hardware ceiling on NIC $1's Combined channels, from the "Pre-set maximums"
+# section of `ethtool -l` (distinct from nic_default_queues, which reads the
+# *current* setting). Prints 0 when the NIC has no combined channels (the line
+# is absent or "n/a") so callers can skip an `ethtool -L combined` retune. The
+# n/a coercion mirrors nic_default_queues — see the note there.
+nic_max_combined() {
+    local nic="$1" out comb
+    out="$(nic_exec ethtool -l "$nic" 2>/dev/null \
+        | sed -n '/Pre-set maximums/,/Current hardware settings/p' || true)"
+    comb="$(printf '%s\n' "$out" | awk '/^Combined:/{print $2; exit}')"
+    case "$comb" in '' | *[!0-9]*) comb=0 ;; esac
+    printf '%s\n' "$comb"
+}
+
+# Delete all ntuple RX-flow filters on NIC $1 (best-effort). Filters persist on
+# the netdev across runs/netns moves; stale ones pin RX queues and would block
+# an `ethtool -L combined` reduction ("requested channel counts are too low for
+# existing ntuple filter settings"). The converge step re-adds the live ones.
+nic_clear_ntuple() {
+    local nic="$1"
+    nic_exec bash -c 'ethtool -n '"$nic"' 2>/dev/null | awk "/Filter:/{print \$2}" \
+        | while read -r id; do ethtool -N '"$nic"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
+}
+
 # Distinct IRQs serving NIC queue index $2 of nic $1: combined "TxRx", or split
 # "rx"/"tx" (one or two IRQs). From the global /proc/interrupts (the NIC sits in
 # a netns but its IRQ action labels persist).
@@ -592,8 +616,7 @@ EOF
     # per connection) + our listen port.
     nic_exec ethtool -K "$TUNE_NIC" ntuple on >/dev/null 2>&1 || true
     # Clear stale rules (previous runs' source ports) for a clean slate.
-    nic_exec bash -c 'ethtool -n '"$TUNE_NIC"' 2>/dev/null | awk "/Filter:/{print \$2}" \
-        | while read -r id; do ethtool -N '"$TUNE_NIC"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
+    nic_clear_ntuple "$TUNE_NIC"
     echo ">> steering each flow to its io-thread queue via NIC ntuple (no IPI)"
     while read -r qid tid cpus group peer; do
         [ -n "$qid" ] || continue
