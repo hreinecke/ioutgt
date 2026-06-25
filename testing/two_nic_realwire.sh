@@ -296,13 +296,11 @@ cmd_down() {
     # Stop the targets first with 'stop' — the nvmet configfs teardown must
     # nsenter into NS_T while it still exists. (We do not stop them here; the
     # nvmet port would otherwise leak in the now-deleted netns.)
-    # Undo the offloads 'up' enabled, while the NICs are still in their netns
-    # (best-effort; the settings are per-netdev and survive the netns move).
-    # Skip when NIC_TUNE=0 -- 'up' never touched them.
-    if [ "$NIC_TUNE" = 1 ]; then
-        [ -n "${NIC_T:-}" ] && nic_offloads "$NIC_T" off "$NS_T" || true
-        [ -n "${NIC_I:-}" ] && nic_offloads "$NIC_I" off "$NS_I" || true
-    fi
+    # We deliberately do NOT toggle offloads here. 'up' enabled gro/gso/tso
+    # (which is also the mlx5 driver default), and these settings are per-netdev
+    # and persist across the move back to root. Forcing them *off* would leave
+    # the NIC degraded for later, unrelated tests -- e.g. a single-stream iperf
+    # over this link drops from ~20 to ~8 Gb/s with GRO off.
     # Return NICs to root if we know their names; deleting the netns also
     # auto-returns physical NICs, so this is best-effort and env-tolerant.
     [ -n "${NIC_T:-}" ] && in_net "$NS_T" ip link set "$NIC_T" netns 1 2>/dev/null || true
