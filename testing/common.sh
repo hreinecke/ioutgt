@@ -415,8 +415,15 @@ nic_default_queues() {
     comb="$(printf '%s\n' "$out" | awk '/^Combined:/{print $2; exit}')"
     rx="$(printf '%s\n' "$out" | awk '/^RX:/{print $2; exit}')"
     tx="$(printf '%s\n' "$out" | awk '/^TX:/{print $2; exit}')"
-    rx=$(( ${rx:-0} + ${comb:-0} ))
-    tx=$(( ${tx:-0} + ${comb:-0} ))
+    # ethtool prints "n/a" for an unsupported channel type; coerce any
+    # non-numeric token to 0 (a bare "n/a" inside $(( )) would be parsed as
+    # the variables n / a and abort under `set -u`). `${x:-0}` guards only
+    # emptiness, not non-numeric values, so it is not enough on its own.
+    case "$comb" in '' | *[!0-9]*) comb=0 ;; esac
+    case "$rx" in '' | *[!0-9]*) rx=0 ;; esac
+    case "$tx" in '' | *[!0-9]*) tx=0 ;; esac
+    rx=$((rx + comb))
+    tx=$((tx + comb))
     if [ "$rx" -eq 0 ]; then
         rx="$(nic_exec bash -c "ls -d /sys/class/net/$nic/queues/rx-* 2>/dev/null | wc -l" || echo 0)"
     fi
