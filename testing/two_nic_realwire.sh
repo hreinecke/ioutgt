@@ -143,6 +143,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   connect       [nvmet|ioutgt]  nvme connect; wait for the namespace device
   disconnect    [nvmet|ioutgt]  nvme disconnect
   fio           [nvmet|ioutgt]  fio on the connected device(s)
+  iperf                         raw-TCP iperf3 over the wire (server@NIC_T, client@NIC_I);
+                                link-only baseline, run before 'fio_perf'
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k},
                                 one line per combo (iops/BW/fio_cpu)
   status                        netns, addresses, listeners, connected devices
@@ -349,6 +351,30 @@ cmd_status() {
     tune_status
 }
 
+# Raw-TCP iperf3 throughput over the wire, independent of any target: the
+# server runs behind the TARGET NIC (in NS_T, bound to IP_T), the client behind
+# the INITIATOR NIC (in NS_I) -- the same roles fio uses. Needs only 'up' (no
+# start/connect), so run it before 'fio_perf' for a transport baseline. Single
+# stream by default. Knobs: STREAMS=1 IPERF_SECS=10 IPERF_PORT=5201 IPERF_OMIT=2.
+cmd_iperf() {
+    command -v iperf3 >/dev/null 2>&1 || { echo "iperf3 not found (install iperf3)"; exit 1; }
+    ip netns list 2>/dev/null | grep -q "$NS_T" || { echo "link not up -- run 'up' first"; exit 1; }
+    local streams="${STREAMS:-1}" secs="${IPERF_SECS:-10}" port="${IPERF_PORT:-5201}" omit="${IPERF_OMIT:-2}"
+    # -1: server handles this one client then exits, so nothing is left running.
+    local -a srv=(iperf3 -s -p "$port" -1)
+    local -a cli=(iperf3 -c "$IP_T" -p "$port" -t "$secs" -O "$omit" -P "$streams")
+    echo ">> iperf3 over the $NIC_I -> $NIC_T wire ($streams stream(s), ${secs}s, ${omit}s omit)"
+    echo "   server (behind $NIC_T, in $NS_T): ip netns exec $NS_T ${srv[*]}"
+    echo "   client (behind $NIC_I, in $NS_I): ip netns exec $NS_I ${cli[*]}"
+    # exec in the backgrounded subshell so $! is iperf3 itself (reliable kill).
+    { exec ip netns exec "$NS_T" "${srv[@]}" >/dev/null 2>&1; } &
+    local spid=$!
+    # shellcheck disable=SC2064  # expand spid now
+    trap "kill $spid 2>/dev/null || true" RETURN
+    sleep 0.5
+    ip netns exec "$NS_I" "${cli[@]}"
+}
+
 # Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH.
 case "${1:-}" in
     up)                  cmd_up ;;
@@ -362,6 +388,7 @@ case "${1:-}" in
                          case "${2:-}" in ioutgt|"") tune_target_nic ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
+    iperf)               cmd_iperf ;;
     fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
     status)              cmd_status ;;
     help|usage)          usage ;;
