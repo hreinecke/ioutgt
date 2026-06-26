@@ -243,6 +243,29 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         conn.port.queue_buf_bytes
     };
     let queue = NvmeTcpQueue::new(conn.qid, conn.sqsize, pool_bytes, conn.sqhd_disabled);
+    // Register the whole data-buffer pool arena as one io_uring fixed buffer,
+    // so disk IO from pooled slots uses READV_FIXED/WRITEV_FIXED — the kernel
+    // reuses the pre-pinned mapping instead of mapping the pages every IO.
+    // Best-effort: a no-op on kernels without fixed-buffer support, and the
+    // backend then stays on plain readv/writev. Released at teardown.
+    {
+        let pool = queue.nvme.slots.pool();
+        let (ptr, len) = pool.arena();
+        match ioutgt_uring::register_pool_buffer(ptr, len) {
+            Some(idx) => {
+                pool.set_buf_index(idx);
+                debug!(qid = conn.qid, idx, "pool buffer registered: fixed disk IO");
+            }
+            // Distinguish the two None causes: a full table is a capacity
+            // event worth a warning (the connection loses the optimization);
+            // no kernel support is expected and stays quiet.
+            None if ioutgt_uring::fixed_buffers_supported() => warn!(
+                qid = conn.qid,
+                "fixed-buffer table full; disk IO on plain readv/writev"
+            ),
+            None => debug!(qid = conn.qid, "no kernel fixed-buffer support; plain readv/writev"),
+        }
+    }
     let fd = conn.fd.as_raw_fd();
     let peer = ioutgt_core::controller::peer_of(fd);
     let ctx = if conn.qid == 0 {
@@ -440,6 +463,12 @@ async fn teardown<B: Backend>(
         send_task.abort();
         for task in &tasks {
             task.abort();
+        }
+        // All ops have drained: release the pool's fixed-buffer slot so the
+        // index is reusable before the queue (and its arena) is freed on
+        // return. The leak branch above intentionally keeps it pinned.
+        if let Some(idx) = queue.nvme.slots.pool().take_buf_index() {
+            ioutgt_uring::unregister_pool_buffer(idx);
         }
     }
     // Tear down the controller when its admin queue dies.
