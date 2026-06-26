@@ -86,7 +86,7 @@ fn scattered_write_matches_contiguous() {
                 len: 4096,
             },
         ];
-        be.write_segs(0, &segs, 12288).await.unwrap();
+        be.write_segs(0, &segs, 12288, None).await.unwrap();
         be.flush().await.unwrap();
 
         // Read it back vectored into fresh buffers and check the seam.
@@ -95,7 +95,7 @@ fn scattered_write_matches_contiguous() {
             ptr: r.as_ptr().cast_mut(),
             len: 12288,
         }];
-        be.read_segs(0, &rsegs, 12288).await.unwrap();
+        be.read_segs(0, &rsegs, 12288, None).await.unwrap();
         assert!(r[..8192].iter().all(|&x| x == 0xAB), "first segment");
         assert!(r[8192..].iter().all(|&x| x == 0xCD), "second segment");
     });

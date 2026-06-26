@@ -129,7 +129,7 @@ async fn read<B: Backend>(ctx: &Rc<ConnCtx<B>>, ns: &Namespace<B>, tag: u16, sqe
     let buf = slot.data();
     let result = ns
         .backend
-        .read_segs(rw.slba, buf.segs(), len as usize)
+        .read_segs(rw.slba, buf.segs(), len as usize, buf.buf_index())
         .await;
     drop(buf);
     if result.is_ok() {
@@ -160,7 +160,7 @@ async fn write<B: Backend>(
     let buf = slot.data();
     let result = ns
         .backend
-        .write_segs(rw.slba, buf.segs(), len as usize)
+        .write_segs(rw.slba, buf.segs(), len as usize, buf.buf_index())
         .await;
     drop(buf);
     // FUA on a memory/file backend: flush after write.

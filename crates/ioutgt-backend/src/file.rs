@@ -163,13 +163,17 @@ impl FileBackend {
     }
 
     /// Issue one vectored read/write on the backend fd (O_DIRECT or
-    /// buffered, fixed at open), resuming across short transfers.
+    /// buffered, fixed at open), resuming across short transfers. When
+    /// `buf_index` is `Some`, the iovecs point into that registered pool
+    /// buffer and the op is `READV_FIXED`/`WRITEV_FIXED` — the kernel reuses
+    /// the pre-pinned mapping instead of mapping the pages every IO.
     async fn rwv(
         &self,
         write: bool,
         slba: u64,
         iovs: &mut [libc::iovec],
         total: usize,
+        buf_index: Option<u16>,
     ) -> Result<(), BackendError> {
         if total == 0 {
             return Ok(());
@@ -191,11 +195,15 @@ impl FileBackend {
             // memory, valid while the slot is Executing. The reactor's
             // orphan protocol holds the op entry to its terminal CQE on
             // whole-future drop, the same envelope as the other raw ops.
+            // For the fixed variants the buffers additionally fall within the
+            // registered arena `buf_index`, which is unregistered only after
+            // the op drain at teardown.
             let res = unsafe {
-                if write {
-                    ops::writev_at_raw(fd, ptr, cnt, off, 0)
-                } else {
-                    ops::readv_at_raw(fd, ptr, cnt, off, 0)
+                match (write, buf_index) {
+                    (true, Some(bi)) => ops::writev_fixed_at_raw(fd, ptr, cnt, off, bi, 0),
+                    (false, Some(bi)) => ops::readv_fixed_at_raw(fd, ptr, cnt, off, bi, 0),
+                    (true, None) => ops::writev_at_raw(fd, ptr, cnt, off, 0),
+                    (false, None) => ops::readv_at_raw(fd, ptr, cnt, off, 0),
                 }
             };
             let op = res.map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?;
@@ -235,7 +243,7 @@ impl Backend for FileBackend {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         }];
-        self.rwv(false, slba, &mut iovs, buf.len()).await
+        self.rwv(false, slba, &mut iovs, buf.len(), None).await
     }
 
     async fn write(&self, slba: u64, buf: &[u8]) -> Result<(), BackendError> {
@@ -243,19 +251,31 @@ impl Backend for FileBackend {
             iov_base: buf.as_ptr().cast_mut().cast(),
             iov_len: buf.len(),
         }];
-        self.rwv(true, slba, &mut iovs, buf.len()).await
+        self.rwv(true, slba, &mut iovs, buf.len(), None).await
     }
 
-    async fn read_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+    async fn read_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+        buf_index: Option<u16>,
+    ) -> Result<(), BackendError> {
         let mut iovs = [EMPTY_IOVEC; MAX_SEGS];
         let n = fill_iovecs(&mut iovs, segs, total);
-        self.rwv(false, slba, &mut iovs[..n], total).await
+        self.rwv(false, slba, &mut iovs[..n], total, buf_index).await
     }
 
-    async fn write_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+    async fn write_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+        buf_index: Option<u16>,
+    ) -> Result<(), BackendError> {
         let mut iovs = [EMPTY_IOVEC; MAX_SEGS];
         let n = fill_iovecs(&mut iovs, segs, total);
-        self.rwv(true, slba, &mut iovs[..n], total).await
+        self.rwv(true, slba, &mut iovs[..n], total, buf_index).await
     }
 
     async fn flush(&self) -> Result<(), BackendError> {

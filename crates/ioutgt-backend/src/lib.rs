@@ -61,19 +61,31 @@ impl Backend for AnyBackend {
         }
     }
 
-    async fn read_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+    async fn read_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+        buf_index: Option<u16>,
+    ) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Null(b) => b.read_segs(slba, segs, total).await,
-            AnyBackend::Memory(b) => b.read_segs(slba, segs, total).await,
-            AnyBackend::File(b) => b.read_segs(slba, segs, total).await,
+            AnyBackend::Null(b) => b.read_segs(slba, segs, total, buf_index).await,
+            AnyBackend::Memory(b) => b.read_segs(slba, segs, total, buf_index).await,
+            AnyBackend::File(b) => b.read_segs(slba, segs, total, buf_index).await,
         }
     }
 
-    async fn write_segs(&self, slba: u64, segs: &[Seg], total: usize) -> Result<(), BackendError> {
+    async fn write_segs(
+        &self,
+        slba: u64,
+        segs: &[Seg],
+        total: usize,
+        buf_index: Option<u16>,
+    ) -> Result<(), BackendError> {
         match self {
-            AnyBackend::Null(b) => b.write_segs(slba, segs, total).await,
-            AnyBackend::Memory(b) => b.write_segs(slba, segs, total).await,
-            AnyBackend::File(b) => b.write_segs(slba, segs, total).await,
+            AnyBackend::Null(b) => b.write_segs(slba, segs, total, buf_index).await,
+            AnyBackend::Memory(b) => b.write_segs(slba, segs, total, buf_index).await,
+            AnyBackend::File(b) => b.write_segs(slba, segs, total, buf_index).await,
         }
     }
 

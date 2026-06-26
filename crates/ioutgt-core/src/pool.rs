@@ -121,6 +121,16 @@ impl SlotData {
         &self.segs[..self.nsegs as usize]
     }
 
+    /// The io_uring fixed-buffer index covering these segments, when this is a
+    /// registered pool lease (`None` for owned/admin buffers). The backend
+    /// uses it to pick `READV_FIXED`/`WRITEV_FIXED` over plain readv/writev.
+    pub fn buf_index(&self) -> Option<u16> {
+        match &self.owner {
+            Owner::Pool(pool) => pool.buf_index(),
+            Owner::Owned(_) | Owner::Empty => None,
+        }
+    }
+
     /// Contiguous read view. Panics (debug) if the buffer is scattered.
     pub fn as_slice(&self) -> &[u8] {
         // A hard assert, not debug-only: on a scattered buffer `seg[0]` is
@@ -202,6 +212,11 @@ pub struct BufPool {
     free_pages: Cell<u32>,
     /// Tasks parked waiting for pages; woken on any free.
     waiters: RefCell<Vec<Waker>>,
+    /// io_uring fixed-buffer index for the whole arena, set once the
+    /// transport registers it (`None` until then, or when the kernel lacks
+    /// fixed-buffer support). Pool leases carry it to the backend so disk IO
+    /// can use `READV_FIXED`/`WRITEV_FIXED`.
+    buf_index: Cell<Option<u16>>,
 }
 
 /// Insert `run` into the sorted free list, coalescing with neighbors.
@@ -234,7 +249,29 @@ impl BufPool {
             }]),
             free_pages: Cell::new(npages),
             waiters: RefCell::new(Vec::new()),
+            buf_index: Cell::new(None),
         })
+    }
+
+    /// The whole arena as `(ptr, len)` — what the transport registers as one
+    /// io_uring fixed buffer.
+    pub fn arena(&self) -> (*const u8, usize) {
+        (self.base.as_ptr(), self.npages as usize * PAGE)
+    }
+
+    /// Record the fixed-buffer index the transport registered the arena under.
+    pub fn set_buf_index(&self, idx: u16) {
+        self.buf_index.set(Some(idx));
+    }
+
+    /// The arena's fixed-buffer index, if registered.
+    pub fn buf_index(&self) -> Option<u16> {
+        self.buf_index.get()
+    }
+
+    /// Clear and return the fixed-buffer index (teardown, before unregister).
+    pub fn take_buf_index(&self) -> Option<u16> {
+        self.buf_index.take()
     }
 
     pub fn capacity_pages(&self) -> u32 {

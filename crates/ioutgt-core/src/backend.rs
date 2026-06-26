@@ -54,6 +54,13 @@ pub trait Backend: Send + Sync + 'static {
     /// filling segments in order. Default: one [`Self::read`] per segment;
     /// backends that support vectored IO override with a single op.
     ///
+    /// `buf_index` is the io_uring fixed-buffer index covering `segs` when
+    /// they are a registered pool lease (`None` otherwise); a vectored
+    /// backend may issue `READV_FIXED` against it. The default ignores it.
+    /// The index is meaningful only on the lease's owning queue thread — the
+    /// thread whose reactor registered it and on which this op runs — which
+    /// the task-per-tag model guarantees.
+    ///
     /// # Safety contract
     /// Each [`Seg`] must describe a buffer valid and exclusively borrowed
     /// for the duration of the returned future.
@@ -62,7 +69,9 @@ pub trait Backend: Send + Sync + 'static {
         slba: u64,
         segs: &[Seg],
         total: usize,
+        buf_index: Option<u16>,
     ) -> impl Future<Output = Result<(), BackendError>> {
+        let _ = buf_index;
         async move {
             let mut remaining = total;
             let mut cur = slba;
@@ -84,7 +93,8 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Write `total` bytes drawn from `segs` (in order) starting at logical
     /// block `slba`. Default: one [`Self::write`] per segment; backends that
-    /// support vectored IO override with a single op.
+    /// support vectored IO override with a single op. `buf_index` is as in
+    /// [`Self::read_segs`]; the default ignores it.
     ///
     /// # Safety contract
     /// As [`Self::read_segs`] (the buffers are read only).
@@ -93,7 +103,9 @@ pub trait Backend: Send + Sync + 'static {
         slba: u64,
         segs: &[Seg],
         total: usize,
+        buf_index: Option<u16>,
     ) -> impl Future<Output = Result<(), BackendError>> {
+        let _ = buf_index;
         async move {
             let mut remaining = total;
             let mut cur = slba;
