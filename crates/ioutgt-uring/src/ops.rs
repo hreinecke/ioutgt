@@ -580,3 +580,60 @@ pub unsafe fn writev_at_raw(
     )?;
     Ok(RawOp { op })
 }
+
+/// Vectored read (`READV_FIXED`) whose iovecs point into the registered
+/// buffer `buf_index` — the kernel uses the pre-pinned mapping instead of
+/// mapping the pages per IO. `rw_flags` is a `preadv2(2)` flag bitset.
+///
+/// # Safety
+///
+/// Same contract as [`readv_at_raw`], and every `iov_base` must fall within
+/// the region registered at `buf_index` (the connection's pool arena).
+pub unsafe fn readv_fixed_at_raw(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    n: u32,
+    offset: u64,
+    buf_index: u16,
+    rw_flags: i32,
+) -> io::Result<RawOp> {
+    let op = Op::submit_classed(
+        |key| {
+            opcode::ReadvFixed::new(types::Fd(fd), iov, n, buf_index)
+                .offset(offset)
+                .rw_flags(rw_flags)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Read,
+    )?;
+    Ok(RawOp { op })
+}
+
+/// Vectored write (`WRITEV_FIXED`) from the registered buffer `buf_index`.
+///
+/// # Safety
+///
+/// Same contract as [`readv_fixed_at_raw`] (reads the buffers only).
+pub unsafe fn writev_fixed_at_raw(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    n: u32,
+    offset: u64,
+    buf_index: u16,
+    rw_flags: i32,
+) -> io::Result<RawOp> {
+    let op = Op::submit_classed(
+        |key| {
+            opcode::WritevFixed::new(types::Fd(fd), iov, n, buf_index)
+                .offset(offset)
+                .rw_flags(rw_flags)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Write,
+    )?;
+    Ok(RawOp { op })
+}

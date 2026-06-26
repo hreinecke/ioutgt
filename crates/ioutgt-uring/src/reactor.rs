@@ -4,7 +4,14 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::io;
 use std::rc::Rc;
 
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{IoUring, Probe, opcode, squeue, types};
+
+/// Fixed-buffer table slots: the cap on data-buffer pools (one per
+/// connection) live on one queue thread at once. Sized well above the
+/// realistic connections-per-thread (≈ `ceil(io-queues / io-threads)`);
+/// past it, further connections fall back to plain `readv`/`writev`.
+/// Registering empty slots is cheap, so erring large costs little.
+const MAX_REG_BUFS: u16 = 64;
 use slab::Slab;
 
 use crate::cqe::CqeResult;
@@ -108,6 +115,16 @@ pub struct Reactor {
     ring: RefCell<IoUring>,
     slab: RefCell<Slab<OpEntry>>,
     stats: StatCells,
+    /// Free indices into the ring's fixed-buffer table. Empty when the
+    /// kernel lacks `READV_FIXED`/`WRITEV_FIXED` or sparse buffer
+    /// registration — then [`Self::register_buffer`] returns `None` and the
+    /// backend falls back to plain `readv`/`writev`. A non-empty pop
+    /// therefore *implies* the fixed ops are usable.
+    free_bufs: RefCell<Vec<u16>>,
+    /// Whether the kernel supports the fixed-buffer table at all (distinct
+    /// from `free_bufs` being momentarily empty because every slot is
+    /// claimed). Lets callers tell "no kernel support" from "table full".
+    fixed_supported: bool,
 }
 
 impl Reactor {
@@ -127,10 +144,31 @@ impl Reactor {
                 .setup_defer_taskrun()
                 .setup_cqsize(config.cq_entries)
                 .build(config.sq_entries)?;
+            // Enable fixed-buffer (`READV_FIXED`/`WRITEV_FIXED`) registration
+            // when the kernel supports those ops AND a sparse buffer table.
+            // The whole table is reserved once here; each connection pool
+            // claims one slot for its arena. On any gap, leave the table
+            // empty so the backend stays on plain readv/writev.
+            let mut probe = Probe::new();
+            let fixed_supported = ring.submitter().register_probe(&mut probe).is_ok()
+                && probe.is_supported(opcode::ReadvFixed::CODE)
+                && probe.is_supported(opcode::WritevFixed::CODE)
+                && ring
+                    .submitter()
+                    .register_buffers_sparse(u32::from(MAX_REG_BUFS))
+                    .is_ok();
+            // Pop from the back so indices hand out 0, 1, 2, …
+            let free_bufs = if fixed_supported {
+                (0..MAX_REG_BUFS).rev().collect()
+            } else {
+                Vec::new()
+            };
             let reactor = Rc::new(Reactor {
                 ring: RefCell::new(ring),
                 slab: RefCell::new(Slab::with_capacity(config.cq_entries as usize)),
                 stats: StatCells::default(),
+                free_bufs: RefCell::new(free_bufs),
+                fixed_supported,
             });
             *current = Some(Rc::clone(&reactor));
             Ok(reactor)
@@ -369,6 +407,59 @@ impl Reactor {
     /// address them by index.
     pub fn register_files(&self, fds: &[std::os::fd::RawFd]) -> io::Result<()> {
         self.ring.borrow_mut().submitter().register_files(fds)
+    }
+
+    /// Pin `ptr..ptr+len` as one fixed buffer and return its table index, or
+    /// `None` when the fixed-buffer table is unavailable (kernel gap) or
+    /// full. A returned index implies `READV_FIXED`/`WRITEV_FIXED` work, so
+    /// callers treat `Some` as "use the fixed ops". The caller must
+    /// [`unregister_buffer`](Self::unregister_buffer) before freeing the
+    /// memory (queue teardown, after the op drain).
+    pub fn register_buffer(&self, ptr: *const u8, len: usize) -> Option<u16> {
+        let idx = self.free_bufs.borrow_mut().pop()?;
+        let iov = libc::iovec {
+            iov_base: ptr.cast_mut().cast(),
+            iov_len: len,
+        };
+        // SAFETY: `ptr..ptr+len` is the pool arena, kept alive and unmoved
+        // for the pool's lifetime; the slot is cleared in `unregister_buffer`
+        // before the arena is freed, after the reactor has drained in-flight
+        // ops that may reference it.
+        let r = unsafe {
+            self.ring
+                .borrow_mut()
+                .submitter()
+                .register_buffers_update(u32::from(idx), &[iov], None)
+        };
+        if r.is_err() {
+            self.free_bufs.borrow_mut().push(idx);
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// Whether the kernel supports the fixed-buffer table at all. A `None`
+    /// from [`register_buffer`](Self::register_buffer) means "no support"
+    /// when this is false, or "table full" when true.
+    pub fn fixed_buffers_supported(&self) -> bool {
+        self.fixed_supported
+    }
+
+    /// Release a fixed-buffer slot taken by [`register_buffer`](Self::register_buffer),
+    /// clearing the kernel's pin and returning the index to the free list.
+    pub fn unregister_buffer(&self, idx: u16) {
+        let empty = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        // SAFETY: clearing slot `idx` with an empty iovec drops the prior pin.
+        let _ = unsafe {
+            self.ring
+                .borrow_mut()
+                .submitter()
+                .register_buffers_update(u32::from(idx), &[empty], None)
+        };
+        self.free_bufs.borrow_mut().push(idx);
     }
 
     /// Wait until every in-flight op has reached its terminal CQE.

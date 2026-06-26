@@ -92,6 +92,125 @@ fn writev_readv_roundtrip() {
 }
 
 #[test]
+fn writev_readv_fixed_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixeddata");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let reactor = rt.reactor().clone();
+    rt.block_on(async move {
+        // One registered buffer holds both the source and the read-back
+        // region; the fixed ops reference it by index with iovecs that are
+        // sub-ranges of it.
+        let mut buf = vec![0u8; 16384];
+        let Some(idx) = reactor.register_buffer(buf.as_ptr(), buf.len()) else {
+            eprintln!("kernel lacks READV_FIXED/WRITEV_FIXED; skipping");
+            return;
+        };
+
+        // Source: [0x11 ×4096][0x22 ×2048] at the front of the registered buf.
+        buf[..4096].fill(0x11);
+        buf[4096..6144].fill(0x22);
+        let base = buf.as_ptr();
+        // SAFETY: all offsets stay within the 16 KiB registered buffer.
+        let (w1, r0, r1) = unsafe { (base.add(4096), base.add(8192), base.add(8192 + 4096)) };
+        let wiov = [
+            libc::iovec {
+                iov_base: base.cast_mut().cast(),
+                iov_len: 4096,
+            },
+            libc::iovec {
+                iov_base: w1.cast_mut().cast(),
+                iov_len: 2048,
+            },
+        ];
+        // SAFETY: iov bases lie within registered buffer `idx`; buf outlives
+        // the awaited op.
+        let n = unsafe { ops::writev_fixed_at_raw(fd, wiov.as_ptr(), 2, 0, idx, 0) }
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(n, 6144);
+
+        // Read back into the second half of the same registered buffer.
+        let riov = [
+            libc::iovec {
+                iov_base: r0.cast_mut().cast(),
+                iov_len: 4096,
+            },
+            libc::iovec {
+                iov_base: r1.cast_mut().cast(),
+                iov_len: 2048,
+            },
+        ];
+        // SAFETY: as the write; the read-back region is within buffer `idx`.
+        let n = unsafe { ops::readv_fixed_at_raw(fd, riov.as_ptr(), 2, 0, idx, 0) }
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(n, 6144);
+        assert!(buf[8192..12288].iter().all(|&x| x == 0x11), "first segment");
+        assert!(buf[12288..14336].iter().all(|&x| x == 0x22), "second segment");
+
+        reactor.unregister_buffer(idx);
+    });
+}
+
+// The fixed-buffer table is a free-list of indices: distinct on the way out,
+// exhausts when full, and reuses a released index. (No file IO — pure reactor
+// accounting; skips where the kernel lacks fixed buffers.)
+#[test]
+fn fixed_buffer_table_accounting() {
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let reactor = rt.reactor().clone();
+    if !reactor.fixed_buffers_supported() {
+        eprintln!("kernel lacks fixed buffers; skipping");
+        return;
+    }
+    let buf = vec![0u8; 4096];
+
+    // Drain the whole table; every slot hands out a distinct index.
+    let mut idxs = Vec::new();
+    while let Some(i) = reactor.register_buffer(buf.as_ptr(), buf.len()) {
+        idxs.push(i);
+    }
+    assert!(!idxs.is_empty(), "supported but no slots handed out");
+    let mut uniq = idxs.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(uniq.len(), idxs.len(), "duplicate indices handed out");
+
+    // Full table declines further registration (the connection then falls
+    // back to plain readv/writev).
+    assert!(
+        reactor.register_buffer(buf.as_ptr(), buf.len()).is_none(),
+        "expected None when the table is full"
+    );
+
+    // Releasing one slot frees exactly it for reuse.
+    let freed = idxs.pop().unwrap();
+    reactor.unregister_buffer(freed);
+    assert_eq!(
+        reactor.register_buffer(buf.as_ptr(), buf.len()),
+        Some(freed),
+        "released index should be the one reused"
+    );
+
+    for i in idxs {
+        reactor.unregister_buffer(i);
+    }
+    reactor.unregister_buffer(freed);
+}
+
+#[test]
 fn fallocate_punch_hole_zeroes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("holes");

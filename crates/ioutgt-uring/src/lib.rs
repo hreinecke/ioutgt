@@ -52,3 +52,34 @@ pub fn reset_reactor_stats() -> std::io::Result<()> {
     reactor::Reactor::current()?.reset_stats();
     Ok(())
 }
+
+/// Pin `ptr..ptr+len` as one fixed buffer on the current thread's reactor,
+/// returning its index — `Some` means `READV_FIXED`/`WRITEV_FIXED` are usable
+/// against it, `None` means fall back to plain readv/writev. Used to register
+/// a connection's whole data-buffer pool arena at install. See
+/// [`Reactor::register_buffer`].
+///
+/// The returned index is valid only on the reactor that minted it (the
+/// calling thread's). That is sound because a pool lease carrying the index
+/// is produced and consumed entirely on its owning queue thread (task-per-tag
+/// on the same current-thread runtime), and reactor handles are `!Send`, so an
+/// index can never reach another thread's ring.
+pub fn register_pool_buffer(ptr: *const u8, len: usize) -> Option<u16> {
+    reactor::Reactor::current().ok()?.register_buffer(ptr, len)
+}
+
+/// Whether the current thread's reactor supports the fixed-buffer table —
+/// lets a `None` from [`register_pool_buffer`] be reported as "no kernel
+/// support" vs "table full". `false` if there is no live reactor.
+pub fn fixed_buffers_supported() -> bool {
+    reactor::Reactor::current()
+        .map(|r| r.fixed_buffers_supported())
+        .unwrap_or(false)
+}
+
+/// Release a fixed-buffer index from [`register_pool_buffer`] at teardown.
+pub fn unregister_pool_buffer(idx: u16) {
+    if let Ok(r) = reactor::Reactor::current() {
+        r.unregister_buffer(idx);
+    }
+}
