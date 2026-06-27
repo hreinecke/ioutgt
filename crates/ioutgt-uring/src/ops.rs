@@ -361,6 +361,52 @@ pub unsafe fn recvmsg_raw(fd: RawFd, msg: *mut libc::msghdr) -> io::Result<RawOp
     Ok(RawOp { op })
 }
 
+/// Stream of received chunks from a multishot recv backed by a
+/// provided-buffer ring ([`crate::bufring::BufRing`]).
+pub struct RecvMultiOp {
+    op: MultiOp,
+}
+
+impl RecvMultiOp {
+    /// Next received chunk. `None` on orderly EOF (peer closed) or once the
+    /// multishot has fully ended; `Some(Err(ENOBUFS))` when the buffer
+    /// group ran dry — in both terminal cases the caller replenishes
+    /// buffers and re-arms with a fresh [`recv_multi`].
+    pub async fn next(&mut self) -> Option<io::Result<crate::bufring::RecvChunk>> {
+        let result = std::future::poll_fn(|cx| self.op.poll_next(cx)).await?;
+        let more = result.more();
+        let buf_more = io_uring::cqueue::buffer_more(result.flags);
+        match result.io() {
+            Ok(0) => None, // EOF
+            Ok(len) => match io_uring::cqueue::buffer_select(result.flags) {
+                Some(bid) => Some(Ok(crate::bufring::RecvChunk {
+                    bid,
+                    len,
+                    more,
+                    buf_more,
+                })),
+                None => Some(Err(io::Error::other("recv CQE carried no buffer"))),
+            },
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Multishot recv drawing buffers from the `bgid` provided-buffer ring.
+/// One SQE; a CQE per received chunk until the group drains or EOF.
+pub fn recv_multi(fd: RawFd, bgid: u16) -> io::Result<RecvMultiOp> {
+    let op = MultiOp::submit_classed(
+        |key| {
+            opcode::RecvMulti::new(types::Fd(fd), bgid)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Recv,
+    )?;
+    Ok(RecvMultiOp { op })
+}
+
 /// Send from caller-managed memory.
 ///
 /// # Safety

@@ -24,6 +24,7 @@
 //!
 //! See `docs/architecture.md` ("Reactor") for the full design.
 
+pub mod bufring;
 mod cqe;
 pub mod mailbox;
 mod op;
@@ -33,6 +34,7 @@ mod reactor;
 mod runtime;
 pub mod sendbatch;
 
+pub use bufring::{BufRing, RecvChunk};
 pub use cqe::CqeResult;
 pub use probe::{Features, probe};
 pub use reactor::{Reactor, ReactorStats, RingConfig};

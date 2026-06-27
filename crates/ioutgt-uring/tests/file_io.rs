@@ -158,7 +158,10 @@ fn writev_readv_fixed_roundtrip() {
             .unwrap();
         assert_eq!(n, 6144);
         assert!(buf[8192..12288].iter().all(|&x| x == 0x11), "first segment");
-        assert!(buf[12288..14336].iter().all(|&x| x == 0x22), "second segment");
+        assert!(
+            buf[12288..14336].iter().all(|&x| x == 0x22),
+            "second segment"
+        );
 
         reactor.unregister_buffer(idx);
     });

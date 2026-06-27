@@ -51,7 +51,9 @@ impl Drop for QueueRuntime {
         // Release the thread-local now so a subsequent QueueRuntime can be
         // created on this thread; in-flight op drops during `rt` teardown
         // hold their own Rc<Reactor> and do not go through the
-        // thread-local.
+        // thread-local. Per-connection recv rings are owned by their
+        // connection readers and already dropped (unregistering their
+        // buf_ring + fixed buffers) by the time the connection tasks end.
         Reactor::clear_current();
     }
 }

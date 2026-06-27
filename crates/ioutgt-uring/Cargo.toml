@@ -17,5 +17,10 @@ tokio = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[features]
+## Expose internal test-only counters for integration tests in sibling crates.
+## Never enable in production code.
+test-helpers = []
+
 [lints]
 workspace = true

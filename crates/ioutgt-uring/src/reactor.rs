@@ -454,12 +454,49 @@ impl Reactor {
         };
         // SAFETY: clearing slot `idx` with an empty iovec drops the prior pin.
         let _ = unsafe {
-            self.ring
-                .borrow_mut()
-                .submitter()
-                .register_buffers_update(u32::from(idx), &[empty], None)
+            self.ring.borrow_mut().submitter().register_buffers_update(
+                u32::from(idx),
+                &[empty],
+                None,
+            )
         };
         self.free_bufs.borrow_mut().push(idx);
+    }
+
+    /// Register a provided-buffer ring (`bgid`) for incremental multishot
+    /// recv. `ring_addr`/`entries` describe a page-aligned `io_uring_buf`
+    /// array that must stay alive until `unregister_buf_ring`.
+    ///
+    /// # Safety
+    /// Caller upholds the ring-memory lifetime contract.
+    pub(crate) unsafe fn register_buf_ring(
+        &self,
+        ring_addr: u64,
+        entries: u16,
+        bgid: u16,
+    ) -> io::Result<()> {
+        // IOU_PBUF_RING_INC (== 2): the kernel keeps filling ONE buffer across
+        // successive recvs (advancing its internal offset), only advancing
+        // `head` once the buffer is full. Essential here: with only 2 buffers
+        // and zero-copy write borrows pinning them, per-recv whole-buffer
+        // consumption would exhaust the ring and deadlock the recv loop.
+        // io-uring 0.7.12 re-exports IOU_PBUF_RING_INC as a c_uint, but
+        // register_buf_ring_with_flags takes a u16 — pass the value directly.
+        const INC_FLAG: u16 = 2;
+        const _: () = assert!(io_uring::types::IOU_PBUF_RING_INC == INC_FLAG as _);
+        // SAFETY: caller upholds the ring-memory lifetime contract.
+        unsafe {
+            self.ring
+                .borrow()
+                .submitter()
+                .register_buf_ring_with_flags(ring_addr, entries, bgid, INC_FLAG)
+        }
+    }
+
+    /// Unregister the provided-buffer ring `bgid` registered by
+    /// [`register_buf_ring`](Self::register_buf_ring).
+    pub(crate) fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        self.ring.borrow().submitter().unregister_buf_ring(bgid)
     }
 
     /// Wait until every in-flight op has reached its terminal CQE.

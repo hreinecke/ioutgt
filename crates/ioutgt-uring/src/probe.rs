@@ -28,6 +28,8 @@ pub struct Features {
     /// Provided-buffer-ring registration is available (phase-2 multishot
     /// recv).
     pub buf_ring: bool,
+    /// Multishot `RECV` opcode is available (provided-buffer-ring recv).
+    pub recv_multi: bool,
 }
 
 impl Features {
@@ -62,6 +64,7 @@ pub fn probe() -> io::Result<Features> {
     ring.submitter().register_probe(&mut probe)?;
 
     let buf_ring = probe.is_supported(opcode::ProvideBuffers::CODE);
+    let recv_multi = probe.is_supported(opcode::RecvMulti::CODE);
 
     Ok(Features {
         defer_taskrun,
@@ -81,5 +84,6 @@ pub fn probe() -> io::Result<Features> {
         timeout: probe.is_supported(opcode::Timeout::CODE),
         async_cancel: probe.is_supported(opcode::AsyncCancel::CODE),
         buf_ring,
+        recv_multi,
     })
 }
