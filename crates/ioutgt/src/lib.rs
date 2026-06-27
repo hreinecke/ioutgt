@@ -64,6 +64,10 @@ pub struct TargetConfig {
     pub idle_teardown: Option<Duration>,
     /// Subsystems served on this port.
     pub subsystems: Vec<SubsystemConfig>,
+    /// Test-only: artificial per-write delay (microseconds) injected into
+    /// memory-backed namespaces, emulating a slow real disk so recv-side data
+    /// buffers stay referenced across the write. `0` keeps writes synchronous.
+    pub mem_write_delay_us: u64,
 }
 
 impl TargetConfig {
@@ -81,6 +85,7 @@ impl TargetConfig {
             recv_buf_bytes: 0,
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
+            mem_write_delay_us: 0,
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
                 serial: "IOUTGT0001".into(),
@@ -110,6 +115,7 @@ impl TargetConfig {
             control_socket: file.control_socket,
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),
+            mem_write_delay_us: 0,
             subsystems: file.subsystems,
         })
     }
@@ -421,6 +427,12 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
         for ns in &spec.namespaces {
             let backend =
                 build_backend(&ns.backend, config.recv_buf_bytes > 0).map_err(io::Error::other)?;
+            // Test-only slow-disk emulation for memory namespaces.
+            if config.mem_write_delay_us > 0
+                && let AnyBackend::Memory(m) = &backend
+            {
+                m.set_write_delay_us(config.mem_write_delay_us);
+            }
             let mut uuid = [0u8; 16];
             uuid[..4].copy_from_slice(&ns.nsid.to_be_bytes());
             uuid[8] = 0x80;

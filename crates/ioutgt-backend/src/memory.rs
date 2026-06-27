@@ -6,6 +6,8 @@
 //! chunks return zeroes).
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use ioutgt_core::{Backend, BackendError, LbaRange};
 
@@ -17,6 +19,13 @@ pub struct MemoryBackend {
     block_shift: u8,
     nr_blocks: u64,
     chunks: Vec<RwLock<Option<Box<[u8]>>>>,
+    /// Test-only artificial per-write completion delay (microseconds). A real
+    /// SSD makes writes take time, so the data buffer feeding the write stays
+    /// referenced for the op's duration; the instant memory backend hides any
+    /// bug that depends on a buffer being held across a slow write. `0`
+    /// (default) keeps writes synchronous. Set via
+    /// [`MemoryBackend::set_write_delay_us`].
+    write_delay_us: AtomicU64,
 }
 
 impl MemoryBackend {
@@ -29,6 +38,27 @@ impl MemoryBackend {
             block_shift,
             nr_blocks,
             chunks: (0..nr_chunks).map(|_| RwLock::new(None)).collect(),
+            write_delay_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Set the test-only artificial per-write delay in microseconds (see
+    /// [`MemoryBackend::write_delay_us`]). Used to emulate a slow real disk so
+    /// recv-side buffers stay referenced across the write, exposing
+    /// hold-across-write bugs the instant default cannot.
+    pub fn set_write_delay_us(&self, us: u64) {
+        self.write_delay_us.store(us, Ordering::Relaxed);
+    }
+
+    /// Park the current op on the reactor timer for the configured write delay,
+    /// if any. A no-op when the delay is 0 or no reactor timer is available.
+    async fn write_delay(&self) {
+        let us = self.write_delay_us.load(Ordering::Relaxed);
+        if us == 0 {
+            return;
+        }
+        if let Ok(sleep) = ioutgt_uring::ops::sleep(Duration::from_micros(us)) {
+            let _ = sleep.await;
         }
     }
 
@@ -80,6 +110,7 @@ impl Backend for MemoryBackend {
 
     async fn write(&self, slba: u64, buf: &[u8]) -> Result<(), BackendError> {
         self.check_range(slba, (buf.len() as u64) >> self.block_shift)?;
+        self.write_delay().await;
         let offset = slba << self.block_shift;
         self.for_each_chunk(offset, buf.len(), |chunk, in_chunk, take, buf_off| {
             let mut guard = chunk.write().expect("chunk poisoned");

@@ -32,7 +32,19 @@ fn fill_pattern(buf: &mut [u8], slba: u64, generation: u8) {
     }
 }
 
-fn write_region(client: &mut Client, cid: u16, slba: u64, len: u32, generation: u8) {
+/// `single_h2c`: deliver an R2T transfer as one whole-transfer H2CData PDU
+/// (offset 0, length == data_len) instead of two fragments. The single-PDU
+/// shape is the one the controller can retain zero-copy into the recv ring, so
+/// the ring tests use it to exercise the H2C retention path; the default
+/// two-PDU split keeps reassembly under test.
+fn write_region_cfg(
+    client: &mut Client,
+    cid: u16,
+    slba: u64,
+    len: u32,
+    generation: u8,
+    single_h2c: bool,
+) {
     let mut data = vec![0u8; len as usize];
     fill_pattern(&mut data, slba, generation);
     let nlb0 = u16::try_from(u64::from(len) / BLOCK - 1).unwrap();
@@ -42,17 +54,21 @@ fn write_region(client: &mut Client, cid: u16, slba: u64, len: u32, generation: 
     if inline {
         client.send_capsule(&sqe, &data);
     } else {
-        // R2T path: wait for the solicitation, deliver in two PDUs to
-        // exercise reassembly under concurrency.
+        // R2T path: wait for the solicitation, then deliver either as one
+        // whole-transfer PDU (retainable) or in two PDUs (reassembly).
         client.send_capsule(&sqe, &[]);
         let (decoded, _) = client.recv_pdu();
         let PduKind::R2T { ttag, length, .. } = decoded.kind else {
             panic!("expected R2T, got {:?}", decoded.kind);
         };
         assert_eq!(length, len);
-        let half = (len as usize / 2) & !511;
-        client.send_h2c_data(cid, ttag, 0, &data[..half], false);
-        client.send_h2c_data(cid, ttag, u32::try_from(half).unwrap(), &data[half..], true);
+        if single_h2c {
+            client.send_h2c_data_one_write(cid, ttag, 0, &data, true);
+        } else {
+            let half = (len as usize / 2) & !511;
+            client.send_h2c_data(cid, ttag, 0, &data[..half], false);
+            client.send_h2c_data(cid, ttag, u32::try_from(half).unwrap(), &data[half..], true);
+        }
     }
     let cqe = client.recv_response();
     assert_eq!(
@@ -92,6 +108,15 @@ fn run_verify(hdgst: bool, ddgst: bool) {
 }
 
 fn run_verify_cfg(hdgst: bool, ddgst: bool, tweak: impl FnOnce(&mut ioutgt::TargetConfig)) {
+    run_verify_full(hdgst, ddgst, false, tweak);
+}
+
+fn run_verify_full(
+    hdgst: bool,
+    ddgst: bool,
+    single_h2c: bool,
+    tweak: impl FnOnce(&mut ioutgt::TargetConfig),
+) {
     let mut config = ioutgt::TargetConfig::single_memory(NQN, 64);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 2;
@@ -116,7 +141,7 @@ fn run_verify_cfg(hdgst: bool, ddgst: bool, tweak: impl FnOnce(&mut ioutgt::Targ
                     let index = stripe * 2 + parity;
                     let slba = index * region_blocks;
                     let len = SIZES[(index as usize) % SIZES.len()];
-                    write_region(&mut io, cid, slba, len, 1);
+                    write_region_cfg(&mut io, cid, slba, len, 1, single_h2c);
                     cid = cid.wrapping_add(1).max(10);
                 }
                 io
@@ -143,7 +168,14 @@ fn run_verify_cfg(hdgst: bool, ddgst: bool, tweak: impl FnOnce(&mut ioutgt::Targ
 
     // Overwrite a band with a new generation through one connection and
     // confirm both the new data and that neighbours kept generation 1.
-    write_region(&mut clients[0], 300, 4 * region_blocks, 131_072, 7);
+    write_region_cfg(
+        &mut clients[0],
+        300,
+        4 * region_blocks,
+        131_072,
+        7,
+        single_h2c,
+    );
     verify_region(&mut clients[1], 301, 4 * region_blocks, 131_072, 7);
     let neighbour = 5 * region_blocks;
     let len = SIZES[5 % SIZES.len()];
@@ -178,5 +210,51 @@ fn concurrent_verify_small_pool() {
 fn concurrent_verify_small_pool_digests() {
     run_verify_cfg(true, true, |c| {
         c.queue_buf_bytes = 256 * 1024;
+    });
+}
+
+// Data integrity over the provided-buffer recv ring with a deliberately tiny
+// ring (256 KiB total → two 128 KiB sub-buffers). Many concurrent up-to-128K
+// writes contend for the two sub-buffers, exercising the zero-copy retention
+// path, the straddle/over-size copy-out fallback, and the 2-buffer
+// back-pressure (recv parks on ENOBUFS until a completing write re-provides) —
+// all under the cross-connection verify torture. Must not hang (a hang means
+// the back-pressure/refcount deadlock regressed). A no-op on kernels without
+// provided-buffer-ring support: recv silently falls back to the classic
+// scratch buffer and the test still verifies data integrity.
+#[test]
+fn concurrent_verify_recv_ring() {
+    run_verify_cfg(false, false, |c| {
+        c.recv_buf_bytes = 256 * 1024;
+    });
+}
+
+// Same, with digests on (DDGST folded over ring memory on the recv side).
+#[test]
+fn concurrent_verify_recv_ring_digests() {
+    run_verify_cfg(true, true, |c| {
+        c.recv_buf_bytes = 256 * 1024;
+    });
+}
+
+// Drive the R2T writes as single whole-transfer H2CData PDUs so the controller
+// retains them zero-copy into the recv ring. With only two 128 KiB sub-buffers
+// and up-to-128K writes from two concurrent connections, retained sub-buffers
+// stay borrowed by in-flight writes while recv keeps filling — exercising the
+// 2-buffer back-pressure (recv parks on ENOBUFS, a completing write re-provides
+// and wakes it). A hang here is the retention/refcount deadlock regressing.
+#[test]
+fn concurrent_verify_recv_ring_single_h2c() {
+    run_verify_full(false, false, true, |c| {
+        c.recv_buf_bytes = 256 * 1024;
+    });
+}
+
+// Same, with digests on: the DDGST is folded over the retained ring memory as
+// each window arrives, never over bytes the kernel has not yet delivered.
+#[test]
+fn concurrent_verify_recv_ring_single_h2c_digests() {
+    run_verify_full(true, true, true, |c| {
+        c.recv_buf_bytes = 256 * 1024;
     });
 }

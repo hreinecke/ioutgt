@@ -130,6 +130,29 @@ fn temp_dir_roundtrip_either_path() {
 }
 
 #[test]
+fn ring_off_keeps_direct_on_real_fs() {
+    // The scratch file lives under target/ (a real filesystem per this
+    // module's docs), which supports O_DIRECT. With the recv ring OFF (the
+    // default), O_DIRECT must be kept even though such a store typically
+    // reports a `dio_mem` of 512 (> 4) — the gate the ring needs must not
+    // pessimize the default page-aligned-buffer path into buffered IO.
+    let path = scratch_file("fb-ring-off-direct", 8 << 20);
+    let be_off = FileBackend::open(&path, 9, false).unwrap();
+    assert!(
+        be_off.is_direct(),
+        "ring off on a real fs must keep O_DIRECT"
+    );
+
+    // Ring on is never *more* permissive than ring off: if it kept O_DIRECT,
+    // ring off must have too.
+    let be_on = FileBackend::open(&path, 9, true).unwrap();
+    assert!(
+        be_off.is_direct() || !be_on.is_direct(),
+        "ring off must be at least as direct as ring on"
+    );
+}
+
+#[test]
 fn open_rejects_missing_and_tiny() {
     assert!(FileBackend::open(std::path::Path::new("/nonexistent/x"), 9, false).is_err());
     let path = scratch_file("fb-tiny", 256); // < one block
