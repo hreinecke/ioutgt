@@ -155,7 +155,11 @@ fn resolve<'a>(
 }
 
 /// Build a backend from its config (block shift 9, as the static path).
-pub fn build_backend(config: &BackendConfig) -> Result<AnyBackend, String> {
+/// `ring_enabled` is the port's recv-ring state: a `FileBackend` only gates
+/// O_DIRECT on `statx` DIO alignment when the ring is on (it may then write
+/// from 4-byte-aligned ring memory); with the ring off it keeps O_DIRECT
+/// whenever the fd opened (writes come from page-aligned pool buffers).
+pub fn build_backend(config: &BackendConfig, ring_enabled: bool) -> Result<AnyBackend, String> {
     const BLOCK_SHIFT: u8 = 9;
     Ok(match config {
         BackendConfig::Memory { size_mb } => {
@@ -165,7 +169,8 @@ pub fn build_backend(config: &BackendConfig) -> Result<AnyBackend, String> {
             AnyBackend::Null(NullBackend::new(size_mb << 20, BLOCK_SHIFT))
         }
         BackendConfig::File { path } => {
-            let file = FileBackend::open(path, BLOCK_SHIFT).map_err(|e| e.to_string())?;
+            let file =
+                FileBackend::open(path, BLOCK_SHIFT, ring_enabled).map_err(|e| e.to_string())?;
             if !file.is_direct() {
                 warn!(?path, "O_DIRECT unavailable; using buffered IO");
             }
@@ -197,7 +202,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
             if nsid == 0 || nsid == u32::MAX {
                 return Response::err("nsid reserved");
             }
-            let backend = match build_backend(&backend) {
+            let backend = match build_backend(&backend, state.port.recv_buf_bytes > 0) {
                 Ok(backend) => backend,
                 Err(err) => return Response::err(err),
             };

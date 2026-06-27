@@ -23,7 +23,7 @@ fn scratch_file(name: &str, size: u64) -> std::path::PathBuf {
 fn direct_write_read_roundtrip() {
     let path = scratch_file("fb-roundtrip", 8 << 20);
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-    let be = FileBackend::open(&path, 9).unwrap();
+    let be = FileBackend::open(&path, 9, false).unwrap();
     eprintln!("O_DIRECT active: {}", be.is_direct());
     assert_eq!(be.nr_blocks(), (8 << 20) / 512);
 
@@ -68,7 +68,7 @@ fn scattered_write_matches_contiguous() {
     // contiguous write of the concatenation.
     let path = scratch_file("fb-scatter", 8 << 20);
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-    let be = FileBackend::open(&path, 12).unwrap(); // 4K blocks
+    let be = FileBackend::open(&path, 12, false).unwrap(); // 4K blocks
 
     rt.block_on(async move {
         // Two separate page-aligned buffers (non-adjacent in memory).
@@ -115,7 +115,7 @@ fn temp_dir_roundtrip_either_path() {
         .unwrap();
 
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-    let be = FileBackend::open(&path, 9).unwrap();
+    let be = FileBackend::open(&path, 9, false).unwrap();
     eprintln!("temp_dir O_DIRECT active: {}", be.is_direct());
     rt.block_on(async move {
         let mut buf = AlignedBuf::zeroed(4096);
@@ -131,7 +131,7 @@ fn temp_dir_roundtrip_either_path() {
 
 #[test]
 fn open_rejects_missing_and_tiny() {
-    assert!(FileBackend::open(std::path::Path::new("/nonexistent/x"), 9).is_err());
+    assert!(FileBackend::open(std::path::Path::new("/nonexistent/x"), 9, false).is_err());
     let path = scratch_file("fb-tiny", 256); // < one block
-    assert!(FileBackend::open(&path, 9).is_err());
+    assert!(FileBackend::open(&path, 9, false).is_err());
 }

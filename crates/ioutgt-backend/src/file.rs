@@ -1,24 +1,38 @@
 //! File and block-device backend: vectored IO through the queue
-//! thread's io_uring, O_DIRECT on a backing store that supports it,
-//! buffered otherwise (e.g. tmpfs).
+//! thread's io_uring, O_DIRECT on a backing store whose alignment our
+//! ring payloads meet, buffered (`RWF_DONTCACHE`) otherwise.
 //!
 //! One implementation serves both regular files and block devices
 //! (geometry probing differs; the IO path is identical), mirroring how
 //! little actually differs in userspace — unlike kernel nvmet's
 //! bio-vs-kiocb split.
 //!
-//! A single fd is opened `O_DIRECT`, falling back to a plain buffered fd
-//! when the store refuses it. The choice is fixed at open and needs no
-//! alignment probing: our data buffers come from the page-granular slot
-//! pool and every NVMe transfer is a logical-block multiple, so once an
-//! O_DIRECT fd opens it serves *every* IO. (Sub-page-aligned buffers —
-//! which would need the per-store `statx STATX_DIOALIGN` check and a
-//! buffered fallback — only arise with a zero-copy recv ring, which this
-//! backend does not yet receive into.)
+//! A single fd is opened `O_DIRECT`; whether O_DIRECT is *used* is decided
+//! once, at open. The decision depends on whether the zero-copy recv ring is
+//! enabled (see [`FileBackend::open`]'s `ring_enabled`):
+//!
+//! - **Ring off (the default).** The backend only ever sees page-aligned pool
+//!   buffers, which satisfy any DIO alignment a store can demand, so O_DIRECT
+//!   is kept whenever the kernel opened the `O_DIRECT` fd — no `statx` gate.
+//! - **Ring on.** Write payloads can live in ring memory at only **dword/PDO
+//!   (4-byte) alignment**, not page alignment, so O_DIRECT is usable only when
+//!   the store's `statx STATX_DIOALIGN` reports a memory alignment no coarser
+//!   than 4 bytes (`stx_dio_mem_align <= 4`) and an offset alignment no coarser
+//!   than our logical block. NVMe-class block devices (and filesystems on them)
+//!   report a 4-byte DIO memory alignment, so the dword-aligned ring payloads
+//!   DMA straight from ring memory.
+//!
+//! When O_DIRECT is rejected — a too-coarse DIO alignment under the ring, a
+//! store where the kernel can't report DIOALIGN (e.g. tmpfs), or a store that
+//! refuses `O_DIRECT` at open — the backend falls back to a buffered fd with
+//! `RWF_DONTCACHE` (self-correcting to plain buffered on the first
+//! `EOPNOTSUPP`/`EINVAL`, for pre-6.14 kernels and filesystems without
+//! DONTCACHE).
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ioutgt_core::pool::{MAX_SEGS, Seg};
 use ioutgt_core::{Backend, BackendError, LbaRange};
@@ -41,16 +55,53 @@ const EMPTY_IOVEC: libc::iovec = libc::iovec {
     iov_len: 0,
 };
 
-/// File/bdev backend issuing vectored IO; O_DIRECT or buffered, fixed at
-/// open. See module docs.
+/// File/bdev backend issuing vectored IO; O_DIRECT or buffered+DONTCACHE,
+/// decided at open from `statx STATX_DIOALIGN`. See module docs.
 pub struct FileBackend {
-    /// O_DIRECT when the store allowed it, else a plain buffered fd.
+    /// O_DIRECT when the store's DIO alignment fits our 4-byte ring
+    /// payloads, else a plain buffered fd.
     fd: OwnedFd,
     kind: Kind,
     block_shift: u8,
     nr_blocks: u64,
-    /// O_DIRECT is in effect (false ⇒ the store refused it, IO is buffered).
+    /// O_DIRECT is in effect (false ⇒ the store's DIO alignment was too
+    /// coarse or unavailable, IO is buffered with `RWF_DONTCACHE`).
     direct: bool,
+    /// `RWF_DONTCACHE` usable on the buffered fd. Optimistically true;
+    /// self-corrects to false on the first `EOPNOTSUPP`/`EINVAL`.
+    dontcache: AtomicBool,
+}
+
+/// Query DIO alignment via `statx(STATX_DIOALIGN)`. Returns
+/// `(stx_dio_mem_align, stx_dio_offset_align)`, or `(0, 0)` when the kernel
+/// can't report it (pre-6.1, or a backing store without DIO support).
+fn query_dioalign(fd: RawFd) -> (u32, u32) {
+    // SAFETY: statx writes the struct on success; zeroed is a valid init.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: empty path + AT_EMPTY_PATH targets `fd`; out-pointer valid.
+    let r = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_DIOALIGN,
+            &raw mut stx,
+        )
+    };
+    if r < 0 || stx.stx_mask & libc::STATX_DIOALIGN == 0 {
+        return (0, 0);
+    }
+    (stx.stx_dio_mem_align, stx.stx_dio_offset_align)
+}
+
+/// Whether to keep the opened `O_DIRECT` fd, given the store's `statx
+/// STATX_DIOALIGN` and whether the recv ring is enabled (see module docs for
+/// the ring-off vs ring-on rule).
+fn direct_usable(ring_enabled: bool, dio_mem: u32, dio_off: u32, block_shift: u8) -> bool {
+    if !ring_enabled {
+        return true;
+    }
+    dio_mem != 0 && dio_mem <= 4 && dio_off != 0 && u64::from(dio_off) <= (1u64 << block_shift)
 }
 
 /// Fill `iovs` from `segs`, clamping the total to `total` bytes; returns
@@ -90,26 +141,47 @@ fn advance_iovecs(iovs: &mut [libc::iovec], idx: &mut usize, mut n: usize) {
 }
 
 impl FileBackend {
-    /// Open `path` (regular file or block device) `O_DIRECT`, falling back
-    /// to buffered IO where the store refuses direct.
-    pub fn open(path: &Path, block_shift: u8) -> io::Result<FileBackend> {
+    /// Open `path` (regular file or block device). Tries `O_DIRECT`, keeping it
+    /// or falling back to a buffered (`RWF_DONTCACHE`) fd per the ring-gated
+    /// rule in the module docs.
+    pub fn open(path: &Path, block_shift: u8, ring_enabled: bool) -> io::Result<FileBackend> {
         use std::os::unix::ffi::OsStrExt;
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
 
-        let mut direct = true;
+        // Try O_DIRECT; keep it only if direct_usable() (see module docs), else
+        // close and reopen buffered.
         // SAFETY: valid NUL-terminated path; flags are plain constants.
-        let mut rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
-        if rfd < 0 && matches!(errno(), libc::EINVAL | libc::EOPNOTSUPP) {
-            direct = false;
-            // SAFETY: as above.
-            rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-        }
-        if rfd < 0 {
+        let dfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+        let (fd, direct) = if dfd >= 0 {
+            // SAFETY: fresh fd, exclusively owned.
+            let dfd = unsafe { OwnedFd::from_raw_fd(dfd) };
+            let (dio_mem, dio_off) = query_dioalign(dfd.as_raw_fd());
+            let usable = direct_usable(ring_enabled, dio_mem, dio_off, block_shift);
+            if usable {
+                (dfd, true)
+            } else {
+                drop(dfd);
+                // SAFETY: valid NUL-terminated path; flags are plain constants.
+                let bfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+                if bfd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: fresh fd, exclusively owned.
+                (unsafe { OwnedFd::from_raw_fd(bfd) }, false)
+            }
+        } else if matches!(errno(), libc::EINVAL | libc::EOPNOTSUPP) {
+            // Store refuses O_DIRECT outright (e.g. tmpfs): buffered fd.
+            // SAFETY: valid NUL-terminated path; flags are plain constants.
+            let bfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+            if bfd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fresh fd, exclusively owned.
+            (unsafe { OwnedFd::from_raw_fd(bfd) }, false)
+        } else {
             return Err(io::Error::last_os_error());
-        }
-        // SAFETY: fresh fd, exclusively owned.
-        let fd = unsafe { OwnedFd::from_raw_fd(rfd) };
+        };
 
         // SAFETY: stat is written by the kernel on success.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -150,6 +222,7 @@ impl FileBackend {
             block_shift,
             nr_blocks,
             direct,
+            dontcache: AtomicBool::new(true),
         })
     }
 
@@ -163,7 +236,7 @@ impl FileBackend {
     }
 
     /// Issue one vectored read/write on the backend fd (O_DIRECT or
-    /// buffered, fixed at open), resuming across short transfers. When
+    /// buffered+DONTCACHE, fixed at open), resuming across short transfers. When
     /// `buf_index` is `Some`, the iovecs point into that registered pool
     /// buffer and the op is `READV_FIXED`/`WRITEV_FIXED` — the kernel reuses
     /// the pre-pinned mapping instead of mapping the pages every IO.
@@ -186,6 +259,11 @@ impl FileBackend {
         let mut idx = 0usize;
         while done < total {
             let off = base_off + done as u64;
+            // Buffered IO drops the page cache via RWF_DONTCACHE (close to
+            // DIO without alignment constraints); O_DIRECT needs no flag.
+            // The flag self-corrects off on the first EOPNOTSUPP/EINVAL.
+            let use_dc = !self.direct && self.dontcache.load(Ordering::Relaxed);
+            let flags = if use_dc { libc::RWF_DONTCACHE } else { 0 };
             let ptr = iovs[idx..].as_ptr();
             #[allow(clippy::cast_possible_truncation)]
             let cnt = (iovs.len() - idx) as u32;
@@ -200,10 +278,10 @@ impl FileBackend {
             // the op drain at teardown.
             let res = unsafe {
                 match (write, buf_index) {
-                    (true, Some(bi)) => ops::writev_fixed_at_raw(fd, ptr, cnt, off, bi, 0),
-                    (false, Some(bi)) => ops::readv_fixed_at_raw(fd, ptr, cnt, off, bi, 0),
-                    (true, None) => ops::writev_at_raw(fd, ptr, cnt, off, 0),
-                    (false, None) => ops::readv_at_raw(fd, ptr, cnt, off, 0),
+                    (true, Some(bi)) => ops::writev_fixed_at_raw(fd, ptr, cnt, off, bi, flags),
+                    (false, Some(bi)) => ops::readv_fixed_at_raw(fd, ptr, cnt, off, bi, flags),
+                    (true, None) => ops::writev_at_raw(fd, ptr, cnt, off, flags),
+                    (false, None) => ops::readv_at_raw(fd, ptr, cnt, off, flags),
                 }
             };
             let op = res.map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?;
@@ -214,7 +292,16 @@ impl FileBackend {
                     advance_iovecs(iovs, &mut idx, n);
                     done += n;
                 }
-                Err(e) => return Err(map_errno(e.raw_os_error().unwrap_or(libc::EIO))),
+                Err(e) => {
+                    let code = e.raw_os_error().unwrap_or(libc::EIO);
+                    // RWF_DONTCACHE unsupported (pre-6.14 or this fs): drop
+                    // the flag for good and retry the same offset buffered.
+                    if use_dc && matches!(code, libc::EOPNOTSUPP | libc::EINVAL) {
+                        self.dontcache.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                    return Err(map_errno(code));
+                }
             }
         }
         Ok(())
@@ -263,7 +350,8 @@ impl Backend for FileBackend {
     ) -> Result<(), BackendError> {
         let mut iovs = [EMPTY_IOVEC; MAX_SEGS];
         let n = fill_iovecs(&mut iovs, segs, total);
-        self.rwv(false, slba, &mut iovs[..n], total, buf_index).await
+        self.rwv(false, slba, &mut iovs[..n], total, buf_index)
+            .await
     }
 
     async fn write_segs(
@@ -298,12 +386,8 @@ impl Backend for FileBackend {
             }
             let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
             let len = u64::from(range.nlb) << self.block_shift;
-            if let Ok(op) = ops::fallocate(
-                self.fd.as_raw_fd(),
-                mode,
-                self.offset(range.slba),
-                len,
-            ) {
+            if let Ok(op) = ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
+            {
                 let _ = op.await;
             }
         }
@@ -319,12 +403,9 @@ impl Backend for FileBackend {
                 libc::FALLOC_FL_ZERO_RANGE,
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
             ] {
-                if let Ok(op) = ops::fallocate(
-                    self.fd.as_raw_fd(),
-                    mode,
-                    self.offset(range.slba),
-                    len,
-                ) {
+                if let Ok(op) =
+                    ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
+                {
                     if op.await.is_ok() {
                         return Ok(());
                     }
@@ -340,12 +421,10 @@ impl Backend for FileBackend {
             let want = u32::try_from(remaining.min(chunk.len() as u64)).expect("chunk-bounded");
             // SAFETY: chunk is alive across the await; read-only for the
             // kernel.
-            let n = unsafe {
-                ops::write_at_raw(self.fd.as_raw_fd(), chunk.as_ptr(), want, off)
-            }
-            .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
-            .await
-            .map_err(|e| map_errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let n = unsafe { ops::write_at_raw(self.fd.as_raw_fd(), chunk.as_ptr(), want, off) }
+                .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
+                .await
+                .map_err(|e| map_errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
             if n == 0 {
                 return Err(BackendError::Io(libc::EIO));
             }
@@ -353,5 +432,56 @@ impl Backend for FileBackend {
             off += u64::from(n);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::direct_usable;
+
+    #[test]
+    fn ring_off_keeps_direct_regardless_of_dio_alignment() {
+        // The default (ring off) path only writes from page-aligned pool
+        // buffers, so O_DIRECT is kept whatever the store reports — including a
+        // `dio_mem > 4` device (the case the statx gate used to pessimize into
+        // buffered+RWF_DONTCACHE) and a store that can't report DIOALIGN (0, 0).
+        for (dio_mem, dio_off) in [(512u32, 512u32), (4096, 4096), (8, 8), (0, 0)] {
+            assert!(
+                direct_usable(false, dio_mem, dio_off, 9),
+                "ring off must keep O_DIRECT (dio_mem={dio_mem}, dio_off={dio_off})"
+            );
+        }
+    }
+
+    #[test]
+    fn ring_on_gates_direct_on_dword_alignment() {
+        // Ring on: payloads may be 4-byte-aligned ring memory. Keep O_DIRECT
+        // only for NVMe-class stores (mem align <= 4, offset align <= block).
+        assert!(
+            direct_usable(true, 4, 512, 9),
+            "NVMe-class: 4-byte mem, 512 off"
+        );
+        assert!(direct_usable(true, 1, 1, 9), "byte-aligned store");
+        assert!(
+            !direct_usable(true, 512, 512, 9),
+            "512-byte mem align too coarse"
+        );
+        assert!(
+            !direct_usable(true, 4096, 4096, 12),
+            "4K mem align too coarse"
+        );
+        assert!(
+            !direct_usable(true, 0, 0, 9),
+            "unreportable DIOALIGN -> buffered"
+        );
+        // Offset alignment coarser than the logical block is unusable.
+        assert!(
+            !direct_usable(true, 4, 8192, 9),
+            "8K offset align > 512 block"
+        );
+        assert!(
+            direct_usable(true, 4, 4096, 12),
+            "4K offset align == 4K block ok"
+        );
     }
 }

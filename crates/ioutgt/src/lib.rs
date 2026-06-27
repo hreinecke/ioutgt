@@ -419,7 +419,8 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
         for ns in &spec.namespaces {
-            let backend = build_backend(&ns.backend).map_err(io::Error::other)?;
+            let backend =
+                build_backend(&ns.backend, config.recv_buf_bytes > 0).map_err(io::Error::other)?;
             let mut uuid = [0u8; 16];
             uuid[..4].copy_from_slice(&ns.nsid.to_be_bytes());
             uuid[8] = 0x80;
