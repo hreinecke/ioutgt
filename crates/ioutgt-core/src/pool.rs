@@ -21,8 +21,10 @@ use crate::buf::AlignedBuf;
 /// Allocation granule and minimum segment size.
 pub const PAGE: usize = 4096;
 
-/// Default per-IO-queue data-buffer pool.
-pub const DEFAULT_POOL_BYTES: usize = 4 * 1024 * 1024;
+/// Default per-IO-queue data-buffer pool size, in MiB. The single source for
+/// the `--queue-buf-mb` CLI default, the JSON `queue_buf_mb` default, and the
+/// in-process `TargetConfig` default.
+pub const DEFAULT_POOL_MB: usize = 8;
 
 /// Max physical segments a single command buffer can span: MDTS
 /// (128 KiB) divided by the 4 KiB page granule.

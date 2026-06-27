@@ -34,7 +34,7 @@ pub struct FileConfig {
     #[serde(default = "default_io_queue_size")]
     pub io_queue_size: u16,
     /// Per-IO-queue data-buffer pool size in MiB (slots lease on
-    /// demand). Default 4 MiB.
+    /// demand). Default 8 MiB.
     #[serde(default = "default_queue_buf_mb")]
     pub queue_buf_mb: usize,
     /// Per-CONNECTION receive-ring size in MiB for zero-copy receive; 0 = off
@@ -63,7 +63,7 @@ fn default_io_queue_size() -> u16 {
 }
 
 fn default_queue_buf_mb() -> usize {
-    ioutgt_core::pool::DEFAULT_POOL_BYTES / (1024 * 1024)
+    ioutgt_core::pool::DEFAULT_POOL_MB
 }
 
 fn default_recv_buf_mb() -> usize {

@@ -45,8 +45,8 @@ struct Args {
 
     /// Per-IO-queue data-buffer pool size in MiB. Slots lease their
     /// read/write buffers from this shared arena on demand (4 KiB grain);
-    /// deliberately smaller than depth × MDTS. Default 4 MiB.
-    #[arg(long, default_value_t = 4)]
+    /// deliberately smaller than depth × MDTS. Default 8 MiB.
+    #[arg(long, default_value_t = ioutgt_core::pool::DEFAULT_POOL_MB)]
     queue_buf_mb: usize,
 
     /// Per-CONNECTION receive-ring size in MiB for zero-copy receive; 0 = off

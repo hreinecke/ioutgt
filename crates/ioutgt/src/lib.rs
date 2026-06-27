@@ -81,7 +81,7 @@ impl TargetConfig {
             pin_threads: false,
             send_zc: false,
             io_queue_size: 128,
-            queue_buf_bytes: ioutgt_core::pool::DEFAULT_POOL_BYTES,
+            queue_buf_bytes: ioutgt_core::pool::DEFAULT_POOL_MB * 1024 * 1024,
             recv_buf_bytes: 0,
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
