@@ -36,6 +36,7 @@ pub mod sendbatch;
 
 pub use bufring::{BufRing, RecvChunk};
 pub use cqe::CqeResult;
+pub use ops::BackendFd;
 pub use probe::{Features, probe};
 pub use reactor::{Reactor, ReactorStats, RingConfig};
 pub use runtime::QueueRuntime;
@@ -84,4 +85,27 @@ pub fn unregister_pool_buffer(idx: u16) {
     if let Ok(r) = reactor::Reactor::current() {
         r.unregister_buffer(idx);
     }
+}
+
+/// Fixed-file table index for `fd` on the current thread's reactor, lazily
+/// registering it on first use — `Some(idx)` means disk ops may address `fd`
+/// via [`BackendFd::Fixed`], `None` means use [`BackendFd::Raw`]. `None` when
+/// there is no live reactor. See [`Reactor::fixed_file_index`].
+///
+/// As with [`register_pool_buffer`], the returned index is valid only on the
+/// reactor that minted it (the calling thread's); reactor handles are `!Send`,
+/// so an index can never reach another thread's ring.
+pub fn fixed_file_index(fd: std::os::fd::RawFd) -> Option<u16> {
+    reactor::Reactor::current()
+        .ok()
+        .and_then(|r| r.fixed_file_index(fd))
+}
+
+/// Whether the current thread's reactor supports the fixed-file table — lets a
+/// `None` from [`fixed_file_index`] be reported as "no kernel support" vs
+/// "table full". `false` if there is no live reactor.
+pub fn fixed_files_supported() -> bool {
+    reactor::Reactor::current()
+        .map(|r| r.fixed_files_supported())
+        .unwrap_or(false)
 }

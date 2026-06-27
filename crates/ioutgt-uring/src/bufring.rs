@@ -721,12 +721,17 @@ mod tests {
             }];
             // SAFETY: iov base is within registered buffer `idx`; the ring
             // outlives the awaited op.
-            let got = unsafe { ops::writev_fixed_at_raw(fd, iov.as_ptr(), 1, 0, idx, 0) }
+            let got = unsafe {
+                ops::writev_fixed_at_raw(ops::BackendFd::Raw(fd), iov.as_ptr(), 1, 0, idx, 0)
+            }
+            .unwrap()
+            .await
+            .unwrap();
+            assert_eq!(got as usize, N, "WRITE_FIXED short write");
+            ops::fsync(ops::BackendFd::Raw(fd), false)
                 .unwrap()
                 .await
                 .unwrap();
-            assert_eq!(got as usize, N, "WRITE_FIXED short write");
-            ops::fsync(fd, false).unwrap().await.unwrap();
         });
 
         let mut back = Vec::new();

@@ -235,6 +235,17 @@ impl FileBackend {
         slba << self.block_shift
     }
 
+    /// The op target for this backend's fd: a registered fixed-file index when
+    /// the reactor accepted one (skips the kernel's per-IO fd lookup), else the
+    /// raw fd. Best-effort and per-thread, mirroring the fixed-buffer fallback.
+    fn backend_fd(&self) -> ops::BackendFd {
+        let fd = self.fd.as_raw_fd();
+        match ioutgt_uring::fixed_file_index(fd) {
+            Some(idx) => ops::BackendFd::Fixed(idx),
+            None => ops::BackendFd::Raw(fd),
+        }
+    }
+
     /// Issue one vectored read/write on the backend fd (O_DIRECT or
     /// buffered+DONTCACHE, fixed at open), resuming across short transfers. When
     /// `buf_index` is `Some`, the iovecs point into that registered pool
@@ -253,7 +264,7 @@ impl FileBackend {
         }
         self.check_range(slba, (total as u64) >> self.block_shift)?;
         let base_off = self.offset(slba);
-        let fd = self.fd.as_raw_fd();
+        let file = self.backend_fd();
 
         let mut done = 0usize;
         let mut idx = 0usize;
@@ -278,10 +289,10 @@ impl FileBackend {
             // the op drain at teardown.
             let res = unsafe {
                 match (write, buf_index) {
-                    (true, Some(bi)) => ops::writev_fixed_at_raw(fd, ptr, cnt, off, bi, flags),
-                    (false, Some(bi)) => ops::readv_fixed_at_raw(fd, ptr, cnt, off, bi, flags),
-                    (true, None) => ops::writev_at_raw(fd, ptr, cnt, off, flags),
-                    (false, None) => ops::readv_at_raw(fd, ptr, cnt, off, flags),
+                    (true, Some(bi)) => ops::writev_fixed_at_raw(file, ptr, cnt, off, bi, flags),
+                    (false, Some(bi)) => ops::readv_fixed_at_raw(file, ptr, cnt, off, bi, flags),
+                    (true, None) => ops::writev_at_raw(file, ptr, cnt, off, flags),
+                    (false, None) => ops::readv_at_raw(file, ptr, cnt, off, flags),
                 }
             };
             let op = res.map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?;
@@ -367,7 +378,7 @@ impl Backend for FileBackend {
     }
 
     async fn flush(&self) -> Result<(), BackendError> {
-        ops::fsync(self.fd.as_raw_fd(), true)
+        ops::fsync(self.backend_fd(), true)
             .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
             .await
             .map(|_| ())
@@ -386,8 +397,7 @@ impl Backend for FileBackend {
             }
             let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
             let len = u64::from(range.nlb) << self.block_shift;
-            if let Ok(op) = ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
-            {
+            if let Ok(op) = ops::fallocate(self.backend_fd(), mode, self.offset(range.slba), len) {
                 let _ = op.await;
             }
         }
@@ -404,7 +414,7 @@ impl Backend for FileBackend {
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
             ] {
                 if let Ok(op) =
-                    ops::fallocate(self.fd.as_raw_fd(), mode, self.offset(range.slba), len)
+                    ops::fallocate(self.backend_fd(), mode, self.offset(range.slba), len)
                 {
                     if op.await.is_ok() {
                         return Ok(());
@@ -421,7 +431,7 @@ impl Backend for FileBackend {
             let want = u32::try_from(remaining.min(chunk.len() as u64)).expect("chunk-bounded");
             // SAFETY: chunk is alive across the await; read-only for the
             // kernel.
-            let n = unsafe { ops::write_at_raw(self.fd.as_raw_fd(), chunk.as_ptr(), want, off) }
+            let n = unsafe { ops::write_at_raw(self.backend_fd(), chunk.as_ptr(), want, off) }
                 .map_err(|e| BackendError::Io(e.raw_os_error().unwrap_or(libc::EIO)))?
                 .await
                 .map_err(|e| map_errno(e.raw_os_error().unwrap_or(libc::EIO)))?;

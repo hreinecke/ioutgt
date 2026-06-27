@@ -18,6 +18,20 @@ use io_uring::{opcode, types};
 use crate::op::{MsgResources, MultiOp, Op, Resources};
 use crate::reactor::SqeClass;
 
+/// A disk op's file target: a raw fd, or a registered fixed-file table index.
+///
+/// Mirrors the fixed-buffer pattern: the backend best-effort registers each
+/// fd once per thread ([`crate::fixed_file_index`]) and addresses it by index
+/// (`types::Fixed`) so the kernel skips the per-IO fd lookup; `Raw` is the
+/// plain non-registered fallback.
+#[derive(Clone, Copy)]
+pub enum BackendFd {
+    /// A plain (non-registered) file descriptor.
+    Raw(RawFd),
+    /// An index into the ring's registered fixed-file table.
+    Fixed(u16),
+}
+
 fn buf_len(buf: &[u8]) -> io::Result<u32> {
     u32::try_from(buf.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer too large"))
@@ -250,7 +264,7 @@ pub fn sleep(duration: Duration) -> io::Result<Sleep> {
 }
 
 /// `fsync(2)` / `fdatasync(2)` via the ring.
-pub fn fsync(fd: RawFd, datasync: bool) -> io::Result<RawOp> {
+pub fn fsync(file: BackendFd, datasync: bool) -> io::Result<RawOp> {
     let flags = if datasync {
         types::FsyncFlags::DATASYNC
     } else {
@@ -258,10 +272,13 @@ pub fn fsync(fd: RawFd, datasync: bool) -> io::Result<RawOp> {
     };
     let op = Op::submit(
         |key| {
-            opcode::Fsync::new(types::Fd(fd))
-                .flags(flags)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
+                BackendFd::Fixed(idx) => opcode::Fsync::new(types::Fixed(idx.into()))
+                    .flags(flags)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
     )?;
@@ -270,14 +287,20 @@ pub fn fsync(fd: RawFd, datasync: bool) -> io::Result<RawOp> {
 
 /// `fallocate(2)` via the ring (`FALLOC_FL_*` modes: punch-hole,
 /// zero-range, ... — the file backend's discard/write-zeroes primitive).
-pub fn fallocate(fd: RawFd, mode: i32, offset: u64, len: u64) -> io::Result<RawOp> {
+pub fn fallocate(file: BackendFd, mode: i32, offset: u64, len: u64) -> io::Result<RawOp> {
     let op = Op::submit(
         |key| {
-            opcode::Fallocate::new(types::Fd(fd), len)
-                .offset(offset)
-                .mode(mode)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd), len)
+                    .offset(offset)
+                    .mode(mode)
+                    .build(),
+                BackendFd::Fixed(idx) => opcode::Fallocate::new(types::Fixed(idx.into()), len)
+                    .offset(offset)
+                    .mode(mode)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
     )?;
@@ -489,13 +512,23 @@ pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<
 /// # Safety
 ///
 /// Same contract as [`recv_raw`].
-pub unsafe fn read_at_raw(fd: RawFd, ptr: *mut u8, len: u32, offset: u64) -> io::Result<RawOp> {
+pub unsafe fn read_at_raw(
+    file: BackendFd,
+    ptr: *mut u8,
+    len: u32,
+    offset: u64,
+) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::Read::new(types::Fd(fd), ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Read::new(types::Fd(fd), ptr, len)
+                    .offset(offset)
+                    .build(),
+                BackendFd::Fixed(idx) => opcode::Read::new(types::Fixed(idx.into()), ptr, len)
+                    .offset(offset)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Read,
@@ -508,13 +541,23 @@ pub unsafe fn read_at_raw(fd: RawFd, ptr: *mut u8, len: u32, offset: u64) -> io:
 /// # Safety
 ///
 /// Same contract as [`recv_raw`] (reads only).
-pub unsafe fn write_at_raw(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> io::Result<RawOp> {
+pub unsafe fn write_at_raw(
+    file: BackendFd,
+    ptr: *const u8,
+    len: u32,
+    offset: u64,
+) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Write::new(types::Fd(fd), ptr, len)
+                    .offset(offset)
+                    .build(),
+                BackendFd::Fixed(idx) => opcode::Write::new(types::Fixed(idx.into()), ptr, len)
+                    .offset(offset)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Write,
@@ -531,7 +574,7 @@ pub unsafe fn write_at_raw(fd: RawFd, ptr: *const u8, len: u32, offset: u64) -> 
 /// points at must stay valid and exclusively borrowed until the terminal
 /// CQE is reaped.
 pub unsafe fn readv_at_raw(
-    fd: RawFd,
+    file: BackendFd,
     iov: *const libc::iovec,
     n: u32,
     offset: u64,
@@ -539,11 +582,17 @@ pub unsafe fn readv_at_raw(
 ) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::Readv::new(types::Fd(fd), iov, n)
-                .offset(offset)
-                .rw_flags(rw_flags)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Readv::new(types::Fd(fd), iov, n)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+                BackendFd::Fixed(idx) => opcode::Readv::new(types::Fixed(idx.into()), iov, n)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Read,
@@ -558,7 +607,7 @@ pub unsafe fn readv_at_raw(
 ///
 /// Same contract as [`readv_at_raw`] (reads the buffers only).
 pub unsafe fn writev_at_raw(
-    fd: RawFd,
+    file: BackendFd,
     iov: *const libc::iovec,
     n: u32,
     offset: u64,
@@ -566,11 +615,17 @@ pub unsafe fn writev_at_raw(
 ) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::Writev::new(types::Fd(fd), iov, n)
-                .offset(offset)
-                .rw_flags(rw_flags)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::Writev::new(types::Fd(fd), iov, n)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+                BackendFd::Fixed(idx) => opcode::Writev::new(types::Fixed(idx.into()), iov, n)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Write,
@@ -587,7 +642,7 @@ pub unsafe fn writev_at_raw(
 /// Same contract as [`readv_at_raw`], and every `iov_base` must fall within
 /// the region registered at `buf_index` (the connection's pool arena).
 pub unsafe fn readv_fixed_at_raw(
-    fd: RawFd,
+    file: BackendFd,
     iov: *const libc::iovec,
     n: u32,
     offset: u64,
@@ -596,11 +651,19 @@ pub unsafe fn readv_fixed_at_raw(
 ) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::ReadvFixed::new(types::Fd(fd), iov, n, buf_index)
-                .offset(offset)
-                .rw_flags(rw_flags)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::ReadvFixed::new(types::Fd(fd), iov, n, buf_index)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+                BackendFd::Fixed(idx) => {
+                    opcode::ReadvFixed::new(types::Fixed(idx.into()), iov, n, buf_index)
+                        .offset(offset)
+                        .rw_flags(rw_flags)
+                        .build()
+                }
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Read,
@@ -614,7 +677,7 @@ pub unsafe fn readv_fixed_at_raw(
 ///
 /// Same contract as [`readv_fixed_at_raw`] (reads the buffers only).
 pub unsafe fn writev_fixed_at_raw(
-    fd: RawFd,
+    file: BackendFd,
     iov: *const libc::iovec,
     n: u32,
     offset: u64,
@@ -623,11 +686,19 @@ pub unsafe fn writev_fixed_at_raw(
 ) -> io::Result<RawOp> {
     let op = Op::submit_classed(
         |key| {
-            opcode::WritevFixed::new(types::Fd(fd), iov, n, buf_index)
-                .offset(offset)
-                .rw_flags(rw_flags)
-                .build()
-                .user_data(key)
+            let e = match file {
+                BackendFd::Raw(fd) => opcode::WritevFixed::new(types::Fd(fd), iov, n, buf_index)
+                    .offset(offset)
+                    .rw_flags(rw_flags)
+                    .build(),
+                BackendFd::Fixed(idx) => {
+                    opcode::WritevFixed::new(types::Fixed(idx.into()), iov, n, buf_index)
+                        .offset(offset)
+                        .rw_flags(rw_flags)
+                        .build()
+                }
+            };
+            e.user_data(key)
         },
         Resources::None,
         SqeClass::Write,

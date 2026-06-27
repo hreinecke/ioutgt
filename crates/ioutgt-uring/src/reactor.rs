@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::io;
+use std::os::fd::RawFd;
 use std::rc::Rc;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
@@ -12,6 +13,12 @@ use io_uring::{IoUring, Probe, opcode, squeue, types};
 /// past it, further connections fall back to plain `readv`/`writev`.
 /// Registering empty slots is cheap, so erring large costs little.
 const MAX_REG_BUFS: u16 = 64;
+/// Fixed-file table slots: the cap on distinct backend fds registered on one
+/// queue thread at once. A handful in practice (one per backing store); sized
+/// well above that. Past it, further fds fall back to plain (non-registered)
+/// IO. Registered sparsely on the same ring as the buffer table (separate
+/// tables).
+const MAX_REG_FILES: u16 = 64;
 use slab::Slab;
 
 use crate::cqe::CqeResult;
@@ -125,6 +132,18 @@ pub struct Reactor {
     /// from `free_bufs` being momentarily empty because every slot is
     /// claimed). Lets callers tell "no kernel support" from "table full".
     fixed_supported: bool,
+    /// Free indices into the ring's fixed-file table. Empty when the kernel
+    /// lacks sparse file-table registration — then [`Self::register_file`]
+    /// returns `None` and disk ops stay on the plain (non-registered) fd.
+    free_files: RefCell<Vec<u16>>,
+    /// Whether the kernel supports the fixed-file table at all (vs the free
+    /// list being momentarily empty).
+    files_supported: bool,
+    /// Per-fd memo of fixed-file registration results: each backend fd is
+    /// registered at most once per reactor, and a cached `None` (failure or
+    /// no support) suppresses retries. A linear scan over a few entries beats
+    /// a HashMap. Lives on the Reactor so it resets when the ring is rebuilt.
+    file_index_cache: RefCell<Vec<(RawFd, Option<u16>)>>,
 }
 
 impl Reactor {
@@ -163,12 +182,27 @@ impl Reactor {
             } else {
                 Vec::new()
             };
+            // Reserve a sparse fixed-file table too (separate from the buffer
+            // table). Backend fds register lazily into it; on any gap, leave it
+            // empty so disk ops stay on plain (non-registered) fds.
+            let files_supported = ring
+                .submitter()
+                .register_files_sparse(u32::from(MAX_REG_FILES))
+                .is_ok();
+            let free_files = if files_supported {
+                (0..MAX_REG_FILES).rev().collect()
+            } else {
+                Vec::new()
+            };
             let reactor = Rc::new(Reactor {
                 ring: RefCell::new(ring),
                 slab: RefCell::new(Slab::with_capacity(config.cq_entries as usize)),
                 stats: StatCells::default(),
                 free_bufs: RefCell::new(free_bufs),
                 fixed_supported,
+                free_files: RefCell::new(free_files),
+                files_supported,
+                file_index_cache: RefCell::new(Vec::new()),
             });
             *current = Some(Rc::clone(&reactor));
             Ok(reactor)
@@ -403,12 +437,6 @@ impl Reactor {
         woken
     }
 
-    /// Register files with the ring (fixed-file table). Phase-2 ops will
-    /// address them by index.
-    pub fn register_files(&self, fds: &[std::os::fd::RawFd]) -> io::Result<()> {
-        self.ring.borrow_mut().submitter().register_files(fds)
-    }
-
     /// Pin `ptr..ptr+len` as one fixed buffer and return its table index, or
     /// `None` when the fixed-buffer table is unavailable (kernel gap) or
     /// full. A returned index implies `READV_FIXED`/`WRITEV_FIXED` work, so
@@ -461,6 +489,54 @@ impl Reactor {
             )
         };
         self.free_bufs.borrow_mut().push(idx);
+    }
+
+    /// Claim a fixed-file slot for `fd` and return its table index, or `None`
+    /// when the table is unavailable (kernel gap) or full. Mirrors
+    /// [`register_buffer`](Self::register_buffer).
+    fn register_file(&self, fd: RawFd) -> Option<u16> {
+        let idx = self.free_files.borrow_mut().pop()?;
+        let r = self
+            .ring
+            .borrow_mut()
+            .submitter()
+            .register_files_update(u32::from(idx), &[fd]);
+        if r.is_err() {
+            self.free_files.borrow_mut().push(idx);
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// Fixed-file index for `fd`, lazily registering it on first use and
+    /// memoizing the result (including failure, so we never retry per-IO).
+    /// `Some(idx)` means disk ops may address `fd` via `types::Fixed`; `None`
+    /// means fall back to the raw fd.
+    ///
+    /// No explicit unregister is needed: backend fds (held by the
+    /// `Arc<AnyBackend>`) outlive every reactor, and the fixed-file
+    /// registrations die when the ring drops at thread teardown — before the
+    /// fd is ever closed. The cache lives on the Reactor, so it resets when the
+    /// reactor is rebuilt.
+    pub fn fixed_file_index(&self, fd: RawFd) -> Option<u16> {
+        if let Some((_, r)) = self
+            .file_index_cache
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == fd)
+        {
+            return *r;
+        }
+        let r = self.register_file(fd);
+        self.file_index_cache.borrow_mut().push((fd, r));
+        r
+    }
+
+    /// Whether the kernel supports the fixed-file table at all — lets a `None`
+    /// from [`fixed_file_index`](Self::fixed_file_index) be told apart from
+    /// "table full".
+    pub fn fixed_files_supported(&self) -> bool {
+        self.files_supported
     }
 
     /// Register a provided-buffer ring (`bgid`) for incremental multishot

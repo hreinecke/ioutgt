@@ -23,7 +23,10 @@ fn write_fsync_read_roundtrip() {
         let (res, _) = ops::write_at(fd, data, 0).unwrap().await;
         assert_eq!(res.unwrap(), 12);
 
-        ops::fsync(fd, false).unwrap().await.unwrap();
+        ops::fsync(ops::BackendFd::Raw(fd), false)
+            .unwrap()
+            .await
+            .unwrap();
 
         let buf = vec![0u8; 12].into_boxed_slice();
         let (res, buf) = ops::read_at(fd, buf, 0).unwrap().await;
@@ -62,7 +65,7 @@ fn writev_readv_roundtrip() {
             },
         ];
         // SAFETY: iov + a/b outlive the awaited op.
-        let n = unsafe { ops::writev_at_raw(fd, iov.as_ptr(), 2, 0, 0) }
+        let n = unsafe { ops::writev_at_raw(ops::BackendFd::Raw(fd), iov.as_ptr(), 2, 0, 0) }
             .unwrap()
             .await
             .unwrap();
@@ -81,7 +84,7 @@ fn writev_readv_roundtrip() {
             },
         ];
         // SAFETY: riov + r0/r1 outlive the awaited op.
-        let n = unsafe { ops::readv_at_raw(fd, riov.as_ptr(), 2, 0, 0) }
+        let n = unsafe { ops::readv_at_raw(ops::BackendFd::Raw(fd), riov.as_ptr(), 2, 0, 0) }
             .unwrap()
             .await
             .unwrap();
@@ -134,10 +137,12 @@ fn writev_readv_fixed_roundtrip() {
         ];
         // SAFETY: iov bases lie within registered buffer `idx`; buf outlives
         // the awaited op.
-        let n = unsafe { ops::writev_fixed_at_raw(fd, wiov.as_ptr(), 2, 0, idx, 0) }
-            .unwrap()
-            .await
-            .unwrap();
+        let n = unsafe {
+            ops::writev_fixed_at_raw(ops::BackendFd::Raw(fd), wiov.as_ptr(), 2, 0, idx, 0)
+        }
+        .unwrap()
+        .await
+        .unwrap();
         assert_eq!(n, 6144);
 
         // Read back into the second half of the same registered buffer.
@@ -152,10 +157,12 @@ fn writev_readv_fixed_roundtrip() {
             },
         ];
         // SAFETY: as the write; the read-back region is within buffer `idx`.
-        let n = unsafe { ops::readv_fixed_at_raw(fd, riov.as_ptr(), 2, 0, idx, 0) }
-            .unwrap()
-            .await
-            .unwrap();
+        let n = unsafe {
+            ops::readv_fixed_at_raw(ops::BackendFd::Raw(fd), riov.as_ptr(), 2, 0, idx, 0)
+        }
+        .unwrap()
+        .await
+        .unwrap();
         assert_eq!(n, 6144);
         assert!(buf[8192..12288].iter().all(|&x| x == 0x11), "first segment");
         assert!(
@@ -164,6 +171,101 @@ fn writev_readv_fixed_roundtrip() {
         );
 
         reactor.unregister_buffer(idx);
+    });
+}
+
+// Round-trip through a registered fixed-file: register the fd once, then drive
+// writev/readv addressed by the fixed-file index. Skips/falls back to Raw where
+// the kernel lacks the fixed-file table.
+#[test]
+fn fixed_file_writev_readv_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixedfile");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    rt.block_on(async move {
+        // Lazily register the fd into the per-thread fixed-file table. When the
+        // kernel supports it, registration must succeed; otherwise fall back to
+        // the raw fd so the round-trip still exercises the data path.
+        let target = match ioutgt_uring::fixed_file_index(fd) {
+            Some(idx) => {
+                assert!(
+                    ioutgt_uring::fixed_files_supported(),
+                    "got a fixed-file index but support reported false"
+                );
+                ops::BackendFd::Fixed(idx)
+            }
+            None => {
+                assert!(
+                    !ioutgt_uring::fixed_files_supported(),
+                    "no index handed out despite fixed-file support"
+                );
+                eprintln!("kernel lacks fixed-file table; falling back to Raw");
+                ops::BackendFd::Raw(fd)
+            }
+        };
+        // A second lookup must hit the cache and yield the same target index.
+        assert!(
+            matches!(
+                (target, ioutgt_uring::fixed_file_index(fd)),
+                (ops::BackendFd::Fixed(a), Some(b)) if a == b
+            ) || matches!(target, ops::BackendFd::Raw(_)),
+            "fixed-file index not stable across lookups"
+        );
+
+        let a = vec![0x33u8; 4096];
+        let b = vec![0x44u8; 2048];
+        let wiov = [
+            libc::iovec {
+                iov_base: a.as_ptr().cast_mut().cast(),
+                iov_len: a.len(),
+            },
+            libc::iovec {
+                iov_base: b.as_ptr().cast_mut().cast(),
+                iov_len: b.len(),
+            },
+        ];
+        // SAFETY: wiov + a/b outlive the awaited op.
+        let n = unsafe { ops::writev_at_raw(target, wiov.as_ptr(), 2, 0, 0) }
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(n, 4096 + 2048);
+
+        let mut r0 = vec![0u8; 4096];
+        let mut r1 = vec![0u8; 2048];
+        let riov = [
+            libc::iovec {
+                iov_base: r0.as_mut_ptr().cast(),
+                iov_len: r0.len(),
+            },
+            libc::iovec {
+                iov_base: r1.as_mut_ptr().cast(),
+                iov_len: r1.len(),
+            },
+        ];
+        // SAFETY: riov + r0/r1 outlive the awaited op.
+        let n = unsafe { ops::readv_at_raw(target, riov.as_ptr(), 2, 0, 0) }
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(n, 4096 + 2048);
+        assert!(
+            r0.iter().all(|&x| x == 0x33),
+            "first segment via fixed file"
+        );
+        assert!(
+            r1.iter().all(|&x| x == 0x44),
+            "second segment via fixed file"
+        );
     });
 }
 
@@ -233,7 +335,10 @@ fn fallocate_punch_hole_zeroes() {
         assert_eq!(res.unwrap(), 8192);
 
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-        ops::fallocate(fd, mode, 0, 4096).unwrap().await.unwrap();
+        ops::fallocate(ops::BackendFd::Raw(fd), mode, 0, 4096)
+            .unwrap()
+            .await
+            .unwrap();
 
         let buf = vec![0xFFu8; 8192].into_boxed_slice();
         let (res, buf) = ops::read_at(fd, buf, 0).unwrap().await;

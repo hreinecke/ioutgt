@@ -72,13 +72,13 @@ fn read_and_write_sqes_count_separately() {
         let before = reactor_stats().expect("reactor live");
         let wbuf = [0xABu8; 512];
         // SAFETY: `wbuf` outlives the awaited op.
-        let res = unsafe { ops::write_at_raw(fd, wbuf.as_ptr(), 512, 0) }
+        let res = unsafe { ops::write_at_raw(ops::BackendFd::Raw(fd), wbuf.as_ptr(), 512, 0) }
             .expect("write op")
             .await;
         assert_eq!(res.expect("write ok"), 512);
         let mut rbuf = [0u8; 512];
         // SAFETY: `rbuf` outlives the awaited op.
-        let res = unsafe { ops::read_at_raw(fd, rbuf.as_mut_ptr(), 512, 0) }
+        let res = unsafe { ops::read_at_raw(ops::BackendFd::Raw(fd), rbuf.as_mut_ptr(), 512, 0) }
             .expect("read op")
             .await;
         assert_eq!(res.expect("read ok"), 512);
