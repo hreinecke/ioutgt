@@ -133,37 +133,6 @@ impl Future for SendVectored {
     }
 }
 
-/// Vectored send of the first `hlen` bytes of `header` then `plen`
-/// bytes of `payload` in one SENDMSG; both buffers come back whole.
-pub fn send_vectored_partial(
-    fd: RawFd,
-    header: Box<[u8]>,
-    hlen: usize,
-    payload: Box<[u8]>,
-    plen: usize,
-) -> io::Result<SendVectored> {
-    if hlen > header.len() || plen > payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "len exceeds buffer",
-        ));
-    }
-    let mut msg = MsgResources::new_send(header, payload);
-    msg.iovecs[0].iov_len = hlen;
-    msg.iovecs[1].iov_len = plen;
-    let msghdr_ptr: *const libc::msghdr = &msg.msghdr;
-    let op = Op::submit_classed(
-        |key| {
-            opcode::SendMsg::new(types::Fd(fd), msghdr_ptr)
-                .build()
-                .user_data(key)
-        },
-        Resources::Msg(msg),
-        SqeClass::Send,
-    )?;
-    Ok(SendVectored { op })
-}
-
 /// Vectored send of `header` then `payload` in a single SENDMSG — the
 /// phase-1 "PDU header + data in one op" primitive.
 pub fn send_vectored(fd: RawFd, header: Box<[u8]>, payload: Box<[u8]>) -> io::Result<SendVectored> {
@@ -405,24 +374,6 @@ pub fn recv_multi(fd: RawFd, bgid: u16) -> io::Result<RecvMultiOp> {
         SqeClass::Recv,
     )?;
     Ok(RecvMultiOp { op })
-}
-
-/// Send from caller-managed memory.
-///
-/// # Safety
-///
-/// Same contract as [`recv_raw`] (valid until terminal CQE; reads only).
-pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp> {
-    let op = Op::submit_classed(
-        |key| {
-            opcode::Send::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::None,
-        SqeClass::Send,
-    )?;
-    Ok(RawOp { op })
 }
 
 /// Vectored send described by a caller-managed `msghdr` — the batched

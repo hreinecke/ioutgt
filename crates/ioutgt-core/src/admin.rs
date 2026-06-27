@@ -343,13 +343,12 @@ fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
     let subsystems = &ctx.port.subsystems;
     let mut log = Vec::with_capacity(1024 * (1 + subsystems.len()));
 
-    let mut header = DiscoveryLogHeader {
+    let header = DiscoveryLogHeader {
         genctr: 1.into(),
         numrec: (subsystems.len() as u64).into(),
         recfmt: 0.into(),
         resv: [0; 1006],
     };
-    let _ = &mut header;
     log.extend_from_slice(header.as_bytes());
 
     for (index, (nqn, _subsys)) in subsystems.iter().enumerate() {

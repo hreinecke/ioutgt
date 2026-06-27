@@ -135,11 +135,6 @@ impl QueueStatsSnapshot {
 pub type CmdSlot = Slot<Sqe>;
 
 impl Slot<Sqe> {
-    /// The received SQE (alias of [`Slot::cmd`], NVMe naming).
-    pub fn sqe(&self) -> Sqe {
-        self.cmd()
-    }
-
     /// Park the SQE while its in-capsule payload is still arriving
     /// (state stays `Receiving`; [`SlotArray::submit`] delivers it).
     pub fn stash_sqe(&self, sqe: Sqe) {
