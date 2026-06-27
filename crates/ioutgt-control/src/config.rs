@@ -33,10 +33,10 @@ pub struct FileConfig {
     /// host may use. Admin queue unaffected. Default 128.
     #[serde(default = "default_io_queue_size")]
     pub io_queue_size: u16,
-    /// Per-IO-queue data-buffer pool size in bytes (slots lease on
+    /// Per-IO-queue data-buffer pool size in MiB (slots lease on
     /// demand). Default 4 MiB.
-    #[serde(default = "default_queue_buf_bytes")]
-    pub queue_buf_bytes: usize,
+    #[serde(default = "default_queue_buf_mb")]
+    pub queue_buf_mb: usize,
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,
@@ -57,8 +57,8 @@ fn default_io_queue_size() -> u16 {
     128
 }
 
-fn default_queue_buf_bytes() -> usize {
-    ioutgt_core::pool::DEFAULT_POOL_BYTES
+fn default_queue_buf_mb() -> usize {
+    ioutgt_core::pool::DEFAULT_POOL_BYTES / (1024 * 1024)
 }
 
 fn default_idle_teardown_secs() -> u64 {
@@ -142,12 +142,14 @@ impl FileConfig {
         }
         // The pool must hold at least one max-size transfer (MDTS); cap it
         // so a typo can't reserve absurd amounts of RAM per IO queue.
-        const MAX_POOL_BYTES: usize = 1 << 30; // 1 GiB
-        if !(ioutgt_core::MDTS_BYTES as usize..=MAX_POOL_BYTES).contains(&self.queue_buf_bytes) {
+        const MAX_POOL_MB: usize = 1024; // 1 GiB
+        let min_pool_mb = (ioutgt_core::MDTS_BYTES as usize)
+            .div_ceil(1024 * 1024)
+            .max(1);
+        if !(min_pool_mb..=MAX_POOL_MB).contains(&self.queue_buf_mb) {
             return Err(format!(
-                "queue_buf_bytes {} out of range ({}..={MAX_POOL_BYTES})",
-                self.queue_buf_bytes,
-                ioutgt_core::MDTS_BYTES,
+                "queue_buf_mb {} out of range ({min_pool_mb}..={MAX_POOL_MB})",
+                self.queue_buf_mb,
             ));
         }
         if self.subsystems.is_empty() {
@@ -241,15 +243,15 @@ mod tests {
             .unwrap_err()
             .contains("reserved")
         );
-        // queue_buf_bytes below one MDTS is rejected (can't hold a max IO).
+        // queue_buf_mb below one MDTS is rejected (can't hold a max IO).
         assert!(
             parse(
-                r#"{ "listen": "127.0.0.1:4420", "queue_buf_bytes": 4096,
+                r#"{ "listen": "127.0.0.1:4420", "queue_buf_mb": 0,
                  "subsystems": [ { "nqn": "nqn.x", "namespaces": [
                    { "nsid": 1, "backend": { "type": "memory", "size_mb": 1 } } ] } ] }"#
             )
             .unwrap_err()
-            .contains("queue_buf_bytes")
+            .contains("queue_buf_mb")
         );
     }
 }

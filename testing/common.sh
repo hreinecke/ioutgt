@@ -38,7 +38,7 @@ BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file
 IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
 IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = ioutgt --send-zc (zero-copy send)
 # Extra ioutgt flags appended verbatim, e.g.
-#   IOUTGT_EXTRA="--queue-buf-bytes 262144"
+#   IOUTGT_EXTRA="--queue-buf-mb 1"
 IOUTGT_EXTRA="${IOUTGT_EXTRA:-}"
 
 # TCP digest negotiation (CRC32C), coupled across both ends so the two

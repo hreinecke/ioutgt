@@ -99,7 +99,7 @@ impl TargetConfig {
             pin_threads: file.pin_threads,
             send_zc: file.send_zc,
             io_queue_size: file.io_queue_size,
-            queue_buf_bytes: file.queue_buf_bytes,
+            queue_buf_bytes: file.queue_buf_mb.saturating_mul(1024 * 1024),
             control_socket: file.control_socket,
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),
