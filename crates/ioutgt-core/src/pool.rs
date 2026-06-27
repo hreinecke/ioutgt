@@ -41,6 +41,19 @@ pub struct Seg {
     pub len: usize,
 }
 
+/// A provider of recv-ring sub-buffers, implemented outside core (in the
+/// transport, which owns the `ioutgt-uring` ring) so `ioutgt-core` keeps its
+/// no-`ioutgt-uring`-dependency invariant. A ring-backed [`SlotData`] holds an
+/// `Rc<dyn RingProvider>` (a refcount clone of one long-lived handle — no
+/// per-write allocation) and returns the borrowed sub-buffer on drop.
+pub trait RingProvider {
+    /// The io_uring fixed-buffer index of sub-buffer `bid`, if registered, so
+    /// the backend can `WRITE_FIXED` straight from ring memory.
+    fn buf_index(&self, bid: u16) -> Option<u16>;
+    /// Release one borrow of sub-buffer `bid` (a retained write finished).
+    fn release(&self, bid: u16);
+}
+
 /// A command's data buffer, as a (possibly scattered) segment list.
 ///
 /// The `segs` are the view every consumer uses; `owner` keeps the backing
@@ -59,6 +72,13 @@ enum Owner {
     Owned(#[allow(dead_code)] AlignedBuf),
     /// Pages leased from a [`BufPool`]; returned on drop.
     Pool(Rc<BufPool>),
+    /// A retained region of a recv-ring sub-buffer (zero-copy write receive):
+    /// the segment points into ring memory the `provider` keeps borrowed until
+    /// this drops, when `provider.release(bid)` runs.
+    Ring {
+        provider: Rc<dyn RingProvider>,
+        bid: u16,
+    },
 }
 
 const NULL_SEG: Seg = Seg {
@@ -68,8 +88,10 @@ const NULL_SEG: Seg = Seg {
 
 impl Drop for SlotData {
     fn drop(&mut self) {
-        if let Owner::Pool(pool) = &self.owner {
-            pool.free_segs(&self.segs[..self.nsegs as usize]);
+        match &self.owner {
+            Owner::Pool(pool) => pool.free_segs(&self.segs[..self.nsegs as usize]),
+            Owner::Ring { provider, bid } => provider.release(*bid),
+            Owner::Empty | Owner::Owned(_) => {}
         }
     }
 }
@@ -102,6 +124,29 @@ impl SlotData {
         }
     }
 
+    /// A zero-copy lease of one contiguous region `ptr..ptr+len` of recv-ring
+    /// sub-buffer `bid`. The caller must have already taken the borrow
+    /// (`provider`-side `borrow(bid)`); the matching release runs on drop.
+    ///
+    /// # Safety
+    /// `ptr..ptr+len` must be a valid region of sub-buffer `bid` that the
+    /// `provider`'s borrow keeps alive for this `SlotData`'s whole lifetime.
+    pub unsafe fn ring(
+        provider: Rc<dyn RingProvider>,
+        bid: u16,
+        ptr: *mut u8,
+        len: usize,
+    ) -> SlotData {
+        let mut segs = [NULL_SEG; MAX_SEGS];
+        segs[0] = Seg { ptr, len };
+        SlotData {
+            segs,
+            nsegs: 1,
+            len,
+            owner: Owner::Ring { provider, bid },
+        }
+    }
+
     /// Logical capacity in bytes (sum of segment lengths).
     pub fn len(&self) -> usize {
         self.len
@@ -127,6 +172,7 @@ impl SlotData {
     pub fn buf_index(&self) -> Option<u16> {
         match &self.owner {
             Owner::Pool(pool) => pool.buf_index(),
+            Owner::Ring { provider, bid } => provider.buf_index(*bid),
             Owner::Owned(_) | Owner::Empty => None,
         }
     }
@@ -537,5 +583,43 @@ mod tests {
 
         drop(held); // frees the page and wakes waiters
         assert!(matches!(poll(fut.as_mut()), Poll::Ready(d) if d.len() == PAGE));
+    }
+
+    // A ring-backed SlotData reports the provider's fixed-buffer index and
+    // returns the borrowed sub-buffer (release(bid)) exactly on drop.
+    #[test]
+    fn ring_slotdata_reports_index_and_releases_on_drop() {
+        struct MockProvider {
+            released: Cell<Option<u16>>,
+            idx: Option<u16>,
+        }
+        impl RingProvider for MockProvider {
+            fn buf_index(&self, _bid: u16) -> Option<u16> {
+                self.idx
+            }
+            fn release(&self, bid: u16) {
+                self.released.set(Some(bid));
+            }
+        }
+        let provider = Rc::new(MockProvider {
+            released: Cell::new(None),
+            idx: Some(3),
+        });
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `buf` outlives `d` below.
+        let d = unsafe {
+            SlotData::ring(
+                Rc::clone(&provider) as Rc<dyn RingProvider>,
+                1,
+                buf.as_mut_ptr(),
+                4096,
+            )
+        };
+        assert_eq!(d.buf_index(), Some(3), "ring buf_index comes from provider");
+        assert!(d.is_contiguous());
+        assert_eq!(d.len(), 4096);
+        assert_eq!(provider.released.get(), None, "no release while alive");
+        drop(d);
+        assert_eq!(provider.released.get(), Some(1), "release(bid) ran on drop");
     }
 }
