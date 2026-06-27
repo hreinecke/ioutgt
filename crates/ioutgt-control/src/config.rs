@@ -37,6 +37,11 @@ pub struct FileConfig {
     /// demand). Default 4 MiB.
     #[serde(default = "default_queue_buf_mb")]
     pub queue_buf_mb: usize,
+    /// Per-CONNECTION receive-ring size in MiB for zero-copy receive; 0 = off
+    /// (classic per-recv scratch). Each ring-enabled connection owns its ring,
+    /// so memory scales as (connections × this). Default 0.
+    #[serde(default = "default_recv_buf_mb")]
+    pub recv_buf_mb: usize,
     /// Unix socket path for the runtime control API.
     #[serde(default)]
     pub control_socket: Option<PathBuf>,
@@ -59,6 +64,10 @@ fn default_io_queue_size() -> u16 {
 
 fn default_queue_buf_mb() -> usize {
     ioutgt_core::pool::DEFAULT_POOL_BYTES / (1024 * 1024)
+}
+
+fn default_recv_buf_mb() -> usize {
+    0
 }
 
 fn default_idle_teardown_secs() -> u64 {
@@ -150,6 +159,17 @@ impl FileConfig {
             return Err(format!(
                 "queue_buf_mb {} out of range ({min_pool_mb}..={MAX_POOL_MB})",
                 self.queue_buf_mb,
+            ));
+        }
+        // Zero-copy receive ring: 0 = off. Otherwise each of the 2 sub-
+        // buffers (recv_buf_mb*MiB/2) must hold a max transfer (MDTS); 1 MiB
+        // → 512 KiB/sub-buffer clears the 128 KiB MDTS. Cap at 256 MiB so a
+        // typo can't reserve absurd per-thread RAM.
+        const MAX_RECV_BUF_MB: usize = 256;
+        if self.recv_buf_mb != 0 && !(1..=MAX_RECV_BUF_MB).contains(&self.recv_buf_mb) {
+            return Err(format!(
+                "recv_buf_mb {} out of range (0 = off, else 1..={MAX_RECV_BUF_MB})",
+                self.recv_buf_mb,
             ));
         }
         if self.subsystems.is_empty() {
@@ -253,5 +273,29 @@ mod tests {
             .unwrap_err()
             .contains("queue_buf_mb")
         );
+        // recv_buf_mb out of range (above the 256 MiB cap) is rejected; 0
+        // (off) and small values are fine.
+        assert!(
+            parse(
+                r#"{ "listen": "127.0.0.1:4420", "recv_buf_mb": 9999,
+                 "subsystems": [ { "nqn": "nqn.x", "namespaces": [
+                   { "nsid": 1, "backend": { "type": "memory", "size_mb": 1 } } ] } ] }"#
+            )
+            .unwrap_err()
+            .contains("recv_buf_mb")
+        );
+    }
+
+    #[test]
+    fn recv_buf_mb_off_and_in_range_ok() {
+        // 0 = off (default) and a small in-range value both validate.
+        for mb in [0, 1, 256] {
+            parse(&format!(
+                r#"{{ "listen": "127.0.0.1:4420", "recv_buf_mb": {mb},
+                 "subsystems": [ {{ "nqn": "nqn.x", "namespaces": [
+                   {{ "nsid": 1, "backend": {{ "type": "memory", "size_mb": 1 }} }} ] }} ] }}"#
+            ))
+            .unwrap();
+        }
     }
 }

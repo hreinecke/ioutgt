@@ -617,10 +617,10 @@ and future transports slot in without touching protocol logic:
 - `RecvSource` — yields borrowed byte chunks to the codec. Phase 1: plain
   single-shot `RECV` into a per-connection recv buffer, with a
   payload bypass as built: large H2C tails skip the buffer and land
-  in the slot via `MSG_WAITALL` raw recv (§4.2.3). Phase 2: multishot
-  recv with a provided-buffer ring — irreconcilable with the bypass
-  on one connection (the kernel picks the buffer), so it becomes a
-  per-connection strategy choice. (RECV_ZC requires NIC header-data
+  in the slot via `MSG_WAITALL` raw recv (§4.2.3). Phase 2 (as built,
+  opt-in via `--recv-buf-mb`, §6.2): multishot recv with a per-connection
+  provided-buffer ring — irreconcilable with the bypass on one connection
+  (the kernel picks the buffer), so it is a per-connection strategy choice. (RECV_ZC requires NIC header-data
   split; deferred to real-NIC benchmarking.)
 - Send side — queue tasks emit `SendWork` onto the ordered send list;
   the per-connection sender ships vectored `SENDMSG` gather batches
@@ -719,6 +719,73 @@ still rules the thread. `QueueCore<Sqe>`, dispatch, controller model, and discov
 are all reused unchanged; `PortConfig.trtype = TransportType::Rdma` makes
 discovery advertise the correct TRTYPE.
 
+## 6.2 Zero-copy receive: the per-connection provided-buffer ring
+
+`--recv-buf-mb N` (default 0 = off) turns on the Phase-2 receive path: a
+provided-buffer multishot RECV ring per IO connection
+(`ioutgt-uring/src/bufring.rs`). The kernel fills app-registered memory as
+data arrives — no per-recv submission, no copy into a scratch buffer — and an
+H2C write payload is handed to the backend `WRITE_FIXED` straight from ring
+memory. Admin queues skip it (qid 0 carries no bulk write payload); without
+`IOU_PBUF_RING_INC` (≈ kernel 6.12) the connection transparently falls back to
+the classic scratch-recv path (§9), logging a one-line `debug!`.
+
+**Two fixed sub-buffers, filled incrementally.** Each ring is one page-aligned
+arena split into exactly two sub-buffers of `recv_buf_mb / 2`, each registered
+as an io_uring fixed buffer so the backend can `WRITE_FIXED` it. The ring
+carries `IOU_PBUF_RING_INC`: the kernel fills *one* sub-buffer across many recv
+completions — advancing an internal offset, emitting a variable-length chunk
+per CQE (`IORING_CQE_F_BUF_MORE` set while room remains), advancing `head` only
+when the buffer fills. So a whole H2C payload accumulates *contiguously* in one
+fixed buffer — exactly what a single-`buf_index` `WRITE_FIXED` needs. Two is the
+minimum that double-buffers: one sub-buffer is the active recv target while the
+other drains in-flight writes.
+
+**Per-connection, not shared — for correctness.** A recv CQE reports only
+`(bid, len)`, not the consume offset; the consumer tracks it. With one consumer
+per ring that offset is authoritative; sharing one ring across the connections
+multiplexed onto an io-thread would desync it — their slot tasks do not drain
+CQEs in completion order, so one connection would read another's bytes. So each
+ring-enabled connection owns its ring: its own `bgid` (thread-local allocator)
+and its own two fixed buffers. Contention is keyed on *controller* count, not
+queue count — the target offers `io_threads` IO queues per controller (a
+bijection onto the io-threads), so a shared ring was only ever at risk with ≥ 2
+controllers; per-connection ownership makes it moot regardless.
+
+**Retain + borrow lifecycle.** When an H2C write payload fits the current
+sub-buffer it is retained in place (via `SlotData::ring()`, a lease carrying the
+fixed-buffer index) rather than copied, and the backend `WRITE_FIXED`s from that
+region. A sub-buffer must not return to the kernel while a write still reads it,
+so each retained payload *borrows* its sub-buffer; a sub-buffer is re-provided
+only once recv is done with it *and* all borrows have drained (the
+`pending`/`awaiting` refcount in `bufring.rs`). A payload that would straddle
+the two sub-buffers falls back to the copy path — correctness never depends on
+retention.
+
+**Back-pressure, no stalls.** With both sub-buffers out (one filling, one
+borrowed by a slow write) the multishot drains and posts `-ENOBUFS`; the recv
+loop parks in `wait_for_provide` rather than busy re-arming, which would spin the
+reactor and starve the very slot tasks whose write completions return buffers. It
+wakes when a completing write releases its borrow. Invariant: a write's
+completion never waits on recv, so progress is guaranteed. The park is gated on a
+provide-generation snapshot taken at *arm* time, not park time — the kernel can
+exhaust and re-provide every buffer before userspace observes the queued
+`-ENOBUFS`, so snapshotting at park would block forever (see
+`BufRing::wait_for_provide`).
+
+**Cost, ceilings, and why it is off by default.** Memory is pre-pinned per
+connection (the zero-allocation-on-the-IO-path invariant forbids per-command
+allocation), so it scales as *connections × recv_buf_mb* — the inverse of kernel
+nvmet, which allocates per-command on demand. Two ceilings bound it, both with
+graceful fallback to classic recv: the per-io-thread fixed-buffer table (64
+slots, ~3 per connection counting the pool arena) and the process
+`RLIMIT_MEMLOCK` (all ring memory is pinned — on a tight memlock the ring
+silently will not engage, so confirm the `recv ring engaged` log line). It is off
+by default because the win is copy-elision and freed io-thread CPU, not headline
+throughput: at depth the link and disk already bound a single queue, so on real
+100GbE + NVMe the ring measured perf-neutral; its payoff shows at high connection
+counts where copy bandwidth competes.
+
 ## 7. Core model
 
 **Object model — Port / Subsystem / Namespace, and the per-Connect Controller**
@@ -792,11 +859,11 @@ roadmap item.
 
 | Concern | As built |
 |---------|----------|
-| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 4 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. |
-| Recv | Classic single-shot RECV → 64 KiB scratch → copy into the slot for headers and small payloads; H2C write tails ≥ 16 KiB are received **straight into the slot's pooled segments** (`MSG_WAITALL`, per-segment — contiguous or scattered), i.e. zero-copy receive, then written by the file backend's vectored `WRITEV`. (A per-thread provided-buffer ring + multishot RECV is a deferred alternative — NVMe/TCP interleaves PDU headers with payload so ring chunks straddle PDU/command boundaries, making chunk-retention into the slot lower-value than receiving straight into the pooled slot.) |
+| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 4 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. Separately, `--recv-buf-mb` (default 0 = off) sizes the **per-connection** provided-buffer receive ring for zero-copy receive — each ring-enabled connection owns its own ring (its own `bgid` from a thread-local pool + 2 fixed-buffer sub-buffers), so memory scales as (connections × size); left off, recv uses the classic per-recv scratch path. Per-connection (not shared) for correctness — see §6.2. |
+| Recv | Classic single-shot RECV → 64 KiB scratch → copy into the slot for headers and small payloads; H2C write tails ≥ 16 KiB are received **straight into the slot's pooled segments** (`MSG_WAITALL`, per-segment — contiguous or scattered), i.e. zero-copy receive, then written by the file backend's vectored `WRITEV`. (The opt-in `--recv-buf-mb` per-connection provided-buffer ring + multishot RECV is the alternative zero-copy path — NVMe/TCP interleaves PDU headers with payload so ring chunks straddle PDU/command boundaries, making chunk-retention into the slot lower-value than receiving straight into the pooled slot.) |
 | Send | Batch-drain into one gather `SENDMSG` (header arena + slot-payload iovecs, contiguous or scattered); opt-in `--send-zc`: `SENDMSG_ZC` per batch, slot reuse gated on the notification CQE, `RLIMIT_MEMLOCK` pin failures fall back to copy. |
 | Disk | Vectored `READV`/`WRITEV` over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §8). |
-| Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split; READ_FIXED/WRITE_FIXED on registered buffers; bundles; second IOPOLL ring. |
+| Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split; bundles; second IOPOLL ring. |
 
 MDTS is 128 KiB on IO queues; the admin queue sizes its pool so its
 synchronous data leases never block.

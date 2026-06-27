@@ -42,6 +42,8 @@ ZC_ARGS=()
 # host's requested depth (e.g. 64) to see the guest kernel clamp to N.
 IOQS_ARGS=()
 [ -n "${IOUTGT_IO_QUEUE_SIZE:-}" ] && IOQS_ARGS=(--io-queue-size "$IOUTGT_IO_QUEUE_SIZE")
+RECV_BUF_ARGS=()
+[ -n "${IOUTGT_RECV_BUF_MB:-}" ] && RECV_BUF_ARGS=(--recv-buf-mb "$IOUTGT_RECV_BUF_MB")
 
 CTL_SOCK="$TOP/target/ioutgt-interop.sock"
 MARKER_DIR="$(dirname "$VMTEST")/data/tmp"
@@ -83,7 +85,7 @@ echo "$T_IO_URING" > "$MARKER_DIR/ioutgt_tiou"
 
 start_target() {
     "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads "${IOUTGT_IO_THREADS:-2}" \
-        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" "${IOQS_ARGS[@]}" >>"$LOG" 2>&1 &
+        --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" "${IOQS_ARGS[@]}" "${RECV_BUF_ARGS[@]}" >>"$LOG" 2>&1 &
     echo $! >"$PID_FILE"
 }
 start_target

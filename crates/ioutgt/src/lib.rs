@@ -106,7 +106,7 @@ impl TargetConfig {
             send_zc: file.send_zc,
             io_queue_size: file.io_queue_size,
             queue_buf_bytes: file.queue_buf_mb.saturating_mul(1024 * 1024),
-            recv_buf_bytes: 0,
+            recv_buf_bytes: file.recv_buf_mb.saturating_mul(1024 * 1024),
             control_socket: file.control_socket,
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),

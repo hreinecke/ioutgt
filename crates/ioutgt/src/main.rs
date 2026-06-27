@@ -49,6 +49,12 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     queue_buf_mb: usize,
 
+    /// Per-CONNECTION receive-ring size in MiB for zero-copy receive; 0 = off
+    /// (classic per-recv scratch). Each ring-enabled connection allocates its
+    /// own ring, so memory scales as (connections × this). Default 0.
+    #[arg(long, default_value_t = 0)]
+    recv_buf_mb: usize,
+
     /// Tear the queue-thread pool down after this many seconds with zero
     /// active connections, respawning it on the next connect; 0 keeps the
     /// pool alive for the process lifetime once spawned.
@@ -578,6 +584,7 @@ fn main() -> std::io::Result<()> {
             config.send_zc = args.send_zc;
             config.io_queue_size = args.io_queue_size;
             config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
+            config.recv_buf_bytes = args.recv_buf_mb.saturating_mul(1024 * 1024);
             config.idle_teardown = (args.idle_teardown_secs != 0)
                 .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
             config.control_socket = Some(args.control_socket);
