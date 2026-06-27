@@ -17,18 +17,90 @@ use crate::queue::{NvmeTcpQueue, SendWork};
 use ioutgt_core::backend::Backend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Role};
+use ioutgt_core::pool::{RingProvider, SlotData};
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::pdu::{self, PduDecoder, PduError, PduKind};
 use ioutgt_nvme::spec::{Cqe, Sqe, sgl};
 use ioutgt_nvme::{digest, status};
 use ioutgt_stream::{Staged, StreamReader, StreamSender};
+use ioutgt_uring::bufring::BufRing;
 use ioutgt_uring::ops;
 use ioutgt_uring::sendbatch::GatherBatch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 pub use ioutgt_core::permit::ConnPermit;
+
+/// Transport-side [`RingProvider`]: the bridge that lets a core
+/// [`SlotData::ring`] lease carry the recv-ring sub-buffer's fixed-buffer
+/// index and run the deferred re-provide on drop, without `ioutgt-core`
+/// depending on `ioutgt-uring`. One handle per connection (in ring mode); a
+/// retained write holds a refcount clone of it, so retention allocates nothing
+/// beyond the first `Rc`.
+struct RingHandle {
+    ring: Rc<BufRing>,
+}
+
+impl RingProvider for RingHandle {
+    fn buf_index(&self, bid: u16) -> Option<u16> {
+        self.ring.buf_index(bid)
+    }
+    fn release(&self, bid: u16) {
+        self.ring.release(bid);
+    }
+}
+
+/// Per-window ring context handed to the PDU handlers so a write payload can
+/// be retained zero-copy in place. `bid` is the sub-buffer backing the current
+/// recv window; `provider`/`ring` are the connection's long-lived handles.
+struct RingCtx<'a> {
+    provider: &'a Rc<dyn RingProvider>,
+    ring: &'a Rc<BufRing>,
+    bid: u16,
+}
+
+/// Try to retain a write payload in place in the recv ring (zero-copy).
+///
+/// `payload_ptr` is the start of the payload on the wire — the current recv
+/// window's unconsumed pointer, which is exactly where the payload's bytes
+/// land (those already arrived are there; under the incremental ring the rest
+/// fill the same sub-buffer contiguously). Retains only when the whole payload
+/// fits in this sub-buffer's remaining capacity (so it never straddles into
+/// the next sub-buffer — `SlotData::ring` is a single contiguous segment);
+/// returns `false` to fall back to the lease-and-copy path otherwise. On
+/// success it takes the ring borrow and installs the ring-backed `SlotData` on
+/// the slot, so the bytes land directly in the slot buffer.
+fn try_retain_payload(
+    queue: &Rc<NvmeTcpQueue>,
+    rc: &RingCtx<'_>,
+    tag: u16,
+    payload_ptr: *const u8,
+    payload_len: usize,
+) -> bool {
+    let cap = rc.ring.buf_size() as usize;
+    let off = (payload_ptr as usize).wrapping_sub(rc.ring.buf(rc.bid) as usize);
+    // `off > cap` guards the header-ends-exactly-at-buffer-end case (the
+    // payload is in the *next* sub-buffer, so `payload_ptr` is past this one).
+    if off > cap || payload_len > cap - off {
+        return false;
+    }
+    rc.ring.borrow(rc.bid);
+    // SAFETY: off + payload_len <= buf_size (checked above), so
+    // [payload_ptr, payload_ptr + payload_len) lies within sub-buffer `bid`;
+    // the borrow keeps that sub-buffer pinned (not re-provided to the kernel)
+    // until this SlotData drops at release_tag, which releases the borrow.
+    let data = unsafe {
+        SlotData::ring(
+            Rc::clone(rc.provider),
+            rc.bid,
+            payload_ptr.cast_mut(),
+            payload_len,
+        )
+    };
+    queue.slot(tag).set_data(data);
+    true
+}
 
 /// Everything a queue thread receives to run one connection.
 #[allow(missing_docs)]
@@ -101,6 +173,11 @@ struct DataPhase {
     crc: digest::Crc32c,
     ddgst: bool,
     kind: PayloadKind,
+    /// Zero-copy retention (ring mode): the slot's `SlotData::ring` already
+    /// points at this payload's region in the recv ring, so `advance` must NOT
+    /// copy — the bytes land directly in the slot buffer. It only folds the
+    /// DDGST over the window slice and advances the cursor.
+    retained: bool,
 }
 
 impl DataPhase {
@@ -112,7 +189,10 @@ impl DataPhase {
         slice: &mut &[u8],
     ) -> Result<Option<RecvPhase>, RecvEnd> {
         let take = (self.remaining as usize).min(slice.len());
-        {
+        // Retained payloads already live in the slot buffer (it is the recv
+        // ring sub-buffer): skip the copy. Otherwise copy the window into the
+        // slot's leased buffer at the reassembly offset.
+        if !self.retained {
             let slot = queue.slot(self.tag);
             let total = match self.kind {
                 PayloadKind::InCapsule => slot.data_len(),
@@ -123,8 +203,7 @@ impl DataPhase {
         }
         // Only fold bytes into the digest when one was negotiated; with the
         // data digest off the result is discarded, so the CRC pass is pure
-        // waste over every received byte (the direct-recv tail path and kernel
-        // nvmet both gate it the same way).
+        // waste over every received byte.
         if self.ddgst {
             self.crc.update(&slice[..take]);
         }
@@ -263,7 +342,10 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
                 qid = conn.qid,
                 "fixed-buffer table full; disk IO on plain readv/writev"
             ),
-            None => debug!(qid = conn.qid, "no kernel fixed-buffer support; plain readv/writev"),
+            None => debug!(
+                qid = conn.qid,
+                "no kernel fixed-buffer support; plain readv/writev"
+            ),
         }
     }
     let fd = conn.fd.as_raw_fd();
@@ -305,8 +387,24 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     let tag = queue.claim_tag().expect("fresh queue has free tags");
     queue.submit(tag, conn.connect_sqe);
 
-    // Receive path (this task).
-    if let Err(err) = recv_loop(&queue, fd, conn.hdr_digest, conn.data_digest).await {
+    // Receive path (this task). The admin queue (qid 0) never carries an H2C
+    // write payload, so the zero-copy ring buys it nothing — skip it and keep
+    // the classic recv path, sparing a ring's pinned memory + 2 fixed-buffer
+    // slots + a bgid per controller on the (shared) admin thread.
+    let recv_buf_bytes = if conn.qid == 0 {
+        0
+    } else {
+        conn.port.recv_buf_bytes
+    };
+    if let Err(err) = recv_loop(
+        &queue,
+        fd,
+        conn.hdr_digest,
+        conn.data_digest,
+        recv_buf_bytes,
+    )
+    .await
+    {
         debug!(qid = conn.qid, "connection closed: {err}");
     }
 
@@ -543,8 +641,9 @@ async fn recv_loop(
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
+    recv_buf_bytes: usize,
 ) -> std::io::Result<()> {
-    match drive_recv(queue, fd, hdr_digest, data_digest).await {
+    match drive_recv(queue, fd, hdr_digest, data_digest, recv_buf_bytes).await {
         Ok(()) | Err(RecvEnd::Closed) => Ok(()),
         Err(RecvEnd::Io(err)) => Err(err),
         Err(RecvEnd::Term(err)) => {
@@ -566,33 +665,77 @@ async fn drive_recv(
     fd: i32,
     hdr_digest: bool,
     data_digest: bool,
+    recv_buf_bytes: usize,
 ) -> Result<(), RecvEnd> {
     let mut decoder = PduDecoder::new(hdr_digest);
     let mut phase = RecvPhase::Header;
-    // 64 KiB scratch buffer, allocated once per connection: only headers,
-    // in-capsule payloads (≤ 16 KiB inline limit), and payload prefixes
-    // pass through it — H2C tails ≥ H2C_DIRECT_MIN bypass it into the
-    // slot via reader.read_direct_vectored, and read data never touches it. The
-    // size is the small-IO batching unit (~15 × 4 KiB write capsules per
-    // wakeup) and matches the kernel's max GRO/loopback burst (64 KiB),
-    // so one recv drains the largest coalesced unit the stack delivers
-    // per softirq pass. Larger buys nothing (big payloads are routed
-    // around it); smaller splits one burst into several wakeup +
-    // state-machine passes.
-    let mut reader = StreamReader::new(fd, 64 * 1024);
+    // Ring mode (recv_buf_bytes > 0 and the kernel supports a buf_ring) draws
+    // recv chunks from this connection's own provided-buffer ring; otherwise a
+    // 64 KiB scratch buffer, allocated once per connection. The 64 KiB size is
+    // the small-IO batching unit (~15 × 4 KiB write capsules per wakeup) and
+    // matches the kernel's max GRO/loopback burst (64 KiB), so one recv drains
+    // a full coalesced burst; only headers, in-capsule payloads, and payload
+    // prefixes flow through it (large H2C tails bypass into the slot).
+    let mut reader = match (recv_buf_bytes > 0)
+        .then(|| ioutgt_uring::bufring::BufRing::for_connection(recv_buf_bytes))
+        .flatten()
+    {
+        Some(ring) => {
+            debug!(qid = queue.qid, "recv ring engaged: zero-copy receive");
+            StreamReader::new_ring(fd, ring)
+        }
+        None => {
+            if recv_buf_bytes > 0 {
+                debug!(
+                    qid = queue.qid,
+                    "recv ring unavailable (kernel gap); classic recv"
+                );
+            }
+            StreamReader::new(fd, 64 * 1024)
+        }
+    };
+
+    // Connection-scoped ring handles (ring mode only), built once: every recv
+    // window draws from this connection's own ring, and a retained write holds
+    // a refcount clone of `provider` — so retention adds no per-write allocation.
+    let ring = reader.ring().map(Rc::clone);
+    let provider: Option<Rc<dyn RingProvider>> = ring
+        .as_ref()
+        .map(|r| Rc::new(RingHandle { ring: Rc::clone(r) }) as Rc<dyn RingProvider>);
 
     loop {
-        let window = reader.fill().await?;
+        // `fill_with_bid` bundles the sub-buffer id with the window so a
+        // zero-copy consumer records the in-place borrow against the right
+        // buffer without a second `&reader` query racing the window's borrow.
+        let (window, window_bid) = reader.fill_with_bid().await?;
         if window.is_empty() {
             return Ok(()); // orderly shutdown
         }
         let window_len = window.len();
         let mut slice = window;
 
+        // Retention context for this window (None in classic mode): all of
+        // `provider`, `ring`, and a bid are present exactly in ring mode.
+        let ring_ctx = match (provider.as_ref(), ring.as_ref(), window_bid) {
+            (Some(provider), Some(ring), Some(bid)) => Some(RingCtx {
+                provider,
+                ring,
+                bid,
+            }),
+            _ => None,
+        };
+
         while !slice.is_empty() {
             let next = match &mut phase {
                 RecvPhase::Header => {
-                    feed_header(queue, &mut decoder, &mut slice, data_digest).await?
+                    feed_header(
+                        queue,
+                        &mut decoder,
+                        &mut slice,
+                        data_digest,
+                        ring_ctx.as_ref(),
+                    )
+                    .await?
                 }
                 RecvPhase::Data(data) => data.advance(queue, &mut slice)?,
                 RecvPhase::Ddgst(ddgst) => ddgst.advance(queue, &mut slice)?,
@@ -608,14 +751,16 @@ async fn drive_recv(
 
         // Buffer exhausted mid-payload with a large H2C tail still to
         // come: pull it straight into the slot, skipping the
-        // buffer→slot copy. Copy-snapshot of the phase (every field is
-        // Copy — Crc32c included — so this is cheap): a failed guard
-        // falls through with `phase`, including its
-        // partially-accumulated CRC, untouched for the normal copy
-        // path.
+        // buffer→slot copy. Copy-snapshot the phase (cheap — DataPhase
+        // is Copy): a failed guard leaves phase untouched for the normal
+        // copy path.
         // The direct path receives straight into the slot's pool segments —
-        // contiguous or scattered — so no contiguity gate is needed.
+        // contiguous or scattered — so no contiguity gate is needed. Ring mode
+        // owns the fd with a multishot recv, so the classic single-recv direct
+        // tail is gated off there; ring payloads flow through the phase machine
+        // (and, in P5b, can be retained in place zero-copy).
         if let &RecvPhase::Data(data) = &phase
+            && !reader.is_ring()
             && matches!(data.kind, PayloadKind::H2c { .. })
             && data.remaining >= H2C_DIRECT_MIN
         {
@@ -631,6 +776,7 @@ async fn feed_header(
     decoder: &mut PduDecoder,
     slice: &mut &[u8],
     data_digest: bool,
+    ring_ctx: Option<&RingCtx<'_>>,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
     let consumed = decoder.feed(slice)?;
     *slice = &slice[consumed..];
@@ -638,7 +784,11 @@ async fn feed_header(
         return Ok(None);
     }
     let decoded = decoder.take()?;
-    handle_pdu(queue, decoded, data_digest).await
+    // The header is fully consumed: the unconsumed window pointer is now the
+    // start of this PDU's payload on the wire — exactly where a retained
+    // zero-copy write payload lands in the recv ring.
+    let payload_ptr = slice.as_ptr();
+    handle_pdu(queue, decoded, data_digest, ring_ctx, payload_ptr).await
 }
 
 /// Split the slot-buffer segments covering the logical range
@@ -730,7 +880,8 @@ async fn recv_tail_direct(
         for &(ptr, len) in &subs[..nsub] {
             // SAFETY: ptr..ptr+len is the just-filled slot sub-segment,
             // held exclusively for this transfer.
-            data.crc.update(unsafe { std::slice::from_raw_parts(ptr, len) });
+            data.crc
+                .update(unsafe { std::slice::from_raw_parts(ptr, len) });
         }
         // Next recv starts at the 4-byte digest.
         Ok(RecvPhase::ddgst(data.tag, data.crc.finalize(), data.kind))
@@ -749,10 +900,14 @@ async fn handle_pdu(
     queue: &Rc<NvmeTcpQueue>,
     decoded: pdu::DecodedPdu,
     data_digest: bool,
+    ring_ctx: Option<&RingCtx<'_>>,
+    payload_ptr: *const u8,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
     let ddgst = decoded.ddgst && data_digest;
     match decoded.kind {
-        PduKind::CapsuleCmd(sqe) => handle_capsule_cmd(queue, sqe, decoded.data_len, ddgst).await,
+        PduKind::CapsuleCmd(sqe) => {
+            handle_capsule_cmd(queue, sqe, decoded.data_len, ddgst, ring_ctx, payload_ptr).await
+        }
         PduKind::H2CData {
             cid,
             ttag,
@@ -761,6 +916,17 @@ async fn handle_pdu(
             last,
         } => {
             let tag = validate_h2c(queue, cid, ttag, offset, length, decoded.data_len)?;
+            // Retain zero-copy only when this single H2CData PDU carries the
+            // *whole* solicited transfer (offset 0, length == data_len) and it
+            // lands contiguously in the current sub-buffer: `SlotData::ring` is
+            // one contiguous segment, so a split/partial transfer can't use it
+            // and falls through to the lease-and-copy path set up at R2T time.
+            let retained = match ring_ctx {
+                Some(rc) if offset == 0 && length == queue.slot(tag).data_len() => {
+                    try_retain_payload(queue, rc, tag, payload_ptr, length as usize)
+                }
+                _ => false,
+            };
             Ok(Some(RecvPhase::Data(DataPhase {
                 tag,
                 base: offset,
@@ -768,6 +934,7 @@ async fn handle_pdu(
                 crc: digest::Crc32c::new(),
                 ddgst,
                 kind: PayloadKind::H2c { last, length },
+                retained,
             })))
         }
         PduKind::H2CTerm { fes, fei } => Err(RecvEnd::HostTerm { fes, fei }),
@@ -786,6 +953,8 @@ async fn handle_capsule_cmd(
     sqe: Sqe,
     data_len: u32,
     ddgst: bool,
+    ring_ctx: Option<&RingCtx<'_>>,
+    payload_ptr: *const u8,
 ) -> Result<Option<RecvPhase>, RecvEnd> {
     // An empty freelist is a transient, NOT a depth violation, so park
     // (TCP backpressure) rather than terminating. A tag releases only when
@@ -804,9 +973,17 @@ async fn handle_capsule_cmd(
         if data_len > ioutgt_core::MDTS_BYTES {
             return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
         }
-        // Lease the landing buffer (deadlock-free: the serial recv loop
-        // never blocks, falling back to a private buffer under pressure).
-        queue.lease_or_owned(tag, data_len as usize);
+        // In ring mode, try to retain the in-capsule payload in place
+        // (zero-copy); otherwise lease the landing buffer for the copy path
+        // (deadlock-free: the serial recv loop never blocks, falling back to a
+        // private buffer under pressure).
+        let retained = match ring_ctx {
+            Some(rc) => try_retain_payload(queue, rc, tag, payload_ptr, data_len as usize),
+            None => false,
+        };
+        if !retained {
+            queue.lease_or_owned(tag, data_len as usize);
+        }
         slot.set_data_len(data_len);
         slot.stash_sqe(sqe);
         Ok(Some(RecvPhase::Data(DataPhase {
@@ -816,6 +993,7 @@ async fn handle_capsule_cmd(
             crc: digest::Crc32c::new(),
             ddgst,
             kind: PayloadKind::InCapsule,
+            retained,
         })))
     } else if needs_r2t(&sqe) {
         let length = sqe.dptr.length.get();
