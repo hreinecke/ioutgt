@@ -126,16 +126,6 @@ impl StreamReader {
         matches!(self.mode, Mode::Ring(_))
     }
 
-    /// Buffer id of the ring chunk currently in hand (ring mode only). The
-    /// transport uses this to retain a chunk zero-copy; `None` in classic
-    /// mode or with no chunk held.
-    pub fn current_bid(&self) -> Option<u16> {
-        match &self.mode {
-            Mode::Ring(r) => r.cur.as_ref().map(|c| c.bid),
-            Mode::Classic(_) => None,
-        }
-    }
-
     /// The thread's ring (ring mode only) — for re-providing a retained
     /// chunk and querying geometry.
     pub fn ring(&self) -> Option<&Rc<BufRing>> {
@@ -151,11 +141,7 @@ impl StreamReader {
     /// [`fill`](Self::fill)/[`read_direct_vectored`](Self::read_direct_vectored);
     /// [`consume`](Self::consume) advances past bytes already processed.
     pub async fn fill(&mut self) -> std::io::Result<&[u8]> {
-        let fd = self.fd;
-        match &mut self.mode {
-            Mode::Classic(c) => c.fill(fd).await,
-            Mode::Ring(r) => r.fill(fd).await,
-        }
+        Ok(self.fill_with_bid().await?.0)
     }
 
     /// Like [`fill`](Self::fill), but also returns the ring buffer id backing
@@ -270,11 +256,7 @@ impl ClassicMode {
 }
 
 impl RingMode {
-    async fn fill(&mut self, fd: i32) -> std::io::Result<&[u8]> {
-        Ok(self.fill_bid(fd).await?.0)
-    }
-
-    /// As [`fill`](Self::fill), returning the window together with the bid of
+    /// Return the next window together with the bid of
     /// the buffer backing it. The bid is read before the returned slice is
     /// constructed, so both leave the `&mut self` borrow at once. On EOF the
     /// window is empty and the bid is a placeholder the caller ignores.
@@ -422,12 +404,11 @@ mod tests {
             // First fill so we learn which buffer the kernel handed out, and
             // borrow it (a zero-copy write holding it open).
             send_all(&b, b"hello");
-            let first_len = {
-                let win = reader.fill().await.unwrap();
+            let (bid0, first_len) = {
+                let (win, bid) = reader.fill_with_bid().await.unwrap();
                 assert!(!win.is_empty());
-                win.len()
+                (bid.unwrap(), win.len())
             };
-            let bid0 = reader.current_bid().unwrap();
             ring.borrow(bid0);
 
             // Drive bytes through buffer 0 until it is fully consumed (the
@@ -449,12 +430,11 @@ mod tests {
             // Read until the current buffer differs from bid0: that fill is the
             // one that fully consumed bid0 and called recv_done(bid0).
             loop {
-                let win_len = {
-                    let win = reader.fill().await.unwrap();
+                let (cur, win_len) = {
+                    let (win, bid) = reader.fill_with_bid().await.unwrap();
                     assert!(!win.is_empty(), "unexpected EOF");
-                    win.len()
+                    (bid.unwrap(), win.len())
                 };
-                let cur = reader.current_bid().unwrap();
                 reader.consume(win_len);
                 if cur != bid0 {
                     break;

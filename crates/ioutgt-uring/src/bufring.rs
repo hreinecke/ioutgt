@@ -36,6 +36,13 @@ use crate::reactor::Reactor;
 
 const PAGE: usize = 4096;
 
+/// Sub-buffers per ring — exactly 2, the minimum that double-buffers (one
+/// filled by the kernel while the other is consumed). Fixed, not configurable:
+/// the per-buffer state arrays are `[_; 2]` and `BUF_MASK` (= `NBUFS - 1`)
+/// drives `bid & BUF_MASK` indexing.
+const NBUFS: u16 = 2;
+const BUF_MASK: u16 = NBUFS - 1;
+
 /// A page-aligned zeroed heap allocation.
 struct AlignedMem {
     ptr: *mut u8,
@@ -85,18 +92,14 @@ pub struct BufRing {
     /// be returned to it on drop. Connection rings own their id; test rings
     /// built with an explicit `bgid` via [`BufRing::new`] do not.
     bgid_owned: bool,
-    /// Entry array (`entries × size_of::<BufRingEntry>()`), page-aligned.
+    /// Entry array (`NBUFS × size_of::<BufRingEntry>()`), page-aligned.
     ring: AlignedMem,
-    /// Buffer data arena (`entries × buf_size`), page-aligned.
+    /// Buffer data arena (`NBUFS × buf_size`), page-aligned.
     data: AlignedMem,
-    /// Buffer count — fixed at exactly 2 (the per-buffer state arrays are
-    /// `[_; 2]`); `mask` (= `entries - 1`) drives `bid & mask` indexing.
-    entries: u16,
-    mask: u16,
     buf_size: u32,
     /// Our cached copy of the ring tail.
     tail: Cell<u16>,
-    /// Number of in-flight write borrows per buffer (indexed by bid & mask).
+    /// Number of in-flight write borrows per buffer (indexed by bid & BUF_MASK).
     pending: [Cell<u32>; 2],
     /// Whether the recv loop has finished with this buffer and is waiting
     /// for all borrows to drain before returning it to the kernel.
@@ -168,9 +171,8 @@ impl BufRing {
         let reactor = Reactor::current()?;
         let half = (ring_bytes / 2) & !(PAGE - 1);
         let buf_size = half.max(PAGE);
-        let entries: u16 = 2;
-        let ring = AlignedMem::zeroed(entries as usize * size_of::<BufRingEntry>());
-        let data = AlignedMem::zeroed(entries as usize * buf_size);
+        let ring = AlignedMem::zeroed(NBUFS as usize * size_of::<BufRingEntry>());
+        let data = AlignedMem::zeroed(NBUFS as usize * buf_size);
 
         // Register each sub-buffer's data region as a fixed buffer so the
         // backend can WRITE_FIXED received write payloads straight from ring
@@ -196,7 +198,7 @@ impl BufRing {
         // SAFETY: `ring` stays alive until this BufRing drops, which
         // unregisters the bgid first (see Drop). On failure, unwind the
         // fixed buffers registered above before returning (Drop won't run).
-        if let Err(e) = unsafe { reactor.register_buf_ring(ring.ptr as u64, entries, bgid) } {
+        if let Err(e) = unsafe { reactor.register_buf_ring(ring.ptr as u64, NBUFS, bgid) } {
             for idx in buf_index.into_iter().flatten() {
                 reactor.unregister_buffer(idx);
             }
@@ -209,8 +211,6 @@ impl BufRing {
             bgid_owned: owned,
             ring,
             data,
-            entries,
-            mask: entries - 1,
             #[allow(clippy::cast_possible_truncation)] // buf_size is page-aligned; max practical value fits u32
             buf_size: buf_size as u32,
             tail: Cell::new(0),
@@ -223,13 +223,13 @@ impl BufRing {
             #[cfg(any(test, feature = "test-helpers"))]
             provided_count: [Cell::new(0), Cell::new(0)],
         });
-        for bid in 0..entries {
+        for bid in 0..NBUFS {
             br.kernel_provide(bid);
         }
         // Reset test counters so they reflect only post-construction provides.
         #[cfg(any(test, feature = "test-helpers"))]
         {
-            for i in 0..entries as usize {
+            for i in 0..NBUFS as usize {
                 br.provided_count[i].set(0);
             }
         }
@@ -243,7 +243,7 @@ impl BufRing {
 
     /// Number of buffers (== ring entries).
     pub fn nbufs(&self) -> u16 {
-        self.entries
+        NBUFS
     }
 
     /// Per-buffer capacity in bytes.
@@ -255,7 +255,7 @@ impl BufRing {
     /// registered. `Some` ⇒ the backend can `WRITE_FIXED` received data from
     /// this sub-buffer; `None` ⇒ fall back to plain writev from `buf(bid)`.
     pub fn buf_index(&self, bid: u16) -> Option<u16> {
-        self.buf_index[(bid & self.mask) as usize]
+        self.buf_index[(bid & BUF_MASK) as usize]
     }
 
     /// Start of buffer `bid`'s data.
@@ -272,12 +272,12 @@ impl BufRing {
         // in-flight WRITE_FIXED is still reading. Every provide site (init,
         // recv_done, release) is supposed to gate on `pending == 0`.
         debug_assert_eq!(
-            self.pending[(bid & self.mask) as usize].get(),
+            self.pending[(bid & BUF_MASK) as usize].get(),
             0,
             "re-provide of borrowed sub-buffer bid={bid}"
         );
         let tail = self.tail.get();
-        let idx = (tail & self.mask) as usize;
+        let idx = (tail & BUF_MASK) as usize;
         let base = self.ring.ptr.cast::<BufRingEntry>();
         // SAFETY: idx < entries; `base` is our registered ring memory, and
         // the kernel has not been shown slot `idx` yet (tail not advanced),
@@ -293,7 +293,7 @@ impl BufRing {
         let tail_ptr = unsafe { BufRingEntry::tail(base.cast_const()) }.cast_mut();
         // SAFETY: `tail_ptr` is a valid, aligned u16 inside our ring memory.
         unsafe { AtomicU16::from_ptr(tail_ptr).store(new_tail, Ordering::Release) };
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         self.awaiting[i].set(false);
         // Fresh buffer: the kernel restarts its per-buffer offset at 0, so the
         // shared running offset must reset in lockstep.
@@ -349,14 +349,14 @@ impl BufRing {
     /// A write begins borrowing buffer `bid`; it will not return to the
     /// kernel until released.
     pub fn borrow(&self, bid: u16) {
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         self.pending[i].set(self.pending[i].get() + 1);
     }
 
     /// A borrowing write finished. Returns the buffer to the kernel once the
     /// recv loop is also done with it and no borrows remain.
     pub fn release(&self, bid: u16) {
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         debug_assert!(
             self.pending[i].get() > 0,
             "release of unborrowed sub-buffer bid={bid} (borrow/release imbalance)"
@@ -373,13 +373,13 @@ impl BufRing {
     /// `buf(bid) + recv_off(bid)`; after consuming it the reader calls
     /// [`recv_advance`](Self::recv_advance).
     pub fn recv_off(&self, bid: u16) -> usize {
-        self.recv_off[(bid & self.mask) as usize].get()
+        self.recv_off[(bid & BUF_MASK) as usize].get()
     }
 
     /// Advance buffer `bid`'s running consume offset by `len` after a recv CQE
     /// that did NOT fully consume the buffer (`IORING_CQE_F_BUF_MORE` set).
     pub fn recv_advance(&self, bid: u16, len: usize) {
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         self.recv_off[i].set(self.recv_off[i].get() + len);
     }
 
@@ -387,7 +387,7 @@ impl BufRing {
     /// kernel immediately if no writes are currently borrowing it; otherwise
     /// defers until all borrows are released.
     pub fn recv_done(&self, bid: u16) {
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         if self.pending[i].get() == 0 {
             self.kernel_provide(bid);
         } else {
@@ -401,7 +401,7 @@ impl BufRing {
     /// (for integration tests in sibling crates). Never use in production.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn kernel_provided_count(&self, bid: u16) -> u32 {
-        let i = (bid & self.mask) as usize;
+        let i = (bid & BUF_MASK) as usize;
         self.provided_count[i].get()
     }
 }
