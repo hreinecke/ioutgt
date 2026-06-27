@@ -51,6 +51,11 @@ pub struct TargetConfig {
     pub io_queue_size: u16,
     /// Per-IO-queue data-buffer pool size in bytes (slots lease on demand).
     pub queue_buf_bytes: usize,
+    /// Per-CONNECTION receive-ring size in bytes (`0` = ring off; the classic
+    /// per-recv scratch buffer is used). When non-zero and supported, each IO
+    /// connection owns a provided-buffer ring of this size and recv draws from
+    /// it (zero-copy receive); memory scales as (connections × this).
+    pub recv_buf_bytes: usize,
     /// Unix socket path for the runtime control API.
     pub control_socket: Option<std::path::PathBuf>,
     /// Tear the queue-thread pool down after this long with zero active
@@ -73,6 +78,7 @@ impl TargetConfig {
             send_zc: false,
             io_queue_size: 128,
             queue_buf_bytes: ioutgt_core::pool::DEFAULT_POOL_BYTES,
+            recv_buf_bytes: 0,
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
             subsystems: vec![SubsystemConfig {
@@ -100,6 +106,7 @@ impl TargetConfig {
             send_zc: file.send_zc,
             io_queue_size: file.io_queue_size,
             queue_buf_bytes: file.queue_buf_mb.saturating_mul(1024 * 1024),
+            recv_buf_bytes: 0,
             control_socket: file.control_socket,
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),
@@ -441,6 +448,7 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
         trtype: TransportType::Tcp,
         io_queue_size: config.io_queue_size,
         queue_buf_bytes: config.queue_buf_bytes,
+        recv_buf_bytes: config.recv_buf_bytes,
         subsystems,
     }))
 }

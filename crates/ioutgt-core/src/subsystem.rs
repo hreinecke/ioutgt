@@ -174,6 +174,12 @@ pub struct PortConfig<B> {
     /// Per-IO-queue data-buffer pool size in bytes. Slots lease their
     /// read/write buffers from this shared arena on demand.
     pub queue_buf_bytes: usize,
+    /// Per-CONNECTION receive-ring size in bytes (`0` = ring off, the classic
+    /// per-recv scratch buffer). When non-zero and the kernel supports
+    /// provided-buffer rings, each IO connection owns a ring of this size and
+    /// recv draws chunks from it, retaining write payloads zero-copy; memory
+    /// scales as (connections × this).
+    pub recv_buf_bytes: usize,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }
