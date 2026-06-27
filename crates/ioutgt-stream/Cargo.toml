@@ -13,5 +13,10 @@ ioutgt-core = { workspace = true }
 ioutgt-uring = { workspace = true }
 libc = { workspace = true }
 
+[dev-dependencies]
+# Enable internal test counters for the ring reader tests
+# (ring_drain_calls_recv_done_not_provide).
+ioutgt-uring = { path = "../ioutgt-uring", features = ["test-helpers"] }
+
 [lints]
 workspace = true
