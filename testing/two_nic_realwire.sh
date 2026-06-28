@@ -63,6 +63,11 @@ NS_I="${NS_I:-nvmei}"           # initiator network namespace
 IP_T="${IP_T:-192.168.50.1}"    # target IP (on NIC_T, inside NS_T)
 IP_I="${IP_I:-192.168.50.2}"    # initiator IP (on NIC_I, inside NS_I)
 PREFIX="${PREFIX:-24}"
+# Jumbo frames by default: a 4 KiB read's C2HData PDU (~4120 B) then rides one
+# wire packet instead of three at MTU 1500, cutting the NIC packet rate ~3x on
+# the small-IO path. Both NICs (cabled back-to-back) must agree. Override
+# MTU=1500 for a NIC/link that cannot do jumbo.
+MTU="${MTU:-9000}"
 # Each target has its OWN hardcoded port + NQN so both can run at once on
 # the same target IP and be addressed unambiguously. ioutgt keeps the repo's
 # conventional 14420; the nvmet target uses 24420.
@@ -155,7 +160,7 @@ started target's backend (IOUTGT_BACKEND / NVMET_BACKEND, a file or bdev).
 Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE IOUTGT_SENDZC=$IOUTGT_SENDZC
   HDGST=$HDGST DDGST=$DDGST
   NIC_TUNE=$NIC_TUNE   (0 = netns + addressing only; no offloads/channel/affinity tuning)
-  IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX  FIO_RW/BS/QD/JOBS/SECS
+  IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX MTU=$MTU  FIO_RW/BS/QD/JOBS/SECS
 
 Example:
   export NIC_T=enp1s0f0 NIC_I=enp1s0f1 IOUTGT_BACKEND=/dev/sdb
@@ -217,6 +222,11 @@ cmd_up() {
 
     ip netns exec "$NS_T" ip addr add "$IP_T/$PREFIX" dev "$NIC_T"
     ip netns exec "$NS_I" ip addr add "$IP_I/$PREFIX" dev "$NIC_I"
+
+    # MTU before carrier: both ends must match (mismatched MTU silently drops
+    # oversized frames). Set on each NIC inside its namespace.
+    ip netns exec "$NS_T" ip link set "$NIC_T" mtu "$MTU"
+    ip netns exec "$NS_I" ip link set "$NIC_I" mtu "$MTU"
 
     ip netns exec "$NS_T" ip link set lo up
     ip netns exec "$NS_I" ip link set lo up
@@ -282,13 +292,18 @@ cmd_up() {
 cmd_up_prove_wire() {
     echo ">> waiting for link/carrier, then proving the wire with ping"
     sleep 2
-    if ip netns exec "$NS_I" ping -c 3 -W 2 "$IP_T" >/dev/null; then
-        echo "   OK: $IP_I -> $IP_T reachable. Only path is the physical"
-        echo "   link between $NIC_I and $NIC_T, so traffic crosses the wire."
+    # Size the probe to the MTU (DF set) so the ping also proves the jumbo path
+    # end to end: an MTU mismatch or a link that cannot carry full frames drops
+    # the oversized, do-not-fragment packet here instead of silently later.
+    local psize=$((MTU - 28)) # minus IP(20)+ICMP(8) headers
+    if ip netns exec "$NS_I" ping -c 3 -W 2 -M do -s "$psize" "$IP_T" >/dev/null; then
+        echo "   OK: $IP_I -> $IP_T reachable at MTU $MTU (full-frame, DF). Only"
+        echo "   path is the physical link between $NIC_I and $NIC_T -> wire."
     else
-        echo "   FAIL: no ping. Check the cable/switch between $NIC_I and"
-        echo "   $NIC_T, that both have carrier (ip netns exec $NS_T ip -br link),"
-        echo "   and that IP_T/IP_I share subnet /$PREFIX."
+        echo "   FAIL: no full-frame ping at MTU $MTU. Check the cable/switch"
+        echo "   between $NIC_I and $NIC_T, that both have carrier (ip netns exec"
+        echo "   $NS_T ip -br link), that IP_T/IP_I share subnet /$PREFIX, and that"
+        echo "   the link supports MTU $MTU (else re-run with MTU=1500)."
         exit 1
     fi
 }
