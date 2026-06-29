@@ -11,7 +11,18 @@ pub const UIO_MAXIOV: usize = libc::UIO_MAXIOV as usize;
 /// One batch's gather state. All memory is preallocated at
 /// construction; `reset()` recycles everything.
 pub struct GatherBatch {
-    arena: Box<[u8]>,
+    /// Header arena: `[arena_ptr, arena_ptr+arena_len)`. Either heap-owned
+    /// (`_arena_owner` holds the `Box`) or a borrowed region of a registered
+    /// pool buffer (owner `None`; the caller keeps it alive). A raw pointer
+    /// either way so both cases share one code path.
+    arena_ptr: *mut u8,
+    arena_len: usize,
+    _arena_owner: Option<Box<[u8]>>,
+    /// io_uring fixed-buffer index covering the arena — and, by construction,
+    /// every payload staged into this batch (both live in the one registered
+    /// data pool). `Some` enables a vectored fixed-buffer ZC send (no per-send
+    /// page-pin/IOMMU map); `None` (heap arena) ⇒ plain SENDMSG_ZC.
+    buf_index: Option<u16>,
     arena_used: usize,
     iovs: Vec<libc::iovec>,
     /// Hard entry cap (≤ UIO_MAXIOV). `Vec::with_capacity` may
@@ -26,9 +37,44 @@ impl GatherBatch {
     /// Preallocate `arena_bytes` (≥ 4 KiB) of header arena and up to
     /// `iov_cap` iovec entries (clamped to [`UIO_MAXIOV`]).
     pub fn new(arena_bytes: usize, iov_cap: usize) -> GatherBatch {
+        let mut owner = vec![0u8; arena_bytes.max(4096)].into_boxed_slice();
+        let arena_ptr = owner.as_mut_ptr();
+        let arena_len = owner.len();
+        GatherBatch::build(arena_ptr, arena_len, Some(owner), None, iov_cap)
+    }
+
+    /// A batch whose header arena is a borrowed region `[ptr, ptr+len)` of the
+    /// registered data pool, covered by fixed-buffer index `buf_index`. The
+    /// region — and the pool registration — must outlive this `GatherBatch`.
+    /// Lets a vectored fixed-buffer ZC send ship the whole gather (arena
+    /// headers + pool payloads, all under one `buf_index`).
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+len` must be a valid, exclusively-owned region of the buffer
+    /// registered at `buf_index`, living at least as long as this batch.
+    pub unsafe fn from_pool_arena(
+        ptr: *mut u8,
+        len: usize,
+        buf_index: u16,
+        iov_cap: usize,
+    ) -> GatherBatch {
+        GatherBatch::build(ptr, len, None, Some(buf_index), iov_cap)
+    }
+
+    fn build(
+        arena_ptr: *mut u8,
+        arena_len: usize,
+        owner: Option<Box<[u8]>>,
+        buf_index: Option<u16>,
+        iov_cap: usize,
+    ) -> GatherBatch {
         let iov_cap = iov_cap.min(UIO_MAXIOV);
         GatherBatch {
-            arena: vec![0u8; arena_bytes.max(4096)].into_boxed_slice(),
+            arena_ptr,
+            arena_len,
+            _arena_owner: owner,
+            buf_index,
             arena_used: 0,
             iovs: Vec::with_capacity(iov_cap),
             iov_cap,
@@ -50,14 +96,22 @@ impl GatherBatch {
     /// `iovs_need` (unmerged) iovec entries?
     #[inline]
     pub fn fits(&self, arena_need: usize, iovs_need: usize) -> bool {
-        self.arena_used + arena_need <= self.arena.len()
+        self.arena_used + arena_need <= self.arena_len
             && self.iovs.len() + iovs_need <= self.iov_cap
     }
 
     /// Unused arena to encode the next header piece into.
     #[inline]
     pub fn arena_tail(&mut self) -> &mut [u8] {
-        &mut self.arena[self.arena_used..]
+        // SAFETY: `[arena_ptr, arena_ptr+arena_len)` is the valid arena (heap
+        // box or borrowed registered pool region, both alive for `self`), and
+        // `arena_used <= arena_len`, so the tail slice stays in bounds.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.arena_ptr.add(self.arena_used),
+                self.arena_len - self.arena_used,
+            )
+        }
     }
 
     /// Publish `len` bytes just written at the arena tail.
@@ -65,8 +119,28 @@ impl GatherBatch {
     pub fn push_arena(&mut self, len: usize) {
         let start = self.arena_used;
         self.arena_used += len;
-        let ptr = self.arena[start..].as_ptr();
+        // SAFETY: `start <= arena_len`; the pointer is within the arena.
+        let ptr = unsafe { self.arena_ptr.add(start) };
         self.push_raw(ptr, len);
+    }
+
+    /// The fixed-buffer index covering this batch's arena and (by
+    /// construction) its payloads — `Some` enables a vectored fixed-buffer
+    /// ZC send; `None` (heap arena) means plain SENDMSG_ZC.
+    #[inline]
+    pub fn buf_index(&self) -> Option<u16> {
+        self.buf_index
+    }
+
+    /// The unsent iovec suffix as a raw `(ptr, count)` — for a vectored
+    /// fixed-buffer ZC send (`SEND_ZC | VECTORIZED | FIXED_BUF`), which takes
+    /// the iovec array directly rather than a `msghdr`. Mirrors [`Self::msghdr`]
+    /// and is advanced the same way by [`Self::advance`] on short sends.
+    #[inline]
+    pub fn live_iov(&self) -> (*const libc::iovec, u32) {
+        let live = &self.iovs[self.live..];
+        #[allow(clippy::cast_possible_truncation)] // len <= iov_cap <= UIO_MAXIOV
+        (live.as_ptr(), live.len() as u32)
     }
 
     /// Append a wire chunk; merges with the previous entry when
