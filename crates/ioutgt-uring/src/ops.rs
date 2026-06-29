@@ -247,6 +247,24 @@ impl Future for Sleep {
     }
 }
 
+/// Wait for `fd` to become ready for the given `poll(2)` event mask (e.g.
+/// `libc::POLLIN`) via `IORING_OP_POLL_ADD` (one-shot). On readiness the op
+/// completes with the returned events mask; re-issue to wait again. Lets a
+/// queue thread's reactor wake on an arbitrary external fd — e.g. an RDMA
+/// completion-channel fd — through the same `submit_and_wait` park as its IO,
+/// instead of busy-polling that fd.
+pub fn poll_add(fd: RawFd, events: u32) -> io::Result<RawOp> {
+    let op = Op::submit(
+        |key| {
+            opcode::PollAdd::new(types::Fd(fd), events)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+    )?;
+    Ok(RawOp { op })
+}
+
 /// Sleep via `IORING_OP_TIMEOUT` — the only timer primitive on queue
 /// threads (Tokio's time driver is disabled there).
 pub fn sleep(duration: Duration) -> io::Result<Sleep> {
