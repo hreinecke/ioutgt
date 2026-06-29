@@ -31,7 +31,7 @@ ioutgt_run_affinity() {
         echo "${IOUTGT_DIR:-}")
     [ -n "$top" ] ||
         vt_die "no ioutgt checkout (missing ioutgt_top marker and IOUTGT_DIR)"
-    local bin="$top/target/release/ioutgt"
+    local bin="$top/target/release/ioutgt-nvme-tcp"
     [ -x "$bin" ] || vt_die "no ioutgt binary at $bin (run testing/run_affinity.sh)"
 
     # NUMA layout of this guest.

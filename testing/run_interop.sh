@@ -84,7 +84,7 @@ echo "$T_IO_URING" > "$MARKER_DIR/ioutgt_tiou"
 [ -n "${IOUTGT_SOAK_ONLY:-}" ] && echo "$IOUTGT_SOAK_ONLY" > "$MARKER_DIR/ioutgt_soak_only"
 
 start_target() {
-    "$TOP/target/release/ioutgt" --listen "0.0.0.0:$PORT" --io-threads "${IOUTGT_IO_THREADS:-2}" \
+    "$TOP/target/release/ioutgt-nvme-tcp" --listen "0.0.0.0:$PORT" --io-threads "${IOUTGT_IO_THREADS:-2}" \
         --control-socket "$CTL_SOCK" "${BACKEND_ARGS[@]}" "${ZC_ARGS[@]}" "${IOQS_ARGS[@]}" "${RECV_BUF_ARGS[@]}" >>"$LOG" 2>&1 &
     echo $! >"$PID_FILE"
 }
@@ -100,7 +100,7 @@ TARGET_PID=$(cat "$PID_FILE")
         sleep 0.5
         if [ -f "$MARKER_DIR/ioutgt_want_ns2" ]; then
             rm -f "$MARKER_DIR/ioutgt_want_ns2"
-            "$TOP/target/release/ioutgt" ctl --socket "$CTL_SOCK" \
+            "$TOP/target/release/ioutgt-nvme-tcp" ctl --socket "$CTL_SOCK" \
                 '{"op":"ADD_NAMESPACE","nsid":2,"backend":{"type":"memory","size_mb":32}}' ||
                 echo "ctl hot-add failed" >>"$LOG"
         fi

@@ -35,7 +35,7 @@ HOSTID="${HOSTID:-2e3b0c44-1c2e-4f3a-9b6d-000000000001}"
 NR_QUEUES="${NR_QUEUES:-4}"          # IO queues  (ioutgt --io-threads; connect -i)
 QUEUE_SIZE="${QUEUE_SIZE:-128}"      # IO qdepth   (ioutgt --io-queue-size; connect -q)
 BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file
-IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt}"
+IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt-nvme-tcp}"
 IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = ioutgt --send-zc (zero-copy send)
 # Extra ioutgt flags appended verbatim, e.g.
 #   IOUTGT_EXTRA="--queue-buf-mb 1"

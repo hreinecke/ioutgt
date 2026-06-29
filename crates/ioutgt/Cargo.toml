@@ -10,6 +10,12 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# The binary is transport-named (ioutgt-nvme-tcp) so a future
+# ioutgt-nvme-rdma can sit beside it; the library stays `ioutgt`.
+[[bin]]
+name = "ioutgt-nvme-tcp"
+path = "src/main.rs"
+
 [dependencies]
 ioutgt-backend = { workspace = true }
 ioutgt-control = { workspace = true }

@@ -18,7 +18,7 @@ set -euo pipefail
 
 REPO="${IOUTGT_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 cd "$REPO"
-[ -x ./target/release/ioutgt ] || { echo "FAIL: ./target/release/ioutgt missing (build on host: cargo build --release -p ioutgt)"; exit 1; }
+[ -x ./target/release/ioutgt-nvme-tcp ] || { echo "FAIL: ./target/release/ioutgt-nvme-tcp missing (build on host: cargo build --release -p ioutgt)"; exit 1; }
 
 # Small + short so the sweep (4 combos) fits the VM and runs fast.
 export FIO_JOBS="${FIO_JOBS:-1}" FIO_QD="${FIO_QD:-64}" FIO_SECS="${FIO_SECS:-3}" BACKEND_GB="${BACKEND_GB:-1}"
