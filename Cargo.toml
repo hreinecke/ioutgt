@@ -9,6 +9,7 @@ members = [
     "crates/ioutgt-nvme-tcp",
     "crates/ioutgt-backend",
     "crates/ioutgt-control",
+    "crates/ioutgt-harness",
     "crates/ioutgt",
 ]
 
@@ -33,6 +34,7 @@ ioutgt-stream = { path = "crates/ioutgt-stream" }
 ioutgt-nvme-tcp = { path = "crates/ioutgt-nvme-tcp" }
 ioutgt-backend = { path = "crates/ioutgt-backend" }
 ioutgt-control = { path = "crates/ioutgt-control" }
+ioutgt-harness = { path = "crates/ioutgt-harness" }
 
 # external
 io-uring = "0.7"

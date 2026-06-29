@@ -20,18 +20,18 @@ path = "src/main.rs"
 ioutgt-backend = { workspace = true }
 ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
-ioutgt-cpus = { workspace = true }
-ioutgt-nvme = { workspace = true }
+ioutgt-harness = { workspace = true }
 ioutgt-nvme-tcp = { workspace = true }
 ioutgt-uring = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-core_affinity = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# The in-process integration test client speaks the sans-IO NVMe codec.
+ioutgt-nvme = { workspace = true }
 libc = { workspace = true }
 zerocopy = { workspace = true }
 

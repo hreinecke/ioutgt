@@ -1,74 +1,21 @@
-//! The fabric-transport seam. The harness (queue-thread pool + control loop,
-//! in [`crate`]) is generic over a [`Transport`]: the transport supplies the
-//! connection source (bind / accept / handshake) and the per-queue driver
-//! (`run_queue`); everything else — pool, control API, stats, pinning, idle
-//! teardown — is transport-neutral. [`TcpTransport`] is the NVMe/TCP
-//! implementation; an NVMe/RDMA one slots in beside it without touching the
-//! harness.
+//! NVMe/TCP implementation of the harness [`Transport`] seam: a `TcpListener`,
+//! the ICReq/ICResp + first-Connect handshake, and the TCP `run_queue`. An
+//! NVMe/RDMA transport implements the same trait in its own crate.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use ioutgt_backend::AnyBackend;
 use ioutgt_core::controller::Registry;
-use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::subsystem::{PortConfig, TransportType};
+use ioutgt_harness::{OnCtx, TargetConfig, Transport};
 use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue as tcp_run_queue};
 use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
 
-use crate::{CONNECT_DISABLE_SQFLOW, TargetConfig, sqsize_cap};
-
-/// Install callback, run once a connection's dispatch context exists: the admin
-/// thread registers the live controller for AER nudges, and every thread
-/// records the queue's stats handle. Boxed so the generic pool can hand it to a
-/// transport's `run_queue` without the pool being generic over the closure.
-pub type OnCtx = Box<dyn FnOnce(&Rc<ConnCtx<AnyBackend>>)>;
-
-/// A fabric transport. All methods are associated (the implementing type is a
-/// ZST marker); the harness threads `Self::Conn` through the queue-thread pool
-/// and mailbox. Connection-source methods run on the control thread's
-/// `LocalSet` (non-`Send` futures are fine); `run_queue` runs on a queue thread.
-pub trait Transport: 'static {
-    /// Everything a queue thread needs to run one connection. Sent across the
-    /// mailbox to the queue thread, so it must be `Send`.
-    type Conn: Send + 'static;
-    /// A freshly accepted, pre-handshake connection. Lives only on the control
-    /// thread, between [`Transport::accept`] and [`Transport::handshake`].
-    type Raw;
-    /// The bound listening endpoint.
-    type Listener;
-
-    /// Transport type recorded in the served port model (discovery log entries,
-    /// `LIST_CONTROLLER`).
-    fn trtype() -> TransportType;
-
-    /// Bind the listening endpoint; returns the listener and the actual bound
-    /// address (an ephemeral port resolves to the real one).
-    fn bind(cfg: &TargetConfig)
-    -> impl Future<Output = io::Result<(Self::Listener, SocketAddr)>>;
-
-    /// Accept one raw connection. Used inside a `select!`, so it must be cancel-safe.
-    fn accept(listener: &Self::Listener) -> impl Future<Output = io::Result<Self::Raw>>;
-
-    /// Complete the fabric handshake, yielding the queue id (for routing to a
-    /// queue thread) and the queue `Conn`. Spawned per connection so a slow or
-    /// hostile handshake never blocks [`Transport::accept`].
-    fn handshake(
-        raw: Self::Raw,
-        cfg: Arc<TargetConfig>,
-        port: Arc<PortConfig<AnyBackend>>,
-        registry: Arc<Registry>,
-        permit: ConnPermit,
-    ) -> impl Future<Output = io::Result<(u16, Self::Conn)>>;
-
-    /// Drive one queue connection to completion on the queue thread. `on_ctx`
-    /// runs once the dispatch context exists.
-    fn run_queue(conn: Self::Conn, on_ctx: OnCtx) -> impl Future<Output = ()>;
-}
+use crate::{CONNECT_DISABLE_SQFLOW, sqsize_cap};
 
 /// NVMe/TCP transport: a `TcpListener`, the ICReq/ICResp + first-Connect
 /// handshake, and the TCP `run_queue`.

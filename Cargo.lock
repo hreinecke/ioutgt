@@ -253,11 +253,10 @@ name = "ioutgt"
 version = "0.1.0"
 dependencies = [
  "clap",
- "core_affinity",
  "ioutgt-backend",
  "ioutgt-control",
  "ioutgt-core",
- "ioutgt-cpus",
+ "ioutgt-harness",
  "ioutgt-nvme",
  "ioutgt-nvme-tcp",
  "ioutgt-uring",
@@ -306,6 +305,21 @@ name = "ioutgt-cpus"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+]
+
+[[package]]
+name = "ioutgt-harness"
+version = "0.1.0"
+dependencies = [
+ "core_affinity",
+ "ioutgt-backend",
+ "ioutgt-control",
+ "ioutgt-core",
+ "ioutgt-cpus",
+ "ioutgt-uring",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
