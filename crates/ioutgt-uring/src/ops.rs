@@ -424,6 +424,12 @@ pub unsafe fn sendmsg_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<Raw
 /// whether the kernel copied (the loopback fallback). Rides the SQE
 /// ioprio field; the io-uring crate does not re-export the constant.
 const SEND_ZC_REPORT_USAGE: u16 = 8;
+/// `IORING_SEND_VECTORIZED` (kernel ABI bit 5): make `SEND_ZC` read `addr`
+/// as an iovec array of `len` segments instead of one buffer. With
+/// `FIXED_BUF` set, every segment must lie inside the registered buffer
+/// `buf_index` — a vectored zero-copy send that reuses one registration
+/// (no per-send page-pin/IOMMU map). Rides the SQE ioprio; not in the crate.
+const SEND_VECTORIZED: u16 = 1 << 5;
 /// Notification-CQE `res` bit set when a "zero-copy" send actually
 /// copied. Bit 31 — notif results are raw flags, never an errno.
 const NOTIF_ZC_COPIED: u32 = 1 << 31;
@@ -498,6 +504,40 @@ pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<
         |key| {
             opcode::SendMsgZc::new(types::Fd(fd), msg)
                 .ioprio(SEND_ZC_REPORT_USAGE)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Send,
+    )?;
+    Ok(SendZcOp { op })
+}
+
+/// Vectored zero-copy send (`SEND_ZC` + `VECTORIZED` + `FIXED_BUF`) whose
+/// every `iov` segment lies inside the single registered buffer `buf_index`.
+/// The kernel reuses that buffer's registration — no per-send page-pin or
+/// IOMMU map, unlike [`sendmsg_zc_raw`]. Two CQEs (send result, then notif),
+/// same as [`SendZcOp`]; REPORT_USAGE is requested. Requires kernel
+/// `IORING_SEND_VECTORIZED` support — probe with
+/// [`crate::send_vectored_fixed_supported`] before use.
+///
+/// # Safety
+///
+/// `iov` (an array of `nr_segs` entries) and the registered buffer must stay
+/// valid (reads only) until this op's **terminal** (notification) CQE — same
+/// contract as [`sendmsg_zc_raw`]. Every segment must fall within the bytes
+/// registered under `buf_index`, or the kernel rejects the import (`EFAULT`).
+pub unsafe fn send_zc_vec_fixed_raw(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    nr_segs: u32,
+    buf_index: u16,
+) -> io::Result<SendZcOp> {
+    let op = MultiOp::submit_classed(
+        |key| {
+            opcode::SendZc::new(types::Fd(fd), iov.cast(), nr_segs)
+                .buf_index(Some(buf_index))
+                .zc_flags(SEND_ZC_REPORT_USAGE | SEND_VECTORIZED)
                 .build()
                 .user_data(key)
         },

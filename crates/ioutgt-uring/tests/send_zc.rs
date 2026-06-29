@@ -77,6 +77,85 @@ fn zc_send_two_cqes_and_reassembly() {
     });
 }
 
+/// Vectored fixed-buffer ZC send: a header and a payload as two iovecs that
+/// both live inside ONE registered buffer, shipped via SEND_ZC | VECTORIZED |
+/// FIXED_BUF. Confirms the kernel accepts the vectored fixed-buffer import
+/// and reassembles the PDU correctly. Skips on a kernel without the feature.
+#[test]
+fn zc_vectored_fixed_buf_send() {
+    let (client, server) = tcp_pair();
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let reactor = rt.reactor().clone();
+
+    rt.block_on(async move {
+        if !reactor.fixed_buffers_supported() {
+            eprintln!("skip: no fixed-buffer support");
+            return;
+        }
+        // One registered buffer holding both the header (at offset 0) and the
+        // payload (at offset 4096) — distinct regions sharing one buf_index,
+        // exactly as the pool-reserved send arena will.
+        let mut arena = vec![0u8; 64 * 1024].into_boxed_slice();
+        arena[..4].copy_from_slice(b"hdr:");
+        arena[4096..4096 + 32 * 1024].fill(0xa5);
+        let Some(idx) = reactor.register_buffer(arena.as_ptr(), arena.len()) else {
+            eprintln!("skip: buffer registration failed");
+            return;
+        };
+        let (hdr_len, pay_len) = (4usize, 32 * 1024usize);
+        let iovs = [
+            libc::iovec {
+                iov_base: arena.as_ptr().cast_mut().cast(),
+                iov_len: hdr_len,
+            },
+            libc::iovec {
+                // SAFETY: offset 4096 is within the 64 KiB registered arena.
+                iov_base: unsafe { arena.as_ptr().add(4096) }.cast_mut().cast(),
+                iov_len: pay_len,
+            },
+        ];
+        let total = hdr_len + pay_len;
+
+        // SAFETY: `iovs` and `arena` outlive the notif await below; both
+        // segments lie inside the buffer registered at `idx`.
+        let mut op =
+            unsafe { ops::send_zc_vec_fixed_raw(client.as_raw_fd(), iovs.as_ptr(), 2, idx) }
+                .unwrap();
+        let n = match op.sent().await {
+            Ok(n) => n as usize,
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::EFAULT)
+                ) =>
+            {
+                eprintln!("skip: kernel lacks SEND_ZC vectored fixed-buf: {e}");
+                let _ = op.into_notif().await;
+                reactor.unregister_buffer(idx);
+                return;
+            }
+            Err(e) => panic!("vectored fixed-buf ZC send: {e}"),
+        };
+        assert_eq!(n, total, "header+payload fits the loopback sndbuf");
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8192].into_boxed_slice();
+        while got.len() < total {
+            let (res, b2) = ops::recv(server.as_raw_fd(), buf).unwrap().await;
+            let r = res.unwrap() as usize;
+            assert!(r > 0, "peer closed early");
+            got.extend_from_slice(&b2[..r]);
+            buf = b2;
+        }
+        assert_eq!(&got[..4], b"hdr:", "header corrupted");
+        assert!(got[4..].iter().all(|&x| x == 0xa5), "payload corrupted");
+
+        let _copied = op.into_notif().await; // loopback degrades to copy
+        reactor.unregister_buffer(idx);
+        assert_eq!(reactor.pending_ops(), 0, "notif must be terminal");
+    });
+}
+
 /// Shrink a socket's send buffer so a large ZC send must return short.
 fn set_sndbuf(stream: &TcpStream, bytes: i32) {
     // SAFETY: plain setsockopt on a live fd with a local int.
