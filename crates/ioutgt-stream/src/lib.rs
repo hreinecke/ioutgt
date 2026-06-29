@@ -86,8 +86,50 @@ struct GatherSendBatch {
 impl GatherSendBatch {
     fn new(sqsize: u16, arena_per_item: usize, iovs_per_item: usize) -> GatherSendBatch {
         let n = usize::from(sqsize);
+        Self::around(
+            GatherBatch::new(n * arena_per_item, n * iovs_per_item + iovs_per_item),
+            n,
+            arena_per_item,
+            iovs_per_item,
+        )
+    }
+
+    /// Like [`Self::new`] but the header arena is the borrowed registered pool
+    /// region `[arena_ptr, arena_ptr + n*arena_per_item)` under `buf_index`,
+    /// so this batch's send can be a vectored fixed-buffer ZC op.
+    ///
+    /// # Safety
+    ///
+    /// `arena_ptr` must point at `n*arena_per_item` valid, exclusively-owned
+    /// bytes of the buffer registered at `buf_index`, alive for this batch.
+    unsafe fn with_pool_arena(
+        sqsize: u16,
+        arena_per_item: usize,
+        iovs_per_item: usize,
+        arena_ptr: *mut u8,
+        buf_index: u16,
+    ) -> GatherSendBatch {
+        let n = usize::from(sqsize);
+        // SAFETY: forwarded from this fn's contract.
+        let gather = unsafe {
+            GatherBatch::from_pool_arena(
+                arena_ptr,
+                n * arena_per_item,
+                buf_index,
+                n * iovs_per_item + iovs_per_item,
+            )
+        };
+        Self::around(gather, n, arena_per_item, iovs_per_item)
+    }
+
+    fn around(
+        gather: GatherBatch,
+        n: usize,
+        arena_per_item: usize,
+        iovs_per_item: usize,
+    ) -> GatherSendBatch {
         GatherSendBatch {
-            gather: GatherBatch::new(n * arena_per_item, n * iovs_per_item + iovs_per_item),
+            gather,
             arena_per_item,
             iovs_per_item,
             tags_at_cqe: Vec::with_capacity(n),
@@ -134,22 +176,65 @@ pub struct StreamSender {
     zc_batches: u64,
     zc_copied: u64,
     zc_fallbacks: u64,
+    /// Whether vectored fixed-buffer ZC sends are usable. Starts true when the
+    /// batches have a pool arena; cleared on the first `EINVAL`/`EFAULT`/
+    /// `EOPNOTSUPP` (a kernel without `IORING_SEND_VECTORIZED`), after which
+    /// the send path falls back to plain `SENDMSG_ZC` for the connection's
+    /// life — a self-correcting probe, no startup cost.
+    vec_fixed_ok: bool,
 }
 
 impl StreamSender {
     /// A sender for a queue of `sqsize` slots. `arena_per_item` /
     /// `iovs_per_item` are the transport's worst-case per-item sizings
     /// (they bound the preallocated arena and iovec list).
-    pub fn new(sqsize: u16, arena_per_item: usize, iovs_per_item: usize) -> StreamSender {
-        StreamSender {
-            batches: [
+    /// `pool_arena`, when `Some((ptr, buf_index))`, is a registered region of
+    /// at least `2 * sqsize * arena_per_item` bytes carved from the data pool
+    /// (via [`ioutgt_core::pool::BufPool::reserve_arena`]); the two batches
+    /// take the first and second halves so their gathers ship as vectored
+    /// fixed-buffer ZC sends. `None` keeps both arenas on the heap (plain
+    /// `SENDMSG_ZC`).
+    pub fn new(
+        sqsize: u16,
+        arena_per_item: usize,
+        iovs_per_item: usize,
+        pool_arena: Option<(*mut u8, u16)>,
+    ) -> StreamSender {
+        let half = usize::from(sqsize) * arena_per_item;
+        let batches = match pool_arena {
+            // SAFETY: the caller guarantees `ptr..ptr+2*half` is the reserved
+            // registered region (alive for the queue); each batch takes a
+            // distinct, non-overlapping `half`.
+            Some((ptr, idx)) => unsafe {
+                [
+                    GatherSendBatch::with_pool_arena(
+                        sqsize,
+                        arena_per_item,
+                        iovs_per_item,
+                        ptr,
+                        idx,
+                    ),
+                    GatherSendBatch::with_pool_arena(
+                        sqsize,
+                        arena_per_item,
+                        iovs_per_item,
+                        ptr.add(half),
+                        idx,
+                    ),
+                ]
+            },
+            None => [
                 GatherSendBatch::new(sqsize, arena_per_item, iovs_per_item),
                 GatherSendBatch::new(sqsize, arena_per_item, iovs_per_item),
             ],
+        };
+        StreamSender {
+            batches,
             inflight: VecDeque::with_capacity(2),
             zc_batches: 0,
             zc_copied: 0,
             zc_fallbacks: 0,
+            vec_fixed_ok: pool_arena.is_some(),
         }
     }
 
@@ -218,7 +303,15 @@ impl StreamSender {
             let idx = self.acquire(slots).await;
             let batch = &mut self.batches[idx];
             carry = stage_batch(batch, first, work, stage);
-            ship_batch(fd, batch, send_zc, &mut self.zc_fallbacks).await?;
+            let use_zc = send_zc;
+            ship_batch(
+                fd,
+                batch,
+                use_zc,
+                &mut self.zc_fallbacks,
+                &mut self.vec_fixed_ok,
+            )
+            .await?;
             self.retire(slots, idx);
         }
     }
@@ -379,17 +472,31 @@ async fn ship_batch(
     batch: &mut GatherSendBatch,
     send_zc: bool,
     zc_fallbacks: &mut u64,
+    vec_fixed_ok: &mut bool,
 ) -> std::io::Result<()> {
     let mut use_zc = send_zc;
     loop {
         let n = if use_zc {
-            // SAFETY: msghdr, iovecs, arena, and referenced slot buffers
-            // stay allocated until this batch's notifs are reaped
-            // (reap_oldest/drain precede reset, and the caller joins this
-            // task — or leaks the queue — before freeing anything). The
-            // kernel snapshots the iovec array at issue, so advance()
-            // after the send CQE never races it.
-            let mut op = unsafe { ops::sendmsg_zc_raw(fd, batch.gather.msghdr()) }?;
+            // Vectored fixed-buffer ZC when the arena and payloads share one
+            // registered buffer: the kernel reuses that registration, so no
+            // per-send page-pin/IOMMU map. Else plain SENDMSG_ZC.
+            let fixed = batch.gather.buf_index().filter(|_| *vec_fixed_ok);
+            // SAFETY: arena, iovecs, and referenced slot buffers stay
+            // allocated until this batch's notifs are reaped (reap_oldest/
+            // drain precede reset; the caller joins this task before freeing).
+            // The kernel snapshots the iovec array at issue, so advance() after
+            // the send CQE never races it. For the fixed path every segment
+            // lies inside `buf_index` (arena from the pool, payloads from slots
+            // in the same pool).
+            let mut op = unsafe {
+                match fixed {
+                    Some(idx) => {
+                        let (iov, nsegs) = batch.gather.live_iov();
+                        ops::send_zc_vec_fixed_raw(fd, iov, nsegs, idx)?
+                    }
+                    None => ops::sendmsg_zc_raw(fd, batch.gather.msghdr())?,
+                }
+            };
             let res = op.sent().await;
             // Stash the notif BEFORE examining the result: a failed ZC
             // send can still have pinned pages (F_MORE), and only the
@@ -397,6 +504,20 @@ async fn ship_batch(
             batch.pending_notifs.push(op.into_notif());
             match res {
                 Ok(n) => n as usize,
+                // A kernel without IORING_SEND_VECTORIZED rejects the vectored
+                // fixed-buffer op at import. Disable it for good and re-ship
+                // this batch as plain SENDMSG_ZC. (The pushed notif resolves
+                // immediately — an import error pins no pages.)
+                Err(err)
+                    if fixed.is_some()
+                        && matches!(
+                            err.raw_os_error(),
+                            Some(libc::EINVAL | libc::EFAULT | libc::EOPNOTSUPP)
+                        ) =>
+                {
+                    *vec_fixed_ok = false;
+                    continue;
+                }
                 // ZC pins pages against the per-user RLIMIT_MEMLOCK
                 // (ENOMEM past it; ENOBUFS for the optmem variant); two
                 // full batches alone can exceed the default 8 MiB, and

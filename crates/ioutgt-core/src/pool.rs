@@ -265,6 +265,11 @@ pub struct BufPool {
     /// fixed-buffer support). Pool leases carry it to the backend so disk IO
     /// can use `READV_FIXED`/`WRITEV_FIXED`.
     buf_index: Cell<Option<u16>>,
+    /// Page-aligned region carved from the arena for the send path's header
+    /// gather (`reserve_arena`), shared with payloads under one `buf_index` so
+    /// a vectored fixed-buffer ZC send needs no per-send page map. Never freed
+    /// back to `free`; lives as long as the pool.
+    send_arena: Cell<Option<(*mut u8, usize)>>,
 }
 
 /// Insert `run` into the sorted free list, coalescing with neighbors.
@@ -298,6 +303,7 @@ impl BufPool {
             free_pages: Cell::new(npages),
             waiters: RefCell::new(Vec::new()),
             buf_index: Cell::new(None),
+            send_arena: Cell::new(None),
         })
     }
 
@@ -320,6 +326,37 @@ impl BufPool {
     /// Clear and return the fixed-buffer index (teardown, before unregister).
     pub fn take_buf_index(&self) -> Option<u16> {
         self.buf_index.take()
+    }
+
+    /// Permanently reserve `bytes` (rounded up to whole pages) of contiguous
+    /// arena for non-slot use — the send-path header arena — returning its
+    /// `(ptr, len)`. Unlike [`Self::alloc`] the pages are never returned to
+    /// the free list; the region lives as long as the pool. Because it lies
+    /// inside the one registered fixed buffer, iovecs into it share the pool's
+    /// `buf_index`, so a vectored fixed-buffer ZC send can cover arena headers
+    /// and slot payloads in one op. `None` when the pool is not registered
+    /// (no `buf_index`) or has no contiguous run that large.
+    pub fn reserve_arena(&self, bytes: usize) -> Option<(*mut u8, usize)> {
+        self.buf_index.get()?;
+        let pages = u32::try_from(bytes.div_ceil(PAGE).max(1)).ok()?;
+        let mut free = self.free.borrow_mut();
+        let i = free.iter().position(|r| r.len >= pages)?;
+        let start = free[i].start;
+        free[i].start += pages;
+        free[i].len -= pages;
+        if free[i].len == 0 {
+            free.remove(i);
+        }
+        drop(free);
+        self.free_pages.set(self.free_pages.get() - pages);
+        let region = (self.page_ptr(start), pages as usize * PAGE);
+        self.send_arena.set(Some(region));
+        Some(region)
+    }
+
+    /// The reserved send-arena region, if [`Self::reserve_arena`] has run.
+    pub fn send_arena(&self) -> Option<(*mut u8, usize)> {
+        self.send_arena.get()
     }
 
     pub fn capacity_pages(&self) -> u32 {

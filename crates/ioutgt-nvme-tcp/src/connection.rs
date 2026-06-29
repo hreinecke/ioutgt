@@ -333,7 +333,16 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         match ioutgt_uring::register_pool_buffer(ptr, len) {
             Some(idx) => {
                 pool.set_buf_index(idx);
-                debug!(qid = conn.qid, idx, "pool buffer registered: fixed disk IO");
+                // Reserve the send-path header arena (page-aligned) from the
+                // same registered buffer now, before any slot allocates, so a
+                // contiguous run is guaranteed and arena + payloads share this
+                // buf_index for vectored fixed-buffer ZC sends.
+                let arena_bytes = 2 * usize::from(conn.sqsize) * ARENA_PER_ITEM;
+                let reserved = pool.reserve_arena(arena_bytes).is_some();
+                debug!(
+                    qid = conn.qid,
+                    idx, reserved, "pool buffer registered: fixed disk IO + send arena"
+                );
             }
             // Distinguish the two None causes: a full table is a capacity
             // event worth a warning (the connection loses the optimization);
@@ -1150,7 +1159,15 @@ async fn send_loop(
     data_digest: bool,
     send_zc: bool,
 ) -> std::io::Result<()> {
-    let mut sender = StreamSender::new(queue.sqsize, ARENA_PER_ITEM, IOVS_PER_ITEM);
+    // The send arenas were reserved from the registered data pool at queue
+    // install (above), so headers and slot payloads share one buf_index —
+    // enabling vectored fixed-buffer ZC sends (no per-send IOMMU map). `None`
+    // (pool unregistered) keeps the heap arena + plain SENDMSG_ZC path.
+    let pool = queue.nvme.slots.pool();
+    let pool_arena = pool
+        .send_arena()
+        .and_then(|(ptr, _)| pool.buf_index().map(|idx| (ptr, idx)));
+    let mut sender = StreamSender::new(queue.sqsize, ARENA_PER_ITEM, IOVS_PER_ITEM, pool_arena);
     let result = sender
         .run(
             fd,
