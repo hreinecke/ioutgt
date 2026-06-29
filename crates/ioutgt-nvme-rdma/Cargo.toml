@@ -1,0 +1,24 @@
+[package]
+name = "ioutgt-nvme-rdma"
+description = "NVMe/RDMA transport for the ioutgt target (RoCE / InfiniBand via ibverbs)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Safe, maintained ibverbs + RDMA-CM bindings that link the system rdma-core
+# (no vendored build, no libnl-devel) and expose the completion-channel fd we
+# register in io_uring. (ibverbs-sys vendors rdma-core via cmake/libnl;
+# rdma-sys pins a bindgen too old for modern rdma-core headers — both unusable
+# here, see docs/nvme-rdma.md.)
+sideway = "0.4"
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

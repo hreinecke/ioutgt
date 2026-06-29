@@ -10,6 +10,7 @@ members = [
     "crates/ioutgt-backend",
     "crates/ioutgt-control",
     "crates/ioutgt-harness",
+    "crates/ioutgt-nvme-rdma",
     "crates/ioutgt",
 ]
 
