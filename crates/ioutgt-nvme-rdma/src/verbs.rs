@@ -11,7 +11,7 @@ use std::io;
 use std::sync::Arc;
 
 use sideway::ibverbs::AccessFlags;
-use sideway::ibverbs::address::{AddressHandleAttribute, GidEntry};
+use sideway::ibverbs::address::{AddressHandleAttribute, GidEntry, GidType};
 use sideway::ibverbs::completion::GenericCompletionQueue;
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
 use sideway::ibverbs::device_context::{DeviceContext, Mtu};
@@ -120,13 +120,32 @@ impl Rdma {
         Ok(builder.build_ex().map_err(oerr)?.into())
     }
 
-    /// A usable local GID entry for RoCE global routing (first non-zero GID).
+    /// A usable local GID entry for RoCE global routing. Prefers a routable
+    /// RoCEv2 GID (the IPv4-mapped, non-link-local one) — routing through a
+    /// link-local `fe80::` GID fails the RTR transition with "network
+    /// unreachable" on rxe — falling back through RoCEv2-link-local to any
+    /// non-zero GID.
     pub fn local_gid(&self) -> io::Result<GidEntry> {
         let table = self.ctx.query_gid_table().map_err(oerr)?;
-        table
-            .into_iter()
-            .find(|g| !g.gid().is_zero())
-            .ok_or_else(|| io::Error::other("no usable GID on port"))
+        let rank = |g: &GidEntry| -> i32 {
+            if g.gid().is_zero() {
+                return -1;
+            }
+            match (g.gid_type(), g.gid().is_unicast_link_local()) {
+                (GidType::RoceV2, false) => 3,
+                (GidType::RoceV2, true) => 2,
+                (_, false) => 1,
+                _ => 0,
+            }
+        };
+        let best = table
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| rank(g) >= 0)
+            .max_by_key(|(_, g)| rank(g))
+            .map(|(i, _)| i)
+            .ok_or_else(|| io::Error::other("no usable GID on port"))?;
+        Ok(table.into_iter().nth(best).expect("index in range"))
     }
 
     /// Drive an RC QP RESET→INIT→RTR→RTS, wiring it to `dest`. The same
