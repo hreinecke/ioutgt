@@ -9,4 +9,4 @@
 
 mod verbs;
 
-pub use verbs::rdma_devices;
+pub use verbs::{Rdma, RcDest, rdma_devices};
