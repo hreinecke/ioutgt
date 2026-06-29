@@ -11,12 +11,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+ioutgt-uring = { workspace = true }
 # Safe, maintained ibverbs + RDMA-CM bindings that link the system rdma-core
 # (no vendored build, no libnl-devel) and expose the completion-channel fd we
 # register in io_uring. (ibverbs-sys vendors rdma-core via cmake/libnl;
 # rdma-sys pins a bindgen too old for modern rdma-core headers — both unusable
 # here, see docs/nvme-rdma.md.)
 sideway = { workspace = true }
+# Raw FFI for the CQ-event calls sideway does not wrap (req_notify/get/ack).
+rdma-mummy-sys = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 

@@ -14,7 +14,7 @@ echo "[rdma] netdev=${DEV:-<none>}"
 rdma link show 2>&1 | head -4
 ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
 echo "[rdma] === running rxe_loopback ==="
-"$BIN" --test-threads=1 --nocapture rxe_loopback
+"$BIN" --test-threads=1 --nocapture rxe_
 rc=$?
 echo "[rdma] rxe_loopback rc=$rc"
 [ $rc -eq 0 ] && echo "[rdma] RESULT: PASS" || echo "[rdma] RESULT: FAIL"

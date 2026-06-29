@@ -49,6 +49,10 @@ serde_json = "1"
 # Safe ibverbs + RDMA-CM bindings linking the system rdma-core (see
 # crates/ioutgt-nvme-rdma + docs/nvme-rdma.md for why not ibverbs-sys/rdma-sys).
 sideway = "0.4"
+# sideway's raw FFI backend — used directly for the CQ-event calls sideway does
+# not wrap (req_notify/get_cq_event/ack); pinned to sideway's version so the
+# ibv_cq / ibv_comp_channel types unify.
+rdma-mummy-sys = "0.2.4"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

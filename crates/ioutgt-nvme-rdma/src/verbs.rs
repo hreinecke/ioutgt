@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::address::{AddressHandleAttribute, GidEntry, GidType};
-use sideway::ibverbs::completion::GenericCompletionQueue;
+use sideway::ibverbs::completion::{CompletionChannel, GenericCompletionQueue};
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
 use sideway::ibverbs::device_context::{DeviceContext, Mtu};
 use sideway::ibverbs::memory_region::MemoryRegion;
@@ -100,6 +100,24 @@ impl Rdma {
     pub fn create_cq(&self, cqe: u32) -> io::Result<GenericCompletionQueue> {
         let mut builder = self.ctx.create_cq_builder();
         builder.setup_cqe(cqe);
+        Ok(GenericCompletionQueue::from(builder.build_ex().map_err(oerr)?))
+    }
+
+    /// Create a completion channel — the fd the reactor parks on (via
+    /// `IORING_OP_POLL_ADD`) to wake on completions instead of busy-polling.
+    pub fn create_comp_channel(&self) -> io::Result<Arc<CompletionChannel>> {
+        self.ctx.create_comp_channel().map_err(oerr)
+    }
+
+    /// Create an extended completion queue bound to `channel`, so a completion
+    /// signals the channel fd once the CQ is armed (see [`crate::cq`]).
+    pub fn create_cq_on_channel(
+        &self,
+        channel: &Arc<CompletionChannel>,
+        cqe: u32,
+    ) -> io::Result<GenericCompletionQueue> {
+        let mut builder = self.ctx.create_cq_builder();
+        builder.setup_cqe(cqe).setup_comp_channel(channel, 0);
         Ok(GenericCompletionQueue::from(builder.build_ex().map_err(oerr)?))
     }
 

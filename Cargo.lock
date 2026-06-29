@@ -451,7 +451,9 @@ dependencies = [
 name = "ioutgt-nvme-rdma"
 version = "0.1.0"
 dependencies = [
+ "ioutgt-uring",
  "libc",
+ "rdma-mummy-sys",
  "sideway",
  "tracing",
 ]
