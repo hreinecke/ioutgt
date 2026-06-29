@@ -2,6 +2,11 @@
 //! handoff into the queue-thread pool (admin thread + N IO threads),
 //! which is itself spawned lazily on the first accepted connection.
 //!
+//! The pool and control loop are transport-neutral: they are generic over a
+//! [`transport::Transport`], which supplies the connection source and the
+//! per-queue driver. [`spawn_target`] instantiates them with
+//! [`transport::TcpTransport`]; an NVMe/RDMA transport reuses the same harness.
+//!
 //! Exposed as a library so integration tests can start a full target
 //! in-process on an ephemeral port.
 
@@ -9,7 +14,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -23,11 +27,13 @@ use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
-use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue};
-use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
+use ioutgt_nvme_tcp::connection::ConnPermit;
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{error, info, warn};
+
+mod transport;
+use transport::{OnCtx, TcpTransport, Transport};
 
 /// Target configuration. Built from CLI flags, a JSON file
 /// ([`TargetConfig::from_file`]), or [`TargetConfig::single_memory`] in
@@ -122,14 +128,12 @@ impl TargetConfig {
 }
 
 /// Connect CATTR bit 2: host requests SQ flow control disabled.
-const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
+pub(crate) const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
 
 /// Maximum concurrent connections accepted. Bounds total preallocated
 /// queue memory; a host that exceeds it is rejected at accept. (Deeper
 /// mitigation — lazy slot-buffer allocation — is in the roadmap.)
 const MAX_CONNECTIONS: usize = 256;
-
-type Conn = QueueConn<AnyBackend>;
 
 /// A queue thread whose mailbox (and sender) already exist but whose OS
 /// thread, io_uring ring, and runtime are not yet created. Calling it
@@ -141,9 +145,16 @@ type PendingThread = Box<dyn FnOnce() -> io::Result<()> + Send>;
 /// on-thread (control-plane rate) and sends it back.
 type StatsRequest = tokio::sync::oneshot::Sender<serde_json::Value>;
 
-/// Messages to an IO queue thread.
-enum IoMsg {
-    Conn(Conn),
+/// A queue thread's mailbox endpoints (sender kept by the control thread,
+/// receiver moved onto the queue thread), parameterized by the transport's
+/// connection type `C`.
+type IoMailbox<C> = (MailboxSender<IoMsg<C>>, Mailbox<IoMsg<C>>);
+type AdminMailbox<C> = (MailboxSender<AdminMsg<C>>, Mailbox<AdminMsg<C>>);
+
+/// Messages to an IO queue thread. Generic over the transport's connection
+/// type `C`; only `Conn` carries it.
+enum IoMsg<C> {
+    Conn(C),
     Stats {
         reply: StatsRequest,
         clear: bool,
@@ -153,9 +164,10 @@ enum IoMsg {
     Shutdown,
 }
 
-/// Messages to the admin queue thread.
-enum AdminMsg {
-    Conn(Conn),
+/// Messages to the admin queue thread. Generic over the transport's connection
+/// type `C`.
+enum AdminMsg<C> {
+    Conn(C),
     /// A namespace changed: nudge every live controller's AERs.
     NsChanged,
     Stats {
@@ -235,12 +247,12 @@ fn thread_stats_json(
 /// Create an IO queue thread's mailbox and return its sender plus a
 /// deferred spawn closure (the ring/runtime/OS thread are built only when
 /// the closure runs). IO queue threads receive connections and stats
-/// requests.
-fn make_io_thread(
+/// requests; `T` is the fabric transport whose `run_queue` drives them.
+fn make_io_thread<T: Transport>(
     name: String,
     core_id: Option<usize>,
-) -> io::Result<(MailboxSender<IoMsg>, PendingThread)> {
-    let (tx, mut rx): (MailboxSender<IoMsg>, Mailbox<IoMsg>) = mailbox()?;
+) -> io::Result<(MailboxSender<IoMsg<T::Conn>>, PendingThread)> {
+    let (tx, mut rx): IoMailbox<T::Conn> = mailbox()?;
     let spawn: PendingThread = Box::new(move || {
         spawn_pinned(name.clone(), core_id, move || {
             let rt = match QueueRuntime::new(RingConfig::default()) {
@@ -258,12 +270,10 @@ fn make_io_thread(
                         Ok(IoMsg::Conn(conn)) => {
                             prune_dead_queues(&queues, &mut retired);
                             let queues = Rc::clone(&queues);
-                            tokio::task::spawn_local(async move {
-                                run_queue(conn, |ctx| {
-                                    queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
-                                })
-                                .await;
+                            let on_ctx: OnCtx = Box::new(move |ctx| {
+                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
                             });
+                            tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
                         Ok(IoMsg::Stats { reply, clear }) => {
                             prune_dead_queues(&queues, &mut retired);
@@ -289,8 +299,10 @@ fn make_io_thread(
 /// Create the admin queue thread's mailbox and return its sender plus a
 /// deferred spawn closure. The admin thread additionally tracks live
 /// controllers for AER nudges.
-fn make_admin_thread(name: String) -> io::Result<(MailboxSender<AdminMsg>, PendingThread)> {
-    let (tx, mut rx): (MailboxSender<AdminMsg>, Mailbox<AdminMsg>) = mailbox()?;
+fn make_admin_thread<T: Transport>(
+    name: String,
+) -> io::Result<(MailboxSender<AdminMsg<T::Conn>>, PendingThread)> {
+    let (tx, mut rx): AdminMailbox<T::Conn> = mailbox()?;
     let spawn: PendingThread = Box::new(move || {
         spawn_pinned(name.clone(), None, move || {
             let rt = match QueueRuntime::new(RingConfig::default()) {
@@ -312,13 +324,11 @@ fn make_admin_thread(name: String) -> io::Result<(MailboxSender<AdminMsg>, Pendi
                             prune_dead_queues(&queues, &mut retired);
                             let live = Rc::clone(&live);
                             let queues = Rc::clone(&queues);
-                            tokio::task::spawn_local(async move {
-                                run_queue(conn, |ctx| {
-                                    live.borrow_mut().push(Rc::downgrade(ctx));
-                                    queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
-                                })
-                                .await;
+                            let on_ctx: OnCtx = Box::new(move |ctx| {
+                                live.borrow_mut().push(Rc::downgrade(ctx));
+                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
                             });
+                            tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
                         Ok(AdminMsg::NsChanged) => {
                             live.borrow_mut().retain(|weak| {
@@ -419,8 +429,12 @@ fn spawn_pinned(
 /// Build the port snapshot from the configured subsystems.
 /// `bound` is the listener's actual local address, so ephemeral ports
 /// (`--listen …:0`) report the real port in discovery log entries and
-/// LIST_CONTROLLER, not the configured 0.
-fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortConfig<AnyBackend>>> {
+/// LIST_CONTROLLER, not the configured 0. `trtype` is the serving fabric.
+fn build_port(
+    config: &TargetConfig,
+    bound: SocketAddr,
+    trtype: TransportType,
+) -> io::Result<Arc<PortConfig<AnyBackend>>> {
     let mut subsystems = BTreeMap::new();
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
@@ -458,7 +472,7 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
     Ok(Arc::new(PortConfig {
         traddr: bound.ip().to_string(),
         trsvcid: bound.port().to_string(),
-        trtype: TransportType::Tcp,
+        trtype,
         io_queue_size: config.io_queue_size,
         queue_buf_bytes: config.queue_buf_bytes,
         recv_buf_bytes: config.recv_buf_bytes,
@@ -469,22 +483,25 @@ fn build_port(config: &TargetConfig, bound: SocketAddr) -> io::Result<Arc<PortCo
 /// The live mailbox senders for a spawned queue-thread pool: the admin
 /// thread plus one per IO thread. Held behind `Mutex<Option<_>>` in
 /// [`control_loop`] — `None` means the pool is currently down (before the
-/// first connection, or after an idle teardown).
-struct PoolSenders {
-    admin: MailboxSender<AdminMsg>,
-    io: Vec<MailboxSender<IoMsg>>,
+/// first connection, or after an idle teardown). Generic over the transport's
+/// connection type `C`.
+struct PoolSenders<C> {
+    admin: MailboxSender<AdminMsg<C>>,
+    io: Vec<MailboxSender<IoMsg<C>>>,
 }
 
 /// Build the pool's mailboxes: returns the senders plus the deferred
 /// spawn closures (admin first, then one per IO thread). The OS threads /
 /// io_uring rings are created only when the closures run.
-fn build_pool(io_cpus: &[Option<usize>]) -> io::Result<(PoolSenders, Vec<PendingThread>)> {
-    let (admin, admin_pending) = make_admin_thread("ioutgt-admin".into())?;
+fn build_pool<T: Transport>(
+    io_cpus: &[Option<usize>],
+) -> io::Result<(PoolSenders<T::Conn>, Vec<PendingThread>)> {
+    let (admin, admin_pending) = make_admin_thread::<T>("ioutgt-admin".into())?;
     let mut io = Vec::with_capacity(io_cpus.len());
     let mut pending: Vec<PendingThread> = Vec::with_capacity(io_cpus.len() + 1);
     pending.push(admin_pending);
     for (i, core_id) in io_cpus.iter().enumerate() {
-        let (tx, io_pending) = make_io_thread(format!("ioutgt-io{i}"), *core_id)?;
+        let (tx, io_pending) = make_io_thread::<T>(format!("ioutgt-io{i}"), *core_id)?;
         io.push(tx);
         pending.push(io_pending);
     }
@@ -494,12 +511,15 @@ fn build_pool(io_cpus: &[Option<usize>]) -> io::Result<(PoolSenders, Vec<Pending
 /// Spawn the queue-thread pool if it is currently down — the first
 /// connection ever, or the first after an idle teardown. Idempotent;
 /// runs the deferred spawn closures and publishes the senders.
-fn ensure_pool_up(senders: &Mutex<Option<PoolSenders>>, io_cpus: &[Option<usize>]) {
+fn ensure_pool_up<T: Transport>(
+    senders: &Mutex<Option<PoolSenders<T::Conn>>>,
+    io_cpus: &[Option<usize>],
+) {
     let mut guard = senders.lock().expect("pool senders mutex");
     if guard.is_some() {
         return;
     }
-    match build_pool(io_cpus) {
+    match build_pool::<T>(io_cpus) {
         Ok((pool, pending)) => {
             for spawn in pending {
                 if let Err(err) = spawn() {
@@ -524,7 +544,7 @@ fn ensure_pool_up(senders: &Mutex<Option<PoolSenders>>, io_cpus: &[Option<usize>
 /// teardown immediately followed by a reconnect can briefly run the old
 /// and new pools side by side. That is harmless (independent threads,
 /// rings, and fresh mailboxes), just transiently more threads.
-fn teardown_pool(senders: &Mutex<Option<PoolSenders>>) {
+fn teardown_pool<C: Send>(senders: &Mutex<Option<PoolSenders<C>>>) {
     let Some(pool) = senders.lock().expect("pool senders mutex").take() else {
         return;
     };
@@ -568,7 +588,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
                 }
             };
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(control_loop(config, addr_tx)));
+            rt.block_on(local.run_until(control_loop::<TcpTransport>(config, addr_tx)));
         })?;
     addr_rx
         .recv()
@@ -584,8 +604,8 @@ fn zeroed_stats(name: &str) -> serde_json::Value {
 /// One stats source per queue thread (admin + each IO). Each reads the
 /// live sender through `senders`, so it tracks teardown/respawn; while the
 /// pool is down it answers with a zeroed snapshot instead of blocking.
-fn build_stats_sources(
-    senders: &Arc<Mutex<Option<PoolSenders>>>,
+fn build_stats_sources<C: Send + 'static>(
+    senders: &Arc<Mutex<Option<PoolSenders<C>>>>,
     io_threads: usize,
 ) -> Vec<ioutgt_control::server::StatsSource> {
     let mut sources: Vec<ioutgt_control::server::StatsSource> = Vec::with_capacity(1 + io_threads);
@@ -621,11 +641,11 @@ fn build_stats_sources(
 /// Bind and serve the runtime control API on `path`, wiring its stats and
 /// namespace-change hooks to the (possibly-down) pool through `senders`.
 /// Must run on the control thread's `LocalSet` (uses `spawn_local`).
-fn spawn_control_api(
+fn spawn_control_api<C: Send + 'static>(
     path: &std::path::Path,
     port: &Arc<PortConfig<AnyBackend>>,
     registry: &Arc<Registry>,
-    senders: &Arc<Mutex<Option<PoolSenders>>>,
+    senders: &Arc<Mutex<Option<PoolSenders<C>>>>,
     io_groups: &[String],
     io_threads: usize,
 ) -> io::Result<()> {
@@ -693,7 +713,11 @@ impl IdleTeardown {
 
     /// Tear the pool down if it has had zero active connections for the
     /// whole grace period; otherwise track/clear the idle timestamp.
-    fn maybe_teardown(&mut self, senders: &Mutex<Option<PoolSenders>>, active: &AtomicUsize) {
+    fn maybe_teardown<C: Send>(
+        &mut self,
+        senders: &Mutex<Option<PoolSenders<C>>>,
+        active: &AtomicUsize,
+    ) {
         let Some(grace) = self.grace else {
             return; // teardown disabled
         };
@@ -710,69 +734,71 @@ impl IdleTeardown {
     }
 }
 
-/// Handle one accepted socket: bring the pool up if down, then hand the
-/// connection to a per-socket setup task. Runs on the control thread's
-/// `LocalSet` (uses `spawn_local`); never blocks it.
+/// Handle one accepted connection: bring the pool up if down, account for the
+/// connection, then spawn a per-connection task that finishes the transport's
+/// handshake and routes the resulting `Conn` to a queue thread by qid. Runs on
+/// the control thread's `LocalSet` (uses `spawn_local`); never blocks it.
 #[allow(clippy::too_many_arguments)]
-fn accept_connection(
-    accepted: io::Result<(tokio::net::TcpStream, SocketAddr)>,
-    config: &TargetConfig,
-    senders: &Arc<Mutex<Option<PoolSenders>>>,
+fn handle_accept<T: Transport>(
+    accepted: io::Result<T::Raw>,
+    config: &Arc<TargetConfig>,
+    senders: &Arc<Mutex<Option<PoolSenders<T::Conn>>>>,
     io_cpus: &[Option<usize>],
     active: &Arc<AtomicUsize>,
     registry: &Arc<Registry>,
     port: &Arc<PortConfig<AnyBackend>>,
 ) {
-    let (stream, peer) = match accepted {
-        Ok(pair) => pair,
+    let raw = match accepted {
+        Ok(raw) => raw,
         Err(err) => {
             warn!("accept failed: {err}");
             return;
         }
     };
     // Bring the pool up if it is down (first connect or post-teardown).
-    ensure_pool_up(senders, io_cpus);
+    ensure_pool_up::<T>(senders, io_cpus);
     // Clone the live senders for routing, then drop the lock before the
     // async setup task (never hold the mutex across an await).
     let (admin_tx, io_txs) = match senders.lock().expect("pool senders mutex").as_ref() {
         Some(pool) => (pool.admin.clone(), pool.io.clone()),
         None => {
-            warn!(%peer, "queue-thread pool unavailable; dropping connection");
+            warn!("queue-thread pool unavailable; dropping connection");
             return;
         }
     };
     let count = active.fetch_add(1, Ordering::Relaxed) + 1;
     if count > MAX_CONNECTIONS {
         active.fetch_sub(1, Ordering::Relaxed);
-        warn!(%peer, "connection limit {MAX_CONNECTIONS} reached; rejecting");
-        return; // stream drops here, closing the connection
+        warn!("connection limit {MAX_CONNECTIONS} reached; rejecting");
+        return; // raw drops here, closing the connection
     }
     let permit = ConnPermit::new(Arc::clone(active));
-    let allow_hdgst = config.allow_hdgst;
-    let allow_ddgst = config.allow_ddgst;
-    let send_zc = config.send_zc;
+    let config = Arc::clone(config);
     let registry = Arc::clone(registry);
     let port = Arc::clone(port);
     tokio::task::spawn_local(async move {
-        if let Err(err) = setup_connection(
-            stream,
-            allow_hdgst,
-            allow_ddgst,
-            send_zc,
-            &admin_tx,
-            &io_txs,
-            port,
-            registry,
-            permit,
-        )
-        .await
-        {
-            warn!(%peer, "connection setup failed: {err}");
+        match T::handshake(raw, config, port, registry, permit).await {
+            Ok((qid, conn)) => {
+                if qid == 0 {
+                    admin_tx.send(AdminMsg::Conn(conn));
+                } else if io_txs.is_empty() {
+                    warn!(qid, "no IO threads; dropping connection");
+                } else {
+                    io_txs[(usize::from(qid) - 1) % io_txs.len()].send(IoMsg::Conn(conn));
+                }
+            }
+            Err(err) => warn!("connection setup failed: {err}"),
         }
     });
 }
 
-async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<SocketAddr>>) {
+/// The control thread's main loop, generic over the fabric transport `T`:
+/// bind, build the served port, serve the control API, then accept
+/// connections (routing each to a queue thread) and run idle teardown.
+async fn control_loop<T: Transport>(
+    config: TargetConfig,
+    addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
+) {
     let registry = Registry::new();
 
     // The queue-thread pool is spawned lazily on the first connection and
@@ -781,7 +807,7 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     // post-teardown) → control-socket stats reply with a zeroed snapshot
     // and namespace-change nudges no-op (no live controllers). Control-
     // plane only — never locked on the IO path, never held across an await.
-    let senders: Arc<Mutex<Option<PoolSenders>>> = Arc::new(Mutex::new(None));
+    let senders: Arc<Mutex<Option<PoolSenders<T::Conn>>>> = Arc::new(Mutex::new(None));
     // Per-IO-thread CPU assignment is fixed for the process (topology is
     // stable), so compute it once and reuse it for every (re)spawn. `io_cpus`
     // is the pinned (active) CPU per thread; `io_groups` is each thread's full
@@ -798,17 +824,14 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     // Bind before building the port so the model carries the actual bound
     // address (ephemeral ports resolve to the real one). On any setup
     // failure, report it back through `addr_tx` and stop.
-    let listener = match tokio::net::TcpListener::bind(config.listen).await {
-        Ok(listener) => listener,
+    let (listener, local) = match T::bind(&config).await {
+        Ok(bound) => bound,
         Err(err) => {
             let _ = addr_tx.send(Err(err));
             return;
         }
     };
-    let local = listener
-        .local_addr()
-        .expect("bound listener has an address");
-    let port = match build_port(&config, local) {
+    let port = match build_port(&config, local, T::trtype()) {
         Ok(port) => port,
         Err(err) => {
             let _ = addr_tx.send(Err(err));
@@ -832,18 +855,20 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
     let _ = addr_tx.send(Ok(local));
     info!(%local, "ioutgt listening");
 
+    // Config is shared into each per-connection handshake task.
+    let config = Arc::new(config);
     // Bounds total preallocated queue memory across all queue threads.
     let active = Arc::new(AtomicUsize::new(0));
     let mut idle = IdleTeardown::new(config.idle_teardown);
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                // An accepted socket is activity — restart the idle clock.
+            accepted = T::accept(&listener) => {
+                // An accepted connection is activity — restart the idle clock.
                 // An accept *error* is not (and must not defer teardown).
                 if accepted.is_ok() {
                     idle.reset();
                 }
-                accept_connection(accepted, &config, &senders, &io_cpus, &active, &registry, &port);
+                handle_accept::<T>(accepted, &config, &senders, &io_cpus, &active, &registry, &port);
             }
             _ = idle.tick() => idle.maybe_teardown(&senders, &active),
         }
@@ -854,76 +879,12 @@ async fn control_loop(config: TargetConfig, addr_tx: mpsc::Sender<io::Result<Soc
 /// (qid > 0) are bounded by the configured MAXCMD (`io_queue_size`); the
 /// admin queue (qid 0), host-fixed at `NVME_AQ_DEPTH`, keeps the CAP.MQES
 /// guard so it is never rejected when `io_queue_size` is set small.
-fn sqsize_cap(qid: u16, io_queue_size: u16) -> u16 {
+pub(crate) fn sqsize_cap(qid: u16, io_queue_size: u16) -> u16 {
     if qid == 0 {
         ioutgt_core::MAX_QUEUE_ENTRIES
     } else {
         io_queue_size
     }
-}
-
-/// ICReq/ICResp + first Connect capsule, then hand the socket to the
-/// queue thread selected by qid.
-#[allow(clippy::too_many_arguments)]
-async fn setup_connection(
-    mut stream: tokio::net::TcpStream,
-    allow_hdgst: bool,
-    allow_ddgst: bool,
-    send_zc: bool,
-    admin_tx: &MailboxSender<AdminMsg>,
-    io_txs: &[MailboxSender<IoMsg>],
-    port: Arc<PortConfig<AnyBackend>>,
-    registry: Arc<Registry>,
-    permit: ConnPermit,
-) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    let negotiated = accept_handshake(
-        &mut stream,
-        allow_hdgst,
-        allow_ddgst,
-        ioutgt_nvme_tcp::MAX_H2C_DATA,
-    )
-    .await?;
-    let first = read_connect(&mut stream, negotiated).await?;
-    let connect = first.connect();
-    let qid = connect.qid.get();
-    let entries = connect.sqsize.get() as u32 + 1;
-    // Enforce the advertised queue-size limit: each slot preallocates a
-    // data buffer, so an oversized queue is a memory-amplification vector
-    // a hostile host could exploit by ignoring the advertised ceiling.
-    let cap = sqsize_cap(qid, port.io_queue_size);
-    if !(2..=u32::from(cap)).contains(&entries) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sqsize out of range",
-        ));
-    }
-    let sqhd_disabled = connect.cattr & CONNECT_DISABLE_SQFLOW != 0;
-
-    let std_stream = stream.into_std()?;
-    let conn = Conn {
-        fd: OwnedFd::from(std_stream),
-        hdr_digest: negotiated.hdr_digest,
-        data_digest: negotiated.data_digest,
-        qid,
-        #[allow(clippy::cast_possible_truncation)]
-        sqsize: entries as u16,
-        sqhd_disabled,
-        send_zc,
-        connect_sqe: first.sqe,
-        connect_data: first.data,
-        port,
-        registry,
-        permit,
-    };
-    if qid == 0 {
-        admin_tx.send(AdminMsg::Conn(conn));
-    } else if io_txs.is_empty() {
-        return Err(io::Error::other("no IO threads"));
-    } else {
-        io_txs[(usize::from(qid) - 1) % io_txs.len()].send(IoMsg::Conn(conn));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
