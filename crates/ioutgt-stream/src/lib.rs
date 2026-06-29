@@ -191,6 +191,14 @@ pub struct StreamSender {
     zc_min_avg: usize,
 }
 
+/// Cap on a ZC-bound batch's gathered payload: stop staging once a large-IO
+/// batch holds this much, so one SENDMSG_ZC pins/maps a bounded page set
+/// (256 × 4 KiB) instead of the whole sqsize worth — keeps per-send memlock
+/// pressure and first-byte latency bounded, and no single connection's batch
+/// monopolizes the pin budget. Only applies to ZC-bound batches (avg ≥
+/// `zc_min_avg`); small-payload (copy) batches gather freely.
+const ZC_GATHER_CAP: usize = 1024 * 1024;
+
 impl StreamSender {
     /// A sender for a queue of `sqsize` slots. `arena_per_item` /
     /// `iovs_per_item` are the transport's worst-case per-item sizings
@@ -314,7 +322,10 @@ impl StreamSender {
             let zc_min = self.zc_min_avg;
             let idx = self.acquire(slots).await;
             let batch = &mut self.batches[idx];
-            carry = stage_batch(batch, first, work, stage);
+            // Only a ZC-bound batch needs the gather cap (it bounds pinned
+            // pages); a copy batch (send_zc off, or small avg) gathers freely.
+            let cap = send_zc.then_some(zc_min);
+            carry = stage_batch(batch, first, work, stage, cap);
             // Whole-batch copy/ZC choice: the gather is one sendmsg, so the
             // decision is per batch. Average per-item payload is the right
             // signal — a homogeneous workload's batch is all-4k or all-128k,
@@ -462,6 +473,7 @@ fn stage_batch<W, F>(
     first: W,
     work: &SendList<W>,
     stage: &mut F,
+    cap: Option<usize>,
 ) -> Option<W>
 where
     F: FnMut(&mut GatherBatch, &W) -> Staged,
@@ -475,6 +487,17 @@ where
             Staged::NoRelease => {}
             Staged::AtCqe(tag) => batch.tags_at_cqe.push(tag),
             Staged::AtNotif(tag) => batch.tags_at_notif.push(tag),
+        }
+        // Cap a ZC-bound (large-payload) batch's gathered payload so one
+        // SENDMSG_ZC pins a bounded page set. `cap` is `Some(zc_min)` only
+        // when this send will be ZC; a copy batch passes `None` and gathers
+        // freely (no pinning to bound). The first item always stages, so a
+        // lone >cap PDU still makes progress; the rest is picked up next round.
+        if let Some(zc_min) = cap
+            && batch.gather.avg_payload() >= zc_min
+            && batch.gather.payload_bytes() >= ZC_GATHER_CAP
+        {
+            return None;
         }
         item = work.try_next();
     }
@@ -615,7 +638,7 @@ mod tests {
         work.push(TestWork::Solicit);
         let mut batch = GatherSendBatch::new(4, 8, 4);
 
-        let carry = stage_batch(&mut batch, TestWork::Payload(1), &work, &mut stage);
+        let carry = stage_batch(&mut batch, TestWork::Payload(1), &work, &mut stage, None);
 
         assert!(carry.is_none());
         assert_eq!(batch.tags_at_notif, vec![1]);

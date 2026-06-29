@@ -111,6 +111,14 @@ impl GatherBatch {
         self.payload_items += 1;
     }
 
+    /// Total payload (non-header) bytes staged this round. Drives the ZC
+    /// gather cap: stop gathering a large-payload batch once it holds this
+    /// much, bounding the pages a single SENDMSG_ZC pins/maps.
+    #[inline]
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
     /// Average per-item payload bytes this round, or 0 when no item carried
     /// payload (e.g. a batch of R2Ts or capsule-only responses). The
     /// copy-vs-ZC discriminator: small average ⇒ copy beats ZC.
