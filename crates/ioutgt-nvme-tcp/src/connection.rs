@@ -1119,6 +1119,9 @@ fn stage_send_work(
                     gather.push_raw(seg.ptr.cast_const(), take);
                     remaining -= take;
                 }
+                // Account this item's payload so the sender can pick copy vs
+                // ZC for the whole batch by average per-item size.
+                gather.note_payload(data_len);
                 if data_digest {
                     let mut crc = digest::Crc32c::new();
                     slot_data.for_each_seg(0, data_len, |c| crc.update(c));

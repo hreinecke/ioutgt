@@ -182,6 +182,13 @@ pub struct StreamSender {
     /// the send path falls back to plain `SENDMSG_ZC` for the connection's
     /// life — a self-correcting probe, no startup cost.
     vec_fixed_ok: bool,
+    /// Minimum average per-item payload (bytes) for a batch to ship
+    /// zero-copy; below it the whole batch copies. ZC's per-send page-pin +
+    /// IOMMU map costs more than copying a small payload, so small-IO
+    /// batches are faster copied even with `--send-zc` on. 0 ⇒ always ZC
+    /// (when `send_zc`), matching the pre-gate behavior. Tunable via
+    /// `IOUTGT_ZC_MIN_BYTES` for crossover sweeps.
+    zc_min_avg: usize,
 }
 
 impl StreamSender {
@@ -235,6 +242,10 @@ impl StreamSender {
             zc_copied: 0,
             zc_fallbacks: 0,
             vec_fixed_ok: pool_arena.is_some(),
+            zc_min_avg: std::env::var("IOUTGT_ZC_MIN_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(12288),
         }
     }
 
@@ -300,10 +311,16 @@ impl StreamSender {
                     None => return Ok(()), // close(): teardown
                 },
             };
+            let zc_min = self.zc_min_avg;
             let idx = self.acquire(slots).await;
             let batch = &mut self.batches[idx];
             carry = stage_batch(batch, first, work, stage);
-            let use_zc = send_zc;
+            // Whole-batch copy/ZC choice: the gather is one sendmsg, so the
+            // decision is per batch. Average per-item payload is the right
+            // signal — a homogeneous workload's batch is all-4k or all-128k,
+            // and ZC only pays off once the per-item payload outweighs its
+            // page-pin + IOMMU-map cost.
+            let use_zc = send_zc && batch.gather.avg_payload() >= zc_min;
             ship_batch(
                 fd,
                 batch,
@@ -470,11 +487,11 @@ where
 async fn ship_batch(
     fd: i32,
     batch: &mut GatherSendBatch,
-    send_zc: bool,
+    zc: bool,
     zc_fallbacks: &mut u64,
     vec_fixed_ok: &mut bool,
 ) -> std::io::Result<()> {
-    let mut use_zc = send_zc;
+    let mut use_zc = zc;
     loop {
         let n = if use_zc {
             // Vectored fixed-buffer ZC when the arena and payloads share one

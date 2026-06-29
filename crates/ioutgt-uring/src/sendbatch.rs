@@ -31,6 +31,13 @@ pub struct GatherBatch {
     /// First entry not yet fully sent (short-send resume point).
     live: usize,
     msghdr: Box<libc::msghdr>,
+    /// Total payload (non-header) bytes staged this round, and the number
+    /// of payload-bearing items they came from. Their ratio is the average
+    /// per-item payload — the signal a caller uses to choose copy vs
+    /// zero-copy for the whole batch (small items: copy beats ZC's per-send
+    /// page-pin + IOMMU map). Headers (`push_arena`) are excluded.
+    payload_bytes: usize,
+    payload_items: usize,
 }
 
 impl GatherBatch {
@@ -82,6 +89,8 @@ impl GatherBatch {
             // SAFETY: a zeroed msghdr is a valid value; msg_iov[len]
             // are set in msghdr() before every submit.
             msghdr: Box::new(unsafe { std::mem::zeroed() }),
+            payload_bytes: 0,
+            payload_items: 0,
         }
     }
 
@@ -90,6 +99,27 @@ impl GatherBatch {
         self.arena_used = 0;
         self.iovs.clear();
         self.live = 0;
+        self.payload_bytes = 0;
+        self.payload_items = 0;
+    }
+
+    /// Record one payload-bearing item of `bytes` total payload (call once
+    /// per item, after its `push_raw` segments). Feeds [`Self::avg_payload`].
+    #[inline]
+    pub fn note_payload(&mut self, bytes: usize) {
+        self.payload_bytes += bytes;
+        self.payload_items += 1;
+    }
+
+    /// Average per-item payload bytes this round, or 0 when no item carried
+    /// payload (e.g. a batch of R2Ts or capsule-only responses). The
+    /// copy-vs-ZC discriminator: small average ⇒ copy beats ZC.
+    #[inline]
+    pub fn avg_payload(&self) -> usize {
+        if self.payload_items == 0 {
+            return 0;
+        }
+        self.payload_bytes / self.payload_items
     }
 
     /// Headroom for one more item of `arena_need` header bytes and
