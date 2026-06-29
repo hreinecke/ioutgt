@@ -30,6 +30,10 @@ impl Transport for TcpTransport {
         TransportType::Tcp
     }
 
+    fn peer(raw: &Self::Raw) -> String {
+        raw.1.to_string()
+    }
+
     async fn bind(cfg: &TargetConfig) -> io::Result<(Self::Listener, SocketAddr)> {
         let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
         let local = listener.local_addr()?;

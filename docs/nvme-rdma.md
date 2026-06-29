@@ -1,7 +1,7 @@
 # NVMe/RDMA transport (`ioutgt-nvme-rdma`)
 
-Status: **work in progress.** Sibling fabric to `ioutgt-nvme-tcp`, shipped as a
-standalone binary `ioutgt-nvme-rdma`. v1 target: discovery + connect + read/write
+Status: **work in progress** (the crate is currently lib-only). Sibling fabric to
+`ioutgt-nvme-tcp`, to ship as a standalone binary `ioutgt-nvme-rdma`. v1 target: discovery + connect + read/write
 over RC queue pairs, with the host's keyed SGL driving target-issued RDMA READ
 (write data) / RDMA WRITE (read data). Reuses the transport-neutral harness
 (`ioutgt-harness`) and the NVMe model / slot engine / backend (`ioutgt-core`,

@@ -21,8 +21,12 @@ use sideway::ibverbs::queue_pair::{
     GenericQueuePair, QueuePair, QueuePairAttribute, QueuePairState, SendOperationFlags,
 };
 
-fn oerr<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::other(e.to_string())
+// Render via `Debug`, not `Display`: most sideway errors are `thiserror`
+// structs whose `Display` is a fixed string with the real errno hidden in a
+// `#[error(transparent)]` source — `Debug` keeps the kind/errno chain, which is
+// what makes an RDMA bring-up failure (EINVAL/ENOMEM/EPERM) diagnosable.
+fn oerr<E: std::error::Error>(e: E) -> io::Error {
+    io::Error::other(format!("{e:?}"))
 }
 
 /// The RDMA devices the host exposes, by name. Empty when no provider is
@@ -44,8 +48,10 @@ pub struct RcDest {
     pub qp_num: u32,
     /// The peer's GID (RoCE global routing; required on rxe).
     pub gid: sideway::ibverbs::address::Gid,
-    /// The local source GID index used to reach the peer.
-    pub src_gid_index: u8,
+    /// The local source GID index used to reach the peer (verbs allows a wider
+    /// index than `u8`; narrowed at the `connect_rc` call with an error rather
+    /// than a silent substitution).
+    pub src_gid_index: u32,
 }
 
 /// An opened RDMA device plus its protection domain — the root from which the
@@ -163,14 +169,18 @@ impl Rdma {
         qp.modify(&init).map_err(oerr)?;
 
         // INIT → RTR
+        let src_gid_index = u8::try_from(dest.src_gid_index)
+            .map_err(|_| io::Error::other("src_gid_index exceeds u8"))?;
         let mut ah = AddressHandleAttribute::new();
         ah.setup_port(self.port)
             .setup_service_level(0)
             .setup_grh_dest_gid(&dest.gid)
-            .setup_grh_src_gid_index(dest.src_gid_index)
+            .setup_grh_src_gid_index(src_gid_index)
             .setup_grh_hop_limit(64);
         let mut rtr = QueuePairAttribute::new();
         rtr.setup_state(QueuePairState::ReadyToReceive)
+            // TODO(perf): query active_mtu; 1024 is safe for rxe but caps an
+            // mlx5 link (4096) — revisit when the CM path lands real peers.
             .setup_path_mtu(Mtu::Mtu1024)
             .setup_dest_qp_num(dest.qp_num)
             .setup_rq_psn(0)
@@ -210,6 +220,9 @@ mod tests {
 
     /// Busy-poll `cq` until a completion with `wr_id` arrives (bounded so a lost
     /// completion fails the test instead of hanging). Asserts success status.
+    /// Single-outstanding-WR only: it drops any completion whose `wr_id` does
+    /// not match, which is correct for this strictly-sequential test but must
+    /// not be reused once the real loops keep multiple WRs in flight.
     fn await_wc(cq: &GenericCompletionQueue, wr_id: u64) -> io::Result<()> {
         for _ in 0..50_000_000u64 {
             let Ok(poller) = cq.start_poll() else {
@@ -273,7 +286,7 @@ mod tests {
         let dest = RcDest {
             qp_num: qp.qp_number(),
             gid: gid.gid(),
-            src_gid_index: u8::try_from(gid.gid_index()).unwrap_or(0),
+            src_gid_index: gid.gid_index(),
         };
         rdma.connect_rc(&mut qp, &dest)?;
 

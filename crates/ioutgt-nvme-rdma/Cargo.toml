@@ -16,7 +16,7 @@ categories.workspace = true
 # register in io_uring. (ibverbs-sys vendors rdma-core via cmake/libnl;
 # rdma-sys pins a bindgen too old for modern rdma-core headers — both unusable
 # here, see docs/nvme-rdma.md.)
-sideway = "0.4"
+sideway = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 

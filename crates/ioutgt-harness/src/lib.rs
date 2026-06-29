@@ -55,6 +55,11 @@ pub trait Transport: 'static {
     /// `LIST_CONTROLLER`).
     fn trtype() -> TransportType;
 
+    /// A short, human-readable description of the connection's peer (the TCP
+    /// peer address, the RDMA source address), for accept-path diagnostics —
+    /// computed before the handshake consumes the raw connection.
+    fn peer(raw: &Self::Raw) -> String;
+
     /// Bind the listening endpoint; returns the listener and the actual bound
     /// address (an ephemeral port resolves to the real one).
     fn bind(cfg: &TargetConfig)
@@ -757,6 +762,7 @@ fn handle_accept<T: Transport>(
             return;
         }
     };
+    let peer = T::peer(&raw);
     // Bring the pool up if it is down (first connect or post-teardown).
     ensure_pool_up::<T>(senders, io_cpus);
     // Clone the live senders for routing, then drop the lock before the
@@ -764,14 +770,14 @@ fn handle_accept<T: Transport>(
     let (admin_tx, io_txs) = match senders.lock().expect("pool senders mutex").as_ref() {
         Some(pool) => (pool.admin.clone(), pool.io.clone()),
         None => {
-            warn!("queue-thread pool unavailable; dropping connection");
+            warn!(%peer, "queue-thread pool unavailable; dropping connection");
             return;
         }
     };
     let count = active.fetch_add(1, Ordering::Relaxed) + 1;
     if count > MAX_CONNECTIONS {
         active.fetch_sub(1, Ordering::Relaxed);
-        warn!("connection limit {MAX_CONNECTIONS} reached; rejecting");
+        warn!(%peer, "connection limit {MAX_CONNECTIONS} reached; rejecting");
         return; // raw drops here, closing the connection
     }
     let permit = ConnPermit::new(Arc::clone(active));
@@ -784,12 +790,12 @@ fn handle_accept<T: Transport>(
                 if qid == 0 {
                     admin_tx.send(AdminMsg::Conn(conn));
                 } else if io_txs.is_empty() {
-                    warn!(qid, "no IO threads; dropping connection");
+                    warn!(qid, %peer, "no IO threads; dropping connection");
                 } else {
                     io_txs[(usize::from(qid) - 1) % io_txs.len()].send(IoMsg::Conn(conn));
                 }
             }
-            Err(err) => warn!("connection setup failed: {err}"),
+            Err(err) => warn!(%peer, "connection setup failed: {err}"),
         }
     });
 }
