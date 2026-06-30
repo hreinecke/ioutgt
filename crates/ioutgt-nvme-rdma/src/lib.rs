@@ -7,6 +7,7 @@
 //! connection acceptance, the recv/send loops) and reuses everything else
 //! through [`ioutgt_harness`] and `ioutgt-core`.
 
+pub mod cmproto;
 pub mod cq;
 mod verbs;
 
