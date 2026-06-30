@@ -849,8 +849,14 @@ pub async fn run_conn(
         .map_err(oerr)?;
     qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
         .map_err(oerr)?;
-    qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
-        .map_err(oerr)?;
+    // librdmacm has already computed this QP's `max_rd_atomic` (the max
+    // write-data RDMA READs we can have outstanding) into the RTS attr as
+    // min(the request's initiator_depth, device `max_qp_init_rd_atom`). Capture
+    // it so the CM accept reply advertises the *same* value as the QP holds —
+    // see the `accept` call below.
+    let rts_attr = conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?;
+    let initiator_depth = rts_attr.max_read_atomic();
+    qp.modify(&rts_attr).map_err(oerr)?;
 
     let mut queue = RdmaQueue::new(
         conn.qid,
@@ -872,7 +878,15 @@ pub async fn run_conn(
         crqsize: sqsize - 1,
     }
     .to_bytes();
-    accept(&conn.id, qp_num, &rep, 1, 1)?;
+    // Mirror nvmet-rdma (drivers/nvme/target/rdma.c): the reply's
+    // initiator_depth must equal the QP's `max_rd_atomic` so the host sets its
+    // `max_dest_rd_atomic` to match and can service every concurrent write-data
+    // RDMA READ we initiate. The old hardcoded `1` capped the host at one
+    // outstanding read while the QP allowed the device max, so under write load
+    // (qd > 1) the host NAK'd the 2nd+ read → transport retry exhaustion → QP
+    // error → connection reset (reconnect storm). responder_resources is 0: an
+    // nvme-rdma host never issues RDMA reads against the target.
+    accept(&conn.id, qp_num, &rep, 0, initiator_depth)?;
 
     let peer = format!("rdma:qid{}", conn.qid);
     queue.run(conn.port, conn.registry, peer, conn.stop, on_ctx).await
