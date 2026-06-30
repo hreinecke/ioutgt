@@ -60,6 +60,13 @@ const WR_WRITE: u64 = 3 << 40;
 const WR_READ: u64 = 4 << 40;
 const WR_KIND_MASK: u64 = 0xff << 40;
 
+/// Reap-loop backstop interval: how long the queue may sit on the comp-channel
+/// event before it defensively re-arms + re-drains the CQ (recovering a rarely
+/// stranded completion). Well under the keep-alive timeout so a stranded
+/// completion can never starve the controller into a host-side reset; only
+/// fires when the queue is otherwise idle, so it costs nothing under load.
+const BACKSTOP: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// SGL descriptor type byte (dptr offset 15). High nibble `0x4` =
 /// `NVME_KEY_SGL_FMT_DATA_DESC` (keyed: host-resident, RDMA READ/WRITE); anything
 /// else here is an in-capsule data+offset descriptor (inline).
@@ -373,6 +380,35 @@ impl RdmaQueue {
         }
     }
 
+    /// Drain the CQ and dispatch each completion. Returns `Ok(true)` when a
+    /// flushed completion is seen (peer gone → stop the reap loop), `Ok(false)`
+    /// to keep going, `Err` on a fatal handler error. Reused by both the
+    /// event-driven reap and the periodic backstop in [`Self::run`].
+    fn process_cqes(
+        &mut self,
+        ctx: &Rc<ConnCtx<AnyBackend>>,
+        comps: &mut Vec<(u64, bool)>,
+    ) -> io::Result<bool> {
+        self.drain_into(comps);
+        // `comps` is a local buffer (disjoint from `self`), so iterating it while
+        // calling `&mut self` handlers is sound.
+        for &(id, ok) in comps.iter() {
+            if !ok {
+                // Flushed completion: the peer is gone.
+                return Ok(true);
+            }
+            match wr_kind(id) {
+                WR_RECV => self.handle_recv(ctx, wr_low(id))?,
+                // A write-data RDMA READ finished: the slot is filled, so submit
+                // it to wake its slot task.
+                WR_READ => self.submit_pending(wr_low(id) as u16),
+                WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// On a response WR (WRITE/SEND) completion, decrement the tag's in-flight
     /// count and release the slot once both its responses have completed.
     fn on_response_done(&mut self, tag: u32) {
@@ -653,36 +689,7 @@ impl RdmaQueue {
             let step: io::Result<bool> = tokio::select! {
                 res = crate::cq::wait(&self.channel, &self.cq) => match res {
                     Err(e) => Err(e),
-                    Ok(()) => {
-                        self.drain_into(&mut comps);
-                        let mut step = Ok(false);
-                        for &(id, ok) in &comps {
-                            if !ok {
-                                // Flushed completion: the peer is gone.
-                                step = Ok(true);
-                                break;
-                            }
-                            let r = match wr_kind(id) {
-                                WR_RECV => self.handle_recv(&ctx, wr_low(id)),
-                                // A write-data RDMA READ finished: the slot is
-                                // filled, so submit it to wake its slot task.
-                                WR_READ => {
-                                    self.submit_pending(wr_low(id) as u16);
-                                    Ok(())
-                                }
-                                WR_SEND | WR_WRITE => {
-                                    self.on_response_done(wr_low(id));
-                                    Ok(())
-                                }
-                                _ => Ok(()),
-                            };
-                            if let Err(e) = r {
-                                step = Err(e);
-                                break;
-                            }
-                        }
-                        step
-                    }
+                    Ok(()) => self.process_cqes(&ctx, &mut comps),
                 },
                 Some(resp) = responses.next() => {
                     let mut r = self.post_response(resp.tag, &resp.cmd, resp.outcome);
@@ -698,6 +705,25 @@ impl RdmaQueue {
                 // CM Disconnected for this connection (the QP isn't cm_id-bound,
                 // so this is the only prompt teardown signal).
                 () = stop.notified() => Ok(true),
+                // Backstop re-drain. The reap above sleeps on the comp-channel
+                // event (`cq::wait`'s `POLL_ADD`); userspace ibverbs has no
+                // `IB_CQ_REPORT_MISSED_EVENTS`, so a completion that races the
+                // re-arm can be left in the CQ with no event delivered, and the
+                // reactor's `PARK_SAFETY` only re-checks io_uring (not the RDMA
+                // CQ) — wedging the queue under sustained load. This timer fires
+                // ONLY when no completion/response woke us for `BACKSTOP`, then
+                // re-arms + drains so any stranded completion is recovered (the
+                // userspace analog of nvmet-rdma's missed-events re-poll). When
+                // the queue is busy it is re-created every iteration and never
+                // elapses, so steady-state cost is nil.
+                () = async {
+                    if let Ok(s) = ioutgt_uring::ops::sleep(BACKSTOP) {
+                        let _ = s.await;
+                    }
+                } => match crate::cq::arm(&self.cq) {
+                    Err(e) => Err(e),
+                    Ok(()) => self.process_cqes(&ctx, &mut comps),
+                },
             };
             match step {
                 Ok(false) => {}
