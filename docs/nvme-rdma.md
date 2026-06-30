@@ -124,22 +124,35 @@ lock-free. The reap loop `select!`s the CQ against the `SendList`, posting each
 finished response (read-data RDMA WRITE, then the CQE SEND). The per-tag
 `JoinSet` aborts every slot task when it drops at `run` exit.
 
+**Per-queue teardown.** Our QP is built manually + bound via `rdma_accept`'s
+`qp_num`, so it is *not* cm_id-associated — `rdma_disconnect` does not flush it,
+and a host disconnect produces no flushed completions on the queue thread. The
+prompt teardown signal is the CM **Disconnected** event (on the CM thread): its
+arm sends the DREP (`id.disconnect()`), prunes the connection's `ConnSlot` from
+`conns` (so `conns` stays bounded across reconnect churn — passes a reconnect
+soak), and fires the connection's `stop: Arc<Notify>`. The queue thread's reap
+loop `select!`s on `stop` (alongside the CQ and the response queue) and ends on
+it; then a teardown block resolves parked AERs (`ctx.close()`) and drains
+in-flight dispatches (`while executing() > 0`, bounded) before returning — so a
+backend op can't target the pool arena as it's freed.
+
+The stop signal is delivered with a bare `tokio::sync::Notify` from the CM thread
+into the queue thread, *not* through the queue thread's io_uring mailbox. It is
+never lost (the wake is latched), but on a fully idle queue it is only observed
+at the reactor's park backstop (~1s), so teardown can lag up to ~1s. This is a
+second cross-thread wake channel (the harness's mailbox-only invariant covers the
+data path); routing the stop through the mailbox doorbell would make it prompt.
+
 **Known v1 divergences (deferred):**
-- *Teardown drops a slot task mid-dispatch.* When `run()` exits (peer gone), the
-  per-tag `JoinSet` aborts the slot tasks, one of which may be parked inside
-  `dispatch::execute` with a backend op in flight into the pool arena. This relies
-  on the reactor's slab-owns-resources invariant (the orphaned op's slab entry,
-  not the future, keeps its buffer alive until the terminal CQE — the
-  `drop_stress.rs` guarantee); the memory backend used by v1 issues no such op, so
-  it is not yet exercised. Confirm before enabling the file backend over RDMA.
+- *`conns` is pruned only on a graceful `Disconnected`.* An abrupt host loss that
+  surfaces as `TimewaitExit`/`DeviceRemoval`/a CM error leaves the listener's
+  `ConnSlot` in `conns` (the *queue* still tears down via its own stop/flush, so
+  this is listener-side slot accumulation only). The reconnect soak exercises
+  graceful reconnects; a periodic weak-ref sweep would bound the abrupt case.
 - *`write_read_data` does not validate `data_len` against the host's keyed-SGL
   length.* An undersized host SGL surfaces as an RDMA remote-access-error
   completion (→ queue teardown) rather than a clean NVMe `DATA_XFER_ERROR`. RDMA
   protection prevents any local memory-safety issue.
-- *cm_id leak on the CM thread.* `RdmaListener.conns` retains every accepted
-  cm_id for the process lifetime (best-effort teardown), so reconnect churn leaks
-  cm_ids/CM state — it would fail a reconnect-soak gate (`IOUTGT_SOAK_ONLY`). A
-  weak-ref sweep on each `accept()` would bound it.
 - *Over `MAX_CONNECTIONS`, the host times out instead of being rejected.* The
   harness drops the over-limit `RdmaRaw`; for RDMA that means `rdma_accept` is
   simply never called (no `rdma_reject`), so the host times out rather than

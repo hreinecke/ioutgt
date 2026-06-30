@@ -99,5 +99,26 @@ if command -v fio >/dev/null; then
 	    | grep -iE "err=|verify|IO error" | head || fail "fio verify"
 fi
 
+# Reconnect churn: exercises the CM Disconnected path (cm_id prune) and the
+# per-queue teardown drain. Each cycle disconnects all controllers, so the
+# target sees Disconnected for the admin + IO queues, then reconnects.
+echo "[rdma] === reconnect soak (8x) ==="
+nvme disconnect -n "$NQN" >/dev/null 2>&1 || true
+udevadm settle 2>/dev/null || sleep 1
+for i in $(seq 1 8); do
+	nvme connect -t rdma -a "$IP" -s "$PORT" -n "$NQN" 2>&1 || fail "reconnect $i"
+	nvme disconnect -n "$NQN" >/dev/null 2>&1 || true
+done
+udevadm settle 2>/dev/null || sleep 1
+# Final connect must still work + read after the churn.
+before2=$(ls /dev/nvme*n* 2>/dev/null | sort)
+nvme connect -t rdma -a "$IP" -s "$PORT" -n "$NQN" 2>&1 || fail "post-soak connect"
+udevadm settle 2>/dev/null || sleep 1
+after2=$(ls /dev/nvme*n* 2>/dev/null | sort)
+NS2=$(comm -13 <(echo "$before2") <(echo "$after2") | head -1)
+[ -n "${NS2:-}" ] || fail "post-soak no namespace appeared"
+dd if="$NS2" of=/dev/null bs=4096 count=64 iflag=direct 2>&1 || fail "post-soak read"
+echo "[rdma] reconnect soak OK"
+
 echo "[rdma] RESULT: PASS"
 exit 0

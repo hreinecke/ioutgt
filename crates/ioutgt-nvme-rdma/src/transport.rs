@@ -121,6 +121,7 @@ impl Transport for RdmaTransport {
                 port,
                 registry,
                 permit: Some(permit),
+                stop: raw.stop,
             },
         ))
     }

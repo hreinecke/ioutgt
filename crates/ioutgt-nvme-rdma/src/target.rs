@@ -37,6 +37,7 @@ use sideway::ibverbs::queue_pair::{
     SetScatterGatherEntry, WorkRequestFlags,
 };
 use sideway::rdmacm::communication_manager::{EventType, Identifier};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -615,6 +616,7 @@ impl RdmaQueue {
         port: Arc<PortConfig<AnyBackend>>,
         registry: Arc<Registry>,
         peer: String,
+        stop: Arc<Notify>,
         on_ctx: impl FnOnce(&Rc<ConnCtx<AnyBackend>>),
     ) -> io::Result<()> {
         let ctx = self.bootstrap(&port, &registry, &peer).await?;
@@ -644,41 +646,101 @@ impl RdmaQueue {
         let responses = Rc::clone(&self.responses);
         // Reused across iterations: the steady IO path allocates nothing.
         let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
-        loop {
-            tokio::select! {
-                res = crate::cq::wait(&self.channel, &self.cq) => {
-                    res?;
-                    self.drain_into(&mut comps);
-                    for &(id, ok) in &comps {
-                        if !ok {
-                            tracing::warn!(
-                                qid = self.nvme.qid,
-                                kind = wr_kind(id) >> 40,
-                                low = wr_low(id),
-                                "nvme-rdma: completion error, closing queue"
-                            );
-                            ctx.close();
-                            return Ok(()); // flushed completion: peer gone
+        // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
+        // or a fatal error; then drain and tear down. Each select arm yields
+        // Ok(false) to keep going, Ok(true) to stop, or Err for a fatal error.
+        let result: io::Result<()> = loop {
+            let step: io::Result<bool> = tokio::select! {
+                res = crate::cq::wait(&self.channel, &self.cq) => match res {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        self.drain_into(&mut comps);
+                        let mut step = Ok(false);
+                        for &(id, ok) in &comps {
+                            if !ok {
+                                // Flushed completion: the peer is gone.
+                                step = Ok(true);
+                                break;
+                            }
+                            let r = match wr_kind(id) {
+                                WR_RECV => self.handle_recv(&ctx, wr_low(id)),
+                                // A write-data RDMA READ finished: the slot is
+                                // filled, so submit it to wake its slot task.
+                                WR_READ => {
+                                    self.submit_pending(wr_low(id) as u16);
+                                    Ok(())
+                                }
+                                WR_SEND | WR_WRITE => {
+                                    self.on_response_done(wr_low(id));
+                                    Ok(())
+                                }
+                                _ => Ok(()),
+                            };
+                            if let Err(e) = r {
+                                step = Err(e);
+                                break;
+                            }
                         }
-                        match wr_kind(id) {
-                            WR_RECV => self.handle_recv(&ctx, wr_low(id))?,
-                            // A write-data RDMA READ finished: the slot is filled,
-                            // so submit it to wake its slot task.
-                            WR_READ => self.submit_pending(wr_low(id) as u16),
-                            WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
-                            _ => {}
-                        }
+                        step
                     }
-                }
+                },
                 Some(resp) = responses.next() => {
-                    self.post_response(resp.tag, &resp.cmd, resp.outcome)?;
+                    let mut r = self.post_response(resp.tag, &resp.cmd, resp.outcome);
                     // Drain any siblings queued in the same wake without re-parking.
-                    while let Some(r) = responses.try_next() {
-                        self.post_response(r.tag, &r.cmd, r.outcome)?;
+                    while r.is_ok() {
+                        match responses.try_next() {
+                            Some(rr) => r = self.post_response(rr.tag, &rr.cmd, rr.outcome),
+                            None => break,
+                        }
                     }
+                    r.map(|()| false)
                 }
+                // CM Disconnected for this connection (the QP isn't cm_id-bound,
+                // so this is the only prompt teardown signal).
+                () = stop.notified() => Ok(true),
+            };
+            match step {
+                Ok(false) => {}
+                Ok(true) => break Ok(()),
+                Err(e) => break Err(e),
             }
+        };
+
+        // Teardown: resolve parked AERs, then drain in-flight dispatches before
+        // returning (returning drops `self` → the QP and the pool arena). A slot
+        // task mid-dispatch may have a backend op in flight into the arena; the
+        // in-flight RDMA WRs are handled by the QP destroy + Drop's CQ drain.
+        // `ctx.close()` lets executing() reach 0. Bounded; the memory backend
+        // dispatches synchronously, so this is ~instant there.
+        tracing::debug!(qid = self.nvme.qid, "nvme-rdma: queue teardown");
+        ctx.close();
+        let mut waited = 0u32;
+        while self.nvme.slots.executing() > 0 && waited < 10_000 {
+            match ioutgt_uring::ops::sleep(std::time::Duration::from_millis(2)) {
+                Ok(s) => {
+                    let _ = s.await;
+                }
+                Err(_) => break,
+            }
+            waited += 2;
         }
+        if self.nvme.slots.executing() > 0 {
+            // A wedged backend op (file backend) still references the pool arena.
+            // Returning would drop `self` (dereg the MRs, free the arena) and the
+            // slot tasks while the kernel may still write into the arena — a UAF.
+            // Leak both instead, keeping the arena + the op's buffer alive for the
+            // process's remaining lifetime (mirrors the TCP teardown). v1's memory
+            // backend dispatches synchronously, so this is never reached.
+            tracing::warn!(
+                qid = self.nvme.qid,
+                executing = self.nvme.slots.executing(),
+                "nvme-rdma: teardown drain timed out; leaking queue + tasks"
+            );
+            std::mem::forget(slot_tasks);
+            std::mem::forget(self);
+            return result;
+        }
+        result
     }
 }
 
@@ -751,6 +813,11 @@ pub struct RdmaConn {
     /// connection's lifetime and dropped when its queue ends, so the active
     /// count + idle-teardown track it. `None` on the bare `serve()` path.
     pub permit: Option<ioutgt_core::permit::ConnPermit>,
+    /// Fired by the CM listener on this connection's `Disconnected` event; the
+    /// reap loop ([`RdmaQueue::run`]) selects on it and ends the queue (our
+    /// manually-built QP isn't cm_id-associated, so `rdma_disconnect` doesn't
+    /// flush it — this is how a graceful host disconnect tears the queue down).
+    pub stop: Arc<Notify>,
 }
 
 /// Build the queue for an accepted [`RdmaConn`] and drive it to completion: build
@@ -808,7 +875,7 @@ pub async fn run_conn(
     accept(&conn.id, qp_num, &rep, 1, 1)?;
 
     let peer = format!("rdma:qid{}", conn.qid);
-    queue.run(conn.port, conn.registry, peer, on_ctx).await
+    queue.run(conn.port, conn.registry, peer, conn.stop, on_ctx).await
 }
 
 /// A freshly accepted connection request, pre-QP-build: the cm_id plus the
@@ -822,6 +889,16 @@ pub struct RdmaRaw {
     pub qid: u16,
     /// Host SQ size, 0-based.
     pub hsqsize: u16,
+    /// Fired by the listener when this connection's `Disconnected` arrives; the
+    /// queue's reap loop ends on it (see [`RdmaConn::stop`]).
+    pub stop: Arc<Notify>,
+}
+
+/// A live accepted connection the listener tracks: its cm_id (kept alive +
+/// matched against later CM events) and the stop signal to end its queue.
+struct ConnSlot {
+    id: Arc<Identifier>,
+    stop: Arc<Notify>,
 }
 
 /// The NVMe/RDMA listener: a bound CM event channel that yields one accepted
@@ -833,8 +910,9 @@ pub struct RdmaListener {
     ch: CmChannel,
     /// The listening cm_id — kept alive for the channel's lifetime.
     _listen_id: Arc<Identifier>,
-    /// Accepted cm_ids, held for the process lifetime (best-effort teardown).
-    conns: Vec<Arc<Identifier>>,
+    /// Live accepted connections; entries are pruned on `Disconnected` (which
+    /// also fires the connection's stop signal), bounding this across reconnects.
+    conns: Vec<ConnSlot>,
 }
 
 impl RdmaListener {
@@ -887,12 +965,17 @@ impl RdmaListener {
                             event.ack().map_err(oerr)?;
                             continue;
                         };
-                        self.conns.push(Arc::clone(&id));
+                        let stop = Arc::new(Notify::new());
+                        self.conns.push(ConnSlot {
+                            id: Arc::clone(&id),
+                            stop: Arc::clone(&stop),
+                        });
                         event.ack().map_err(oerr)?;
                         return Ok(RdmaRaw {
                             id,
                             qid: req.qid,
                             hsqsize: req.hsqsize,
+                            stop,
                         });
                     }
                     Err(e) => {
@@ -904,6 +987,24 @@ impl RdmaListener {
                     }
                 },
                 EventType::Established => event.ack().map_err(oerr)?,
+                // The host tore the connection down: drop our keep-alive cm_id
+                // clone so it isn't retained for the process lifetime (bounds
+                // `conns` across reconnect churn — a reconnect-soak leak fix). The
+                // queue's own clone (in its RdmaConn) drops when its reap loop ends
+                // on the flushed completions, so the cm_id is destroyed then.
+                EventType::Disconnected => {
+                    if let Some(id) = event.cm_id() {
+                        // Send the DREP, then fire this connection's stop signal so
+                        // its reap loop ends (our manually-built QP isn't
+                        // cm_id-associated, so rdma_disconnect doesn't flush it),
+                        // and drop the slot — bounding `conns` across reconnects.
+                        let _ = id.disconnect();
+                        if let Some(pos) = self.conns.iter().position(|c| Arc::ptr_eq(&c.id, &id)) {
+                            self.conns.swap_remove(pos).stop.notify_one();
+                        }
+                    }
+                    event.ack().map_err(oerr)?;
+                }
                 other => {
                     tracing::debug!("nvme-rdma CM event {other:?}");
                     event.ack().map_err(oerr)?;
@@ -937,6 +1038,7 @@ pub async fn serve(
             port: Arc::clone(&port),
             registry: Arc::clone(&registry),
             permit: None,
+            stop: raw.stop,
         };
         tokio::task::spawn_local(async move {
             // A failure inside run_conn (QP build / accept / run) only logs — the
