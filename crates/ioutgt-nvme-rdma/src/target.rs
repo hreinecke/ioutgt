@@ -779,6 +779,7 @@ impl RdmaQueue {
 fn build_conn_resources(
     ctx: &Arc<DeviceContext>,
     sqsize: u16,
+    qid: u16,
 ) -> io::Result<(
     Arc<ProtectionDomain>,
     Arc<CompletionChannel>,
@@ -788,9 +789,23 @@ fn build_conn_resources(
     let channel = ctx.create_comp_channel().map_err(oerr)?;
     channel.set_nonblocking(true)?;
     let depth = u32::from(sqsize) * 3 + 16;
-    let mut cqb = ctx.create_cq_builder();
-    cqb.setup_cqe(depth).setup_comp_channel(&channel, 0);
-    let cq = GenericCompletionQueue::from(cqb.build_ex().map_err(oerr)?);
+    // Spread queues across completion vectors (admin on 0, IO queues on 1, 2,
+    // …) like nvmet-rdma (`comp_vector = idx % num_comp_vectors`). Sharing one
+    // vector funnels every queue's CQ interrupts through a single MSI-X
+    // EQ/CPU, so under sustained IO load the admin queue's keep-alive event is
+    // starved behind the IO completions and the host times the controller out.
+    // Devices with few vectors (rxe has one) reject a high index, so fall back
+    // to vector 0.
+    let make_cq = |vector: u32| {
+        let mut cqb = ctx.create_cq_builder();
+        cqb.setup_cqe(depth).setup_comp_channel(&channel, vector);
+        cqb.build_ex()
+    };
+    let cq_ex = match make_cq(u32::from(qid)) {
+        Ok(cq) => cq,
+        Err(_) => make_cq(0).map_err(oerr)?,
+    };
+    let cq = GenericCompletionQueue::from(cq_ex);
 
     let pd = ctx.alloc_pd().map_err(oerr)?;
     let mut b = pd.create_qp_builder();
@@ -870,7 +885,7 @@ pub async fn run_conn(
         u32::from(conn.port.io_queue_size).max(1)
     };
     let sqsize = u16::try_from((u32::from(conn.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
-    let (pd, channel, cq, mut qp) = build_conn_resources(&dev, sqsize)?;
+    let (pd, channel, cq, mut qp) = build_conn_resources(&dev, sqsize, conn.qid)?;
     qp.modify(&conn.id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
         .map_err(oerr)?;
     qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
