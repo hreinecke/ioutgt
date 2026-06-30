@@ -21,6 +21,7 @@ use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Outcome, Role};
 use ioutgt_core::pool::MAX_SEGS;
 use ioutgt_core::queue::QueueCore;
+use ioutgt_core::slotq::SendList;
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::spec::{Cqe, Sqe, io_opcode};
@@ -104,6 +105,14 @@ fn parse_keyed_sgl(sqe: &Sqe) -> KeyedSgl {
     KeyedSgl { addr, len, rkey }
 }
 
+/// A finished command's response, handed from a slot task (or the reap loop's
+/// validation-failure path) to the reap loop, which owns the QP and posts it.
+struct RdmaResp {
+    tag: u16,
+    cmd: Sqe,
+    outcome: Outcome,
+}
+
 /// One RC connection's RDMA resources + the NVMe slot engine. Owns the receive
 /// capsule buffers and a send/response staging buffer, all registered as MRs.
 ///
@@ -135,6 +144,12 @@ pub struct RdmaQueue {
     nslots: u32,
     /// Outstanding response WRs (WRITE + SEND) per tag; release the tag at 0.
     inflight: Vec<u8>,
+    /// Finished responses, pushed by the per-tag slot tasks (and the reap loop's
+    /// validation-failure path) and drained + posted by the reap loop.
+    responses: Rc<SendList<RdmaResp>>,
+    /// For a deferred write command: the SQE stashed at RECV, submitted to its
+    /// slot only once its host write-data RDMA READ (`WR_READ`) completes.
+    pending_read: Vec<Sqe>,
 }
 
 impl Drop for RdmaQueue {
@@ -210,6 +225,8 @@ impl RdmaQueue {
             cdata_mr,
             nslots,
             inflight: vec![0u8; sqsize as usize],
+            responses: Rc::new(SendList::new(sqsize)),
+            pending_read: vec![Sqe::zeroed(); sqsize as usize],
         })
     }
 
@@ -248,6 +265,12 @@ impl RdmaQueue {
     /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
     /// (the fabrics Connect data, which on the admin queue is host-resident, not
     /// in-capsule). Completes with a `WR_READ` work completion.
+    ///
+    /// This shares the `wr(WR_READ, _)` encoding with the write-data path's
+    /// per-tag READs, with `0` in the low bits — but it is bootstrap-only and is
+    /// awaited to completion in [`Self::await_read`] *before* the steady reap loop
+    /// (and thus the `WR_READ => submit_pending` arm) exists, so the two never
+    /// coexist and the shared low value is unambiguous.
     fn post_read_cdata(&mut self, src: &KeyedSgl, len: usize) -> io::Result<()> {
         let lkey = self.cdata_mr.lkey();
         let addr = self.cdata_buf.as_ptr() as u64;
@@ -401,19 +424,13 @@ impl RdmaQueue {
         }
     }
 
-    /// Take a command capsule at buffer `idx`, re-arm its RECV, and claim a slot.
-    /// A host-to-controller-data command (IO write / DSM) first RDMA-READs the
-    /// host's keyed-SGL buffer into a leased slot buffer; its dispatch task is
-    /// spawned when that READ completes (see [`Self::spawn_dispatch`] on
-    /// `WR_READ`). Everything else dispatches immediately. Either way, dispatch
-    /// runs in its own task — a parked Async Event Request never completes, so
-    /// inline dispatch would stall the whole queue on it.
-    fn spawn_command(
-        &mut self,
-        ctx: &Rc<ConnCtx<AnyBackend>>,
-        tasks: &mut JoinSet<(u16, Sqe, Outcome)>,
-        idx: u32,
-    ) -> io::Result<()> {
+    /// Take a command capsule at buffer `idx`, re-arm its RECV, claim a slot, and
+    /// route it. A host-to-controller-data command (IO write / DSM) leases a pool
+    /// buffer and RDMA-READs the host's keyed-SGL data into it; the slot is
+    /// submitted — waking its slot task to dispatch — only when that READ
+    /// completes (`WR_READ` → [`Self::submit_pending`]). Everything else submits
+    /// at once. Commands the transport cannot satisfy are failed without dispatch.
+    fn handle_recv(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>, idx: u32) -> io::Result<()> {
         let sqe = Sqe::read_from_bytes(&self.recv_slice(idx)[..SQE_LEN])
             .map_err(|_| io::Error::other("short command capsule"))?;
         // The capsule buffer is free once the SQE is parsed — re-arm it.
@@ -421,89 +438,64 @@ impl RdmaQueue {
         let Some(tag) = self.nvme.claim_tag() else {
             return Err(io::Error::other("no free tag for command"));
         };
-        self.nvme.submit(tag, sqe);
 
-        if host_data_in(&ctx.role, sqe.opcode) {
-            // RDMA v1 advertises no in-capsule data (ioccsz=4), so a conformant
-            // host always sends a keyed SGL here. Reject anything else cleanly
-            // rather than misparse an in-capsule descriptor into a bogus rkey
-            // (which would fail the RDMA READ and tear the queue down).
-            if sqe.as_bytes()[SGL_TYPE_OFFSET] >> 4 != KEYED_SGL_TYPE_HI {
-                self.spawn_fail(ctx, tasks, tag, status::SGL_INVALID_TYPE | status::DNR);
-                return Ok(());
-            }
-            let sgl = parse_keyed_sgl(&sqe);
-            let len = (sgl.len as usize).min(ioutgt_core::MDTS_BYTES as usize);
-            if len == 0 {
-                // No data to pull; let dispatch reject it with the proper status
-                // rather than post a zero-sge RDMA READ (which can error the QP).
-                self.spawn_fail(ctx, tasks, tag, status::DATA_SGL_LEN_INVALID | status::DNR);
-                return Ok(());
-            }
-            // Lease a pool buffer for the host write-data and RDMA READ it in.
-            // `lease_or_owned` sets the buffer capacity; the dispatch handler
-            // (io::write/dsm) checks `data_len()` — the *received* length — so set
-            // it to the SGL-advertised length the RDMA READ will fill.
-            self.nvme.lease_or_owned(tag, len);
-            self.nvme.slots.slot(tag).set_data_len(len as u32);
-            if self.nvme.slots.slot(tag).data().is_pool() {
-                self.post_read_data(u32::from(tag), len, &sgl)?;
-                // Dispatch is deferred to the WR_READ completion (slot now fills).
-            } else {
-                // Pool momentarily full → the owned fallback is not in the RDMA
-                // MR, so we cannot RDMA into it. Fail the command cleanly (the
-                // host retries) rather than dispatch against unfilled bytes.
-                self.spawn_fail(ctx, tasks, tag, status::DATA_XFER_ERROR | status::DNR);
-            }
-        } else {
-            self.spawn_dispatch(ctx, tasks, tag);
+        if !host_data_in(&ctx.role, sqe.opcode) {
+            self.nvme.submit(tag, sqe);
+            return Ok(());
         }
-        Ok(())
+
+        // RDMA v1 advertises no in-capsule data (ioccsz=4), so a conformant host
+        // always sends a keyed SGL here. Reject anything else cleanly rather than
+        // misparse an in-capsule descriptor into a bogus rkey (which would fail
+        // the RDMA READ and tear the queue down).
+        if sqe.as_bytes()[SGL_TYPE_OFFSET] >> 4 != KEYED_SGL_TYPE_HI {
+            self.fail_recv(ctx, tag, &sqe, status::SGL_INVALID_TYPE | status::DNR);
+            return Ok(());
+        }
+        let sgl = parse_keyed_sgl(&sqe);
+        let len = (sgl.len as usize).min(ioutgt_core::MDTS_BYTES as usize);
+        if len == 0 {
+            self.fail_recv(ctx, tag, &sqe, status::DATA_SGL_LEN_INVALID | status::DNR);
+            return Ok(());
+        }
+        // Lease a pool buffer for the host write-data. `lease_or_owned` sets the
+        // capacity; io::write/dsm check `data_len()` (the *received* length), so
+        // set it to the SGL-advertised length the RDMA READ will fill.
+        self.nvme.lease_or_owned(tag, len);
+        self.nvme.slots.slot(tag).set_data_len(len as u32);
+        if !self.nvme.slots.slot(tag).data().is_pool() {
+            // Pool momentarily full → the owned fallback is not in the RDMA MR, so
+            // we cannot RDMA into it. Fail cleanly (the host retries).
+            self.fail_recv(ctx, tag, &sqe, status::DATA_XFER_ERROR | status::DNR);
+            return Ok(());
+        }
+        // Stash the SQE; RDMA READ the host data and submit on its completion.
+        self.pending_read[tag as usize] = sqe;
+        self.post_read_data(u32::from(tag), len, &sgl)
     }
 
-    /// Spawn the dispatch task for an already-submitted `tag`: await the command,
-    /// run it through `dispatch::execute`, and hand the outcome back via
-    /// `join_next` for [`Self::post_response`].
-    fn spawn_dispatch(
-        &self,
-        ctx: &Rc<ConnCtx<AnyBackend>>,
-        tasks: &mut JoinSet<(u16, Sqe, Outcome)>,
-        tag: u16,
-    ) {
-        let nvme = Rc::clone(&self.nvme);
-        let ctx = Rc::clone(ctx);
-        tasks.spawn_local(async move {
-            let cmd = nvme.await_command(tag).await;
-            let outcome = dispatch::execute(&ctx, tag, &cmd).await;
-            (tag, cmd, outcome)
+    /// Submit a deferred write command once its host-data RDMA READ completed —
+    /// the slot is now filled, so its slot task can dispatch.
+    fn submit_pending(&self, tag: u16) {
+        self.nvme.submit(tag, self.pending_read[tag as usize]);
+    }
+
+    /// Fail a still-`Receiving` command without dispatching it (the slot task
+    /// never sees it): step the slot to `Responding` and queue an error CQE.
+    fn fail_recv(&self, ctx: &Rc<ConnCtx<AnyBackend>>, tag: u16, sqe: &Sqe, status: u16) {
+        self.nvme.slots.respond_receiving(tag);
+        let cqe = ctx.cqe(0, sqe.cid.get(), status);
+        self.responses.push(RdmaResp {
+            tag,
+            cmd: *sqe,
+            outcome: Outcome::status(cqe),
         });
     }
 
-    /// Spawn a task that awaits the command (to advance the slot state machine)
-    /// then completes it with `status` instead of dispatching — used when the
-    /// transport cannot satisfy the command (e.g. no registered buffer for an
-    /// RDMA READ under pool pressure).
-    fn spawn_fail(
-        &self,
-        ctx: &Rc<ConnCtx<AnyBackend>>,
-        tasks: &mut JoinSet<(u16, Sqe, Outcome)>,
-        tag: u16,
-        status: u16,
-    ) {
-        let nvme = Rc::clone(&self.nvme);
-        let ctx = Rc::clone(ctx);
-        tasks.spawn_local(async move {
-            let cmd = nvme.await_command(tag).await;
-            let cqe = ctx.cqe(0, cmd.cid.get(), status);
-            (tag, cmd, Outcome::status(cqe))
-        });
-    }
-
-    /// Post a finished command's response: the RDMA WRITE of any read-data to
-    /// the host's keyed SGL, then the CQE capsule. The slot is released once both
-    /// response WRs complete (tracked by `inflight`).
+    /// Post a finished command's response (its slot is already `Responding`): the
+    /// RDMA WRITE of any read-data to the host's keyed SGL, then the CQE capsule.
+    /// The slot is released once both response WRs complete (tracked by `inflight`).
     fn post_response(&mut self, tag: u16, cmd: &Sqe, outcome: Outcome) -> io::Result<()> {
-        self.nvme.begin_respond(tag);
         let mut pending = 0u8;
         if outcome.data_len > 0 {
             let dst = parse_keyed_sgl(cmd);
@@ -624,10 +616,28 @@ impl RdmaQueue {
     ) -> io::Result<()> {
         let ctx = self.bootstrap(&port, &registry, &peer).await?;
 
-        // Commands execute concurrently as their own tasks so a parked Async
-        // Event Request (held until an async event) does not block the reap loop
-        // or other commands; finished commands surface via `tasks.join_next()`.
-        let mut tasks: JoinSet<(u16, Sqe, Outcome)> = JoinSet::new();
+        // One persistent task per slot (preallocated at queue install — zero
+        // per-command allocation): each loops await_command → dispatch →
+        // begin_respond → push the response for the reap loop to post. Dispatch
+        // off the reap loop means a parked Async Event Request (held until an
+        // async event) cannot stall the queue. The JoinSet aborts every task when
+        // it drops at `run` exit, so a parked AER task is torn down cleanly.
+        let mut slot_tasks: JoinSet<()> = JoinSet::new();
+        for tag in 0..u16::try_from(self.nslots).unwrap_or(u16::MAX) {
+            let nvme = Rc::clone(&self.nvme);
+            let ctx = Rc::clone(&ctx);
+            let responses = Rc::clone(&self.responses);
+            slot_tasks.spawn_local(async move {
+                loop {
+                    let cmd = nvme.await_command(tag).await;
+                    let outcome = dispatch::execute(&ctx, tag, &cmd).await;
+                    nvme.begin_respond(tag);
+                    responses.push(RdmaResp { tag, cmd, outcome });
+                }
+            });
+        }
+
+        let responses = Rc::clone(&self.responses);
         // Reused across iterations: the steady IO path allocates nothing.
         let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
         loop {
@@ -647,19 +657,21 @@ impl RdmaQueue {
                             return Ok(()); // flushed completion: peer gone
                         }
                         match wr_kind(id) {
-                            WR_RECV => self.spawn_command(&ctx, &mut tasks, wr_low(id))?,
+                            WR_RECV => self.handle_recv(&ctx, wr_low(id))?,
                             // A write-data RDMA READ finished: the slot is filled,
-                            // so dispatch can now run.
-                            WR_READ => self.spawn_dispatch(&ctx, &mut tasks, wr_low(id) as u16),
+                            // so submit it to wake its slot task.
+                            WR_READ => self.submit_pending(wr_low(id) as u16),
                             WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
                             _ => {}
                         }
                     }
                 }
-                Some(joined) = tasks.join_next() => {
-                    let (tag, cmd, outcome) =
-                        joined.map_err(|e| io::Error::other(format!("dispatch task: {e}")))?;
-                    self.post_response(tag, &cmd, outcome)?;
+                Some(resp) = responses.next() => {
+                    self.post_response(resp.tag, &resp.cmd, resp.outcome)?;
+                    // Drain any siblings queued in the same wake without re-parking.
+                    while let Some(r) = responses.try_next() {
+                        self.post_response(r.tag, &r.cmd, r.outcome)?;
+                    }
                 }
             }
         }

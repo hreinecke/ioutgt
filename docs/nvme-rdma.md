@@ -91,23 +91,23 @@ subcommands) and TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`) are
 absent until the harness integration (RD6); the single reactor thread advertises
 one IO queue.
 
-Commands execute **concurrently**: the reap loop spawns each command onto a
-`tokio::task::JoinSet` and posts its response when `join_next()` yields it. This
-is required, not a perf choice — an Async Event Request (admin opcode 0x0C) is
-held open until an async event fires, so awaiting dispatch inline would stall the
-whole queue on the parked AER. The reap-loop task remains the sole owner of the
-QP, `inflight[]`, and the response/recv buffers (the spawned tasks only hold
-`Rc<QueueCore>`/`Rc<ConnCtx>` and post nothing), which keeps tag release and WR
-posting single-owner and lock-free.
+Commands execute on **preallocated per-tag tasks** (one persistent task per slot,
+spawned once at queue install — zero per-command allocation, mirroring the TCP
+frontend). Each loops `await_command → dispatch::execute → begin_respond → push
+the response onto a preallocated `SendList``. Dispatching off the reap loop is
+required, not a perf choice — an Async Event Request (admin opcode 0x0C) is held
+open until an async event fires, so awaiting dispatch inline would stall the whole
+queue on the parked AER; here a parked AER just leaves its one slot task waiting.
+The reap-loop task remains the sole owner of the QP, `inflight[]`, and the
+response/recv buffers (slot tasks only hold `Rc<QueueCore>`/`Rc<ConnCtx>`/the
+`SendList` and post nothing), keeping tag release and WR posting single-owner and
+lock-free. The reap loop `select!`s the CQ against the `SendList`, posting each
+finished response (read-data RDMA WRITE, then the CQE SEND). The per-tag
+`JoinSet` aborts every slot task when it drops at `run` exit.
 
 **Known v1 divergences (deferred):**
-- *Per-command task allocation.* Spawning a JoinSet task per command heap-allocates
-  on the IO path, unlike the TCP frontend's preallocated persistent task-per-tag.
-  The task-per-tag shape (one looping task per slot) is the intended convergence —
-  it solves the parked-AER problem per tag without a per-command spawn — and lands
-  with the harness integration (RD6).
-- *Teardown drops command tasks mid-dispatch.* When `run()` exits (peer gone),
-  the JoinSet aborts in-flight command tasks, which may be parked inside
+- *Teardown drops a slot task mid-dispatch.* When `run()` exits (peer gone), the
+  per-tag `JoinSet` aborts the slot tasks, one of which may be parked inside
   `dispatch::execute` with a backend op in flight into the pool arena. This relies
   on the reactor's slab-owns-resources invariant (the orphaned op's slab entry,
   not the future, keeps its buffer alive until the terminal CQE — the
@@ -120,17 +120,20 @@ posting single-owner and lock-free.
 
 **Write-data path (host→controller).** `io::write`/`io::dsm` read the write data
 straight from the slot, which over RDMA must be RDMA-READ from the host's keyed
-SGL *before* dispatch. `spawn_command` detects a host-data-in command
-(`host_data_in()`: IO `WRITE`/`DSM`), leases a pool buffer for it, sets the slot's
-received length (`set_data_len`), and posts an RDMA READ (`WR_READ`) of the
-host's keyed-SGL buffer into the slot's pool-registered segments. Dispatch is
-**deferred**: the reap loop spawns the dispatch task only when the `WR_READ`
-completes, so `io::write` sees the data already in the slot. The READ is a
-request WR, not a response, so it is not counted in `inflight[]` — only the
-trailing CQE SEND gates slot release. Under pool pressure `lease_or_owned` can
-return an owned (unregistered) buffer; since RDMA can only read into the pool MR,
-that case is failed cleanly with `DATA_XFER_ERROR | DNR` (the host retries)
-rather than dispatched against unfilled bytes.
+SGL *before* dispatch. `handle_recv` detects a host-data-in command
+(`host_data_in()`: IO `WRITE`/`DSM`), claims the tag, leases a pool buffer, sets
+the slot's received length (`set_data_len`), stashes the SQE in `pending_read`,
+and posts an RDMA READ (`WR_READ`) of the host's keyed-SGL buffer into the slot's
+pool-registered segments — **without submitting the slot**. Submission is
+**deferred** to the `WR_READ` completion (`submit_pending`), which wakes the
+slot task to dispatch against the now-filled slot. The READ is a request WR, not
+a response, so it is not counted in `inflight[]` — only the trailing CQE SEND
+gates slot release. Commands the transport cannot satisfy — a non-keyed
+(in-capsule) SGL, a zero-length SGL, or an owned (unregistered) buffer when
+`lease_or_owned` falls back under pool pressure — are failed without dispatch via
+`respond_receiving` + a queued error CQE (`SGL_INVALID_TYPE` /
+`DATA_SGL_LEN_INVALID` / `DATA_XFER_ERROR`), so the host retries rather than the
+queue corrupting or tearing down.
 
 ## Testing
 
