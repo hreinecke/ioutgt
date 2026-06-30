@@ -72,6 +72,23 @@ const BACKSTOP: std::time::Duration = std::time::Duration::from_millis(200);
 /// else here is an in-capsule data+offset descriptor (inline).
 const SGL_TYPE_OFFSET: usize = 24 + 15;
 const KEYED_SGL_TYPE_HI: u8 = 0x4;
+/// SGL descriptor sub-type (type byte low nibble) `0xf` = `NVME_SGL_FMT_INVALIDATE`:
+/// the host fast-registered an MR for this transfer and wants the target to invalidate
+/// its rkey remotely in the response (`nvme_rdma_map_sg_fr`). Honoring it via
+/// `IBV_WR_SEND_WITH_INV` spares the host a per-IO local-invalidate WR + completion.
+const SGL_SUBTYPE_MASK: u8 = 0x0f;
+const SGL_FMT_INVALIDATE: u8 = 0x0f;
+
+/// The host rkey to remotely invalidate in the response SEND, if the command's keyed
+/// SGL requested it. Mirrors nvmet's `rsp->invalidate_rkey`.
+fn invalidate_rkey_for(cmd: &Sqe) -> Option<u32> {
+    let type_byte = cmd.as_bytes()[SGL_TYPE_OFFSET];
+    if type_byte >> 4 == KEYED_SGL_TYPE_HI && type_byte & SGL_SUBTYPE_MASK == SGL_FMT_INVALIDATE {
+        Some(parse_keyed_sgl(cmd).rkey)
+    } else {
+        None
+    }
+}
 
 fn wr(kind: u64, low: u32) -> u64 {
     kind | u64::from(low)
@@ -256,14 +273,22 @@ impl RdmaQueue {
         g.post().map_err(oerr)
     }
 
-    /// SEND the 16-byte CQE response capsule for `tag` from the staging buffer.
-    fn send_cqe(&mut self, tag: u32, cqe: Cqe) -> io::Result<()> {
+    /// SEND the 16-byte CQE response capsule for `tag` from the staging buffer. When
+    /// `invalidate_rkey` is `Some` (the command's keyed SGL requested it), use
+    /// `SEND_WITH_INV` so the host's rkey is invalidated remotely instead of the host
+    /// posting a per-IO local-invalidate WR (whose extra completion, on the comp vector
+    /// the host shares between admin + IO, otherwise overloads the host's CQ softirq).
+    fn send_cqe(&mut self, tag: u32, cqe: Cqe, invalidate_rkey: Option<u32>) -> io::Result<()> {
         let off = tag as usize * CQE_LEN;
         self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
         let addr = self.resp_buf.as_ptr() as u64 + off as u64;
         let lkey = self.resp_mr.lkey();
         let mut g = self.qp.start_post_send();
-        let h = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled).setup_send();
+        let wrh = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled);
+        let h = match invalidate_rkey {
+            Some(rkey) => wrh.setup_send_with_inv(rkey),
+            None => wrh.setup_send(),
+        };
         // SAFETY: the staging region is registered and stays valid until the
         // send completes (tag not released until then).
         unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
@@ -539,7 +564,7 @@ impl RdmaQueue {
             self.write_read_data(u32::from(tag), outcome.data_len, &dst)?;
             pending += 1;
         }
-        self.send_cqe(u32::from(tag), outcome.cqe)?;
+        self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(cmd))?;
         pending += 1;
         self.inflight[tag as usize] = pending;
         Ok(())
@@ -621,7 +646,7 @@ impl RdmaQueue {
         let cmd = nvme.await_command(tag).await;
         let outcome = dispatch::execute(&ctx, tag, &cmd).await;
         nvme.begin_respond(tag);
-        self.send_cqe(u32::from(tag), outcome.cqe)?;
+        self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(&sqe))?;
         self.inflight[tag as usize] = 1;
         Ok(ctx)
     }
@@ -817,7 +842,10 @@ fn build_conn_resources(
         .setup_send_cq(cq.clone())
         .setup_recv_cq(cq.clone())
         .setup_send_ops_flags(
-            SendOperationFlags::Send | SendOperationFlags::Write | SendOperationFlags::Read,
+            SendOperationFlags::Send
+                | SendOperationFlags::SendWithInvalidate
+                | SendOperationFlags::Write
+                | SendOperationFlags::Read,
         );
     let qp: GenericQueuePair = b.build_ex().map_err(oerr)?.into();
     Ok((pd, channel, cq, qp))
