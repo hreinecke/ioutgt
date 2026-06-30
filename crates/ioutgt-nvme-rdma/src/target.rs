@@ -607,14 +607,18 @@ impl RdmaQueue {
 
     /// Drive this connection: bootstrap the controller from the Connect capsule,
     /// then process commands until the QP errors (peer disconnect) or a fatal
-    /// error. Requires [`prime`](Self::prime) to have been called first.
+    /// error. Requires [`prime`](Self::prime) to have been called first. `on_ctx`
+    /// is invoked once with the dispatch context after bootstrap — the harness
+    /// uses it to register the controller (AER nudges) and its per-queue stats.
     pub async fn run(
         mut self,
         port: Arc<PortConfig<AnyBackend>>,
         registry: Arc<Registry>,
         peer: String,
+        on_ctx: impl FnOnce(&Rc<ConnCtx<AnyBackend>>),
     ) -> io::Result<()> {
         let ctx = self.bootstrap(&port, &registry, &peer).await?;
+        on_ctx(&ctx);
 
         // One persistent task per slot (preallocated at queue install — zero
         // per-command allocation): each loops await_command → dispatch →
@@ -750,8 +754,12 @@ pub struct RdmaConn {
 /// attributes, prime the RECVs, `accept` with a [`CmRep`], then run
 /// [`RdmaQueue::run`]. This is the reactor-bound half of accepting — it must run
 /// on the thread whose io_uring reaps this queue's completions (the same reactor
-/// thread today; a queue thread once wired into the harness).
-pub async fn run_conn(conn: RdmaConn) -> io::Result<()> {
+/// thread today; a queue thread once wired into the harness). `on_ctx` is invoked
+/// with the dispatch context after bootstrap (see [`RdmaQueue::run`]).
+pub async fn run_conn(
+    conn: RdmaConn,
+    on_ctx: impl FnOnce(&Rc<ConnCtx<AnyBackend>>),
+) -> io::Result<()> {
     let dev = conn
         .id
         .get_device_context()
@@ -796,7 +804,7 @@ pub async fn run_conn(conn: RdmaConn) -> io::Result<()> {
     accept(&conn.id, qp_num, &rep, 1, 1)?;
 
     let peer = format!("rdma:qid{}", conn.qid);
-    queue.run(conn.port, conn.registry, peer).await
+    queue.run(conn.port, conn.registry, peer, on_ctx).await
 }
 
 /// A freshly accepted connection request, pre-QP-build: the cm_id plus the
@@ -930,7 +938,9 @@ pub async fn serve(
             // host times out rather than getting a CM reject. Rare resource paths;
             // the common reject (CmReq parse) happens in `RdmaListener::accept`,
             // and the queue-thread model cannot reject post-handshake either.
-            if let Err(e) = run_conn(conn).await {
+            // serve() has no stats/AER registry to hook; the harness passes a
+            // real on_ctx in run_queue.
+            if let Err(e) = run_conn(conn, |_| {}).await {
                 tracing::warn!("nvme-rdma queue ended: {e}");
             }
         });
