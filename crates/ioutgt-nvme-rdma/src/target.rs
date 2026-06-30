@@ -722,7 +722,6 @@ fn accept_one(
     event: &Event,
     port: &Arc<PortConfig<AnyBackend>>,
     registry: &Arc<Registry>,
-    queue_buf_bytes: usize,
     conns: &mut Vec<Arc<Identifier>>,
 ) -> io::Result<()> {
     let req = CmReq::parse(&private_data(event))?;
@@ -750,7 +749,8 @@ fn accept_one(
     qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
         .map_err(oerr)?;
 
-    let mut queue = RdmaQueue::new(req.qid, sqsize, false, pd, channel, cq, qp, queue_buf_bytes)?;
+    let mut queue =
+        RdmaQueue::new(req.qid, sqsize, false, pd, channel, cq, qp, port.queue_buf_bytes)?;
     let qp_num = queue.qp_number();
     // Post RECVs + arm before accepting, so the host's first capsule is caught.
     queue.prime()?;
@@ -788,7 +788,6 @@ pub async fn serve(
     listen: SocketAddr,
     port: Arc<PortConfig<AnyBackend>>,
     registry: Arc<Registry>,
-    queue_buf_bytes: usize,
 ) -> io::Result<()> {
     let ch = CmChannel::new()?;
     let listen_id = ch.create_id()?;
@@ -820,7 +819,7 @@ pub async fn serve(
         let event = ch.next_event().await?;
         match event.event_type() {
             EventType::ConnectRequest => {
-                if let Err(e) = accept_one(&event, &port, &registry, queue_buf_bytes, &mut conns) {
+                if let Err(e) = accept_one(&event, &port, &registry, &mut conns) {
                     tracing::warn!("nvme-rdma rejecting connect: {e}");
                     if let Some(id) = event.cm_id() {
                         let _ = reject(&id, &[]);

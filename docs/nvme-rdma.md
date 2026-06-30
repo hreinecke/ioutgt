@@ -81,8 +81,15 @@ staging buffer. The pipeline per command:
    index, SEND/WRITE→tag), reaped centrally in `run()`'s `cq::wait` drain loop.
 
 The first capsule on qid 0 bootstraps a controller (`ConnCtx::new_admin`); qid n
-attaches by cntlid (`ConnCtx::new_io`). The binary `ioutgt-nvme-rdma` serves one
-in-memory subsystem (`--listen/--nqn/--mem-size-mb`).
+attaches by cntlid (`ConnCtx::new_io`). The binary `ioutgt-nvme-rdma` mirrors the
+transport-neutral subset of the `ioutgt-nvme-tcp` CLI — `--config` (JSON,
+reusing `ioutgt-control`'s `FileConfig`), `--listen`, `--subsys-nqn`,
+`--backend` (memory/null/file, via the shared `build_backend`), `--mem-size-mb`,
+`--io-queue-size`, `--queue-buf-mb`. Harness-only knobs (`--io-threads`,
+`--no-pin`, `--control-socket`, `--idle-teardown-secs`, the `ctl`/`list`/`stat`
+subcommands) and TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`) are
+absent until the harness integration (RD6); the single reactor thread advertises
+one IO queue.
 
 Commands execute **concurrently**: the reap loop spawns each command onto a
 `tokio::task::JoinSet` and posts its response when `join_next()` yields it. This

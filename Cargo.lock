@@ -451,7 +451,9 @@ dependencies = [
 name = "ioutgt-nvme-rdma"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "ioutgt-backend",
+ "ioutgt-control",
  "ioutgt-core",
  "ioutgt-nvme",
  "ioutgt-uring",

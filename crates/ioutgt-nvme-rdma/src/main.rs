@@ -1,109 +1,142 @@
-//! Focused-v1 NVMe/RDMA target binary.
+//! ioutgt-nvme-rdma — io_uring-based NVMe/RDMA target binary.
 //!
-//! Serves a single in-memory subsystem over RDMA on one reactor thread, enough
-//! to bring up a controller with `nvme connect -t rdma` and run IO against it.
-//! The CLI is intentionally minimal; full flag alignment with the
-//! `ioutgt-nvme-tcp` binary (backends, control socket, pinning, …) is a later
-//! milestone (RD5). All RDMA queues run on this one thread for now.
+//! Focused-v1: a single reactor thread serves the configured subsystem(s) over
+//! RDMA. The CLI mirrors the transport-neutral subset of the `ioutgt-nvme-tcp`
+//! binary — `--config`, `--listen`, `--subsys-nqn`, `--backend`, `--mem-size-mb`,
+//! `--io-queue-size`, `--queue-buf-mb`. The harness-only knobs
+//! (`--io-threads`/`--no-pin`/`--control-socket`/`--idle-teardown-secs`) and
+//! TCP-only knobs (digests/`--send-zc`/`--recv-buf-mb`) are intentionally absent
+//! until the harness integration (RD6).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ioutgt_backend::{AnyBackend, MemoryBackend};
+use clap::Parser;
+use ioutgt_backend::AnyBackend;
+use ioutgt_control::config::{BackendConfig, FileConfig, SubsystemConfig};
+use ioutgt_control::server::build_backend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 
-/// Logical block size (512 B) for the memory namespace.
-const BLOCK_SHIFT: u8 = 9;
-/// Default advertised IO queue depth.
-const IO_QUEUE_SIZE: u16 = 128;
-/// Default per-IO-queue data-buffer pool (bytes).
-const QUEUE_BUF_BYTES: usize = 8 * 1024 * 1024;
-
+#[derive(Parser, Debug)]
+#[command(version, about = "io_uring-based NVMe/RDMA target")]
 struct Args {
+    /// JSON config file (overrides the individual flags below). Shares the
+    /// `ioutgt-nvme-tcp` schema; TCP/harness-only fields (digests, `send_zc`,
+    /// `recv_buf_mb`, `io_threads`, `pin_threads`, `control_socket`,
+    /// `idle_teardown_secs`) are parsed but ignored by this single-threaded
+    /// RDMA target.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+
+    /// Listen address (RoCE addr:port).
+    #[arg(long, default_value = "0.0.0.0:4420")]
     listen: SocketAddr,
-    nqn: String,
+
+    /// NVM subsystem NQN.
+    #[arg(long, default_value = "nqn.2026-06.io.ioutgt:test")]
+    subsys_nqn: String,
+
+    /// Namespace backend: memory, null, or a file/blockdev path.
+    #[arg(long, default_value = "memory")]
+    backend: String,
+
+    /// Memory/null-backend namespace size in MiB.
+    #[arg(long, default_value_t = 64)]
     mem_size_mb: u64,
+
+    /// Max IO queue depth advertised to the host (MAXCMD); the host uses
+    /// min(its queue-size, this). The admin queue is unaffected. Capped at
+    /// CAP.MQES (256).
+    #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(2..=256))]
+    io_queue_size: u16,
+
+    /// Per-IO-queue data-buffer pool size in MiB. Slots lease their read/write
+    /// buffers from this shared arena on demand (4 KiB grain).
+    #[arg(long, default_value_t = ioutgt_core::pool::DEFAULT_POOL_MB)]
+    queue_buf_mb: usize,
 }
 
-fn parse_args() -> Args {
-    let mut listen: SocketAddr = "0.0.0.0:4420".parse().expect("default addr");
-    let mut nqn = "nqn.2025-01.io.ioutgt:rdma".to_string();
-    let mut mem_size_mb: u64 = 256;
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--listen" | "-l" => {
-                listen = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| fail("--listen expects <ip:port>"));
-            }
-            "--nqn" | "-n" => nqn = it.next().unwrap_or_else(|| fail("--nqn expects a value")),
-            "--mem-size-mb" | "-m" => {
-                mem_size_mb = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| fail("--mem-size-mb expects an integer"));
-            }
-            "--help" | "-h" => {
-                eprintln!(
-                    "ioutgt-nvme-rdma [--listen ip:port] [--nqn NQN] [--mem-size-mb N]\n\
-                     defaults: 0.0.0.0:4420, nqn.2025-01.io.ioutgt:rdma, 256 MiB"
-                );
-                std::process::exit(0);
-            }
-            other => fail(&format!("unknown argument: {other}")),
-        }
-    }
-    Args {
-        listen,
-        nqn,
-        mem_size_mb,
-    }
-}
-
-fn fail(msg: &str) -> ! {
-    eprintln!("ioutgt-nvme-rdma: {msg}");
-    std::process::exit(2);
-}
-
-/// Build a one-namespace in-memory subsystem and the port that advertises it.
-fn build_port(args: &Args) -> Arc<PortConfig<AnyBackend>> {
-    let backend = AnyBackend::Memory(MemoryBackend::new(args.mem_size_mb * 1024 * 1024, BLOCK_SHIFT));
-    let mut uuid = [0u8; 16];
-    uuid[..4].copy_from_slice(&1u32.to_be_bytes());
-    uuid[8] = 0x80;
+/// Build a subsystem (with its namespaces' backends) from a config entry.
+fn build_subsystem(spec: &SubsystemConfig) -> Result<Arc<Subsystem<AnyBackend>>, String> {
     let mut namespaces = BTreeMap::new();
-    namespaces.insert(
-        1u32,
-        Arc::new(Namespace {
-            nsid: 1,
-            backend: Arc::new(backend),
-            uuid,
-        }),
-    );
-    let subsystem = Arc::new(Subsystem::new(
-        args.nqn.clone(),
-        "ioutgt-rdma-0".to_string(),
-        "ioutgt-nvme-rdma".to_string(),
-        1, // max IO queues (single thread, v1)
-        true,
+    for ns in &spec.namespaces {
+        let backend = build_backend(&ns.backend, false)?;
+        let mut uuid = [0u8; 16];
+        uuid[..4].copy_from_slice(&ns.nsid.to_be_bytes());
+        uuid[8] = 0x80;
+        namespaces.insert(
+            ns.nsid,
+            Arc::new(Namespace {
+                nsid: ns.nsid,
+                backend: Arc::new(backend),
+                uuid,
+            }),
+        );
+    }
+    // Single reactor thread serves every queue, so one IO queue is advertised.
+    Ok(Arc::new(Subsystem::new(
+        spec.nqn.clone(),
+        spec.serial.clone(),
+        spec.model.clone(),
+        1,
+        spec.allow_any_host,
         namespaces,
-    ));
-    let mut subsystems = BTreeMap::new();
-    subsystems.insert(args.nqn.clone(), subsystem);
-    Arc::new(PortConfig {
-        traddr: args.listen.ip().to_string(),
-        trsvcid: args.listen.port().to_string(),
+    )))
+}
+
+/// Assemble the port from the config file or the individual flags.
+fn build_port(args: &Args) -> Result<(SocketAddr, Arc<PortConfig<AnyBackend>>), String> {
+    let (listen, io_queue_size, queue_buf_bytes, specs): (_, _, _, Vec<SubsystemConfig>) =
+        match &args.config {
+            Some(path) => {
+                // `load` already validates.
+                let cfg = FileConfig::load(path)?;
+                let listen: SocketAddr = cfg
+                    .listen
+                    .parse()
+                    .map_err(|e| format!("listen {}: {e}", cfg.listen))?;
+                let qbb = cfg.queue_buf_mb.saturating_mul(1 << 20);
+                (listen, cfg.io_queue_size, qbb, cfg.subsystems)
+            }
+            None => {
+                let backend = match args.backend.as_str() {
+                    "memory" => BackendConfig::Memory {
+                        size_mb: args.mem_size_mb,
+                    },
+                    "null" => BackendConfig::Null {
+                        size_mb: args.mem_size_mb,
+                    },
+                    path => BackendConfig::File { path: path.into() },
+                };
+                let spec = SubsystemConfig {
+                    nqn: args.subsys_nqn.clone(),
+                    serial: "ioutgt-rdma-0".to_string(),
+                    model: "ioutgt-nvme-rdma".to_string(),
+                    allow_any_host: true,
+                    namespaces: vec![ioutgt_control::config::NamespaceConfig { nsid: 1, backend }],
+                };
+                let qbb = args.queue_buf_mb.saturating_mul(1 << 20);
+                (args.listen, args.io_queue_size, qbb, vec![spec])
+            }
+        };
+
+    let mut subsystems: BTreeMap<String, Arc<Subsystem<AnyBackend>>> = BTreeMap::new();
+    for spec in &specs {
+        subsystems.insert(spec.nqn.clone(), build_subsystem(spec)?);
+    }
+    let port = Arc::new(PortConfig {
+        traddr: listen.ip().to_string(),
+        trsvcid: listen.port().to_string(),
         trtype: TransportType::Rdma,
-        io_queue_size: IO_QUEUE_SIZE,
-        queue_buf_bytes: QUEUE_BUF_BYTES,
+        io_queue_size,
+        queue_buf_bytes,
         recv_buf_bytes: 0,
         subsystems,
-    })
+    });
+    Ok((listen, port))
 }
 
 fn main() -> std::io::Result<()> {
@@ -113,17 +146,10 @@ fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let args = parse_args();
-    let port = build_port(&args);
+    let args = Args::parse();
+    let (listen, port) = build_port(&args).map_err(std::io::Error::other)?;
     let registry = Registry::new();
-    let listen = args.listen;
-    let queue_buf_bytes = port.queue_buf_bytes;
 
     let rt = QueueRuntime::new(RingConfig::default())?;
-    rt.block_on(ioutgt_nvme_rdma::target::serve(
-        listen,
-        port,
-        registry,
-        queue_buf_bytes,
-    ))
+    rt.block_on(ioutgt_nvme_rdma::target::serve(listen, port, registry))
 }

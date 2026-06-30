@@ -13,6 +13,9 @@ categories.workspace = true
 [dependencies]
 ioutgt-core = { workspace = true }
 ioutgt-backend = { workspace = true }
+# Shared backend builder + JSON config (memory/null/file), reused by the binary
+# so `--backend`/`--config` match the ioutgt-nvme-tcp binary.
+ioutgt-control = { workspace = true }
 ioutgt-nvme = { workspace = true }
 ioutgt-uring = { workspace = true }
 # Safe, maintained ibverbs + RDMA-CM bindings that link the system rdma-core
@@ -27,6 +30,7 @@ libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zerocopy = { workspace = true }
+clap = { workspace = true }
 # `spawn_local`/`JoinSet` for per-command tasks + `select!` in the reap loop.
 tokio = { workspace = true, features = ["rt", "macros"] }
 
