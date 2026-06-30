@@ -726,43 +726,63 @@ const MAX_DATA_SGE: u32 = MAX_SEGS as u32;
 /// clamp a host's request to this regardless of what it asks for.
 const ADMIN_QUEUE_DEPTH: u32 = 32;
 
-/// Handle one CONNECT_REQUEST: parse the host's [`CmReq`], build the QP on the
-/// connection's device, drive it to RTS via the CM-derived attributes, prime the
-/// RECVs, `accept` with a [`CmRep`], and spawn the queue's [`RdmaQueue::run`].
-/// The cm_id is pushed into `conns` so it outlives the spawned queue task.
-fn accept_one(
-    event: &Event,
-    port: &Arc<PortConfig<AnyBackend>>,
-    registry: &Arc<Registry>,
-    conns: &mut Vec<Arc<Identifier>>,
-) -> io::Result<()> {
-    let req = CmReq::parse(&private_data(event))?;
-    let id = event
-        .cm_id()
-        .ok_or_else(|| io::Error::other("connect request without cm_id"))?;
-    let ctx = id
+/// An accepted connection handed off to be driven to completion. Every field is
+/// `Send` — the cm_id is `Send`/`Sync` (sideway declares it; librdmacm cm_id ops
+/// are thread-safe), the rest are `Arc`s — so this can cross a mailbox to a queue
+/// thread. This is the shape the harness `Transport::Conn` will take: the CM
+/// listener produces it, and [`run_conn`] (the reactor-bound work) consumes it.
+pub struct RdmaConn {
+    /// The accepted CM identifier: its device context builds the QP, its
+    /// CM-derived attrs drive INIT→RTS, and `rdma_accept` replies on it.
+    pub id: Arc<Identifier>,
+    /// NVMe-oF queue id (0 = admin); routes the connection to a queue thread.
+    pub qid: u16,
+    /// Host SQ size, 0-based (the queue holds `hsqsize + 1`, clamped).
+    pub hsqsize: u16,
+    /// The served port model (subsystems/namespaces, advertised limits).
+    pub port: Arc<PortConfig<AnyBackend>>,
+    /// The controller registry (shared across this port's queues).
+    pub registry: Arc<Registry>,
+}
+
+/// Build the queue for an accepted [`RdmaConn`] and drive it to completion: build
+/// the QP on the cm_id's own device context, drive it to RTS via the CM-derived
+/// attributes, prime the RECVs, `accept` with a [`CmRep`], then run
+/// [`RdmaQueue::run`]. This is the reactor-bound half of accepting — it must run
+/// on the thread whose io_uring reaps this queue's completions (the same reactor
+/// thread today; a queue thread once wired into the harness).
+pub async fn run_conn(conn: RdmaConn) -> io::Result<()> {
+    let dev = conn
+        .id
         .get_device_context()
         .ok_or_else(|| io::Error::other("connect request without device context"))?;
 
-    // hsqsize is the 0-based host SQ size (NVMe-oF); the queue holds hsqsize+1.
-    // Clamp to what we advertise so a buggy/hostile host cannot drive an
-    // enormous recv_buf or QP build (admin is capped to the fabrics AQ depth).
-    let cap = if req.qid == 0 {
+    // hsqsize is 0-based; clamp the queue depth to what we advertise (admin to the
+    // fabrics AQ depth) so a buggy/hostile host can't over-size the QP/recv_buf.
+    let cap = if conn.qid == 0 {
         ADMIN_QUEUE_DEPTH
     } else {
-        u32::from(port.io_queue_size).max(1)
+        u32::from(conn.port.io_queue_size).max(1)
     };
-    let sqsize = u16::try_from((u32::from(req.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
-    let (pd, channel, cq, mut qp) = build_conn_resources(&ctx, sqsize)?;
-    qp.modify(&id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
+    let sqsize = u16::try_from((u32::from(conn.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
+    let (pd, channel, cq, mut qp) = build_conn_resources(&dev, sqsize)?;
+    qp.modify(&conn.id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
         .map_err(oerr)?;
-    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
+    qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
         .map_err(oerr)?;
-    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
+    qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
         .map_err(oerr)?;
 
-    let mut queue =
-        RdmaQueue::new(req.qid, sqsize, false, pd, channel, cq, qp, port.queue_buf_bytes)?;
+    let mut queue = RdmaQueue::new(
+        conn.qid,
+        sqsize,
+        false,
+        pd,
+        channel,
+        cq,
+        qp,
+        conn.port.queue_buf_bytes,
+    )?;
     let qp_num = queue.qp_number();
     // Post RECVs + arm before accepting, so the host's first capsule is caught.
     queue.prime()?;
@@ -773,14 +793,42 @@ fn accept_one(
         crqsize: sqsize - 1,
     }
     .to_bytes();
-    accept(&id, qp_num, &rep, 1, 1)?;
-    conns.push(Arc::clone(&id));
+    accept(&conn.id, qp_num, &rep, 1, 1)?;
 
-    let peer = format!("rdma:qid{}", req.qid);
-    let port = Arc::clone(port);
-    let registry = Arc::clone(registry);
+    let peer = format!("rdma:qid{}", conn.qid);
+    queue.run(conn.port, conn.registry, peer).await
+}
+
+/// Handle one CONNECT_REQUEST: parse the host's [`CmReq`] into an [`RdmaConn`],
+/// hold its cm_id alive in `conns`, and spawn [`run_conn`] to build + accept +
+/// drive the queue. (The QP build and `rdma_accept` happen inside `run_conn` so
+/// that, once wired into the harness, they land on the queue thread.)
+fn accept_one(
+    event: &Event,
+    port: &Arc<PortConfig<AnyBackend>>,
+    registry: &Arc<Registry>,
+    conns: &mut Vec<Arc<Identifier>>,
+) -> io::Result<()> {
+    let req = CmReq::parse(&private_data(event))?;
+    let id = event
+        .cm_id()
+        .ok_or_else(|| io::Error::other("connect request without cm_id"))?;
+    let conn = RdmaConn {
+        id: Arc::clone(&id),
+        qid: req.qid,
+        hsqsize: req.hsqsize,
+        port: Arc::clone(port),
+        registry: Arc::clone(registry),
+    };
+    // Hold the cm_id for the connection's lifetime (best-effort teardown).
+    conns.push(id);
     tokio::task::spawn_local(async move {
-        if let Err(e) = queue.run(port, registry, peer).await {
+        // A failure inside run_conn (QP build / accept / run) only logs — the host
+        // times out rather than getting a CM reject. These are rare
+        // resource-exhaustion paths; the common reject (CmReq parse) stays in
+        // accept_one above, and the queue-thread model this is heading toward
+        // likewise cannot reject post-handshake. (`CmReq` parse rejects via serve.)
+        if let Err(e) = run_conn(conn).await {
             tracing::warn!("nvme-rdma queue ended: {e}");
         }
     });
