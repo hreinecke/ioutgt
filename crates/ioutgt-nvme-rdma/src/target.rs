@@ -36,7 +36,7 @@ use sideway::ibverbs::queue_pair::{
     GenericQueuePair, PostSendGuard, QueuePair, QueuePairState, SendOperationFlags,
     SetScatterGatherEntry, WorkRequestFlags,
 };
-use sideway::rdmacm::communication_manager::{Event, EventType, Identifier};
+use sideway::rdmacm::communication_manager::{EventType, Identifier};
 use tokio::task::JoinSet;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -799,102 +799,140 @@ pub async fn run_conn(conn: RdmaConn) -> io::Result<()> {
     queue.run(conn.port, conn.registry, peer).await
 }
 
-/// Handle one CONNECT_REQUEST: parse the host's [`CmReq`] into an [`RdmaConn`],
-/// hold its cm_id alive in `conns`, and spawn [`run_conn`] to build + accept +
-/// drive the queue. (The QP build and `rdma_accept` happen inside `run_conn` so
-/// that, once wired into the harness, they land on the queue thread.)
-fn accept_one(
-    event: &Event,
-    port: &Arc<PortConfig<AnyBackend>>,
-    registry: &Arc<Registry>,
-    conns: &mut Vec<Arc<Identifier>>,
-) -> io::Result<()> {
-    let req = CmReq::parse(&private_data(event))?;
-    let id = event
-        .cm_id()
-        .ok_or_else(|| io::Error::other("connect request without cm_id"))?;
-    let conn = RdmaConn {
-        id: Arc::clone(&id),
-        qid: req.qid,
-        hsqsize: req.hsqsize,
-        port: Arc::clone(port),
-        registry: Arc::clone(registry),
-    };
-    // Hold the cm_id for the connection's lifetime (best-effort teardown).
-    conns.push(id);
-    tokio::task::spawn_local(async move {
-        // A failure inside run_conn (QP build / accept / run) only logs — the host
-        // times out rather than getting a CM reject. These are rare
-        // resource-exhaustion paths; the common reject (CmReq parse) stays in
-        // accept_one above, and the queue-thread model this is heading toward
-        // likewise cannot reject post-handshake. (`CmReq` parse rejects via serve.)
-        if let Err(e) = run_conn(conn).await {
-            tracing::warn!("nvme-rdma queue ended: {e}");
+/// A freshly accepted connection request, pre-QP-build: the cm_id plus the
+/// host's [`CmReq`] routing fields. The CM-thread half of accepting (what the
+/// harness `Transport::Raw` will be); [`RdmaListener::accept`] produces it and a
+/// caller turns it into an [`RdmaConn`] (adding port/registry) for [`run_conn`].
+pub struct RdmaRaw {
+    /// The accepted CM identifier (see [`RdmaConn::id`]).
+    pub id: Arc<Identifier>,
+    /// NVMe-oF queue id (0 = admin).
+    pub qid: u16,
+    /// Host SQ size, 0-based.
+    pub hsqsize: u16,
+}
+
+/// The NVMe/RDMA listener: a bound CM event channel that yields one accepted
+/// connection per [`accept`](Self::accept), pumping (acking) the lifecycle events
+/// of already-accepted connections in between. This is the connection-source seam
+/// (the harness `Transport::bind`/`accept`); it owns the CM channel and holds
+/// accepted cm_ids alive (best-effort teardown — see `docs/nvme-rdma.md`).
+pub struct RdmaListener {
+    ch: CmChannel,
+    /// The listening cm_id — kept alive for the channel's lifetime.
+    _listen_id: Arc<Identifier>,
+    /// Accepted cm_ids, held for the process lifetime (best-effort teardown).
+    conns: Vec<Arc<Identifier>>,
+}
+
+impl RdmaListener {
+    /// Bind a CM event channel + listen cm_id to `listen` and start listening.
+    pub async fn bind(listen: SocketAddr) -> io::Result<RdmaListener> {
+        let ch = CmChannel::new()?;
+        let listen_id = ch.create_id()?;
+        // The RDMA device's GID/IP association is populated asynchronously after a
+        // soft-RoCE (rxe) netdev is added, so `rdma_bind_addr` on the concrete IP
+        // can transiently fail with ENODEV even once the port is ACTIVE. Retry.
+        // (Binding the unspecified address would skip GID resolution but does not
+        // receive connects on rxe, so we bind the concrete IP.)
+        let mut attempt = 0;
+        loop {
+            match listen_id.bind_addr(listen) {
+                Ok(()) => break,
+                Err(e) if attempt < 120 => {
+                    attempt += 1;
+                    if attempt % 8 == 0 {
+                        tracing::info!(
+                            "nvme-rdma bind {listen} not ready (attempt {attempt}): {e:?}"
+                        );
+                    }
+                    ioutgt_uring::ops::sleep(std::time::Duration::from_millis(250))?.await?;
+                }
+                Err(e) => return Err(oerr(e)),
+            }
         }
-    });
-    Ok(())
+        listen_id.listen(128).map_err(oerr)?;
+        tracing::info!("nvme-rdma listening on {listen}");
+        Ok(RdmaListener {
+            ch,
+            _listen_id: listen_id,
+            conns: Vec::new(),
+        })
+    }
+
+    /// Await the next accepted connection. The CM channel multiplexes all cm_ids,
+    /// so this also acks the lifecycle events of already-accepted connections
+    /// (Established, Disconnected, …) and rejects malformed connect requests,
+    /// returning only on a valid CONNECT_REQUEST.
+    pub async fn accept(&mut self) -> io::Result<RdmaRaw> {
+        loop {
+            let event = self.ch.next_event().await?;
+            match event.event_type() {
+                EventType::ConnectRequest => match CmReq::parse(&private_data(&event)) {
+                    Ok(req) => {
+                        let Some(id) = event.cm_id() else {
+                            tracing::warn!("nvme-rdma connect request without cm_id");
+                            event.ack().map_err(oerr)?;
+                            continue;
+                        };
+                        self.conns.push(Arc::clone(&id));
+                        event.ack().map_err(oerr)?;
+                        return Ok(RdmaRaw {
+                            id,
+                            qid: req.qid,
+                            hsqsize: req.hsqsize,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("nvme-rdma rejecting connect: {e}");
+                        if let Some(id) = event.cm_id() {
+                            let _ = reject(&id, &[]);
+                        }
+                        event.ack().map_err(oerr)?;
+                    }
+                },
+                EventType::Established => event.ack().map_err(oerr)?,
+                other => {
+                    tracing::debug!("nvme-rdma CM event {other:?}");
+                    event.ack().map_err(oerr)?;
+                }
+            }
+        }
+    }
 }
 
 /// Listen for NVMe/RDMA connections on `listen` and drive each to a controller.
 ///
-/// Focused-v1: a single reactor thread owns the listener and every queue. On
-/// each CONNECT_REQUEST it builds the QP, accepts, and spawns an [`RdmaQueue`]
-/// task on the same thread (the CM channel multiplexes all cm_ids; data
-/// completions are reaped per queue via the completion channel). Connection
-/// teardown is best-effort: a queue task ends on its own flushed completions,
-/// and its cm_id is held in `conns` for the process lifetime (clean per-queue
-/// teardown is deferred — see `docs/nvme-rdma.md`).
+/// Focused-v1: a single reactor thread owns the listener and every queue. Each
+/// accepted connection ([`RdmaListener::accept`]) becomes an [`RdmaConn`] and is
+/// spawned on the same thread via [`run_conn`] (which builds the QP, accepts, and
+/// runs the queue). The CM channel multiplexes all cm_ids; data completions are
+/// reaped per queue via its completion channel. Teardown is best-effort — see
+/// `docs/nvme-rdma.md`. This is the seam the harness `Transport` will split:
+/// `bind`/`accept` on the listener, `run_conn` on a queue thread.
 pub async fn serve(
     listen: SocketAddr,
     port: Arc<PortConfig<AnyBackend>>,
     registry: Arc<Registry>,
 ) -> io::Result<()> {
-    let ch = CmChannel::new()?;
-    let listen_id = ch.create_id()?;
-    // The RDMA device's GID/IP association is populated asynchronously after a
-    // soft-RoCE (rxe) netdev is added, so `rdma_bind_addr` on the concrete IP can
-    // transiently fail with ENODEV ("No such device") even once the port is
-    // ACTIVE. Retry. (Binding the unspecified address would skip GID resolution
-    // but does not receive connects on rxe, so we bind the concrete IP.)
-    let mut attempt = 0;
+    let mut listener = RdmaListener::bind(listen).await?;
     loop {
-        match listen_id.bind_addr(listen) {
-            Ok(()) => break,
-            Err(e) if attempt < 120 => {
-                attempt += 1;
-                if attempt % 8 == 0 {
-                    tracing::info!("nvme-rdma bind {listen} not ready (attempt {attempt}): {e:?}");
-                }
-                ioutgt_uring::ops::sleep(std::time::Duration::from_millis(250))?.await?;
+        let raw = listener.accept().await?;
+        let conn = RdmaConn {
+            id: raw.id,
+            qid: raw.qid,
+            hsqsize: raw.hsqsize,
+            port: Arc::clone(&port),
+            registry: Arc::clone(&registry),
+        };
+        tokio::task::spawn_local(async move {
+            // A failure inside run_conn (QP build / accept / run) only logs — the
+            // host times out rather than getting a CM reject. Rare resource paths;
+            // the common reject (CmReq parse) happens in `RdmaListener::accept`,
+            // and the queue-thread model cannot reject post-handshake either.
+            if let Err(e) = run_conn(conn).await {
+                tracing::warn!("nvme-rdma queue ended: {e}");
             }
-            Err(e) => return Err(oerr(e)),
-        }
-    }
-    listen_id.listen(128).map_err(oerr)?;
-    tracing::info!("nvme-rdma listening on {listen}");
-
-    // Hold each accepted connection's cm_id alive for the life of its queue.
-    let mut conns: Vec<Arc<Identifier>> = Vec::new();
-    loop {
-        let event = ch.next_event().await?;
-        match event.event_type() {
-            EventType::ConnectRequest => {
-                if let Err(e) = accept_one(&event, &port, &registry, &mut conns) {
-                    tracing::warn!("nvme-rdma rejecting connect: {e}");
-                    if let Some(id) = event.cm_id() {
-                        let _ = reject(&id, &[]);
-                    }
-                }
-                event.ack().map_err(oerr)?;
-            }
-            EventType::Established => {
-                // The queue task is already draining; nothing to do here.
-                event.ack().map_err(oerr)?;
-            }
-            other => {
-                tracing::debug!("nvme-rdma CM event {other:?}");
-                event.ack().map_err(oerr)?;
-            }
-        }
+        });
     }
 }
