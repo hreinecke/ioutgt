@@ -226,11 +226,18 @@ rdma_address_nic() {
     "${x[@]}" ip link set "$nic" down
     "${x[@]}" ip link set "$nic" up
     "${x[@]}" ip link set "$nic" mtu "$MTU"
+    # A high-speed (100GbE) link can take several seconds to re-negotiate carrier
+    # after the flap, and the RoCE GID only seats once carrier is up — so wait for
+    # carrier BEFORE adding the IP, then allow ample time for the GID to land.
+    local i
+    for i in $(seq 1 40); do
+        [ "$("${x[@]}" cat "/sys/class/net/$nic/carrier" 2>/dev/null)" = 1 ] && break
+        sleep 0.5
+    done
     "${x[@]}" ip addr add "$ip/$PREFIX" dev "$nic"
     "${x[@]}" ip link set lo up 2>/dev/null || true
-    local i
-    for i in $(seq 1 30); do rdma_gid_ready "$nic" "$ip" "$ns" && return 0; sleep 0.5; done
-    echo "   warning: RoCEv2 GID for $ip on $nic ($ns netns) not visible after 15s" >&2
+    for i in $(seq 1 60); do rdma_gid_ready "$nic" "$ip" "$ns" && return 0; sleep 0.5; done
+    echo "   warning: RoCEv2 GID for $ip on $nic ($ns netns) not visible after 30s" >&2
     return 0
 }
 
