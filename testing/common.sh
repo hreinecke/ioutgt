@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# common.sh — shared helpers for the NVMe/TCP target drivers
-# (two_nic_realwire.sh, local_tgt.sh). Sourced, never executed.
+# common.sh — shared helpers for the NVMe target drivers
+# (two_nic_realwire.sh, local_tgt.sh). Sourced, never executed. The fabric is
+# selected by TRANSPORT=tcp|rdma (default tcp); see the knobs section.
 #
 # The sourcing script supplies the transport context; these helpers stay
 # agnostic to whether the initiator runs in a network namespace (realwire)
@@ -32,10 +33,20 @@
 # Pin both, shared across all connects from this host.
 HOSTID="${HOSTID:-2e3b0c44-1c2e-4f3a-9b6d-000000000001}"
 
+# Fabric: tcp (NVMe/TCP) or rdma (NVMe/RDMA over RoCEv2). One knob selects the
+# ioutgt binary, the nvmet kernel modules + port addr_trtype, the `nvme -t`
+# type, and — for rdma — forces digests and zero-copy-send OFF (neither exists
+# on the RDMA fabric, and the ioutgt-nvme-rdma binary has no such flags).
+TRANSPORT="${TRANSPORT:-tcp}"
+case "$TRANSPORT" in
+    tcp|rdma) ;;
+    *) echo "TRANSPORT must be tcp or rdma (got '$TRANSPORT')" >&2; exit 1 ;;
+esac
+
 NR_QUEUES="${NR_QUEUES:-4}"          # IO queues  (ioutgt --io-threads; connect -i)
 QUEUE_SIZE="${QUEUE_SIZE:-128}"      # IO qdepth   (ioutgt --io-queue-size; connect -q)
 BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file
-IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt-nvme-tcp}"
+IOUTGT_BIN="${IOUTGT_BIN:-./target/release/ioutgt-nvme-$TRANSPORT}"
 IOUTGT_SENDZC="${IOUTGT_SENDZC:-0}"  # 1 = ioutgt --send-zc (zero-copy send)
 # Extra ioutgt flags appended verbatim, e.g.
 #   IOUTGT_EXTRA="--queue-buf-mb 1"
@@ -47,14 +58,20 @@ IOUTGT_EXTRA="${IOUTGT_EXTRA:-}"
 # and makes ioutgt refuse it (--no-hdgst / --no-ddgst). nvmet has no target
 # knob — it just honours the host request — so coupling the host request and
 # the ioutgt stance here is what keeps nvmet and ioutgt identical.
-HDGST="${HDGST:-0}"   # header digest
-DDGST="${DDGST:-0}"   # data digest
+HDGST="${HDGST:-0}"   # header digest (TCP only)
+DDGST="${DDGST:-0}"   # data digest (TCP only)
 # Host-side request flags (used by connect/discover) and the matching ioutgt
-# target refuse flags (used by each driver's ioutgt start).
+# target refuse flags (used by each driver's ioutgt start). RDMA has no PDU
+# digests — leave both arrays empty (the ioutgt-nvme-rdma binary has no
+# --no-hdgst/--no-ddgst either) and note any ignored request.
 CONNECT_DGST=()
 IOUTGT_DGST=()
-if [ "$HDGST" = 1 ]; then CONNECT_DGST+=(--hdr-digest);  else IOUTGT_DGST+=(--no-hdgst); fi
-if [ "$DDGST" = 1 ]; then CONNECT_DGST+=(--data-digest); else IOUTGT_DGST+=(--no-ddgst); fi
+if [ "$TRANSPORT" = tcp ]; then
+    if [ "$HDGST" = 1 ]; then CONNECT_DGST+=(--hdr-digest);  else IOUTGT_DGST+=(--no-hdgst); fi
+    if [ "$DDGST" = 1 ]; then CONNECT_DGST+=(--data-digest); else IOUTGT_DGST+=(--no-ddgst); fi
+elif [ "$HDGST" = 1 ] || [ "$DDGST" = 1 ]; then
+    echo "   note: TRANSPORT=rdma has no PDU digests; ignoring HDGST/DDGST" >&2
+fi
 
 # fio knobs
 FIO_RW="${FIO_RW:-randread}"
@@ -97,8 +114,8 @@ ensure_backing() {
     esac
 }
 
-# ---- nvmet-tcp target (Linux in-kernel; configfs) --------------------
-# nvmet_setup NQN PORT IP BACKEND — create + enable an nvmet-tcp subsystem and
+# ---- nvmet target (Linux in-kernel; configfs) ------------------------
+# nvmet_setup NQN PORT IP BACKEND — create + enable an nvmet subsystem and
 # a dynamically-claimed port. configfs is a global singleton, but the listener
 # SOCKET is created in the netns of whatever process writes the enabling
 # symlink, so the whole configfs script runs through the caller-supplied
@@ -110,9 +127,9 @@ ensure_backing() {
 # target context.
 nvmet_setup() {
     local nqn="$1" port="$2" ip="$3" backend="$4"
-    modprobe nvmet; modprobe nvmet-tcp
+    modprobe nvmet; modprobe "nvmet-$TRANSPORT"
     BACKEND="$backend" ensure_backing || return 1
-    echo ">> setting up nvmet-tcp on $ip:$port (backend $backend)"
+    echo ">> setting up nvmet-$TRANSPORT on $ip:$port (backend $backend)"
     nvmet_exec "
         set -euo pipefail
         cfg=/sys/kernel/config/nvmet; sub=\$cfg/subsystems/$nqn
@@ -135,7 +152,7 @@ nvmet_setup() {
         echo ipv4 > \"\$portdir/addr_adrfam\"
         echo $ip   > \"\$portdir/addr_traddr\"
         echo $port > \"\$portdir/addr_trsvcid\"
-        echo tcp   > \"\$portdir/addr_trtype\"
+        echo $TRANSPORT > \"\$portdir/addr_trtype\"
         # queue_size -> advertised per-queue depth (SQSIZE/MAXCMD); must be set
         # BEFORE the port is enabled (the symlink) or the kernel returns -EACCES.
         echo $QUEUE_SIZE > \"\$portdir/param_max_queue_size\"
@@ -150,7 +167,7 @@ nvmet_setup() {
 # symlink, never another target's) and the subsystem. Best-effort (no set -e).
 nvmet_teardown() {
     local nqn="$1"
-    echo ">> removing nvmet-tcp target ($nqn)"
+    echo ">> removing nvmet-$TRANSPORT target ($nqn)"
     nvmet_exec "
         cfg=/sys/kernel/config/nvmet
         for link in \"\$cfg\"/ports/*/subsystems/$nqn; do
@@ -173,14 +190,16 @@ nvmet_teardown() {
 # IOUTGT_SENDZC, IOUTGT_DGST, IOUTGT_SOCK/_LOG/_PIDFILE come from the env/common.
 ioutgt_start() {
     local nqn="$1" port="$2" ip="$3" backend="$4"
-    [ -x "$IOUTGT_BIN" ] || { echo "build first: cargo build --release -p ioutgt (or set IOUTGT_BIN)"; exit 1; }
+    [ -x "$IOUTGT_BIN" ] || { echo "build the $TRANSPORT target first (cargo build --release; or set IOUTGT_BIN=$IOUTGT_BIN)"; exit 1; }
     BACKEND="$backend" ensure_backing || exit 1
     local zc=() zclabel=
-    if [ "$IOUTGT_SENDZC" != 0 ]; then
+    if [ "$IOUTGT_SENDZC" != 0 ] && [ "$TRANSPORT" = tcp ]; then
         zc=(--send-zc); zclabel=", send-zc"
         # --send-zc pins payload pages against RLIMIT_MEMLOCK; raise it so ZC
         # engages instead of silently falling back to a copying send.
         ulimit -l unlimited 2>/dev/null || true
+    elif [ "$IOUTGT_SENDZC" != 0 ]; then
+        echo "   note: TRANSPORT=rdma has no --send-zc; ignoring IOUTGT_SENDZC" >&2
     fi
     local extra=()
     [ -n "$IOUTGT_EXTRA" ] && read -ra extra <<<"$IOUTGT_EXTRA"
@@ -266,18 +285,18 @@ wait_dev() {
 # sysfs device lookups run in the current process (device nodes are global).
 discover_one() {
     local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    modprobe nvme-tcp
-    ini_exec nvme discover -t tcp -a "$TARGET_IP" -s "$port" \
+    modprobe "nvme-$TRANSPORT"
+    ini_exec nvme discover -t "$TRANSPORT" -a "$TARGET_IP" -s "$port" \
         --hostnqn "$HOSTNQN" --hostid "$HOSTID" "${CONNECT_DGST[@]}"
 }
 
 connect_one() {
     local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
-    modprobe nvme-tcp
+    modprobe "nvme-$TRANSPORT"
     echo ">> connecting $1 -> $TARGET_IP:$port (request ${NR_QUEUES}q x $QUEUE_SIZE)"
     # -i/-q make the host REQUEST this many queues / this depth; the target
     # caps it, so the granted values are min(host request, target cap).
-    ini_exec nvme connect -t tcp -a "$TARGET_IP" -s "$port" \
+    ini_exec nvme connect -t "$TRANSPORT" -a "$TARGET_IP" -s "$port" \
         -n "$nqn" --hostnqn "$HOSTNQN" --hostid "$HOSTID" \
         --nr-io-queues "$NR_QUEUES" --queue-size "$QUEUE_SIZE" \
         "${CONNECT_DGST[@]}"
