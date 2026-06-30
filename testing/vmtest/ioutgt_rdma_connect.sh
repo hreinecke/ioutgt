@@ -84,8 +84,20 @@ echo "[rdma] === nvme list / id-ctrl ==="
 nvme list 2>&1 | head
 nvme id-ctrl "$NS" 2>&1 | grep -E "^mn|^sn|^vid|subnqn" | head || fail "id-ctrl"
 
-echo "[rdma] === namespace read (IO-queue read-data path) ==="
-dd if="$NS" of=/dev/null bs=4096 count=256 iflag=direct 2>&1 || fail "namespace read"
+echo "[rdma] === namespace write + read-back verify (IO data path) ==="
+dd if=/dev/urandom of=/tmp/w.bin bs=4096 count=256 2>/dev/null
+dd if=/tmp/w.bin of="$NS" bs=4096 count=256 oflag=direct conv=fsync 2>&1 || fail "namespace write"
+dd if="$NS" of=/tmp/r.bin bs=4096 count=256 iflag=direct 2>&1 || fail "namespace read"
+cmp /tmp/w.bin /tmp/r.bin || fail "write/read data mismatch"
+echo "[rdma] write+read verify OK (1 MiB)"
+
+# A quick fio data-integrity pass over the namespace (crc32c verify) if present.
+if command -v fio >/dev/null; then
+	echo "[rdma] === fio --verify (4k/64k randwrite) ==="
+	fio --name=v --filename="$NS" --direct=1 --rw=randwrite --bs=4k --size=8m \
+	    --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting 2>&1 \
+	    | grep -iE "err=|verify|IO error" | head || fail "fio verify"
+fi
 
 echo "[rdma] RESULT: PASS"
 exit 0

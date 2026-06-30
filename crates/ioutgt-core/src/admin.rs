@@ -210,8 +210,16 @@ fn build_id_ctrl<B: Backend>(
     } else {
         id.nn.set(subsys.as_ref().map_or(0, |s| s.max_nsid()));
         id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
-        // IOCCSZ: (64B SQE + 16K inline) / 16; IORCSZ: one CQE.
-        id.ioccsz.set((64 + crate::INLINE_DATA_SIZE) / 16);
+        // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA v1
+        // advertises no in-capsule data, so every host moves IO data over a
+        // keyed SGL (target-issued RDMA READ/WRITE) — the only path the RDMA
+        // transport's fixed-size RECV buffers and dispatch implement.
+        let inline = if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
+            0
+        } else {
+            crate::INLINE_DATA_SIZE
+        };
+        id.ioccsz.set((64 + inline) / 16);
         id.iorcsz.set(1);
         id.icdoff.set(0);
     }

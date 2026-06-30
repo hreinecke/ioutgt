@@ -111,20 +111,29 @@ posting single-owner and lock-free.
   completion (→ queue teardown) rather than a clean NVMe `DATA_XFER_ERROR`. RDMA
   protection prevents any local memory-safety issue.
 
-**Not yet implemented — write-data path (RD4).** `dispatch::execute` reads write
-data straight from the slot, which over RDMA must be RDMA-READ from the host's
-keyed SGL *before* dispatch (a per-tag deferred-dispatch state machine). Until
-that lands, `host_data_in()` fails IO `WRITE`/`DSM` with `DATA_XFER_ERROR | DNR`
-rather than dispatch against an unfilled slot. So v1 supports connect, discovery,
-Identify, and the IO-queue **read** path only.
+**Write-data path (host→controller).** `io::write`/`io::dsm` read the write data
+straight from the slot, which over RDMA must be RDMA-READ from the host's keyed
+SGL *before* dispatch. `spawn_command` detects a host-data-in command
+(`host_data_in()`: IO `WRITE`/`DSM`), leases a pool buffer for it, sets the slot's
+received length (`set_data_len`), and posts an RDMA READ (`WR_READ`) of the
+host's keyed-SGL buffer into the slot's pool-registered segments. Dispatch is
+**deferred**: the reap loop spawns the dispatch task only when the `WR_READ`
+completes, so `io::write` sees the data already in the slot. The READ is a
+request WR, not a response, so it is not counted in `inflight[]` — only the
+trailing CQE SEND gates slot release. Under pool pressure `lease_or_owned` can
+return an owned (unregistered) buffer; since RDMA can only read into the pool MR,
+that case is failed cleanly with `DATA_XFER_ERROR | DNR` (the host retries)
+rather than dispatched against unfilled bytes.
 
 ## Testing
 
 - **v1 bring-up gate**: `testing/run_rdma_connect.sh` builds the binary and runs
   `testing/vmtest/ioutgt_rdma_connect.sh` in the vmtest guest — soft-RoCE
   (`rdma_rxe`) on the guest NIC, then the in-kernel nvme-rdma host through
-  `nvme discover` → `connect` → `id-ctrl` → a namespace **read** → `disconnect`.
-  Read-only (the write path is gated, above).
+  `nvme discover` → `connect` → `id-ctrl` → a namespace **write + read-back
+  verify** (`cmp`) → an `fio --verify=crc32c` randwrite pass → `disconnect`.
+  (The guest re-adds the netdev IP after `rdma link add` to force the rxe
+  RoCEv2 GID to populate, which otherwise races bind on some boots.)
 - **Full correctness (RD4+)**: `fio --verify=crc32c` against both
   `ioutgt-nvme-rdma` and in-kernel `nvmet-rdma`. Requires `rdma_rxe`,
   `nvmet_rdma`, `nvme_rdma`.

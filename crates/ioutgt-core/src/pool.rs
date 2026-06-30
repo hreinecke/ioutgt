@@ -168,6 +168,14 @@ impl SlotData {
         &self.segs[..self.nsegs as usize]
     }
 
+    /// Whether the backing is a registered pool lease (vs owned/empty/ring).
+    /// The NVMe/RDMA transport RDMA-READs host write-data straight into the slot
+    /// using the pool arena's MR key, which is valid only for pool-leased
+    /// segments; an owned fallback (pool momentarily full) must take another path.
+    pub fn is_pool(&self) -> bool {
+        matches!(self.owner, Owner::Pool(_))
+    }
+
     /// The io_uring fixed-buffer index covering these segments, when this is a
     /// registered pool lease (`None` for owned/admin buffers). The backend
     /// uses it to pick `READV_FIXED`/`WRITEV_FIXED` over plain readv/writev.
