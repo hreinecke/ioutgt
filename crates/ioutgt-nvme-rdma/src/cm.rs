@@ -190,14 +190,51 @@ mod tests {
     use crate::cmproto::{CM_FMT_1_0, CmRep, CmReq};
     use crate::rdma_devices;
     use ioutgt_uring::{QueueRuntime, RingConfig, ops};
-    use sideway::ibverbs::completion::GenericCompletionQueue;
+    use sideway::ibverbs::AccessFlags;
+    use sideway::ibverbs::completion::{GenericCompletionQueue, WorkCompletionStatus};
     use sideway::ibverbs::device_context::DeviceContext;
+    use sideway::ibverbs::memory_region::MemoryRegion;
     use sideway::ibverbs::protection_domain::ProtectionDomain;
-    use sideway::ibverbs::queue_pair::{GenericQueuePair, QueuePair, QueuePairState, SendOperationFlags};
+    use sideway::ibverbs::queue_pair::{
+        GenericQueuePair, PostSendGuard, QueuePair, QueuePairState, SendOperationFlags,
+        SetScatterGatherEntry, WorkRequestFlags,
+    };
     use std::net::SocketAddr;
     use std::time::Duration;
 
     type Held = (Arc<ProtectionDomain>, GenericCompletionQueue, GenericQueuePair);
+
+    /// A 64-byte sample command capsule (a stand-in SQE); each byte = its index.
+    fn sample_capsule() -> [u8; 64] {
+        let mut b = [0u8; 64];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = u8::try_from(i).expect("index < 64");
+        }
+        b
+    }
+
+    /// Async busy-poll: yield (ring timer) between polls so the peer task runs;
+    /// bounded so a lost completion fails instead of spinning forever.
+    async fn busy_wc(cq: &GenericCompletionQueue, wr_id: u64) -> io::Result<()> {
+        for _ in 0..5000 {
+            if let Ok(poller) = cq.start_poll() {
+                for wc in poller {
+                    if wc.status() != WorkCompletionStatus::Success as u32 {
+                        return Err(io::Error::other(format!(
+                            "wr {} status {}",
+                            wc.wr_id(),
+                            wc.status()
+                        )));
+                    }
+                    if wc.wr_id() == wr_id {
+                        return Ok(());
+                    }
+                }
+            }
+            ops::sleep(Duration::from_millis(1)).unwrap().await.unwrap();
+        }
+        Err(io::Error::other(format!("wr {wr_id} never completed")))
+    }
 
     /// Build an RC QP + CQ on the connection's device context (the one the cm_id
     /// landed on). Returns all three so the caller keeps them alive.
@@ -233,6 +270,9 @@ mod tests {
         let mut held: Option<Held> = None;
         let mut child: Option<Arc<Identifier>> = None;
         let mut seen_qid = None;
+        // Backing for the pre-posted command-capsule RECV (must outlive its MR).
+        let mut recv_buf = vec![0u8; 64];
+        let mut recv_mr: Option<Arc<MemoryRegion>> = None;
         loop {
             let event = ch.next_event().await?;
             let et = event.event_type();
@@ -252,6 +292,27 @@ mod tests {
                         .map_err(oerr)?;
                     qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
                         .map_err(oerr)?;
+                    // Pre-post a RECV for the host's first command capsule, so it
+                    // is ready before the connection establishes.
+                    // SAFETY: recv_buf is a live, stable, owned buffer that
+                    // outlives this MR (kept in recv_mr for the test); the NIC
+                    // writes it via LocalWrite.
+                    let mr = unsafe {
+                        pd.reg_mr(
+                            recv_buf.as_mut_ptr() as usize,
+                            recv_buf.len(),
+                            AccessFlags::LocalWrite,
+                        )
+                    }
+                    .map_err(oerr)?;
+                    {
+                        let mut g = qp.start_post_recv();
+                        let h = g.construct_wr(1);
+                        // SAFETY: recv_buf is registered and lives for the test.
+                        unsafe { h.setup_sge(mr.lkey(), recv_buf.as_ptr() as u64, 64) };
+                        g.post().map_err(oerr)?;
+                    }
+                    recv_mr = Some(mr);
                     let rep = CmRep {
                         recfmt: CM_FMT_1_0,
                         crqsize: req.hsqsize,
@@ -263,8 +324,13 @@ mod tests {
                     event.ack().map_err(oerr)?;
                 }
                 EventType::Established => {
-                    // Hold the QP/cm_id alive so the client reaches its OWN
-                    // Established; tearing down here would disconnect it first.
+                    // Reap the host's command capsule (the client sends it now)
+                    // and verify the capsule transport round-tripped it. Hold the
+                    // QP/cm_id alive until the client disconnects.
+                    let cq = &held.as_ref().expect("qp built before established").1;
+                    busy_wc(cq, 1).await?;
+                    assert_eq!(recv_buf, sample_capsule(), "command capsule round-trip");
+                    assert!(recv_mr.is_some(), "recv MR kept alive");
                     event.ack().map_err(oerr)?;
                 }
                 EventType::Disconnected => {
@@ -347,6 +413,34 @@ mod tests {
                         .map_err(oerr)?;
                     id.establish().map_err(oerr)?;
                     event.ack().map_err(oerr)?;
+                    // Send a command capsule over the established QP (capsule
+                    // transport check); wait for the send to complete before
+                    // tearing the connection down.
+                    let send_buf = sample_capsule().to_vec();
+                    let send_mr = {
+                        let pd = &held.as_ref().expect("qp built").0;
+                        // SAFETY: send_buf is a live, stable, owned buffer that
+                        // outlives this MR (dropped after the send completes).
+                        unsafe {
+                            pd.reg_mr(
+                                send_buf.as_ptr() as usize,
+                                send_buf.len(),
+                                AccessFlags::LocalWrite,
+                            )
+                        }
+                        .map_err(oerr)?
+                    };
+                    {
+                        let qp = &mut held.as_mut().expect("qp built").2;
+                        let mut g = qp.start_post_send();
+                        let h = g.construct_wr(2, WorkRequestFlags::Signaled).setup_send();
+                        // SAFETY: send_buf is registered and lives across the wait.
+                        unsafe { h.setup_sge(send_mr.lkey(), send_buf.as_ptr() as u64, 64) };
+                        g.post().map_err(oerr)?;
+                    }
+                    busy_wc(&held.as_ref().expect("qp built").1, 2).await?;
+                    drop(send_mr);
+                    drop(send_buf);
                     // Connected. Tearing down here disconnects, which the server
                     // sees as Disconnected (its cue that we are done).
                     id.disconnect().map_err(oerr)?;
