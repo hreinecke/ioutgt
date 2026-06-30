@@ -172,7 +172,6 @@ EOF
 # 'help'/'usage' must work without root or NIC_T/NIC_I, so handle it here.
 case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 
-NSDIR=/run/netns
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }
 
 # NIC_T/NIC_I are only needed to move the cards into/out of the namespaces
@@ -182,12 +181,8 @@ require_nics() {
     : "${NIC_I:?set NIC_I to the initiator-side NIC, e.g. NIC_I=enp1s0f1}"
 }
 
-# nsenter --net enters ONLY the net namespace, leaving the mount namespace
-# alone — crucial for the kernel target, because `ip netns exec` remounts a
-# fresh /sys and thereby SHADOWS the configfs at /sys/kernel/config. We need
-# configfs visible AND the socket-creating process inside NS_T (nvmet-tcp
-# creates its listener in the *current* process's netns), so we use nsenter.
-in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
+# in_net / NSDIR (nsenter --net into a namespace, keeping the mount ns so
+# configfs stays visible) live in common.sh, shared with two_nic_realwire_rdma.
 
 # Target context for common.sh's nvmet_setup/ioutgt_start. nvmet's configfs
 # script runs via in_net (nsenter --net, keeping the mount ns so configfs stays
@@ -212,26 +207,7 @@ TUNE_NS="$NS_T"
 # =====================================================================
 cmd_up() {
     require_nics
-    echo ">> creating namespaces $NS_T / $NS_I and moving NICs in"
-    ip netns add "$NS_T"
-    ip netns add "$NS_I"
-
-    # Move each physical NIC into its namespace, address it, bring it up.
-    ip link set "$NIC_T" netns "$NS_T"
-    ip link set "$NIC_I" netns "$NS_I"
-
-    ip netns exec "$NS_T" ip addr add "$IP_T/$PREFIX" dev "$NIC_T"
-    ip netns exec "$NS_I" ip addr add "$IP_I/$PREFIX" dev "$NIC_I"
-
-    # MTU before carrier: both ends must match (mismatched MTU silently drops
-    # oversized frames). Set on each NIC inside its namespace.
-    ip netns exec "$NS_T" ip link set "$NIC_T" mtu "$MTU"
-    ip netns exec "$NS_I" ip link set "$NIC_I" mtu "$MTU"
-
-    ip netns exec "$NS_T" ip link set lo up
-    ip netns exec "$NS_I" ip link set lo up
-    ip netns exec "$NS_T" ip link set "$NIC_T" up
-    ip netns exec "$NS_I" ip link set "$NIC_I" up
+    realwire_netns_create   # shared: create netns, move NICs in, address + MTU + up
 
     if [ "$NIC_TUNE" != 1 ]; then
         # Untuned baseline: no offloads toggle, no channel retune, no affinity
@@ -287,26 +263,10 @@ cmd_up() {
     cmd_up_prove_wire
 }
 
-# Wait for carrier and prove traffic crosses the physical link (the only path
-# between the two namespaces). Shared by the tuned and untuned 'up' paths.
-cmd_up_prove_wire() {
-    echo ">> waiting for link/carrier, then proving the wire with ping"
-    sleep 2
-    # Size the probe to the MTU (DF set) so the ping also proves the jumbo path
-    # end to end: an MTU mismatch or a link that cannot carry full frames drops
-    # the oversized, do-not-fragment packet here instead of silently later.
-    local psize=$((MTU - 28)) # minus IP(20)+ICMP(8) headers
-    if ip netns exec "$NS_I" ping -c 3 -W 2 -M do -s "$psize" "$IP_T" >/dev/null; then
-        echo "   OK: $IP_I -> $IP_T reachable at MTU $MTU (full-frame, DF). Only"
-        echo "   path is the physical link between $NIC_I and $NIC_T -> wire."
-    else
-        echo "   FAIL: no full-frame ping at MTU $MTU. Check the cable/switch"
-        echo "   between $NIC_I and $NIC_T, that both have carrier (ip netns exec"
-        echo "   $NS_T ip -br link), that IP_T/IP_I share subnet /$PREFIX, and that"
-        echo "   the link supports MTU $MTU (else re-run with MTU=1500)."
-        exit 1
-    fi
-}
+# Prove traffic crosses the physical link (the only path between the two
+# namespaces), shared by the tuned and untuned 'up' paths. realwire_prove_wire
+# (common.sh) returns non-zero on failure; a failed wire is fatal to 'up'.
+cmd_up_prove_wire() { realwire_prove_wire || exit 1; }
 
 cmd_down() {
     echo ">> removing namespaces and returning NICs to root"
@@ -318,12 +278,7 @@ cmd_down() {
     # and persist across the move back to root. Forcing them *off* would leave
     # the NIC degraded for later, unrelated tests -- e.g. a single-stream iperf
     # over this link drops from ~20 to ~8 Gb/s with GRO off.
-    # Return NICs to root if we know their names; deleting the netns also
-    # auto-returns physical NICs, so this is best-effort and env-tolerant.
-    [ -n "${NIC_T:-}" ] && in_net "$NS_T" ip link set "$NIC_T" netns 1 2>/dev/null || true
-    [ -n "${NIC_I:-}" ] && in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
-    ip netns del "$NS_T" 2>/dev/null || true
-    ip netns del "$NS_I" 2>/dev/null || true
+    realwire_netns_delete   # shared: return NICs to root, delete the namespaces
     echo "   namespaces removed; NICs returned to root (reconfigure addresses as needed)."
 }
 

@@ -737,3 +737,67 @@ EOF
         echo "  separation: OK (every io-thread on a different CPU than its NIC RX IRQ)"
     fi
 }
+
+# ---- two-NIC netns scaffolding (shared by two_nic_realwire*.sh) ------
+# Force target/initiator traffic across two PHYSICAL NICs on one host by
+# isolating each in its OWN network namespace: with no veth/bridge linking the
+# namespaces, the only path between them is the physical link between the cards,
+# so a successful cross-namespace ping is itself proof the bytes crossed the
+# wire. Transport-neutral — these helpers read the caller's NS_T/NS_I,
+# NIC_T/NIC_I, IP_T/IP_I, PREFIX, MTU globals. (The RDMA driver additionally
+# moves each NIC's rdma device into the netns; see two_nic_realwire_rdma.sh.)
+NSDIR="${NSDIR:-/run/netns}"
+
+# nsenter --net enters ONLY the net namespace, leaving the mount namespace
+# alone — crucial for the kernel target, because `ip netns exec` remounts a
+# fresh /sys and thereby SHADOWS the configfs at /sys/kernel/config.
+in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
+
+# Create the two namespaces, move each physical NIC in, then address + MTU + up.
+realwire_netns_create() {
+    echo ">> creating namespaces $NS_T / $NS_I and moving NICs in"
+    ip netns add "$NS_T"
+    ip netns add "$NS_I"
+    ip link set "$NIC_T" netns "$NS_T"
+    ip link set "$NIC_I" netns "$NS_I"
+    ip netns exec "$NS_T" ip addr add "$IP_T/$PREFIX" dev "$NIC_T"
+    ip netns exec "$NS_I" ip addr add "$IP_I/$PREFIX" dev "$NIC_I"
+    # MTU before carrier: both ends must match (mismatched MTU silently drops
+    # oversized frames).
+    ip netns exec "$NS_T" ip link set "$NIC_T" mtu "$MTU"
+    ip netns exec "$NS_I" ip link set "$NIC_I" mtu "$MTU"
+    ip netns exec "$NS_T" ip link set lo up
+    ip netns exec "$NS_I" ip link set lo up
+    ip netns exec "$NS_T" ip link set "$NIC_T" up
+    ip netns exec "$NS_I" ip link set "$NIC_I" up
+}
+
+# Wait for carrier, then prove traffic crosses the physical link. Sizes the
+# probe to the MTU (DF set) so an MTU mismatch / a link that cannot carry full
+# frames fails here, loudly, instead of silently later. Returns non-zero on
+# failure (the caller decides whether that is fatal).
+realwire_prove_wire() {
+    echo ">> waiting for link/carrier, then proving the wire with ping"
+    sleep 2
+    local psize=$((MTU - 28)) # minus IP(20)+ICMP(8) headers
+    if ip netns exec "$NS_I" ping -c 3 -W 2 -M do -s "$psize" "$IP_T" >/dev/null; then
+        echo "   OK: $IP_I -> $IP_T reachable at MTU $MTU (full-frame, DF). Only"
+        echo "   path is the physical link between $NIC_I and $NIC_T -> wire."
+    else
+        echo "   FAIL: no full-frame ping at MTU $MTU. Check the cable/switch"
+        echo "   between $NIC_I and $NIC_T, that both have carrier (ip netns exec"
+        echo "   $NS_T ip -br link), that IP_T/IP_I share subnet /$PREFIX, and that"
+        echo "   the link supports MTU $MTU (else re-run with MTU=1500)."
+        return 1
+    fi
+}
+
+# Return the NICs to root and delete the namespaces (best-effort; env-tolerant).
+# Deleting a netns also auto-returns its physical NICs, so the explicit moves
+# are belt-and-suspenders.
+realwire_netns_delete() {
+    [ -n "${NIC_T:-}" ] && in_net "$NS_T" ip link set "$NIC_T" netns 1 2>/dev/null || true
+    [ -n "${NIC_I:-}" ] && in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
+    ip netns del "$NS_T" 2>/dev/null || true
+    ip netns del "$NS_I" 2>/dev/null || true
+}
