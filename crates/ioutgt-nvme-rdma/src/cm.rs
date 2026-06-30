@@ -213,8 +213,12 @@ mod tests {
         b
     }
 
-    /// Async busy-poll: yield (ring timer) between polls so the peer task runs;
-    /// bounded so a lost completion fails instead of spinning forever.
+    /// Async busy-poll for a single WR on a private CQ — throwaway test
+    /// scaffolding. The real run_queue must instead drive a shared CQ via the
+    /// completion channel (req_notify + reactor `poll_add`, see `cq::wait`),
+    /// dispatch EVERY drained CQE to its slot by `wr_id`, and keep RECVs armed.
+    /// Yields (ring timer) between polls so the peer task runs; bounded so a
+    /// lost completion fails instead of spinning forever.
     async fn busy_wc(cq: &GenericCompletionQueue, wr_id: u64) -> io::Result<()> {
         for _ in 0..5000 {
             if let Ok(poller) = cq.start_poll() {
@@ -330,7 +334,8 @@ mod tests {
                     let cq = &held.as_ref().expect("qp built before established").1;
                     busy_wc(cq, 1).await?;
                     assert_eq!(recv_buf, sample_capsule(), "command capsule round-trip");
-                    assert!(recv_mr.is_some(), "recv MR kept alive");
+                    // recv_mr is held in the outer scope (kept alive structurally).
+                    let _keep = &recv_mr;
                     event.ack().map_err(oerr)?;
                 }
                 EventType::Disconnected => {
@@ -420,13 +425,11 @@ mod tests {
                     let send_mr = {
                         let pd = &held.as_ref().expect("qp built").0;
                         // SAFETY: send_buf is a live, stable, owned buffer that
-                        // outlives this MR (dropped after the send completes).
+                        // outlives this MR (dropped after the send completes). A
+                        // SEND source is only locally read by the HCA, so it needs
+                        // no access flag.
                         unsafe {
-                            pd.reg_mr(
-                                send_buf.as_ptr() as usize,
-                                send_buf.len(),
-                                AccessFlags::LocalWrite,
-                            )
+                            pd.reg_mr(send_buf.as_ptr() as usize, send_buf.len(), AccessFlags::none())
                         }
                         .map_err(oerr)?
                     };
