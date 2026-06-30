@@ -11,6 +11,7 @@ pub mod cm;
 pub mod cmproto;
 pub mod cq;
 pub mod target;
+pub mod transport;
 mod verbs;
 
 pub use verbs::{Rdma, RcDest, rdma_devices};

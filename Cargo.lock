@@ -455,6 +455,7 @@ dependencies = [
  "ioutgt-backend",
  "ioutgt-control",
  "ioutgt-core",
+ "ioutgt-harness",
  "ioutgt-nvme",
  "ioutgt-uring",
  "libc",

@@ -747,6 +747,10 @@ pub struct RdmaConn {
     pub port: Arc<PortConfig<AnyBackend>>,
     /// The controller registry (shared across this port's queues).
     pub registry: Arc<Registry>,
+    /// Live-connection accounting permit (harness path); held for the
+    /// connection's lifetime and dropped when its queue ends, so the active
+    /// count + idle-teardown track it. `None` on the bare `serve()` path.
+    pub permit: Option<ioutgt_core::permit::ConnPermit>,
 }
 
 /// Build the queue for an accepted [`RdmaConn`] and drive it to completion: build
@@ -932,6 +936,7 @@ pub async fn serve(
             hsqsize: raw.hsqsize,
             port: Arc::clone(&port),
             registry: Arc::clone(&registry),
+            permit: None,
         };
         tokio::task::spawn_local(async move {
             // A failure inside run_conn (QP build / accept / run) only logs — the

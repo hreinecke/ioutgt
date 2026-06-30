@@ -16,6 +16,9 @@ ioutgt-backend = { workspace = true }
 # Shared backend builder + JSON config (memory/null/file), reused by the binary
 # so `--backend`/`--config` match the ioutgt-nvme-tcp binary.
 ioutgt-control = { workspace = true }
+# The transport-neutral queue-thread pool / control-loop / control API: the
+# RDMA Transport impl plugs into it (multi-thread, pinning, ctl/list/stat).
+ioutgt-harness = { workspace = true }
 ioutgt-nvme = { workspace = true }
 ioutgt-uring = { workspace = true }
 # Safe, maintained ibverbs + RDMA-CM bindings that link the system rdma-core
@@ -31,8 +34,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zerocopy = { workspace = true }
 clap = { workspace = true }
-# `spawn_local`/`JoinSet` for per-command tasks + `select!` in the reap loop.
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `spawn_local`/`JoinSet` per-command tasks, `select!`, and `sync` (mpsc/oneshot
+# bridge from the dedicated CM thread to the harness control thread).
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 
 [[bin]]
 name = "ioutgt-nvme-rdma"

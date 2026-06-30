@@ -54,15 +54,34 @@ queue thread's io_uring with `IORING_OP_POLL_ADD`; a readiness CQE wakes the
 thread, which drains `ibv_poll_cq` / processes CM events. Busy-poll is a
 deferred opt-in.
 
-## Queue pipeline (`target.rs`, focused v1)
+## Threading & the harness Transport
 
-One reactor thread owns the CM listener (`serve()`) and every queue. On each
-`CONNECT_REQUEST`, `accept_one` parses the host's `CmReq` (qid, hsqsize), builds
-a PD/comp-channel/CQ/QP on the **cm_id's own device context**, drives it
-INIT→RTR→RTS from the CM-derived attributes, primes the RECVs and arms the CQ
-*before* `accept` (so the host's first capsule is never dropped), then spawns
-`RdmaQueue::run` on the same thread. The cm_id is held for the process lifetime
-(clean per-queue teardown is deferred).
+The binary runs on the shared `ioutgt-harness` queue-thread pool (admin thread +
+N IO threads, CPU-pinned) via `ioutgt_harness::spawn::<RdmaTransport>` — the same
+seam the TCP binary uses, bringing multi-core queues, the control socket
+(`ctl`/`list`/`stat`), `ConnPermit`/`MAX_CONNECTIONS`, and idle-teardown.
+
+The one structural mismatch: the CM event channel parks on its fd via io_uring
+`POLL_ADD`, which needs an io_uring reactor, but the harness control thread is
+plain tokio. So `RdmaTransport::bind` spawns a **dedicated CM reactor thread**
+(`cm_thread_main`, its own `QueueRuntime`) that runs the `RdmaListener` and
+forwards each accepted connection — an `RdmaRaw` (cm_id + qid + hsqsize), all
+`Send` — over a bounded tokio mpsc channel to the control thread. `accept` drains
+that channel; `handshake` packages `RdmaRaw` + `ConnPermit` into an `RdmaConn`;
+`run_queue` runs `run_conn` on the routed (by qid) **queue thread**, which is
+where all reactor-bound work happens: build the PD/comp-channel/CQ/QP on the
+**cm_id's own device context**, drive it INIT→RTR→RTS from the CM-derived attrs,
+prime the RECVs and arm the CQ *before* `rdma_accept` (so the host's first
+capsule is never dropped), then run the queue. So one cm_id is created + has its
+lifecycle events (Established/Disconnected) pumped on the CM thread, but builds
+its QP + `rdma_accept`s on a queue thread — sideway declares `Identifier: Send +
+Sync` and librdmacm's cm_id ops are thread-safe. The cm_id is held for the
+process lifetime (clean per-queue teardown is deferred).
+
+`serve()` remains a single-threaded path (CM listener + every queue on one
+io_uring reactor) — a simpler fallback that bypasses the harness.
+
+## Queue pipeline (`target.rs`)
 
 `RdmaQueue` joins `QueueCore<Sqe>` with the connection's RDMA resources and three
 registered buffers: the data-pool arena (the local source for read-data RDMA
@@ -82,14 +101,14 @@ staging buffer. The pipeline per command:
 
 The first capsule on qid 0 bootstraps a controller (`ConnCtx::new_admin`); qid n
 attaches by cntlid (`ConnCtx::new_io`). The binary `ioutgt-nvme-rdma` mirrors the
-transport-neutral subset of the `ioutgt-nvme-tcp` CLI — `--config` (JSON,
-reusing `ioutgt-control`'s `FileConfig`), `--listen`, `--subsys-nqn`,
-`--backend` (memory/null/file, via the shared `build_backend`), `--mem-size-mb`,
-`--io-queue-size`, `--queue-buf-mb`. Harness-only knobs (`--io-threads`,
-`--no-pin`, `--control-socket`, `--idle-teardown-secs`, the `ctl`/`list`/`stat`
-subcommands) and TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`) are
-absent until the harness integration (RD6); the single reactor thread advertises
-one IO queue.
+transport-neutral CLI of `ioutgt-nvme-tcp` — `--config` (JSON), `--listen`,
+`--subsys-nqn`, `--backend` (memory/null/file), `--mem-size-mb`,
+`--io-queue-size`, `--queue-buf-mb`, `--io-threads`, `--no-pin`,
+`--control-socket`, `--idle-teardown-secs` — and builds a `TargetConfig` for
+`ioutgt_harness::spawn`. TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`)
+are absent; the `ctl`/`list`/`stat` client subcommands are not yet wired into
+this binary (the control socket is served, so the TCP binary's clients or a raw
+socket work against it).
 
 Commands execute on **preallocated per-tag tasks** (one persistent task per slot,
 spawned once at queue install — zero per-command allocation, mirroring the TCP
@@ -117,6 +136,17 @@ finished response (read-data RDMA WRITE, then the CQE SEND). The per-tag
   length.* An undersized host SGL surfaces as an RDMA remote-access-error
   completion (→ queue teardown) rather than a clean NVMe `DATA_XFER_ERROR`. RDMA
   protection prevents any local memory-safety issue.
+- *cm_id leak on the CM thread.* `RdmaListener.conns` retains every accepted
+  cm_id for the process lifetime (best-effort teardown), so reconnect churn leaks
+  cm_ids/CM state — it would fail a reconnect-soak gate (`IOUTGT_SOAK_ONLY`). A
+  weak-ref sweep on each `accept()` would bound it.
+- *Over `MAX_CONNECTIONS`, the host times out instead of being rejected.* The
+  harness drops the over-limit `RdmaRaw`; for RDMA that means `rdma_accept` is
+  simply never called (no `rdma_reject`), so the host times out rather than
+  getting a clean CM reject.
+- *`bind` reports the configured listen address verbatim* (no ephemeral-port
+  resolution), so `--listen …:0` would misadvertise port 0 — fine for the fixed
+  RDMA port, unsupported for `:0`.
 
 **Write-data path (host→controller).** `io::write`/`io::dsm` read the write data
 straight from the slot, which over RDMA must be RDMA-READ from the host's keyed

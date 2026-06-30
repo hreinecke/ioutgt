@@ -48,7 +48,7 @@ show_gids 2>/dev/null | grep -w "$IP" | head -2 || echo "[rdma] (no dotted GID l
 
 # Start the target on the rxe IP. Stream its log live (so a hang/panic is
 # visible in the vmtest console, not hidden until cleanup).
-echo "[rdma] starting target: $BIN --listen $IP:$PORT --nqn $NQN"
+echo "[rdma] starting target: $BIN --listen $IP:$PORT --subsys-nqn $NQN"
 RUST_LOG=debug RUST_BACKTRACE=1 "$BIN" --listen "$IP:$PORT" --subsys-nqn "$NQN" --mem-size-mb 256 >"$LOG" 2>&1 &
 TGT=$!
 tail -f "$LOG" | sed 's/^/[tgt] /' &
