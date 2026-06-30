@@ -187,9 +187,29 @@ queue corrupting or tearing down.
   verify** (`cmp`) → an `fio --verify=crc32c` randwrite pass → `disconnect`.
   (The guest re-adds the netdev IP after `rdma link add` to force the rxe
   RoCEv2 GID to populate, which otherwise races bind on some boots.)
-- **Full correctness (RD4+)**: `fio --verify=crc32c` against both
-  `ioutgt-nvme-rdma` and in-kernel `nvmet-rdma`. Requires `rdma_rxe`,
-  `nvmet_rdma`, `nvme_rdma`.
-- **Box perf**: two physical mlx5 NICs in RoCE mode, `fio` / `fio_perf` sweep
-  comparing `ioutgt-nvme-rdma` vs `nvmet-rdma`.
+- **A/B correctness gate (VM)**: `testing/run_rdma_compare.sh` builds the
+  release binary and runs `testing/vmtest/ioutgt_rdma_compare.sh` in the guest
+  — soft-RoCE (rxe), then the SAME `testing/local_tgt.sh` verbs with
+  `TRANSPORT=rdma` against BOTH `ioutgt-nvme-rdma` and in-kernel `nvmet-rdma`,
+  asserting a clean `fio --verify=crc32c` on each. Backends are loop block
+  devices (the guest root is tmpfs, which supports neither `O_DIRECT` nor the
+  nvmet file backend). Requires `rdma_rxe`, `nvmet_rdma`, `nvme_rdma`.
+- **Shared harness knob**: `testing/common.sh` selects the fabric with
+  `TRANSPORT=tcp|rdma` (default tcp): it picks the binary
+  (`ioutgt-nvme-$TRANSPORT`), the kernel modules (`nvmet-$TRANSPORT` /
+  `nvme-$TRANSPORT`), the port `addr_trtype`, and `nvme -t`, and forces digests
+  + zero-copy-send off for rdma. Both `local_tgt.sh` and the two-NIC drivers
+  share it.
+- **Box perf (two real mlx5 NICs)**: `testing/two_nic_realwire_rdma.sh` —
+  `rdma system set netns exclusive`, forces RoCE across the physical link, and
+  runs `fio` / `fio_perf` for `ioutgt-nvme-rdma` vs `nvmet-rdma` back to back.
+  *Asymmetric topology*: nvmet-rdma's CM listener is hardcoded to `init_net`
+  (`rdma_create_id(&init_net,…)` / `inet_pton_with_scope(&init_net,…)` in
+  `drivers/nvme/target/rdma.c`), so it can only listen in the root netns —
+  unlike nvmet-tcp (`sock_create` in the writer's netns). The driver therefore
+  keeps the **target** (NIC_T + IP_T + its rdma device) in root and isolates
+  only the **initiator** (NIC_I) in its own netns; the wire is still forced
+  because root reaches the initiator IP only out NIC_T → the physical link. On
+  the box, confirm RoCE actually egresses the wire (NIC counters during fio)
+  rather than HCA-looping.
 - Verify a link first with `ibv_devinfo` / `rping` / `ib_send_bw`.
