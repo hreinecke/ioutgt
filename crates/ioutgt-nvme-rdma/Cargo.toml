@@ -23,5 +23,9 @@ rdma-mummy-sys = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# `tokio::select!` in the reactor loopback test (the runtime is QueueRuntime).
+tokio = { workspace = true, features = ["macros"] }
+
 [lints]
 workspace = true

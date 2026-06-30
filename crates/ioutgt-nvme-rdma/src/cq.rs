@@ -1,14 +1,17 @@
 //! Event-driven completion-queue reaping. Arm the CQ to post a notification on
 //! its completion channel for the next completion, park the queue thread's
 //! reactor on the channel fd via io_uring `POLL_ADD`, then consume + ack the
-//! event. This replaces busy-polling `ibv_poll_cq`: the thread sleeps in its
+//! event(s). This replaces busy-polling `ibv_poll_cq`: the thread sleeps in its
 //! normal `submit_and_wait` until a completion arrives.
 //!
 //! sideway wraps no CQ-event calls, so `ibv_req_notify_cq` / `ibv_get_cq_event`
 //! / `ibv_ack_cq_events` are called through `rdma-mummy-sys` (sideway's own FFI
 //! backend, so the `ibv_cq` / `ibv_comp_channel` types match its raw handles).
+//!
+//! These helpers assume one channel per CQ (`create_cq_on_channel`): every
+//! event on `channel` belongs to `cq`, so the events are acked against `cq`.
+//! A channel shared across CQs would need per-event cq dispatch.
 
-use std::ffi::c_void;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::ptr;
@@ -20,9 +23,13 @@ fn pollin() -> u32 {
     u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
 }
 
+fn err_hup() -> u32 {
+    u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
+}
+
 /// Arm `cq` so the next completion posts an event on its completion channel.
-/// Call once before the wait loop and again after each drain (before the next
-/// park) so a completion arriving mid-drain still wakes the thread.
+/// Call once before the first [`wait`]; `wait` re-arms after consuming, before
+/// the caller drains, so a completion arriving mid-drain still re-signals the fd.
 pub fn arm(cq: &GenericCompletionQueue) -> io::Result<()> {
     // SAFETY: `cq.cq()` is the live `ibv_cq` backing this queue (valid for the
     // CQ's lifetime); `ibv_req_notify_cq` only reads it to arm the channel.
@@ -33,31 +40,56 @@ pub fn arm(cq: &GenericCompletionQueue) -> io::Result<()> {
     Ok(())
 }
 
-/// Consume and acknowledge exactly one completion-channel event, after the
-/// channel fd has signalled readable. Events must be acked 1:1 or
-/// `ibv_destroy_cq` blocks at teardown.
-fn consume_event(channel: &CompletionChannel) -> io::Result<()> {
-    let mut cq: *mut ibv_cq = ptr::null_mut();
-    let mut ctx: *mut c_void = ptr::null_mut();
-    // SAFETY: `channel.comp_channel()` is the live channel; `ibv_get_cq_event`
-    // writes the event's cq/context through the out-params.
-    let rc = unsafe { ibv_get_cq_event(channel.comp_channel().as_ptr(), &mut cq, &mut ctx) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+/// Consume and acknowledge every currently-queued event on `channel` (which
+/// must be non-blocking — see [`crate::verbs::Rdma::create_comp_channel`]),
+/// returning the count. One event may announce several completions, and several
+/// may queue before a wakeup, so this drains until `EAGAIN`. Acks are batched.
+///
+/// Used both inside [`wait`] and at teardown: `ibv_destroy_cq` blocks until
+/// every delivered event is acked, so the owner must call this before dropping
+/// the CQ to clear any event that arrived after the last [`wait`].
+pub fn drain_events(channel: &CompletionChannel, cq: &GenericCompletionQueue) -> io::Result<u32> {
+    let mut count = 0u32;
+    loop {
+        let mut ev_cq: *mut ibv_cq = ptr::null_mut();
+        let mut ev_ctx: *mut std::ffi::c_void = ptr::null_mut();
+        // SAFETY: `channel.comp_channel()` is the live, non-blocking channel;
+        // `ibv_get_cq_event` writes the event's cq/context through the out-params
+        // and returns -1/EAGAIN when none are queued.
+        let rc =
+            unsafe { ibv_get_cq_event(channel.comp_channel().as_ptr(), &mut ev_cq, &mut ev_ctx) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                break;
+            }
+            return Err(err);
+        }
+        count += 1;
     }
-    // SAFETY: `cq` is the queue `ibv_get_cq_event` just returned; ack one event.
-    unsafe { ibv_ack_cq_events(cq, 1) };
-    Ok(())
+    if count > 0 {
+        // SAFETY: with one channel per CQ, every drained event belongs to `cq`;
+        // ack exactly the number consumed (batched).
+        unsafe { ibv_ack_cq_events(cq.cq().as_ptr(), count) };
+    }
+    Ok(count)
 }
 
 /// Park the reactor on `channel`'s fd until `cq` notifies, then consume + ack
-/// the event and re-arm `cq`. The caller drains the CQ after this returns;
-/// because the re-arm happens *before* that drain, a completion arriving
-/// mid-drain re-signals the channel, so no wakeup is lost. The caller must
-/// [`arm`] once before the first call.
+/// the queued event(s) and re-arm `cq`. The caller drains the CQ (sideway
+/// `start_poll`) afterwards; because the re-arm happens *before* that drain, a
+/// completion arriving mid-drain re-signals the channel, so no wakeup is lost.
+/// The caller must [`arm`] once before the first call, and [`drain_events`] at
+/// teardown to clear any trailing event.
 pub async fn wait(channel: &CompletionChannel, cq: &GenericCompletionQueue) -> io::Result<()> {
-    ioutgt_uring::ops::poll_add(channel.as_raw_fd(), pollin())?.await?;
-    consume_event(channel)?;
+    let revents = ioutgt_uring::ops::poll_add(channel.as_raw_fd(), pollin())?.await?;
+    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is in error or
+    // hung up with no data (device removed/torn down), fail loudly rather than
+    // letting the drain spin on a fd that will never carry an event again.
+    if revents & pollin() == 0 && revents & err_hup() != 0 {
+        return Err(io::Error::other("completion channel error or hangup"));
+    }
+    drain_events(channel, cq)?;
     arm(cq)?;
     Ok(())
 }
@@ -66,10 +98,13 @@ pub async fn wait(channel: &CompletionChannel, cq: &GenericCompletionQueue) -> i
 mod tests {
     use super::*;
     use crate::{RcDest, Rdma};
-    use ioutgt_uring::{QueueRuntime, RingConfig};
+    use ioutgt_uring::{QueueRuntime, RingConfig, ops};
     use sideway::ibverbs::AccessFlags;
     use sideway::ibverbs::completion::WorkCompletionStatus;
-    use sideway::ibverbs::queue_pair::{PostSendGuard, QueuePair, SetScatterGatherEntry, WorkRequestFlags};
+    use sideway::ibverbs::queue_pair::{
+        PostSendGuard, QueuePair, SetScatterGatherEntry, WorkRequestFlags,
+    };
+    use std::time::Duration;
 
     /// Drain all currently-available completions as `(wr_id, status)`.
     fn drain(cq: &GenericCompletionQueue) -> Vec<(u64, u32)> {
@@ -138,10 +173,17 @@ mod tests {
                 g.post().map_err(|e| io::Error::other(format!("{e:?}")))?;
             }
 
-            // Reap both completions strictly through the reactor wakeup path.
+            // Reap both completions strictly through the reactor wakeup path,
+            // bounding each park with a timer so a lost completion fails with a
+            // diagnostic instead of hanging.
             let mut seen = Vec::new();
             for _ in 0..16 {
-                wait(&channel, &cq).await?;
+                tokio::select! {
+                    r = wait(&channel, &cq) => r?,
+                    _ = ops::sleep(Duration::from_secs(5)).unwrap() => {
+                        panic!("timed out waiting for a CQ event, saw {seen:?}");
+                    }
+                }
                 for (wr_id, status) in drain(&cq) {
                     assert_eq!(
                         status,
@@ -154,6 +196,10 @@ mod tests {
                     break;
                 }
             }
+            // Clear any event that landed between the last re-arm and drain, so
+            // the CQ/channel destroy at scope exit does not block.
+            drain_events(&channel, &cq)?;
+
             assert!(
                 seen.contains(&1) && seen.contains(&2),
                 "missing completions, saw {seen:?}"

@@ -13,9 +13,9 @@ echo "[rdma] netdev=${DEV:-<none>}"
 [ -n "${DEV:-}" ] && rdma link add rxe0 type rxe netdev "$DEV" 2>&1 || echo "[rdma] rdma link add note: $?"
 rdma link show 2>&1 | head -4
 ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
-echo "[rdma] === running rxe_loopback ==="
+echo "[rdma] === running rxe_ tests ==="
 "$BIN" --test-threads=1 --nocapture rxe_
 rc=$?
-echo "[rdma] rxe_loopback rc=$rc"
+echo "[rdma] rxe tests rc=$rc"
 [ $rc -eq 0 ] && echo "[rdma] RESULT: PASS" || echo "[rdma] RESULT: FAIL"
 exit $rc

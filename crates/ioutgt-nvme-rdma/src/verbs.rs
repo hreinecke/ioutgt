@@ -105,8 +105,13 @@ impl Rdma {
 
     /// Create a completion channel — the fd the reactor parks on (via
     /// `IORING_OP_POLL_ADD`) to wake on completions instead of busy-polling.
+    /// The fd is set non-blocking so the reactor-driven drain
+    /// ([`crate::cq::drain_events`]) never blocks the queue thread on a spurious
+    /// wakeup (it parks via `poll_add` instead).
     pub fn create_comp_channel(&self) -> io::Result<Arc<CompletionChannel>> {
-        self.ctx.create_comp_channel().map_err(oerr)
+        let channel = self.ctx.create_comp_channel().map_err(oerr)?;
+        channel.set_nonblocking(true)?;
+        Ok(channel)
     }
 
     /// Create an extended completion queue bound to `channel`, so a completion

@@ -455,6 +455,7 @@ dependencies = [
  "libc",
  "rdma-mummy-sys",
  "sideway",
+ "tokio",
  "tracing",
 ]
 
