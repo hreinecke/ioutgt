@@ -785,9 +785,9 @@ realwire_prove_wire() {
         echo "   path is the physical link between $NIC_I and $NIC_T -> wire."
     else
         echo "   FAIL: no full-frame ping at MTU $MTU. Check the cable/switch"
-        echo "   between $NIC_I and $NIC_T, that both have carrier (ip netns exec"
-        echo "   $NS_T ip -br link), that IP_T/IP_I share subnet /$PREFIX, and that"
-        echo "   the link supports MTU $MTU (else re-run with MTU=1500)."
+        echo "   between $NIC_I and $NIC_T, that both NICs have carrier, that"
+        echo "   IP_T/IP_I share subnet /$PREFIX, and that the link supports"
+        echo "   MTU $MTU (else re-run with MTU=1500)."
         return 1
     fi
 }
