@@ -14,7 +14,7 @@ use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::address::{AddressHandleAttribute, GidEntry, GidType};
 use sideway::ibverbs::completion::{CompletionChannel, GenericCompletionQueue};
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
-use sideway::ibverbs::device_context::{DeviceContext, Mtu};
+use sideway::ibverbs::device_context::DeviceContext;
 use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::protection_domain::ProtectionDomain;
 use sideway::ibverbs::queue_pair::{
@@ -200,11 +200,18 @@ impl Rdma {
             .setup_grh_dest_gid(&dest.gid)
             .setup_grh_src_gid_index(src_gid_index)
             .setup_grh_hop_limit(64);
+        // Match the peer's path MTU by querying the port's active MTU rather than
+        // hardcoding. Our QP is not cm_id-associated, so a path MTU below the host's
+        // CM-negotiated value (1024 vs an mlx5 link's 4096) is an RC MTU mismatch
+        // that stalls/corrupts large RDMA transfers under sustained load.
+        let active_mtu = self
+            .ctx
+            .query_port(self.port)
+            .map_err(|e| io::Error::other(format!("query_port active_mtu: {e:?}")))?
+            .active_mtu();
         let mut rtr = QueuePairAttribute::new();
         rtr.setup_state(QueuePairState::ReadyToReceive)
-            // TODO(perf): query active_mtu; 1024 is safe for rxe but caps an
-            // mlx5 link (4096) — revisit when the CM path lands real peers.
-            .setup_path_mtu(Mtu::Mtu1024)
+            .setup_path_mtu(active_mtu)
             .setup_dest_qp_num(dest.qp_num)
             .setup_rq_psn(0)
             .setup_max_dest_read_atomic(1)
