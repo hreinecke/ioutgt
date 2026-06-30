@@ -209,7 +209,21 @@ queue corrupting or tearing down.
   unlike nvmet-tcp (`sock_create` in the writer's netns). The driver therefore
   keeps the **target** (NIC_T + IP_T + its rdma device) in root and isolates
   only the **initiator** (NIC_I) in its own netns; the wire is still forced
-  because root reaches the initiator IP only out NIC_T → the physical link. On
-  the box, confirm RoCE actually egresses the wire (NIC counters during fio)
-  rather than HCA-looping.
+  because root reaches the initiator IP only out NIC_T → the physical link.
+  Validated on a two-card mlx5 (CX-6) box: discover/connect/IO over the wire
+  for both targets. Two box gotchas baked into the driver:
+  - *Carrier flap to seat the GID.* Under `netns exclusive`, a freshly-added
+    RoCEv2 GID lands in the sysfs GID table but **not** the rdma_cm GID cache
+    until a netdev **carrier** event fires, so `rdma_bind_addr` returns
+    `EADDRNOTAVAIL` (confirmed identically for ioutgt, nvmet-rdma, *and*
+    `rping`). `rdma_address_nic` does an `ip link down/up` (an IP re-add alone
+    is not enough for mlx5) then re-adds the IP and waits for the GID.
+  - *Setting `netns exclusive` needs a quiesced host.* It returns `EBUSY` if any
+    other net namespace exists (e.g. a `systemd PrivateNetwork` service such as
+    `polkit`); free them, set the mode, restore.
+  - *Lossless RoCE for writes.* Reads run clean, but a heavy `randwrite` sweep
+    (target-issued RDMA READs) congests an unconfigured link and drops QPs —
+    `rdma connection establishment failed (-104)` reconnect storms on **both**
+    targets, so it is a fabric/flow-control limit (PFC/ECN), not a target bug.
+    Use lower queue depth or configure PFC/ECN for representative write numbers.
 - Verify a link first with `ibv_devinfo` / `rping` / `ib_send_bw`.

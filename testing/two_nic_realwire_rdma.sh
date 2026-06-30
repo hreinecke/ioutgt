@@ -201,6 +201,39 @@ rdma_netns_exclusive() {
 # followed its netdev into the ns, so tolerate failure and let the verify decide.
 rdma_move_dev() { rdma dev set "$1" netns "$2" 2>/dev/null || true; }
 
+# True once the RoCEv2 GID for IPv4 $2 is present on $1's rdma device (in netns
+# $3, "" for root). $2's dotted quad maps to the ::ffff:HHHH:HHHH GID suffix.
+rdma_gid_ready() {
+    local nic="$1" ip="$2" ns="$3"; local -a x=(); [ -n "$ns" ] && x=(ip netns exec "$ns")
+    local ib hex; ib="$("${x[@]}" sh -c "ls /sys/class/net/$nic/device/infiniband/ 2>/dev/null" | head -1)"
+    [ -n "$ib" ] || return 1
+    # shellcheck disable=SC2086  # deliberate split of the dotted quad into 4 args
+    hex="$(printf '%02x%02x:%02x%02x' ${ip//./ })"
+    "${x[@]}" sh -c "grep -qi 'ffff:$hex' /sys/class/infiniband/$ib/ports/*/gids/* 2>/dev/null"
+}
+
+# Address a RoCE NIC and make its GID usable for rdma_bind_addr/resolve. Under
+# `rdma system netns exclusive`, a freshly-added RoCE GID lands in the sysfs GID
+# table but NOT the rdma_cm GID cache until a netdev carrier event fires — so
+# bind/resolve return EADDRNOTAVAIL despite the GID being "present". mlx5 needs
+# a real link down/up (an IP re-add alone is not enough), so flap the carrier,
+# then add the IP while the link is up and wait for the GID to land. $3 = netns
+# ("" for root). Verified on a two-card mlx5 box: without this, both
+# ioutgt-nvme-rdma and nvmet-rdma (and even rping) fail to bind the target IP.
+rdma_address_nic() {
+    local nic="$1" ip="$2" ns="$3"; local -a x=(); [ -n "$ns" ] && x=(ip netns exec "$ns")
+    "${x[@]}" ip addr flush dev "$nic" 2>/dev/null || true
+    "${x[@]}" ip link set "$nic" down
+    "${x[@]}" ip link set "$nic" up
+    "${x[@]}" ip link set "$nic" mtu "$MTU"
+    "${x[@]}" ip addr add "$ip/$PREFIX" dev "$nic"
+    "${x[@]}" ip link set lo up 2>/dev/null || true
+    local i
+    for i in $(seq 1 30); do rdma_gid_ready "$nic" "$ip" "$ns" && return 0; sleep 0.5; done
+    echo "   warning: RoCEv2 GID for $ip on $nic ($ns netns) not visible after 15s" >&2
+    return 0
+}
+
 # Wait (carrier settles) for an rdma device to be present + ACTIVE. $1 is the
 # netns ("" = root/current); $2 is the device name.
 rdma_verify_dev() {
@@ -234,22 +267,19 @@ cmd_up() {
     echo ">> rdma devices: target $NIC_T -> $ibt (stays in root), initiator $NIC_I -> $ibi (into $NS_I)"
     rdma_netns_exclusive || exit 1
 
-    # Target side stays in the root netns: address NIC_T, set MTU, bring it up.
-    echo ">> addressing target $NIC_T=$IP_T/$PREFIX in root netns"
-    ip addr add "$IP_T/$PREFIX" dev "$NIC_T" 2>/dev/null || true
-    ip link set "$NIC_T" mtu "$MTU"
-    ip link set "$NIC_T" up
+    # Target side stays in the root netns. rdma_address_nic carrier-flaps it so
+    # the RoCEv2 GID lands in the rdma_cm cache (else bind/resolve hit
+    # EADDRNOTAVAIL under exclusive mode).
+    echo ">> addressing target $NIC_T=$IP_T/$PREFIX in root netns (carrier flap to seat GID)"
+    rdma_address_nic "$NIC_T" "$IP_T" ""
 
-    # Initiator side: isolate NIC_I in NS_I, address it, bring it up.
+    # Initiator side: isolate NIC_I in NS_I, move its rdma device there, then
+    # address it (carrier flap) so its GID is usable from inside the netns.
     echo ">> isolating initiator $NIC_I=$IP_I/$PREFIX in $NS_I"
     ip netns add "$NS_I"
     ip link set "$NIC_I" netns "$NS_I"
-    ip netns exec "$NS_I" ip addr add "$IP_I/$PREFIX" dev "$NIC_I"
-    ip netns exec "$NS_I" ip link set "$NIC_I" mtu "$MTU"
-    ip netns exec "$NS_I" ip link set lo up
-    ip netns exec "$NS_I" ip link set "$NIC_I" up
-    # Move the initiator's rdma device into NS_I (may already have followed).
-    rdma_move_dev "$ibi" "$NS_I"
+    rdma_move_dev "$ibi" "$NS_I"   # may already have followed its netdev
+    rdma_address_nic "$NIC_I" "$IP_I" "$NS_I"
 
     realwire_prove_wire || exit 1   # ping NS_I -> IP_T across the wire; settles carrier
     rdma_verify_dev "$NS_I" "$ibi" || fail "$ibi is not ACTIVE in $NS_I (carrier? GID? cable?)"
