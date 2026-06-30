@@ -115,6 +115,10 @@ pub mod nmic {
 /// SGLS bits: byte-aligned SGL support (value 1 in bits 1:0).
 pub const SGLS_BYTE_ALIGNED: u32 = 1;
 
+/// SGLS bit 2: Keyed SGL Data Block descriptor support. NVMe/RDMA hosts treat
+/// this as mandatory (the keyed SGL carries the host's addr+rkey+len).
+pub const SGLS_KEYED: u32 = 1 << 2;
+
 /// LBA format descriptor.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
 #[repr(C)]

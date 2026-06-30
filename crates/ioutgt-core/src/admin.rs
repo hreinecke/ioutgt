@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ioutgt_nvme::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use ioutgt_nvme::identify::{
-    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, cmic, nmic, oncs,
+    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, cmic, nmic, oncs,
 };
 use ioutgt_nvme::spec::{Sqe, admin_opcode, cns, feat, log_page};
 use ioutgt_nvme::status;
@@ -196,7 +196,13 @@ fn build_id_ctrl<B: Backend>(
     id.aerl = 3;
     // MDTS: slot buffer / CAP.MPSMIN(4K) pages: 128K = 2^5 * 4K.
     id.mdts = 5;
-    id.sgls.set(SGLS_BYTE_ALIGNED);
+    // RDMA hosts require keyed SGL support (the command capsule carries the
+    // host's addr+rkey+len); TCP uses byte-aligned in-capsule SGLs only.
+    let mut sgls = SGLS_BYTE_ALIGNED;
+    if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
+        sgls |= SGLS_KEYED;
+    }
+    id.sgls.set(sgls);
 
     if discovery {
         // Discovery controllers: no namespaces, no IO command set.

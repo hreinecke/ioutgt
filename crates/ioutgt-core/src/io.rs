@@ -104,7 +104,12 @@ fn checked_len<B: Backend>(backend: &B, sqe: &Sqe) -> Result<(RwCommand, u32), u
     if len > u64::from(crate::MDTS_BYTES) {
         return Err(status::INVALID_FIELD | status::DNR);
     }
-    if u64::from(sqe.dptr.length.get()) != len {
+    // The SGL data-length field is 32-bit for an in-capsule data-block
+    // descriptor (NVMe/TCP) but only 24-bit for a keyed SGL data-block
+    // descriptor (NVMe/RDMA: bytes 8..11, with byte 11 starting the key). Every
+    // valid transfer is <= MDTS (128 KiB) < 2^24, so the top byte is always zero
+    // for a real length; mask it so the check reads both descriptor formats.
+    if u64::from(sqe.dptr.length.get() & 0x00FF_FFFF) != len {
         return Err(status::DATA_SGL_LEN_INVALID | status::DNR);
     }
     backend.check_range(rw.slba, nlb).map_err(nvme_status)?;

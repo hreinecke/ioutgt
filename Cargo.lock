@@ -451,12 +451,17 @@ dependencies = [
 name = "ioutgt-nvme-rdma"
 version = "0.1.0"
 dependencies = [
+ "ioutgt-backend",
+ "ioutgt-core",
+ "ioutgt-nvme",
  "ioutgt-uring",
  "libc",
  "rdma-mummy-sys",
  "sideway",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]

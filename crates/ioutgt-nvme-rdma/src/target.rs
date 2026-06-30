@@ -1,0 +1,739 @@
+//! Focused-v1 NVMe/RDMA target queue: drive the transport-neutral NVMe model
+//! ([`ioutgt_core::dispatch`]) over RDMA capsules on one CM-established RC QP.
+//!
+//! Per command: RECV the command capsule → parse the [`Sqe`] (and, for Connect,
+//! the in-capsule [`ConnectData`]) → run it through the slot pipeline and
+//! `dispatch::execute` → if it produced read data, RDMA WRITE
+//! `slot.data().segs()` to the host's keyed SGL → SEND the response capsule
+//! (the [`Cqe`]) → release the slot and re-arm the RECV. Mirrors the
+//! `ioutgt-nvme-tcp` `run_queue`, swapping its PDU staging for verbs.
+//!
+//! Single-threaded (one reactor thread owns the QP/CQ/MR pool); not yet wired
+//! into the harness pool. Completions are reaped reactor-driven via [`crate::cq`].
+
+use std::io;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use ioutgt_backend::AnyBackend;
+use ioutgt_core::controller::Registry;
+use ioutgt_core::dispatch::{self, ConnCtx, Outcome, Role};
+use ioutgt_core::pool::MAX_SEGS;
+use ioutgt_core::queue::QueueCore;
+use ioutgt_core::subsystem::PortConfig;
+use ioutgt_nvme::fabrics::ConnectData;
+use ioutgt_nvme::spec::{Cqe, Sqe, io_opcode};
+use ioutgt_nvme::status;
+use rdma_mummy_sys::ibv_sge;
+use sideway::ibverbs::AccessFlags;
+use sideway::ibverbs::completion::{CompletionChannel, GenericCompletionQueue, WorkCompletionStatus};
+use sideway::ibverbs::device_context::DeviceContext;
+use sideway::ibverbs::memory_region::MemoryRegion;
+use sideway::ibverbs::protection_domain::ProtectionDomain;
+use sideway::ibverbs::queue_pair::{
+    GenericQueuePair, PostSendGuard, QueuePair, QueuePairState, SendOperationFlags,
+    SetScatterGatherEntry, WorkRequestFlags,
+};
+use sideway::rdmacm::communication_manager::{Event, EventType, Identifier};
+use tokio::task::JoinSet;
+use zerocopy::{FromBytes, IntoBytes};
+
+use crate::cm::{CmChannel, accept, private_data, reject};
+use crate::cmproto::{CM_FMT_1_0, CmRep, CmReq};
+
+/// Bytes of an NVMe SQE.
+const SQE_LEN: usize = 64;
+/// Max in-capsule data we accept (the fabrics Connect carries 1024 B).
+const ICD_LEN: usize = 1024;
+/// RECV capsule buffer: SQE + max in-capsule data.
+const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
+/// Bytes of an NVMe CQE (the response capsule).
+const CQE_LEN: usize = 16;
+
+// Work-request id encoding: high byte = kind, low 32 bits = slot tag / recv idx.
+const WR_RECV: u64 = 1 << 40;
+const WR_SEND: u64 = 2 << 40;
+const WR_WRITE: u64 = 3 << 40;
+const WR_READ: u64 = 4 << 40;
+const WR_KIND_MASK: u64 = 0xff << 40;
+
+/// SGL descriptor type byte (dptr offset 15). High nibble `0x4` =
+/// `NVME_KEY_SGL_FMT_DATA_DESC` (keyed: host-resident, RDMA READ/WRITE); anything
+/// else here is an in-capsule data+offset descriptor (inline).
+const SGL_TYPE_OFFSET: usize = 24 + 15;
+const KEYED_SGL_TYPE_HI: u8 = 0x4;
+
+fn wr(kind: u64, low: u32) -> u64 {
+    kind | u64::from(low)
+}
+fn wr_kind(id: u64) -> u64 {
+    id & WR_KIND_MASK
+}
+fn wr_low(id: u64) -> u32 {
+    (id & 0xffff_ffff) as u32
+}
+
+fn oerr<E: std::error::Error>(e: E) -> io::Error {
+    io::Error::other(format!("{e:?}"))
+}
+
+/// A host RDMA target region from a command SQE's keyed SGL data block
+/// descriptor (NVMe-oF RDMA). Lives in the SQE `dptr` at offset 24:
+/// `addr`(le64) `length`(24-bit le) `key`(le32 rkey) `type`.
+struct KeyedSgl {
+    addr: u64,
+    len: u32,
+    rkey: u32,
+}
+
+/// Whether `opcode` on this queue carries host→controller data the target must
+/// pull (RDMA READ) before dispatch. v1 has no write-data path, so these are
+/// failed; admin commands in the connect/discovery path carry no host data.
+fn host_data_in(role: &Role<AnyBackend>, opcode: u8) -> bool {
+    matches!(role, Role::Io(_)) && matches!(opcode, io_opcode::WRITE | io_opcode::DSM)
+}
+
+fn parse_keyed_sgl(sqe: &Sqe) -> KeyedSgl {
+    let b = sqe.as_bytes();
+    let d = &b[24..40];
+    let addr = u64::from_le_bytes(d[0..8].try_into().expect("8 bytes"));
+    // length is a 24-bit little-endian field at descriptor offset 8.
+    let len = u32::from(d[8]) | u32::from(d[9]) << 8 | u32::from(d[10]) << 16;
+    let rkey = u32::from_le_bytes(d[11..15].try_into().expect("4 bytes"));
+    KeyedSgl { addr, len, rkey }
+}
+
+/// One RC connection's RDMA resources + the NVMe slot engine. Owns the receive
+/// capsule buffers and a send/response staging buffer, all registered as MRs.
+///
+/// Field order is the drop order and is load-bearing: the QP is destroyed first
+/// (no in-flight DMA, and it frees the CQ for destroy), then each MR is
+/// deregistered *before* the memory it pins is freed (an MR outliving its backing
+/// buffer would `ibv_dereg_mr` an already-freed region). [`Drop`] additionally
+/// drains the comp channel so destroying the CQ cannot block.
+pub struct RdmaQueue {
+    qp: GenericQueuePair,
+    cq: GenericCompletionQueue,
+    channel: Arc<CompletionChannel>,
+    /// MR over the data pool arena (local key for RDMA WRITE sges); dropped
+    /// before `nvme`, which owns the arena memory.
+    _pool_mr: Arc<MemoryRegion>,
+    pool_lkey: u32,
+    nvme: Rc<QueueCore<Sqe>>,
+    /// MR over the `nslots` receive capsule buffers; dropped before `recv_buf`.
+    recv_mr: Arc<MemoryRegion>,
+    recv_buf: Vec<u8>,
+    /// MR over the per-slot response (CQE) staging; dropped before `resp_buf`.
+    resp_mr: Arc<MemoryRegion>,
+    resp_buf: Vec<u8>,
+    /// MR over the connect-data RDMA-READ landing buffer; before `cdata_buf`.
+    cdata_mr: Arc<MemoryRegion>,
+    /// Destination for the admin-queue fabrics Connect data (host-resident via
+    /// keyed SGL, RDMA READ here before bootstrap parses it).
+    cdata_buf: Vec<u8>,
+    nslots: u32,
+    /// Outstanding response WRs (WRITE + SEND) per tag; release the tag at 0.
+    inflight: Vec<u8>,
+}
+
+impl Drop for RdmaQueue {
+    fn drop(&mut self) {
+        // `ibv_destroy_cq` (when `cq` drops next) blocks until every *delivered*
+        // comp-channel event is acked. A completion arriving after the last
+        // `cq::wait` re-arm leaves an unacked event; consume it here so the CQ
+        // destroy cannot hang this (single) reactor thread.
+        let _ = crate::cq::drain_events(&self.channel, &self.cq);
+    }
+}
+
+// Capsule/CQE lengths are small compile-time constants and slot tags fit u16
+// (sqsize <= MAX_QUEUE_ENTRIES); the casts here are provably lossless.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+impl RdmaQueue {
+    /// Build the per-connection queue on the connection's PD/CQ/QP. `qid==0` is
+    /// the admin queue (its pool is sized so leases never block).
+    pub fn new(
+        qid: u16,
+        sqsize: u16,
+        sqhd_disabled: bool,
+        pd: Arc<ProtectionDomain>,
+        channel: Arc<CompletionChannel>,
+        cq: GenericCompletionQueue,
+        qp: GenericQueuePair,
+        queue_buf_bytes: usize,
+    ) -> io::Result<RdmaQueue> {
+        let pool_bytes = if qid == 0 {
+            usize::from(sqsize).max(1) * ioutgt_core::ADMIN_DATA_MAX
+        } else {
+            queue_buf_bytes
+        };
+        let nvme = QueueCore::new(qid, sqsize, pool_bytes, sqhd_disabled, Sqe::zeroed());
+        // Register the data pool arena as one MR — the local source for RDMA
+        // WRITEs of read responses.
+        let (ptr, len) = nvme.slots.pool().arena();
+        // SAFETY: the pool arena is owned by `nvme` (kept in this struct) and
+        // outlives the MR; LocalWrite lets read handlers fill it.
+        let pool_mr = unsafe { pd.reg_mr(ptr as usize, len, AccessFlags::LocalWrite) }.map_err(oerr)?;
+        let pool_lkey = pool_mr.lkey();
+
+        let nslots = u32::from(sqsize);
+        let mut recv_buf = vec![0u8; sqsize as usize * CAPSULE_LEN];
+        // SAFETY: recv_buf outlives recv_mr (both held in this struct); the NIC
+        // writes received capsules into it.
+        let recv_mr =
+            unsafe { pd.reg_mr(recv_buf.as_mut_ptr() as usize, recv_buf.len(), AccessFlags::LocalWrite) }
+                .map_err(oerr)?;
+        let mut resp_buf = vec![0u8; sqsize as usize * CQE_LEN];
+        // SAFETY: resp_buf outlives resp_mr; a SEND source is locally read.
+        let resp_mr =
+            unsafe { pd.reg_mr(resp_buf.as_mut_ptr() as usize, resp_buf.len(), AccessFlags::none()) }
+                .map_err(oerr)?;
+        let mut cdata_buf = vec![0u8; ICD_LEN];
+        // SAFETY: cdata_buf outlives cdata_mr; the NIC writes the RDMA-READ data.
+        let cdata_mr =
+            unsafe { pd.reg_mr(cdata_buf.as_mut_ptr() as usize, cdata_buf.len(), AccessFlags::LocalWrite) }
+                .map_err(oerr)?;
+
+        Ok(RdmaQueue {
+            qp,
+            cq,
+            channel,
+            nvme,
+            pool_lkey,
+            _pool_mr: pool_mr,
+            recv_buf,
+            recv_mr,
+            resp_buf,
+            resp_mr,
+            cdata_buf,
+            cdata_mr,
+            nslots,
+            inflight: vec![0u8; sqsize as usize],
+        })
+    }
+
+    fn recv_slice(&self, idx: u32) -> &[u8] {
+        let off = idx as usize * CAPSULE_LEN;
+        &self.recv_buf[off..off + CAPSULE_LEN]
+    }
+
+    /// (Re-)post the RECV for capsule buffer `idx`.
+    fn post_recv(&mut self, idx: u32) -> io::Result<()> {
+        let off = idx as usize * CAPSULE_LEN;
+        let addr = self.recv_buf.as_ptr() as u64 + off as u64;
+        let lkey = self.recv_mr.lkey();
+        let mut g = self.qp.start_post_recv();
+        let h = g.construct_wr(wr(WR_RECV, idx));
+        // SAFETY: the region is registered (recv_mr) and stays valid; the NIC
+        // writes the next capsule here.
+        unsafe { h.setup_sge(lkey, addr, CAPSULE_LEN as u32) };
+        g.post().map_err(oerr)
+    }
+
+    /// SEND the 16-byte CQE response capsule for `tag` from the staging buffer.
+    fn send_cqe(&mut self, tag: u32, cqe: Cqe) -> io::Result<()> {
+        let off = tag as usize * CQE_LEN;
+        self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
+        let addr = self.resp_buf.as_ptr() as u64 + off as u64;
+        let lkey = self.resp_mr.lkey();
+        let mut g = self.qp.start_post_send();
+        let h = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled).setup_send();
+        // SAFETY: the staging region is registered and stays valid until the
+        // send completes (tag not released until then).
+        unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
+        g.post().map_err(oerr)
+    }
+
+    /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
+    /// (the fabrics Connect data, which on the admin queue is host-resident, not
+    /// in-capsule). Completes with a `WR_READ` work completion.
+    fn post_read_cdata(&mut self, src: &KeyedSgl, len: usize) -> io::Result<()> {
+        let lkey = self.cdata_mr.lkey();
+        let addr = self.cdata_buf.as_ptr() as u64;
+        let mut g = self.qp.start_post_send();
+        let h = g
+            .construct_wr(wr(WR_READ, 0), WorkRequestFlags::Signaled)
+            .setup_read(src.rkey, src.addr);
+        // SAFETY: cdata_buf is registered (cdata_mr, LocalWrite) and lives in
+        // this struct; len is clamped to its size by the caller.
+        unsafe { h.setup_sge(lkey, addr, len as u32) };
+        g.post().map_err(oerr)
+    }
+
+    /// RDMA WRITE the first `data_len` bytes of `slot(tag).data().segs()` to the
+    /// host's keyed-SGL region.
+    fn write_read_data(&mut self, tag: u32, data_len: u32, dst: &KeyedSgl) -> io::Result<()> {
+        // A pool lease spans at most MAX_SEGS runs (and the QP's max_send_sge is
+        // built to match), so a fixed array holds every sge with no allocation.
+        let mut sges = [ibv_sge {
+            addr: 0,
+            length: 0,
+            lkey: 0,
+        }; MAX_SEGS];
+        let mut n = 0usize;
+        let mut remaining = data_len as usize;
+        {
+            let data = self.nvme.slots.slot(tag as u16).data();
+            for seg in data.segs() {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(seg.len);
+                sges[n] = ibv_sge {
+                    addr: seg.ptr as u64,
+                    length: take as u32,
+                    lkey: self.pool_lkey,
+                };
+                n += 1;
+                remaining -= take;
+            }
+        }
+        let mut g = self.qp.start_post_send();
+        let h = g
+            .construct_wr(wr(WR_WRITE, tag), WorkRequestFlags::Signaled)
+            .setup_write(dst.rkey, dst.addr);
+        // SAFETY: the sges reference the registered pool arena (pool_lkey); the
+        // slot stays leased until the WRITE completes (tag not released).
+        unsafe { h.setup_sge_list(&sges[..n]) };
+        g.post().map_err(oerr)
+    }
+
+    /// Drain all currently-available completions as `(wr_id, success)` into the
+    /// reused `out` buffer (cleared first), so the steady IO path allocates none.
+    fn drain_into(&self, out: &mut Vec<(u64, bool)>) {
+        out.clear();
+        if let Ok(poller) = self.cq.start_poll() {
+            for wc in poller {
+                out.push((wc.wr_id(), wc.status() == WorkCompletionStatus::Success as u32));
+            }
+        }
+    }
+
+    /// On a response WR (WRITE/SEND) completion, decrement the tag's in-flight
+    /// count and release the slot once both its responses have completed.
+    fn on_response_done(&mut self, tag: u32) {
+        let n = &mut self.inflight[tag as usize];
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.nvme.slots.release_tag(tag as u16);
+        }
+    }
+
+    /// Park on the completion channel until the next RECV (command capsule)
+    /// completes, returning its buffer index; service response completions
+    /// (release slots) in the meantime.
+    async fn next_recv(&mut self) -> io::Result<u32> {
+        // Bootstrap-only (one Connect capsule), so this one-time buffer is fine.
+        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(8);
+        loop {
+            crate::cq::wait(&self.channel, &self.cq).await?;
+            self.drain_into(&mut comps);
+            for &(id, ok) in &comps {
+                if !ok {
+                    return Err(io::Error::other("RDMA completion error (peer gone?)"));
+                }
+                match wr_kind(id) {
+                    WR_RECV => return Ok(wr_low(id)),
+                    WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Park until the pending connect-data RDMA READ (`WR_READ`) completes,
+    /// servicing any response completions meanwhile. Bootstrap-only.
+    async fn await_read(&mut self) -> io::Result<()> {
+        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(4);
+        loop {
+            crate::cq::wait(&self.channel, &self.cq).await?;
+            self.drain_into(&mut comps);
+            for &(id, ok) in &comps {
+                if !ok {
+                    return Err(io::Error::other("RDMA READ completion error"));
+                }
+                match wr_kind(id) {
+                    WR_READ => return Ok(()),
+                    WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Take a command capsule at buffer `idx`, re-arm its RECV, claim a slot, and
+    /// spawn the command's execution as its own task. Spawning (rather than
+    /// awaiting inline) is essential: a parked Async Event Request never
+    /// completes, and inline dispatch would stall the whole queue on it.
+    fn spawn_command(
+        &mut self,
+        ctx: &Rc<ConnCtx<AnyBackend>>,
+        tasks: &mut JoinSet<(u16, Sqe, Outcome)>,
+        idx: u32,
+    ) -> io::Result<()> {
+        let sqe = Sqe::read_from_bytes(&self.recv_slice(idx)[..SQE_LEN])
+            .map_err(|_| io::Error::other("short command capsule"))?;
+        // The capsule buffer is free once the SQE is parsed — re-arm it.
+        self.post_recv(idx)?;
+        let Some(tag) = self.nvme.claim_tag() else {
+            return Err(io::Error::other("no free tag for command"));
+        };
+        self.nvme.submit(tag, sqe);
+
+        let nvme = Rc::clone(&self.nvme);
+        let ctx = Rc::clone(ctx);
+        tasks.spawn_local(async move {
+            let cmd = nvme.await_command(tag).await;
+            // The write-data path (RDMA READ pulling the host's keyed-SGL buffer
+            // into the slot *before* dispatch) is not yet implemented (RD4).
+            // Until it is, fail any host-to-controller-data command rather than
+            // dispatch against an unfilled slot and silently write garbage.
+            let outcome = if host_data_in(&ctx.role, cmd.opcode) {
+                tracing::warn!(opcode = cmd.opcode, "nvme-rdma: write-data path unimplemented");
+                Outcome::status(ctx.cqe(0, cmd.cid.get(), status::DATA_XFER_ERROR | status::DNR))
+            } else {
+                dispatch::execute(&ctx, tag, &cmd).await
+            };
+            (tag, cmd, outcome)
+        });
+        Ok(())
+    }
+
+    /// Post a finished command's response: the RDMA WRITE of any read-data to
+    /// the host's keyed SGL, then the CQE capsule. The slot is released once both
+    /// response WRs complete (tracked by `inflight`).
+    fn post_response(&mut self, tag: u16, cmd: &Sqe, outcome: Outcome) -> io::Result<()> {
+        self.nvme.begin_respond(tag);
+        let mut pending = 0u8;
+        if outcome.data_len > 0 {
+            let dst = parse_keyed_sgl(cmd);
+            self.write_read_data(u32::from(tag), outcome.data_len, &dst)?;
+            pending += 1;
+        }
+        self.send_cqe(u32::from(tag), outcome.cqe)?;
+        pending += 1;
+        self.inflight[tag as usize] = pending;
+        Ok(())
+    }
+
+    /// Bootstrap the controller from the first capsule (the fabrics Connect),
+    /// dispatch it, and return the dispatch context.
+    ///
+    /// The connect data lands two ways depending on the queue: the **admin**
+    /// queue's host sends it via a keyed SGL (host-resident), so we RDMA READ it
+    /// into `cdata_buf`; an **IO** queue's host sends it inline (in-capsule). We
+    /// branch on the SGL descriptor type byte.
+    async fn bootstrap(
+        &mut self,
+        port: &Arc<PortConfig<AnyBackend>>,
+        registry: &Arc<Registry>,
+        peer: &str,
+    ) -> io::Result<Rc<ConnCtx<AnyBackend>>> {
+        let idx = self.next_recv().await?;
+        // `inline_cd` is Some for an in-capsule (IO-queue) connect, None for a
+        // keyed-SGL (admin-queue) connect that we must RDMA READ below.
+        let (sqe, inline_cd) = {
+            let s = self.recv_slice(idx);
+            let sqe = Sqe::read_from_bytes(&s[..SQE_LEN])
+                .map_err(|_| io::Error::other("short connect capsule"))?;
+            let keyed = s[SGL_TYPE_OFFSET] >> 4 == KEYED_SGL_TYPE_HI;
+            // Parse inline connect data out of the capsule before re-arming.
+            let inline_cd = if keyed {
+                None
+            } else {
+                Some(
+                    ConnectData::read_from_bytes(&s[SQE_LEN..SQE_LEN + ICD_LEN])
+                        .map_err(|_| io::Error::other("short connect data"))?,
+                )
+            };
+            (sqe, inline_cd)
+        };
+        self.post_recv(idx)?;
+
+        let connect_data = if let Some(cd) = inline_cd {
+            Box::new(cd)
+        } else {
+            // Keyed SGL: RDMA READ the host-resident connect data, then parse it.
+            let sgl = parse_keyed_sgl(&sqe);
+            let len = (sgl.len as usize).min(ICD_LEN);
+            self.post_read_cdata(&sgl, len)?;
+            self.await_read().await?;
+            Box::new(
+                ConnectData::read_from_bytes(&self.cdata_buf[..ICD_LEN])
+                    .map_err(|_| io::Error::other("short connect data"))?,
+            )
+        };
+
+        // qid 0 bootstraps a new controller (new_admin); qid n attaches to the
+        // controller the admin Connect created, by cntlid (new_io).
+        let ctx = if self.nvme.qid == 0 {
+            ConnCtx::new_admin(
+                Rc::clone(&self.nvme),
+                Arc::clone(port),
+                Arc::clone(registry),
+                connect_data,
+                peer.to_string(),
+            )
+        } else {
+            ConnCtx::new_io(
+                Rc::clone(&self.nvme),
+                Arc::clone(port),
+                Arc::clone(registry),
+                connect_data,
+                peer.to_string(),
+            )
+        };
+
+        let nvme = Rc::clone(&self.nvme);
+        let tag = nvme
+            .claim_tag()
+            .ok_or_else(|| io::Error::other("no tag for connect"))?;
+        nvme.submit(tag, sqe);
+        let cmd = nvme.await_command(tag).await;
+        let outcome = dispatch::execute(&ctx, tag, &cmd).await;
+        nvme.begin_respond(tag);
+        self.send_cqe(u32::from(tag), outcome.cqe)?;
+        self.inflight[tag as usize] = 1;
+        Ok(ctx)
+    }
+
+    /// The QP number to hand back to the host in the CM accept reply.
+    pub fn qp_number(&self) -> u32 {
+        self.qp.qp_number()
+    }
+
+    /// Post all RECV WRs and arm the CQ. Must be called once, after the QP is at
+    /// least INIT and *before* `accept` (so the host's first capsule, which it
+    /// may send the instant the connection establishes, is never dropped — the
+    /// kernel `nvmet-rdma` posts its RECVs before accepting too).
+    pub fn prime(&mut self) -> io::Result<()> {
+        for idx in 0..self.nslots {
+            self.post_recv(idx)?;
+        }
+        crate::cq::arm(&self.cq)
+    }
+
+    /// Drive this connection: bootstrap the controller from the Connect capsule,
+    /// then process commands until the QP errors (peer disconnect) or a fatal
+    /// error. Requires [`prime`](Self::prime) to have been called first.
+    pub async fn run(
+        mut self,
+        port: Arc<PortConfig<AnyBackend>>,
+        registry: Arc<Registry>,
+        peer: String,
+    ) -> io::Result<()> {
+        let ctx = self.bootstrap(&port, &registry, &peer).await?;
+
+        // Commands execute concurrently as their own tasks so a parked Async
+        // Event Request (held until an async event) does not block the reap loop
+        // or other commands; finished commands surface via `tasks.join_next()`.
+        let mut tasks: JoinSet<(u16, Sqe, Outcome)> = JoinSet::new();
+        // Reused across iterations: the steady IO path allocates nothing.
+        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
+        loop {
+            tokio::select! {
+                res = crate::cq::wait(&self.channel, &self.cq) => {
+                    res?;
+                    self.drain_into(&mut comps);
+                    for &(id, ok) in &comps {
+                        if !ok {
+                            tracing::warn!(
+                                qid = self.nvme.qid,
+                                kind = wr_kind(id) >> 40,
+                                low = wr_low(id),
+                                "nvme-rdma: completion error, closing queue"
+                            );
+                            ctx.close();
+                            return Ok(()); // flushed completion: peer gone
+                        }
+                        match wr_kind(id) {
+                            WR_RECV => self.spawn_command(&ctx, &mut tasks, wr_low(id))?,
+                            WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                            _ => {}
+                        }
+                    }
+                }
+                Some(joined) = tasks.join_next() => {
+                    let (tag, cmd, outcome) =
+                        joined.map_err(|e| io::Error::other(format!("dispatch task: {e}")))?;
+                    self.post_response(tag, &cmd, outcome)?;
+                }
+            }
+        }
+    }
+}
+
+/// Build the per-connection RDMA resources on the cm_id's *own* device context
+/// (the QP must live on the exact `ibv_context` the connection landed on): a
+/// non-blocking completion channel + a CQ bound to it (so completions are reaped
+/// reactor-driven, [`crate::cq`]), a fresh PD, and an RC QP sized for `sqsize`
+/// in-flight commands (one RECV + up to a WRITE and a SEND each).
+#[allow(clippy::type_complexity)]
+fn build_conn_resources(
+    ctx: &Arc<DeviceContext>,
+    sqsize: u16,
+) -> io::Result<(
+    Arc<ProtectionDomain>,
+    Arc<CompletionChannel>,
+    GenericCompletionQueue,
+    GenericQueuePair,
+)> {
+    let channel = ctx.create_comp_channel().map_err(oerr)?;
+    channel.set_nonblocking(true)?;
+    let depth = u32::from(sqsize) * 3 + 16;
+    let mut cqb = ctx.create_cq_builder();
+    cqb.setup_cqe(depth).setup_comp_channel(&channel, 0);
+    let cq = GenericCompletionQueue::from(cqb.build_ex().map_err(oerr)?);
+
+    let pd = ctx.alloc_pd().map_err(oerr)?;
+    let mut b = pd.create_qp_builder();
+    b.setup_max_send_wr(u32::from(sqsize) * 2 + 8)
+        .setup_max_recv_wr(u32::from(sqsize) + 8)
+        // Up to MAX_DATA_SGE pool segments per RDMA WRITE of a read response.
+        .setup_max_send_sge(MAX_DATA_SGE)
+        .setup_max_recv_sge(1)
+        .setup_send_cq(cq.clone())
+        .setup_recv_cq(cq.clone())
+        .setup_send_ops_flags(
+            SendOperationFlags::Send | SendOperationFlags::Write | SendOperationFlags::Read,
+        );
+    let qp: GenericQueuePair = b.build_ex().map_err(oerr)?.into();
+    Ok((pd, channel, cq, qp))
+}
+
+/// QP send-SGE cap. Must equal the pool's max segments per lease so a fragmented
+/// read response's RDMA WRITE (one sge per run) never exceeds `max_send_sge` —
+/// otherwise `ibv_post_send` returns EINVAL and kills the connection.
+#[allow(clippy::cast_possible_truncation)] // MAX_SEGS (32) trivially fits u32
+const MAX_DATA_SGE: u32 = MAX_SEGS as u32;
+
+/// Admin (qid 0) queue-depth cap (entries). The fabrics admin queue is small;
+/// clamp a host's request to this regardless of what it asks for.
+const ADMIN_QUEUE_DEPTH: u32 = 32;
+
+/// Handle one CONNECT_REQUEST: parse the host's [`CmReq`], build the QP on the
+/// connection's device, drive it to RTS via the CM-derived attributes, prime the
+/// RECVs, `accept` with a [`CmRep`], and spawn the queue's [`RdmaQueue::run`].
+/// The cm_id is pushed into `conns` so it outlives the spawned queue task.
+fn accept_one(
+    event: &Event,
+    port: &Arc<PortConfig<AnyBackend>>,
+    registry: &Arc<Registry>,
+    queue_buf_bytes: usize,
+    conns: &mut Vec<Arc<Identifier>>,
+) -> io::Result<()> {
+    let req = CmReq::parse(&private_data(event))?;
+    let id = event
+        .cm_id()
+        .ok_or_else(|| io::Error::other("connect request without cm_id"))?;
+    let ctx = id
+        .get_device_context()
+        .ok_or_else(|| io::Error::other("connect request without device context"))?;
+
+    // hsqsize is the 0-based host SQ size (NVMe-oF); the queue holds hsqsize+1.
+    // Clamp to what we advertise so a buggy/hostile host cannot drive an
+    // enormous recv_buf or QP build (admin is capped to the fabrics AQ depth).
+    let cap = if req.qid == 0 {
+        ADMIN_QUEUE_DEPTH
+    } else {
+        u32::from(port.io_queue_size).max(1)
+    };
+    let sqsize = u16::try_from((u32::from(req.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
+    let (pd, channel, cq, mut qp) = build_conn_resources(&ctx, sqsize)?;
+    qp.modify(&id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
+        .map_err(oerr)?;
+    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
+        .map_err(oerr)?;
+    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
+        .map_err(oerr)?;
+
+    let mut queue = RdmaQueue::new(req.qid, sqsize, false, pd, channel, cq, qp, queue_buf_bytes)?;
+    let qp_num = queue.qp_number();
+    // Post RECVs + arm before accepting, so the host's first capsule is caught.
+    queue.prime()?;
+    // crqsize is 0-based: report the (possibly clamped) queue size we built so
+    // the host sizes its queue to match.
+    let rep = CmRep {
+        recfmt: CM_FMT_1_0,
+        crqsize: sqsize - 1,
+    }
+    .to_bytes();
+    accept(&id, qp_num, &rep, 1, 1)?;
+    conns.push(Arc::clone(&id));
+
+    let peer = format!("rdma:qid{}", req.qid);
+    let port = Arc::clone(port);
+    let registry = Arc::clone(registry);
+    tokio::task::spawn_local(async move {
+        if let Err(e) = queue.run(port, registry, peer).await {
+            tracing::warn!("nvme-rdma queue ended: {e}");
+        }
+    });
+    Ok(())
+}
+
+/// Listen for NVMe/RDMA connections on `listen` and drive each to a controller.
+///
+/// Focused-v1: a single reactor thread owns the listener and every queue. On
+/// each CONNECT_REQUEST it builds the QP, accepts, and spawns an [`RdmaQueue`]
+/// task on the same thread (the CM channel multiplexes all cm_ids; data
+/// completions are reaped per queue via the completion channel). Connection
+/// teardown is best-effort: a queue task ends on its own flushed completions,
+/// and its cm_id is held in `conns` for the process lifetime (clean per-queue
+/// teardown is deferred — see `docs/nvme-rdma.md`).
+pub async fn serve(
+    listen: SocketAddr,
+    port: Arc<PortConfig<AnyBackend>>,
+    registry: Arc<Registry>,
+    queue_buf_bytes: usize,
+) -> io::Result<()> {
+    let ch = CmChannel::new()?;
+    let listen_id = ch.create_id()?;
+    // The RDMA device's GID/IP association is populated asynchronously after a
+    // soft-RoCE (rxe) netdev is added, so `rdma_bind_addr` on the concrete IP can
+    // transiently fail with ENODEV ("No such device") even once the port is
+    // ACTIVE. Retry. (Binding the unspecified address would skip GID resolution
+    // but does not receive connects on rxe, so we bind the concrete IP.)
+    let mut attempt = 0;
+    loop {
+        match listen_id.bind_addr(listen) {
+            Ok(()) => break,
+            Err(e) if attempt < 120 => {
+                attempt += 1;
+                if attempt % 8 == 0 {
+                    tracing::info!("nvme-rdma bind {listen} not ready (attempt {attempt}): {e:?}");
+                }
+                ioutgt_uring::ops::sleep(std::time::Duration::from_millis(250))?.await?;
+            }
+            Err(e) => return Err(oerr(e)),
+        }
+    }
+    listen_id.listen(128).map_err(oerr)?;
+    tracing::info!("nvme-rdma listening on {listen}");
+
+    // Hold each accepted connection's cm_id alive for the life of its queue.
+    let mut conns: Vec<Arc<Identifier>> = Vec::new();
+    loop {
+        let event = ch.next_event().await?;
+        match event.event_type() {
+            EventType::ConnectRequest => {
+                if let Err(e) = accept_one(&event, &port, &registry, queue_buf_bytes, &mut conns) {
+                    tracing::warn!("nvme-rdma rejecting connect: {e}");
+                    if let Some(id) = event.cm_id() {
+                        let _ = reject(&id, &[]);
+                    }
+                }
+                event.ack().map_err(oerr)?;
+            }
+            EventType::Established => {
+                // The queue task is already draining; nothing to do here.
+                event.ack().map_err(oerr)?;
+            }
+            other => {
+                tracing::debug!("nvme-rdma CM event {other:?}");
+                event.ack().map_err(oerr)?;
+            }
+        }
+    }
+}

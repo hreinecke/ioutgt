@@ -10,6 +10,7 @@
 pub mod cm;
 pub mod cmproto;
 pub mod cq;
+pub mod target;
 mod verbs;
 
 pub use verbs::{Rdma, RcDest, rdma_devices};
