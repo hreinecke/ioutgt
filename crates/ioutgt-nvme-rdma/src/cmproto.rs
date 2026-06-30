@@ -76,6 +76,17 @@ impl CmReq {
             cntlid: le16(data, 8),
         })
     }
+
+    /// Encode for the host (client) side's `rdma_connect` private data.
+    pub fn to_bytes(self) -> [u8; Self::WIRE_LEN] {
+        let mut b = [0u8; Self::WIRE_LEN];
+        b[0..2].copy_from_slice(&self.recfmt.to_le_bytes());
+        b[2..4].copy_from_slice(&self.qid.to_le_bytes());
+        b[4..6].copy_from_slice(&self.hrqsize.to_le_bytes());
+        b[6..8].copy_from_slice(&self.hsqsize.to_le_bytes());
+        b[8..10].copy_from_slice(&self.cntlid.to_le_bytes());
+        b
+    }
 }
 
 /// `nvme_rdma_cm_rep` — the target's accept reply (32 bytes:
@@ -92,7 +103,21 @@ impl CmRep {
     /// Wire length of the private data.
     pub const WIRE_LEN: usize = 32;
 
-    /// Encode for `ConnectionParameter::setup_private_data` at accept.
+    /// Parse the target's accept-reply private data (from a ConnectResponse).
+    pub fn parse(data: &[u8]) -> io::Result<CmRep> {
+        if data.len() < Self::WIRE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("nvme_rdma_cm_rep: {} bytes, need {}", data.len(), Self::WIRE_LEN),
+            ));
+        }
+        Ok(CmRep {
+            recfmt: le16(data, 0),
+            crqsize: le16(data, 2),
+        })
+    }
+
+    /// Encode for the accept reply private data.
     pub fn to_bytes(self) -> [u8; Self::WIRE_LEN] {
         let mut b = [0u8; Self::WIRE_LEN];
         b[0..2].copy_from_slice(&self.recfmt.to_le_bytes());
@@ -176,6 +201,30 @@ mod tests {
         assert_eq!(le16(&bytes, 0), CM_FMT_1_0);
         assert_eq!(le16(&bytes, 2), 127);
         assert!(bytes[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn cm_req_round_trips() {
+        let req = CmReq {
+            recfmt: CM_FMT_1_0,
+            qid: 9,
+            hrqsize: 128,
+            hsqsize: 127,
+            cntlid: 0xabcd,
+        };
+        let back = CmReq::parse(&req.to_bytes()).unwrap();
+        assert_eq!((back.recfmt, back.qid, back.hrqsize, back.hsqsize, back.cntlid), (req.recfmt, req.qid, req.hrqsize, req.hsqsize, req.cntlid));
+    }
+
+    #[test]
+    fn cm_rep_round_trips() {
+        let rep = CmRep {
+            recfmt: CM_FMT_1_0,
+            crqsize: 127,
+        };
+        let back = CmRep::parse(&rep.to_bytes()).unwrap();
+        assert_eq!((back.recfmt, back.crqsize), (rep.recfmt, rep.crqsize));
+        assert!(CmRep::parse(&[0u8; 8]).is_err());
     }
 
     #[test]

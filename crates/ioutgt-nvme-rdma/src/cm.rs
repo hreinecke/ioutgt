@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use rdma_mummy_sys::{rdma_accept, rdma_conn_param, rdma_connect, rdma_reject};
 use sideway::rdmacm::communication_manager::{
-    Event, EventChannel, GetEventErrorKind, Identifier, PortSpace,
+    Event, EventChannel, EventType, GetEventErrorKind, Identifier, PortSpace,
 };
 
 fn oerr<E: std::error::Error>(e: E) -> io::Error {
@@ -25,6 +25,10 @@ fn oerr<E: std::error::Error>(e: E) -> io::Error {
 
 fn pollin() -> u32 {
     u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
+}
+
+fn err_hup() -> u32 {
+    u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
 }
 
 /// A non-blocking RDMA-CM event channel whose fd the reactor parks on (io_uring
@@ -54,7 +58,15 @@ impl CmChannel {
             match self.channel.get_cm_event() {
                 Ok(event) => return Ok(event),
                 Err(e) if matches!(e.0, GetEventErrorKind::NoEvent) => {
-                    ioutgt_uring::ops::poll_add(self.channel.as_raw_fd(), pollin())?.await?;
+                    let revents =
+                        ioutgt_uring::ops::poll_add(self.channel.as_raw_fd(), pollin())?.await?;
+                    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is
+                    // in error/hangup with no readable event, fail rather than
+                    // respin (librdmacm normally surfaces problems as events, but
+                    // guard the livelock anyway).
+                    if revents & pollin() == 0 && revents & err_hup() != 0 {
+                        return Err(io::Error::other("CM event channel error or hangup"));
+                    }
                 }
                 Err(e) => return Err(oerr(e)),
             }
@@ -66,9 +78,18 @@ impl CmChannel {
 /// host's `nvme_rdma_cm_req` on a connect request). Copied, not borrowed, so the
 /// caller may `ack` the event afterwards (which frees the underlying buffer).
 pub fn private_data(event: &Event) -> Vec<u8> {
-    // SAFETY: `event()` is valid until the Event is acked/dropped; for a
-    // connection-management event the `conn` arm of the param union is active
-    // and its private_data/_len describe the inbound buffer.
+    // Only connection-management events have the `conn` arm of the param union
+    // active; reading it for any other event type would be union UB. (The
+    // vendored `Event::event()` is `unsafe` precisely to push this check here.)
+    if !matches!(
+        event.event_type(),
+        EventType::ConnectRequest | EventType::ConnectResponse
+    ) {
+        return Vec::new();
+    }
+    // SAFETY: `event()` is valid until the Event is acked/dropped; the type
+    // check above guarantees the `conn` arm is active, and its private_data/_len
+    // describe the inbound buffer.
     unsafe {
         let ev = event.event().as_ptr();
         let conn = &(*ev).param.conn;
@@ -152,7 +173,7 @@ pub fn reject(id: &Identifier, reason: &[u8]) -> io::Result<()> {
     } else {
         (
             reason.as_ptr() as *const c_void,
-            u8::try_from(reason.len()).unwrap_or(u8::MAX),
+            u8::try_from(reason.len()).map_err(|_| io::Error::other("CM reject > 255 bytes"))?,
         )
     };
     // SAFETY: `id()` is valid; rdma_reject copies the private data synchronously.
@@ -214,10 +235,10 @@ mod tests {
         let mut seen_qid = None;
         loop {
             let event = ch.next_event().await?;
-            let ty = format!("{:?}", event.event_type());
-            eprintln!("[cm-server] event {ty}");
-            match ty.as_str() {
-                "ConnectRequest" => {
+            let et = event.event_type();
+            eprintln!("[cm-server] event {et:?}");
+            match et {
+                EventType::ConnectRequest => {
                     let req = CmReq::parse(&private_data(&event))?;
                     seen_qid = Some(req.qid);
                     let id = event.cm_id().ok_or_else(|| io::Error::other("no child cm_id"))?;
@@ -241,23 +262,24 @@ mod tests {
                     child = Some(id);
                     event.ack().map_err(oerr)?;
                 }
-                "Established" => {
+                EventType::Established => {
                     // Hold the QP/cm_id alive so the client reaches its OWN
                     // Established; tearing down here would disconnect it first.
                     event.ack().map_err(oerr)?;
                 }
-                "Disconnected" => {
+                EventType::Disconnected => {
                     // Client finished and tore the connection down — done.
                     event.ack().map_err(oerr)?;
                     drop(held);
                     drop(child);
                     return Ok(seen_qid.expect("qid set before disconnect"));
                 }
-                other => {
+                EventType::DeviceRemoval => {
                     event.ack().map_err(oerr)?;
-                    if other == "DeviceRemoval" {
-                        return Err(io::Error::other(format!("server CM event {other}")));
-                    }
+                    return Err(io::Error::other("server CM event DeviceRemoval"));
+                }
+                _ => {
+                    event.ack().map_err(oerr)?;
                 }
             }
         }
@@ -276,14 +298,14 @@ mod tests {
         let mut addr_retries = 0u32;
         loop {
             let event = ch.next_event().await?;
-            let ty = format!("{:?}", event.event_type());
-            eprintln!("[cm-client] event {ty}");
-            match ty.as_str() {
-                "AddressResolved" => {
+            let et = event.event_type();
+            eprintln!("[cm-client] event {et:?}");
+            match et {
+                EventType::AddressResolved => {
                     id.resolve_route(Duration::from_secs(5)).map_err(oerr)?;
                     event.ack().map_err(oerr)?;
                 }
-                "AddressError" => {
+                EventType::AddressError => {
                     event.ack().map_err(oerr)?;
                     addr_retries += 1;
                     if addr_retries > 5 {
@@ -292,7 +314,7 @@ mod tests {
                     ops::sleep(Duration::from_millis(200)).unwrap().await.unwrap();
                     id.resolve_addr(Some(src), dst, Duration::from_secs(5)).map_err(oerr)?;
                 }
-                "RouteResolved" => {
+                EventType::RouteResolved => {
                     let ctx = id
                         .get_device_context()
                         .ok_or_else(|| io::Error::other("no device context"))?;
@@ -306,19 +328,15 @@ mod tests {
                         hsqsize: 127,
                         cntlid: 0xffff,
                     };
-                    // Encode the 32-byte request (reuse CmRep's layout would be wrong;
-                    // build the bytes explicitly).
-                    let mut req_bytes = [0u8; 32];
-                    req_bytes[0..2].copy_from_slice(&req.recfmt.to_le_bytes());
-                    req_bytes[2..4].copy_from_slice(&req.qid.to_le_bytes());
-                    req_bytes[4..6].copy_from_slice(&req.hrqsize.to_le_bytes());
-                    req_bytes[6..8].copy_from_slice(&req.hsqsize.to_le_bytes());
-                    req_bytes[8..10].copy_from_slice(&req.cntlid.to_le_bytes());
-                    connect(&id, qp.qp_number(), &req_bytes, 1, 1)?;
+                    connect(&id, qp.qp_number(), &req.to_bytes(), 1, 1)?;
                     held = Some((pd, cq, qp));
                     event.ack().map_err(oerr)?;
                 }
-                "ConnectResponse" => {
+                EventType::ConnectResponse => {
+                    // Validate the target's accept reply (the reverse private-data
+                    // direction): the server set crqsize = our hsqsize.
+                    let rep = CmRep::parse(&private_data(&event))?;
+                    assert_eq!(rep.crqsize, 127, "server crqsize round-trip");
                     // Active side with an externally-managed QP: move it to RTS
                     // and `establish()` — that completes the handshake; there is
                     // NO separate Established event on the active side.
@@ -335,20 +353,20 @@ mod tests {
                     drop(held);
                     return Ok(());
                 }
-                "Established" => {
+                EventType::Established => {
                     // Not expected for the active side, but harmless: done.
                     event.ack().map_err(oerr)?;
                     id.disconnect().map_err(oerr)?;
                     drop(held);
                     return Ok(());
                 }
-                "Rejected" => {
+                EventType::Rejected => {
                     event.ack().map_err(oerr)?;
                     return Err(io::Error::other("client connect rejected"));
                 }
                 other => {
                     event.ack().map_err(oerr)?;
-                    return Err(io::Error::other(format!("client CM event {other}")));
+                    return Err(io::Error::other(format!("client CM event {other:?}")));
                 }
             }
         }
