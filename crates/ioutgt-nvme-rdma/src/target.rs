@@ -426,79 +426,6 @@ impl RdmaQueue {
         Ok(())
     }
 
-    /// Post a read command's response as ONE doorbell: RDMA WRITE the first
-    /// `data_len` bytes of `slot(tag).data().segs()` to the host's keyed SGL,
-    /// then SEND the CQE — chained on a single guard so the two WRs ride one
-    /// `ibv_post_send`. RC in-order delivery keeps the SEND after the WRITE, so
-    /// the host sees the data before completion. Mirrors nvmet's
-    /// `rdma_rw_ctx_wrs` + linked `send_wr`. Both WRs complete separately and
-    /// each decrements the tag's `inflight` (set to 2 by the caller).
-    fn post_read_response(
-        &mut self,
-        tag: u32,
-        data_len: u32,
-        dst: &KeyedSgl,
-        cqe: Cqe,
-        invalidate_rkey: Option<u32>,
-    ) -> io::Result<()> {
-        // A pool lease spans at most MAX_SEGS runs (and the QP's max_send_sge is
-        // built to match), so a fixed array holds every sge with no allocation.
-        let mut sges = [ibv_sge {
-            addr: 0,
-            length: 0,
-            lkey: 0,
-        }; MAX_SEGS];
-        let mut n = 0usize;
-        let mut remaining = data_len as usize;
-        {
-            let data = self.nvme.slots.slot(tag as u16).data();
-            for seg in data.segs() {
-                if remaining == 0 {
-                    break;
-                }
-                let take = remaining.min(seg.len);
-                sges[n] = ibv_sge {
-                    addr: seg.ptr as u64,
-                    length: take as u32,
-                    lkey: self.pool_lkey,
-                };
-                n += 1;
-                remaining -= take;
-            }
-        }
-        // Stage the CQE for the trailing SEND before taking the guard.
-        let off = tag as usize * CQE_LEN;
-        self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
-        let cqe_addr = self.resp_buf.as_ptr() as u64 + off as u64;
-        let cqe_lkey = self.resp_mr.lkey();
-
-        let mut g = self.qp.start_post_send();
-        let hw = g
-            .construct_wr(wr(WR_WRITE, tag), WorkRequestFlags::Signaled)
-            .setup_write(dst.rkey, dst.addr);
-        // SAFETY: the sges reference the registered pool arena (pool_lkey); the
-        // slot stays leased until both WRs complete (tag not released).
-        unsafe { hw.setup_sge_list(&sges[..n]) };
-        let ws = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled);
-        let hs = match invalidate_rkey {
-            Some(rkey) => ws.setup_send_with_inv(rkey),
-            None => ws.setup_send(),
-        };
-        // SAFETY: the staging region is registered and stays valid until the
-        // SEND completes (tag not released until then).
-        unsafe { hs.setup_sge(cqe_lkey, cqe_addr, CQE_LEN as u32) };
-        // The QP is built with `build_ex`, so this posts via `ibv_wr_complete` —
-        // both WRs post or neither does. That atomicity is load-bearing: a split
-        // post (WRITE ok, SEND fails) would leave a lone WRITE completion to
-        // decrement a tag whose `inflight` was never set to 2. A `post` error is
-        // fatal (it tears the queue down) and returns before that count is set.
-        g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.write_posted, &self.wr.write_inflight);
-        RdmaWrStats::post(&self.wr.send_posted, &self.wr.send_inflight);
-        self.wr.sq_doorbells.set(self.wr.sq_doorbells.get() + 1);
-        Ok(())
-    }
-
     /// RDMA READ `len` bytes from the host's keyed-SGL region (`src`) into
     /// `slot(tag)`'s leased pool-backed segments, so the deferred dispatch task
     /// (spawned on the `WR_READ` completion) sees the host write-data already in
@@ -730,26 +657,104 @@ impl RdmaQueue {
         });
     }
 
-    /// Post a finished command's response (its slot is already `Responding`): the
-    /// RDMA WRITE of any read-data to the host's keyed SGL, then the CQE capsule.
-    /// The slot is released once both response WRs complete (tracked by `inflight`).
-    fn post_response(&mut self, tag: u16, cmd: &Sqe, outcome: Outcome) -> io::Result<()> {
-        if outcome.data_len > 0 {
-            // Read-data WRITE + CQE SEND chained on one doorbell; two WRs to
-            // complete, so the tag's in-flight count starts at 2.
-            let dst = parse_keyed_sgl(cmd);
-            self.post_read_response(
-                u32::from(tag),
-                outcome.data_len,
-                &dst,
-                outcome.cqe,
-                invalidate_rkey_for(cmd),
-            )?;
-            self.inflight[tag as usize] = 2;
-        } else {
-            self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(cmd))?;
-            self.inflight[tag as usize] = 1;
+    /// Post every finished response in `batch` on ONE doorbell: for each, the
+    /// read-data RDMA WRITE (if any) then the CQE SEND, all constructed on a
+    /// single send guard and flushed with one `ibv_post_send`. Extends B1's
+    /// per-command WRITE+SEND chain across all responses drained in one reactor
+    /// wake — N responses collapse from up to 2N doorbells to one. Each WR still
+    /// completes separately and decrements its tag's `inflight` (set here to 1
+    /// for a bare CQE, 2 when a read-data WRITE precedes it).
+    fn post_responses_batch(&mut self, batch: &[RdmaResp]) -> io::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
+        // Split `self` into disjoint field borrows: the send guard borrows
+        // `&mut qp`, while CQE staging (`resp_buf`) and sge construction
+        // (`nvme`/`pool_lkey`) touch other fields concurrently.
+        let RdmaQueue {
+            qp,
+            resp_buf,
+            resp_mr,
+            nvme,
+            pool_lkey,
+            inflight,
+            wr: stats,
+            ..
+        } = self;
+        let resp_lkey = resp_mr.lkey();
+        let pool_lkey = *pool_lkey;
+        let mut writes = 0u64;
+        let mut sends = 0u64;
+        let mut g = qp.start_post_send();
+        for resp in batch {
+            let tag = resp.tag;
+            let mut pending = 1u8;
+            if resp.outcome.data_len > 0 {
+                // A pool lease spans at most MAX_SEGS runs; a fixed stack array
+                // holds every sge with no allocation. The extended guard copies
+                // the sges into the WQE at `setup_sge_list`, so reusing this
+                // array across iterations is sound.
+                let mut sges = [ibv_sge {
+                    addr: 0,
+                    length: 0,
+                    lkey: 0,
+                }; MAX_SEGS];
+                let mut n = 0usize;
+                let mut remaining = resp.outcome.data_len as usize;
+                {
+                    let data = nvme.slots.slot(tag).data();
+                    for seg in data.segs() {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(seg.len);
+                        sges[n] = ibv_sge {
+                            addr: seg.ptr as u64,
+                            length: take as u32,
+                            lkey: pool_lkey,
+                        };
+                        n += 1;
+                        remaining -= take;
+                    }
+                }
+                let dst = parse_keyed_sgl(&resp.cmd);
+                let hw = g
+                    .construct_wr(wr(WR_WRITE, u32::from(tag)), WorkRequestFlags::Signaled)
+                    .setup_write(dst.rkey, dst.addr);
+                // SAFETY: the sges reference the registered pool arena (pool_lkey);
+                // the slot stays leased until both WRs complete (tag not released).
+                unsafe { hw.setup_sge_list(&sges[..n]) };
+                pending = 2;
+                writes += 1;
+            }
+            let off = tag as usize * CQE_LEN;
+            resp_buf[off..off + CQE_LEN].copy_from_slice(resp.outcome.cqe.as_bytes());
+            let cqe_addr = resp_buf.as_ptr() as u64 + off as u64;
+            let ws = g.construct_wr(wr(WR_SEND, u32::from(tag)), WorkRequestFlags::Signaled);
+            let hs = match invalidate_rkey_for(&resp.cmd) {
+                Some(rkey) => ws.setup_send_with_inv(rkey),
+                None => ws.setup_send(),
+            };
+            // SAFETY: the staging region is registered and stays valid until the
+            // SEND completes (tag not released until then).
+            unsafe { hs.setup_sge(resp_lkey, cqe_addr, CQE_LEN as u32) };
+            sends += 1;
+            inflight[tag as usize] = pending;
+        }
+        // One atomic ibv_post_send for the whole batch (extended guard's
+        // ibv_wr_complete): all WRs post or none do, so no partial batch can
+        // generate stray completions. `inflight[tag]` was set in the loop above;
+        // on a post error it stays non-zero with no completion to clear it, but
+        // that is harmless — a post error is fatal and tears the queue down,
+        // discarding the residue. The stats below run only on the Ok path.
+        g.post().map_err(oerr)?;
+        for _ in 0..writes {
+            RdmaWrStats::post(&stats.write_posted, &stats.write_inflight);
+        }
+        for _ in 0..sends {
+            RdmaWrStats::post(&stats.send_posted, &stats.send_inflight);
+        }
+        stats.sq_doorbells.set(stats.sq_doorbells.get() + 1);
         Ok(())
     }
 
@@ -890,6 +895,8 @@ impl RdmaQueue {
         let responses = Rc::clone(&self.responses);
         // Reused across iterations: the steady IO path allocates nothing.
         let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
+        // Drained-response batch, posted on one doorbell; reused, so no steady alloc.
+        let mut resp_batch: Vec<RdmaResp> = Vec::with_capacity(self.nslots as usize);
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields
         // Ok(false) to keep going, Ok(true) to stop, or Err for a fatal error.
@@ -900,15 +907,14 @@ impl RdmaQueue {
                     Ok(()) => self.process_cqes(&ctx, &mut comps),
                 },
                 Some(resp) = responses.next() => {
-                    let mut r = self.post_response(resp.tag, &resp.cmd, resp.outcome);
-                    // Drain any siblings queued in the same wake without re-parking.
-                    while r.is_ok() {
-                        match responses.try_next() {
-                            Some(rr) => r = self.post_response(rr.tag, &rr.cmd, rr.outcome),
-                            None => break,
-                        }
+                    // Collect this wake's response and any siblings queued in the
+                    // same wake, then post them all on one doorbell.
+                    resp_batch.clear();
+                    resp_batch.push(resp);
+                    while let Some(rr) = responses.try_next() {
+                        resp_batch.push(rr);
                     }
-                    r.map(|()| false)
+                    self.post_responses_batch(&resp_batch).map(|()| false)
                 }
                 // CM Disconnected for this connection (the QP isn't cm_id-bound,
                 // so this is the only prompt teardown signal).
