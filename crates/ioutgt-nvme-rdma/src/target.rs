@@ -139,6 +139,18 @@ struct RdmaResp {
     outcome: Outcome,
 }
 
+/// A write command's host-data pull deferred from `handle_recv` so all the
+/// RDMA READs of one CQ-poll's RECV batch flush on a single doorbell. The
+/// slot's pool lease (the READ's local landing segments) is already set up;
+/// this carries the remote side (`rkey`/`addr`) and length.
+#[derive(Clone, Copy)]
+struct PendingRead {
+    tag: u16,
+    len: u32,
+    rkey: u32,
+    addr: u64,
+}
+
 /// Per-queue RDMA work-request counters, one class each for READ (host
 /// write-data pulls), WRITE (read-data pushes), SEND (CQE capsules), and RECV
 /// (command capsules). `posted`/`done` are cumulative (reset by GET_STATS
@@ -272,6 +284,9 @@ pub struct RdmaQueue {
     /// Per-class RDMA WR counters (READ/WRITE/SEND/RECV posted/done/inflight),
     /// shared with `nvme.stats` so GET_STATS can snapshot them on this thread.
     wr: Rc<RdmaWrStats>,
+    /// Write-command host-data READs deferred from `handle_recv`, flushed on one
+    /// doorbell after each CQ-poll's RECV batch. Reused; sized to the queue depth.
+    read_batch: Vec<PendingRead>,
 }
 
 impl Drop for RdmaQueue {
@@ -355,6 +370,7 @@ impl RdmaQueue {
             responses: Rc::new(SendList::new(sqsize)),
             pending_read: vec![Sqe::zeroed(); sqsize as usize],
             wr,
+            read_batch: Vec::with_capacity(sqsize as usize),
         })
     }
 
@@ -426,21 +442,39 @@ impl RdmaQueue {
         Ok(())
     }
 
-    /// RDMA READ `len` bytes from the host's keyed-SGL region (`src`) into
-    /// `slot(tag)`'s leased pool-backed segments, so the deferred dispatch task
-    /// (spawned on the `WR_READ` completion) sees the host write-data already in
-    /// the slot. The caller must have confirmed the lease is pool-backed.
-    fn post_read_data(&mut self, tag: u32, len: usize, src: &KeyedSgl) -> io::Result<()> {
-        let mut sges = [ibv_sge {
-            addr: 0,
-            length: 0,
-            lkey: 0,
-        }; MAX_SEGS];
-        let mut n = 0usize;
-        let mut remaining = len;
-        {
-            let data = self.nvme.slots.slot(tag as u16).data();
-            for seg in data.segs() {
+    /// Post every write-command host-data READ collected in `read_batch` on ONE
+    /// doorbell: for each, an RDMA READ scattering the host's keyed-SGL region
+    /// into the slot's leased pool segments, all constructed on a single guard
+    /// and flushed with one `ibv_post_send`. Each READ completes independently
+    /// (`WR_READ` → submit_pending). Empties `read_batch` on success.
+    fn post_reads_batch(&mut self) -> io::Result<()> {
+        if self.read_batch.is_empty() {
+            return Ok(());
+        }
+        // Split-borrow so the send guard (&mut qp) coexists with the sge
+        // construction reading from the slot pool.
+        let RdmaQueue {
+            qp,
+            nvme,
+            pool_lkey,
+            wr: stats,
+            read_batch,
+            ..
+        } = self;
+        let pool_lkey = *pool_lkey;
+        let mut reads = 0u64;
+        let mut g = qp.start_post_send();
+        for pr in read_batch.iter().copied() {
+            // The extended guard copies each sge list into the WQE at setup, so
+            // this per-iteration stack array is reused safely across the batch.
+            let mut sges = [ibv_sge {
+                addr: 0,
+                length: 0,
+                lkey: 0,
+            }; MAX_SEGS];
+            let mut n = 0usize;
+            let mut remaining = pr.len as usize;
+            for seg in nvme.slots.slot(pr.tag).data().segs() {
                 if remaining == 0 {
                     break;
                 }
@@ -448,22 +482,29 @@ impl RdmaQueue {
                 sges[n] = ibv_sge {
                     addr: seg.ptr as u64,
                     length: take as u32,
-                    lkey: self.pool_lkey,
+                    lkey: pool_lkey,
                 };
                 n += 1;
                 remaining -= take;
             }
+            let h = g
+                .construct_wr(wr(WR_READ, u32::from(pr.tag)), WorkRequestFlags::Signaled)
+                .setup_read(pr.rkey, pr.addr);
+            // SAFETY: the sges reference the registered pool arena (pool_lkey,
+            // is_pool-checked in handle_recv); the slot stays leased until its
+            // response SEND completes (tag not released until then).
+            unsafe { h.setup_sge_list(&sges[..n]) };
+            reads += 1;
         }
-        let mut g = self.qp.start_post_send();
-        let h = g
-            .construct_wr(wr(WR_READ, tag), WorkRequestFlags::Signaled)
-            .setup_read(src.rkey, src.addr);
-        // SAFETY: the sges reference the registered pool arena (pool_lkey,
-        // is_pool-checked by the caller); the slot stays leased until the slot's
-        // SEND completes (tag not released until then).
-        unsafe { h.setup_sge_list(&sges[..n]) };
+        // One atomic ibv_post_send for the batch (extended guard's
+        // ibv_wr_complete); a post error is fatal and tears the queue down, so
+        // the not-yet-cleared read_batch residue is harmless.
         g.post().map_err(oerr)?;
-        RdmaWrStats::sq_post(&self.wr.read_posted, &self.wr.read_inflight, &self.wr.sq_doorbells);
+        for _ in 0..reads {
+            RdmaWrStats::post(&stats.read_posted, &stats.read_inflight);
+        }
+        stats.sq_doorbells.set(stats.sq_doorbells.get() + 1);
+        read_batch.clear();
         Ok(())
     }
 
@@ -514,6 +555,9 @@ impl RdmaQueue {
                 _ => {}
             }
         }
+        // Flush the write-command host-data READs `handle_recv` collected from
+        // this poll's RECV batch — all on one doorbell.
+        self.post_reads_batch()?;
         Ok(false)
     }
 
@@ -634,9 +678,17 @@ impl RdmaQueue {
             self.fail_recv(ctx, tag, &sqe, status::DATA_XFER_ERROR | status::DNR);
             return Ok(());
         }
-        // Stash the SQE; RDMA READ the host data and submit on its completion.
+        // Stash the SQE and defer the host-data RDMA READ into read_batch, so all
+        // of this CQ poll's write-command reads flush on one doorbell; the slot
+        // is submitted when the READ completes (`WR_READ` → submit_pending).
         self.pending_read[tag as usize] = sqe;
-        self.post_read_data(u32::from(tag), len, &sgl)
+        self.read_batch.push(PendingRead {
+            tag,
+            len: len as u32,
+            rkey: sgl.rkey,
+            addr: sgl.addr,
+        });
+        Ok(())
     }
 
     /// Submit a deferred write command once its host-data RDMA READ completed —
