@@ -1164,8 +1164,17 @@ pub async fn run_conn(
     // min(the request's initiator_depth, device `max_qp_init_rd_atom`). Capture
     // it so the CM accept reply advertises the *same* value as the QP holds —
     // see the `accept` call below.
-    let rts_attr = conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?;
+    let mut rts_attr = conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?;
     let initiator_depth = rts_attr.max_read_atomic();
+    // DIAG: widen this QP's RC ACK timeout to 4.096us * 2^20 (~4.3s). librdmacm
+    // derives a short timeout from the CM path; under sustained large writes the
+    // host can retransmit before the target's batched RDMA READs drain, tripping
+    // local_ack_timeout_err -> transport-retry exhaustion -> the QID-0 keep-alive
+    // wedge. The wide window rides out the transient congestion (target-side
+    // mirror of the host nvme-rdma `ack_timeout_ms` knob). Diagnostic mitigation,
+    // not a final design choice.
+    rts_attr.setup_timeout(20);
+    tracing::warn!(qid = conn.qid, ack_timeout = 20, "DIAG widened RC ACK timeout");
     qp.modify(&rts_attr).map_err(oerr)?;
 
     let mut queue = RdmaQueue::new(
