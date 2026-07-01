@@ -275,6 +275,13 @@ fn thread_stats_json(
             let mut value = counters_json(&snap);
             value["qid"] = snap.qid.into();
             value["cntlid"] = snap.cntlid.into();
+            // Transport-specific per-queue counters (RDMA WR classes), if any.
+            if let Some(wr) = stats.transport_snapshot() {
+                value["wr"] = wr
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::from(v)))
+                    .collect();
+            }
             value
         })
         .collect();

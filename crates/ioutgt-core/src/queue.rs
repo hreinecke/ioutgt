@@ -11,13 +11,23 @@
 //! transport-side [`NvmeTcpQueue`][ioutgt_nvme_tcp::queue::NvmeTcpQueue]
 //! (or its equivalent for other transports), not here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use ioutgt_nvme::spec::Sqe;
 
 use crate::slotq::SlotArray;
 pub use crate::slotq::{Slot, SlotState};
+
+/// Optional transport-specific per-queue counters (e.g. RDMA work-request
+/// classes) reported alongside [`QueueStats`] under a `"wr"` object in
+/// GET_STATS. Snapshotted on the owning queue thread, like the core counters.
+pub trait TransportStats: std::fmt::Debug {
+    /// `(label, value)` counter pairs to emit under `"wr"`.
+    fn snapshot(&self) -> Vec<(&'static str, u64)>;
+    /// Zero the counters (GET_STATS `clear`).
+    fn reset(&self);
+}
 
 /// Per-queue lifetime IO counters. All writers run on the owning queue
 /// thread (`Cell`, hence `!Sync` — a cross-thread read cannot compile);
@@ -48,6 +58,9 @@ pub struct QueueStats {
     /// bumps this without a cmd-class counter — so the class counters
     /// do not necessarily sum to commands received.
     pub errors: Cell<u64>,
+    /// Optional transport-specific counters (RDMA WR classes); `None` for
+    /// transports without them (TCP). Set on the owning thread at install.
+    transport: RefCell<Option<Rc<dyn TransportStats>>>,
 }
 
 /// Plain-`u64` copy of [`QueueStats`]; doubles as the fold accumulator
@@ -86,7 +99,19 @@ impl QueueStats {
             read_bytes: Cell::new(0),
             write_bytes: Cell::new(0),
             errors: Cell::new(0),
+            transport: RefCell::new(None),
         }
+    }
+
+    /// Attach a transport-specific stats provider (owning thread; once at
+    /// queue install). Reported under `"wr"` in GET_STATS.
+    pub fn set_transport(&self, t: Rc<dyn TransportStats>) {
+        *self.transport.borrow_mut() = Some(t);
+    }
+
+    /// Snapshot the transport-specific counters, if any (owning thread).
+    pub fn transport_snapshot(&self) -> Option<Vec<(&'static str, u64)>> {
+        self.transport.borrow().as_ref().map(|t| t.snapshot())
     }
 
     /// Copy out the current values (owning thread only).
@@ -114,6 +139,9 @@ impl QueueStats {
         self.read_bytes.set(0);
         self.write_bytes.set(0);
         self.errors.set(0);
+        if let Some(t) = self.transport.borrow().as_ref() {
+            t.reset();
+        }
     }
 }
 

@@ -367,6 +367,31 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                 val(u(q, "other_cmds"), u(&q0, "other_cmds")),
                 val(u(q, "errors"), u(&q0, "errors")),
             );
+            // Transport WR row (RDMA only): completion rate + live inflight per
+            // class. A stuck-high read inflight with a zero read rate is the
+            // signature of RDMA READs posted but not completing.
+            if let Some(wr) = q.get("wr").filter(|w| w.is_object()) {
+                let wr0 = q0.get("wr").cloned().unwrap_or_default();
+                let done_amt = amt(u(wr, "read_done"), u(&wr0, "read_done"))
+                    + amt(u(wr, "write_done"), u(&wr0, "write_done"))
+                    + amt(u(wr, "send_done"), u(&wr0, "send_done"))
+                    + amt(u(wr, "recv_done"), u(&wr0, "recv_done"));
+                let _ = writeln!(
+                    out,
+                    "    wr  read {}{suffix} if {}  write {}{suffix} if {}  \
+                     send {}{suffix} if {}  recv {}{suffix} if {}  batches {}{suffix} ({:.1}/batch)",
+                    val(u(wr, "read_done"), u(&wr0, "read_done")),
+                    u(wr, "read_inflight"),
+                    val(u(wr, "write_done"), u(&wr0, "write_done")),
+                    u(wr, "write_inflight"),
+                    val(u(wr, "send_done"), u(&wr0, "send_done")),
+                    u(wr, "send_inflight"),
+                    val(u(wr, "recv_done"), u(&wr0, "recv_done")),
+                    u(wr, "recv_inflight"),
+                    val(u(wr, "poll_batches"), u(&wr0, "poll_batches")),
+                    per(done_amt, amt(u(wr, "poll_batches"), u(&wr0, "poll_batches"))),
+                );
+            }
         }
         // Retired row. In rate mode, diffing `retired` alone would
         // re-report a mid-interval-retired queue's whole lifetime as one
@@ -747,6 +772,22 @@ mod tests {
             "retired": { "read_cmds": 0, "write_cmds": 0, "flush_cmds": 0,
                 "other_cmds": 0, "read_bytes": 0, "write_bytes": 0, "errors": 0 },
         }]})
+    }
+
+    #[test]
+    fn render_stat_shows_wr_row() {
+        let mut data = stat_sample();
+        data["threads"][0]["queues"][0]["wr"] = serde_json::json!({
+            "read_posted": 100u64, "read_done": 90u64, "read_inflight": 10u64,
+            "write_posted": 0u64, "write_done": 0u64, "write_inflight": 0u64,
+            "send_posted": 90u64, "send_done": 90u64, "send_inflight": 0u64,
+            "recv_posted": 128u64, "recv_done": 90u64, "recv_inflight": 38u64,
+            "poll_batches": 45u64,
+        });
+        let out = super::render_stat(&data, None);
+        assert!(out.contains("wr  read 90 if 10"), "{out}");
+        assert!(out.contains("recv 90 if 38"), "{out}");
+        assert!(out.contains("batches 45"), "{out}");
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! Single-threaded (one reactor thread owns the QP/CQ/MR pool); not yet wired
 //! into the harness pool. Completions are reaped reactor-driven via [`crate::cq`].
 
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -20,7 +21,7 @@ use ioutgt_backend::AnyBackend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::dispatch::{self, ConnCtx, Outcome, Role};
 use ioutgt_core::pool::MAX_SEGS;
-use ioutgt_core::queue::QueueCore;
+use ioutgt_core::queue::{QueueCore, TransportStats};
 use ioutgt_core::slotq::SendList;
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
@@ -138,6 +139,84 @@ struct RdmaResp {
     outcome: Outcome,
 }
 
+/// Per-queue RDMA work-request counters, one class each for READ (host
+/// write-data pulls), WRITE (read-data pushes), SEND (CQE capsules), and RECV
+/// (command capsules). `posted`/`done` are cumulative (reset by GET_STATS
+/// `clear`); `inflight` is a live gauge (posted−done), never reset, so it stays
+/// accurate across a clear. Reported under `"wr"` in GET_STATS via
+/// [`TransportStats`]. All access is on the owning queue thread (`Cell`).
+#[derive(Debug, Default)]
+struct RdmaWrStats {
+    read_posted: Cell<u64>,
+    read_done: Cell<u64>,
+    read_inflight: Cell<i64>,
+    write_posted: Cell<u64>,
+    write_done: Cell<u64>,
+    write_inflight: Cell<i64>,
+    send_posted: Cell<u64>,
+    send_done: Cell<u64>,
+    send_inflight: Cell<i64>,
+    recv_posted: Cell<u64>,
+    recv_done: Cell<u64>,
+    recv_inflight: Cell<i64>,
+    /// Non-empty CQ polls (completion batches). `*_done / poll_batches` is the
+    /// average number of each WR class reaped per batch.
+    poll_batches: Cell<u64>,
+}
+
+impl RdmaWrStats {
+    /// Count a posted WR: bump the cumulative `posted` and the live `inflight`.
+    #[inline]
+    fn post(posted: &Cell<u64>, inflight: &Cell<i64>) {
+        posted.set(posted.get() + 1);
+        inflight.set(inflight.get() + 1);
+    }
+
+    /// Count a completed WR: bump cumulative `done`, drop the live `inflight`.
+    #[inline]
+    fn complete(done: &Cell<u64>, inflight: &Cell<i64>) {
+        done.set(done.get() + 1);
+        inflight.set(inflight.get() - 1);
+    }
+}
+
+impl TransportStats for RdmaWrStats {
+    fn snapshot(&self) -> Vec<(&'static str, u64)> {
+        let gauge = |c: &Cell<i64>| u64::try_from(c.get().max(0)).unwrap_or(0);
+        vec![
+            ("read_posted", self.read_posted.get()),
+            ("read_done", self.read_done.get()),
+            ("read_inflight", gauge(&self.read_inflight)),
+            ("write_posted", self.write_posted.get()),
+            ("write_done", self.write_done.get()),
+            ("write_inflight", gauge(&self.write_inflight)),
+            ("send_posted", self.send_posted.get()),
+            ("send_done", self.send_done.get()),
+            ("send_inflight", gauge(&self.send_inflight)),
+            ("recv_posted", self.recv_posted.get()),
+            ("recv_done", self.recv_done.get()),
+            ("recv_inflight", gauge(&self.recv_inflight)),
+            ("poll_batches", self.poll_batches.get()),
+        ]
+    }
+
+    fn reset(&self) {
+        for c in [
+            &self.read_posted,
+            &self.read_done,
+            &self.write_posted,
+            &self.write_done,
+            &self.send_posted,
+            &self.send_done,
+            &self.recv_posted,
+            &self.recv_done,
+            &self.poll_batches,
+        ] {
+            c.set(0);
+        }
+    }
+}
+
 /// One RC connection's RDMA resources + the NVMe slot engine. Owns the receive
 /// capsule buffers and a send/response staging buffer, all registered as MRs.
 ///
@@ -175,6 +254,9 @@ pub struct RdmaQueue {
     /// For a deferred write command: the SQE stashed at RECV, submitted to its
     /// slot only once its host write-data RDMA READ (`WR_READ`) completes.
     pending_read: Vec<Sqe>,
+    /// Per-class RDMA WR counters (READ/WRITE/SEND/RECV posted/done/inflight),
+    /// shared with `nvme.stats` so GET_STATS can snapshot them on this thread.
+    wr: Rc<RdmaWrStats>,
 }
 
 impl Drop for RdmaQueue {
@@ -235,6 +317,11 @@ impl RdmaQueue {
             unsafe { pd.reg_mr(cdata_buf.as_mut_ptr() as usize, cdata_buf.len(), AccessFlags::LocalWrite) }
                 .map_err(oerr)?;
 
+        let wr = Rc::new(RdmaWrStats::default());
+        // Report the RDMA WR counters under "wr" in GET_STATS; snapshotted on
+        // this queue thread (via the mailbox), same as the core QueueStats.
+        nvme.stats.set_transport(wr.clone());
+
         Ok(RdmaQueue {
             qp,
             cq,
@@ -252,6 +339,7 @@ impl RdmaQueue {
             inflight: vec![0u8; sqsize as usize],
             responses: Rc::new(SendList::new(sqsize)),
             pending_read: vec![Sqe::zeroed(); sqsize as usize],
+            wr,
         })
     }
 
@@ -270,7 +358,9 @@ impl RdmaQueue {
         // SAFETY: the region is registered (recv_mr) and stays valid; the NIC
         // writes the next capsule here.
         unsafe { h.setup_sge(lkey, addr, CAPSULE_LEN as u32) };
-        g.post().map_err(oerr)
+        g.post().map_err(oerr)?;
+        RdmaWrStats::post(&self.wr.recv_posted, &self.wr.recv_inflight);
+        Ok(())
     }
 
     /// SEND the 16-byte CQE response capsule for `tag` from the staging buffer. When
@@ -292,7 +382,9 @@ impl RdmaQueue {
         // SAFETY: the staging region is registered and stays valid until the
         // send completes (tag not released until then).
         unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
-        g.post().map_err(oerr)
+        g.post().map_err(oerr)?;
+        RdmaWrStats::post(&self.wr.send_posted, &self.wr.send_inflight);
+        Ok(())
     }
 
     /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
@@ -314,7 +406,9 @@ impl RdmaQueue {
         // SAFETY: cdata_buf is registered (cdata_mr, LocalWrite) and lives in
         // this struct; len is clamped to its size by the caller.
         unsafe { h.setup_sge(lkey, addr, len as u32) };
-        g.post().map_err(oerr)
+        g.post().map_err(oerr)?;
+        RdmaWrStats::post(&self.wr.read_posted, &self.wr.read_inflight);
+        Ok(())
     }
 
     /// RDMA WRITE the first `data_len` bytes of `slot(tag).data().segs()` to the
@@ -352,7 +446,9 @@ impl RdmaQueue {
         // SAFETY: the sges reference the registered pool arena (pool_lkey); the
         // slot stays leased until the WRITE completes (tag not released).
         unsafe { h.setup_sge_list(&sges[..n]) };
-        g.post().map_err(oerr)
+        g.post().map_err(oerr)?;
+        RdmaWrStats::post(&self.wr.write_posted, &self.wr.write_inflight);
+        Ok(())
     }
 
     /// RDMA READ `len` bytes from the host's keyed-SGL region (`src`) into
@@ -391,7 +487,9 @@ impl RdmaQueue {
         // is_pool-checked by the caller); the slot stays leased until the slot's
         // SEND completes (tag not released until then).
         unsafe { h.setup_sge_list(&sges[..n]) };
-        g.post().map_err(oerr)
+        g.post().map_err(oerr)?;
+        RdmaWrStats::post(&self.wr.read_posted, &self.wr.read_inflight);
+        Ok(())
     }
 
     /// Drain all currently-available completions as `(wr_id, success)` into the
@@ -415,12 +513,22 @@ impl RdmaQueue {
         comps: &mut Vec<(u64, bool)>,
     ) -> io::Result<bool> {
         self.drain_into(comps);
+        if !comps.is_empty() {
+            self.wr.poll_batches.set(self.wr.poll_batches.get() + 1);
+        }
         // `comps` is a local buffer (disjoint from `self`), so iterating it while
         // calling `&mut self` handlers is sound.
         for &(id, ok) in comps.iter() {
             if !ok {
                 // Flushed completion: the peer is gone.
                 return Ok(true);
+            }
+            match wr_kind(id) {
+                WR_RECV => RdmaWrStats::complete(&self.wr.recv_done, &self.wr.recv_inflight),
+                WR_READ => RdmaWrStats::complete(&self.wr.read_done, &self.wr.read_inflight),
+                WR_SEND => RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight),
+                WR_WRITE => RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight),
+                _ => {}
             }
             match wr_kind(id) {
                 WR_RECV => self.handle_recv(ctx, wr_low(id))?,
@@ -458,8 +566,18 @@ impl RdmaQueue {
                     return Err(io::Error::other("RDMA completion error (peer gone?)"));
                 }
                 match wr_kind(id) {
-                    WR_RECV => return Ok(wr_low(id)),
-                    WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                    WR_RECV => {
+                        RdmaWrStats::complete(&self.wr.recv_done, &self.wr.recv_inflight);
+                        return Ok(wr_low(id));
+                    }
+                    WR_SEND => {
+                        RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight);
+                        self.on_response_done(wr_low(id));
+                    }
+                    WR_WRITE => {
+                        RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight);
+                        self.on_response_done(wr_low(id));
+                    }
                     _ => {}
                 }
             }
@@ -478,8 +596,18 @@ impl RdmaQueue {
                     return Err(io::Error::other("RDMA READ completion error"));
                 }
                 match wr_kind(id) {
-                    WR_READ => return Ok(()),
-                    WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                    WR_READ => {
+                        RdmaWrStats::complete(&self.wr.read_done, &self.wr.read_inflight);
+                        return Ok(());
+                    }
+                    WR_SEND => {
+                        RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight);
+                        self.on_response_done(wr_low(id));
+                    }
+                    WR_WRITE => {
+                        RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight);
+                        self.on_response_done(wr_low(id));
+                    }
                     _ => {}
                 }
             }
