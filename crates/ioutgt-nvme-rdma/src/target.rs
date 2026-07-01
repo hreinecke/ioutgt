@@ -405,7 +405,12 @@ impl RdmaQueue {
         let addr = self.resp_buf.as_ptr() as u64 + off as u64;
         let lkey = self.resp_mr.lkey();
         let mut g = self.qp.start_post_send();
-        let wrh = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled);
+        // Solicited so the host's solicited-armed CQ raises a completion
+        // interrupt for the response (see post_responses_batch).
+        let wrh = g.construct_wr(
+            wr(WR_SEND, tag),
+            WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
+        );
         let h = match invalidate_rkey {
             Some(rkey) => wrh.setup_send_with_inv(rkey),
             None => wrh.setup_send(),
@@ -782,7 +787,15 @@ impl RdmaQueue {
             let off = tag as usize * CQE_LEN;
             resp_buf[off..off + CQE_LEN].copy_from_slice(resp.outcome.cqe.as_bytes());
             let cqe_addr = resp_buf.as_ptr() as u64 + off as u64;
-            let ws = g.construct_wr(wr(WR_SEND, u32::from(tag)), WorkRequestFlags::Signaled);
+            // Solicited: the host's nvme-rdma CQ is armed for solicited events
+            // only, so the response CQE SEND must set IBV_SEND_SOLICITED or the
+            // host never takes a completion interrupt — it sleeps with the CQE
+            // unreaped and the IO hangs (mirrors nvmet-rdma, which marks its
+            // responses solicited).
+            let ws = g.construct_wr(
+                wr(WR_SEND, u32::from(tag)),
+                WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
+            );
             let hs = match invalidate_rkey_for(&resp.cmd) {
                 Some(rkey) => ws.setup_send_with_inv(rkey),
                 None => ws.setup_send(),
