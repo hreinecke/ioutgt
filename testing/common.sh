@@ -293,13 +293,17 @@ discover_one() {
 connect_one() {
     local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
     modprobe "nvme-$TRANSPORT"
-    echo ">> connecting $1 -> $TARGET_IP:$port (request ${NR_QUEUES}q x $QUEUE_SIZE)"
+    # Bump the host keep-alive timeout to 20s so a transient RC retransmit
+    # under fabric congestion can't trip the keep-alive and wedge QID 0. Fixed
+    # here on purpose — not an outside knob.
+    local kato=20
+    echo ">> connecting $1 -> $TARGET_IP:$port (request ${NR_QUEUES}q x $QUEUE_SIZE, keep-alive-tmo=${kato}s)"
     # -i/-q make the host REQUEST this many queues / this depth; the target
     # caps it, so the granted values are min(host request, target cap).
     ini_exec nvme connect -t "$TRANSPORT" -a "$TARGET_IP" -s "$port" \
         -n "$nqn" --hostnqn "$HOSTNQN" --hostid "$HOSTID" \
         --nr-io-queues "$NR_QUEUES" --queue-size "$QUEUE_SIZE" \
-        "${CONNECT_DGST[@]}"
+        --keep-alive-tmo "$kato" "${CONNECT_DGST[@]}"
     local dev
     if dev=$(wait_dev "$nqn"); then
         echo "   block device: $dev (controller $(find_ctrl "$nqn"), nqn $nqn)"
