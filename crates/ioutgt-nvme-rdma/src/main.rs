@@ -6,9 +6,10 @@
 //! `ioutgt-nvme-tcp` binary; TCP-only knobs (digests, `--send-zc`,
 //! `--recv-buf-mb`) are absent.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ioutgt_control::config::BackendConfig;
 use ioutgt_harness::TargetConfig;
+use ioutgt_harness::client::{ctl, list_target, stat_target};
 use ioutgt_nvme_rdma::transport::RdmaTransport;
 
 #[derive(Parser, Debug)]
@@ -61,6 +62,9 @@ struct Args {
     /// Unix socket path for the runtime control API.
     #[arg(long, default_value_os_t = default_control_socket())]
     control_socket: std::path::PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
 /// `$XDG_RUNTIME_DIR/ioutgt-rdma.sock`, else `/tmp/ioutgt-rdma.sock`.
@@ -71,6 +75,38 @@ fn default_control_socket() -> std::path::PathBuf {
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Send one JSON request to a running target's control socket.
+    Ctl {
+        /// Control socket path.
+        #[arg(long, default_value_os_t = default_control_socket())]
+        socket: std::path::PathBuf,
+        /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
+        request: String,
+    },
+    /// List the target: port inventory plus live controllers
+    /// (queues, threads, namespaces).
+    #[command(alias = "list-ctrl")]
+    List {
+        /// Control socket path.
+        #[arg(long, default_value_os_t = default_control_socket())]
+        socket: std::path::PathBuf,
+    },
+    /// Per-thread ring and per-queue IO counters from a running target.
+    Stat {
+        /// Control socket path.
+        #[arg(long, default_value_os_t = default_control_socket())]
+        socket: std::path::PathBuf,
+        /// Repeat every N seconds, printing per-interval rates.
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: Option<u64>,
+        /// Zero all counters after printing this (final) snapshot.
+        #[arg(long, conflicts_with = "interval")]
+        clear: bool,
+    },
+}
+
 fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -79,6 +115,17 @@ fn main() -> std::io::Result<()> {
         .init();
 
     let args = Args::parse();
+    if let Some(command) = &args.command {
+        match command {
+            Command::Ctl { socket, request } => return ctl(socket, request),
+            Command::List { socket } => return list_target(socket),
+            Command::Stat {
+                socket,
+                interval,
+                clear,
+            } => return stat_target(socket, *interval, *clear),
+        }
+    }
     let config = match &args.config {
         Some(path) => {
             let mut config = TargetConfig::from_file(path)?;

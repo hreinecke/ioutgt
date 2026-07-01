@@ -8,6 +8,8 @@
 //! handshake) and the per-queue driver (`run_queue`). A frontend instantiates
 //! [`spawn`] with its transport (e.g. NVMe/TCP or NVMe/RDMA).
 
+pub mod client;
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
