@@ -426,9 +426,21 @@ impl RdmaQueue {
         Ok(())
     }
 
-    /// RDMA WRITE the first `data_len` bytes of `slot(tag).data().segs()` to the
-    /// host's keyed-SGL region.
-    fn write_read_data(&mut self, tag: u32, data_len: u32, dst: &KeyedSgl) -> io::Result<()> {
+    /// Post a read command's response as ONE doorbell: RDMA WRITE the first
+    /// `data_len` bytes of `slot(tag).data().segs()` to the host's keyed SGL,
+    /// then SEND the CQE — chained on a single guard so the two WRs ride one
+    /// `ibv_post_send`. RC in-order delivery keeps the SEND after the WRITE, so
+    /// the host sees the data before completion. Mirrors nvmet's
+    /// `rdma_rw_ctx_wrs` + linked `send_wr`. Both WRs complete separately and
+    /// each decrements the tag's `inflight` (set to 2 by the caller).
+    fn post_read_response(
+        &mut self,
+        tag: u32,
+        data_len: u32,
+        dst: &KeyedSgl,
+        cqe: Cqe,
+        invalidate_rkey: Option<u32>,
+    ) -> io::Result<()> {
         // A pool lease spans at most MAX_SEGS runs (and the QP's max_send_sge is
         // built to match), so a fixed array holds every sge with no allocation.
         let mut sges = [ibv_sge {
@@ -454,15 +466,36 @@ impl RdmaQueue {
                 remaining -= take;
             }
         }
+        // Stage the CQE for the trailing SEND before taking the guard.
+        let off = tag as usize * CQE_LEN;
+        self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
+        let cqe_addr = self.resp_buf.as_ptr() as u64 + off as u64;
+        let cqe_lkey = self.resp_mr.lkey();
+
         let mut g = self.qp.start_post_send();
-        let h = g
+        let hw = g
             .construct_wr(wr(WR_WRITE, tag), WorkRequestFlags::Signaled)
             .setup_write(dst.rkey, dst.addr);
         // SAFETY: the sges reference the registered pool arena (pool_lkey); the
-        // slot stays leased until the WRITE completes (tag not released).
-        unsafe { h.setup_sge_list(&sges[..n]) };
+        // slot stays leased until both WRs complete (tag not released).
+        unsafe { hw.setup_sge_list(&sges[..n]) };
+        let ws = g.construct_wr(wr(WR_SEND, tag), WorkRequestFlags::Signaled);
+        let hs = match invalidate_rkey {
+            Some(rkey) => ws.setup_send_with_inv(rkey),
+            None => ws.setup_send(),
+        };
+        // SAFETY: the staging region is registered and stays valid until the
+        // SEND completes (tag not released until then).
+        unsafe { hs.setup_sge(cqe_lkey, cqe_addr, CQE_LEN as u32) };
+        // The QP is built with `build_ex`, so this posts via `ibv_wr_complete` —
+        // both WRs post or neither does. That atomicity is load-bearing: a split
+        // post (WRITE ok, SEND fails) would leave a lone WRITE completion to
+        // decrement a tag whose `inflight` was never set to 2. A `post` error is
+        // fatal (it tears the queue down) and returns before that count is set.
         g.post().map_err(oerr)?;
-        RdmaWrStats::sq_post(&self.wr.write_posted, &self.wr.write_inflight, &self.wr.sq_doorbells);
+        RdmaWrStats::post(&self.wr.write_posted, &self.wr.write_inflight);
+        RdmaWrStats::post(&self.wr.send_posted, &self.wr.send_inflight);
+        self.wr.sq_doorbells.set(self.wr.sq_doorbells.get() + 1);
         Ok(())
     }
 
@@ -701,15 +734,22 @@ impl RdmaQueue {
     /// RDMA WRITE of any read-data to the host's keyed SGL, then the CQE capsule.
     /// The slot is released once both response WRs complete (tracked by `inflight`).
     fn post_response(&mut self, tag: u16, cmd: &Sqe, outcome: Outcome) -> io::Result<()> {
-        let mut pending = 0u8;
         if outcome.data_len > 0 {
+            // Read-data WRITE + CQE SEND chained on one doorbell; two WRs to
+            // complete, so the tag's in-flight count starts at 2.
             let dst = parse_keyed_sgl(cmd);
-            self.write_read_data(u32::from(tag), outcome.data_len, &dst)?;
-            pending += 1;
+            self.post_read_response(
+                u32::from(tag),
+                outcome.data_len,
+                &dst,
+                outcome.cqe,
+                invalidate_rkey_for(cmd),
+            )?;
+            self.inflight[tag as usize] = 2;
+        } else {
+            self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(cmd))?;
+            self.inflight[tag as usize] = 1;
         }
-        self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(cmd))?;
-        pending += 1;
-        self.inflight[tag as usize] = pending;
         Ok(())
     }
 
