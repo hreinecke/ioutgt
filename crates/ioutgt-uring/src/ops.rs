@@ -265,6 +265,38 @@ pub fn poll_add(fd: RawFd, events: u32) -> io::Result<RawOp> {
     Ok(RawOp { op })
 }
 
+/// Stream of readiness events from a multishot `IORING_OP_POLL_ADD`: one SQE,
+/// a CQE per readiness edge. The persistent analog of [`poll_add`] — the op is
+/// registered once and stays armed, so a reactor loop watching an RDMA
+/// completion-channel fd never re-registers per wake (no drop/re-submit churn).
+pub struct PollMulti {
+    op: MultiOp,
+}
+
+impl PollMulti {
+    /// Next readiness (`poll(2)` revents mask); `None` once the multishot
+    /// terminates (fd closed / cancelled / the kernel cleared `F_MORE`).
+    pub async fn next(&mut self) -> Option<io::Result<u32>> {
+        let result = std::future::poll_fn(|cx| self.op.poll_next(cx)).await?;
+        Some(result.io())
+    }
+}
+
+/// Multishot poll: one SQE, a CQE each time `fd` is ready for `events` (e.g.
+/// `libc::POLLIN`). See [`poll_add`] for the one-shot form.
+pub fn poll_add_multi(fd: RawFd, events: u32) -> io::Result<PollMulti> {
+    let op = MultiOp::submit(
+        |key| {
+            opcode::PollAdd::new(types::Fd(fd), events)
+                .multi(true)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+    )?;
+    Ok(PollMulti { op })
+}
+
 /// Sleep via `IORING_OP_TIMEOUT` — the only timer primitive on queue
 /// threads (Tokio's time driver is disabled there).
 pub fn sleep(duration: Duration) -> io::Result<Sleep> {

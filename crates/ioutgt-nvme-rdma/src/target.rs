@@ -949,14 +949,34 @@ impl RdmaQueue {
         let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
         // Drained-response batch, posted on one doorbell; reused, so no steady alloc.
         let mut resp_batch: Vec<RdmaResp> = Vec::with_capacity(self.nslots as usize);
+        // Persistent multishot poll on the comp-channel fd: one SQE, a CQE per
+        // readiness edge (IORING_POLL_ADD_MULTI). Registered once, so the reap arm
+        // never re-arms a one-shot poll every wake — no drop/re-submit churn.
+        let mut comp_poll = ioutgt_uring::ops::poll_add_multi(
+            std::os::fd::AsRawFd::as_raw_fd(&self.channel),
+            crate::cq::pollin(),
+        )?;
+        // Persistent backstop timer. A completion whose comp-channel notification
+        // was lost (userspace ibverbs has no IB_CQ_REPORT_MISSED_EVENTS) sits in
+        // the CQ with no fd event, so the multishot poll never fires for it; this
+        // defensively re-arms + re-drains the CQ. Created ONCE and reset only when
+        // it fires, so a busy select! cannot starve it — the previous per-iteration
+        // `sleep` rebuilt its timer op every wake and never survived to elapse
+        // under load, which is exactly how a stranded completion wedged the queue.
+        let mut backstop = std::pin::pin!(ioutgt_uring::ops::sleep(BACKSTOP)?);
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields
         // Ok(false) to keep going, Ok(true) to stop, or Err for a fatal error.
         let result: io::Result<()> = loop {
             let step: io::Result<bool> = tokio::select! {
-                res = crate::cq::wait(&self.channel, &self.cq) => match res {
-                    Err(e) => Err(e),
-                    Ok(()) => self.process_cqes(&ctx, &mut comps),
+                ev = comp_poll.next() => match ev {
+                    // Multishot ended (fd closed/cancelled): peer gone, tear down.
+                    None => Ok(true),
+                    Some(Err(e)) => Err(e),
+                    Some(Ok(revents)) => match crate::cq::consume(revents, &self.channel, &self.cq) {
+                        Err(e) => Err(e),
+                        Ok(()) => self.process_cqes(&ctx, &mut comps),
+                    },
                 },
                 Some(resp) = responses.next() => {
                     // Collect this wake's response and any siblings queued in the
@@ -971,25 +991,25 @@ impl RdmaQueue {
                 // CM Disconnected for this connection (the QP isn't cm_id-bound,
                 // so this is the only prompt teardown signal).
                 () = stop.notified() => Ok(true),
-                // Backstop re-drain. The reap above sleeps on the comp-channel
-                // event (`cq::wait`'s `POLL_ADD`); userspace ibverbs has no
+                // Backstop re-drain (persistent timer, above). The multishot reap
+                // arm only fires on a comp-channel event; userspace ibverbs has no
                 // `IB_CQ_REPORT_MISSED_EVENTS`, so a completion that races the
                 // re-arm can be left in the CQ with no event delivered, and the
                 // reactor's `PARK_SAFETY` only re-checks io_uring (not the RDMA
-                // CQ) — wedging the queue under sustained load. This timer fires
-                // ONLY when no completion/response woke us for `BACKSTOP`, then
-                // re-arms + drains so any stranded completion is recovered (the
-                // userspace analog of nvmet-rdma's missed-events re-poll). When
-                // the queue is busy it is re-created every iteration and never
-                // elapses, so steady-state cost is nil.
-                () = async {
-                    if let Ok(s) = ioutgt_uring::ops::sleep(BACKSTOP) {
-                        let _ = s.await;
-                    }
-                } => match crate::cq::arm(&self.cq) {
-                    Err(e) => Err(e),
-                    Ok(()) => self.process_cqes(&ctx, &mut comps),
-                },
+                // CQ) — which wedges the queue under sustained load. This timer
+                // fires every `BACKSTOP` regardless (it is reset only after firing,
+                // so a busy select! cannot starve it) and re-arms + re-drains, so a
+                // stranded completion is recovered within one interval (the
+                // userspace analog of nvmet-rdma's missed-events re-poll).
+                res = backstop.as_mut() => {
+                    res?;
+                    let r = match crate::cq::arm(&self.cq) {
+                        Err(e) => Err(e),
+                        Ok(()) => self.process_cqes(&ctx, &mut comps),
+                    };
+                    backstop.set(ioutgt_uring::ops::sleep(BACKSTOP)?);
+                    r
+                }
             };
             match step {
                 Ok(false) => {}

@@ -19,7 +19,8 @@ use std::ptr;
 use rdma_mummy_sys::{ibv_ack_cq_events, ibv_cq, ibv_get_cq_event, ibv_req_notify_cq};
 use sideway::ibverbs::completion::{CompletionChannel, CompletionQueue, GenericCompletionQueue};
 
-fn pollin() -> u32 {
+/// The `poll(2)` `POLLIN` mask, for arming a `poll_add` on a completion channel.
+pub fn pollin() -> u32 {
     u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
 }
 
@@ -83,9 +84,22 @@ pub fn drain_events(channel: &CompletionChannel, cq: &GenericCompletionQueue) ->
 /// teardown to clear any trailing event.
 pub async fn wait(channel: &CompletionChannel, cq: &GenericCompletionQueue) -> io::Result<()> {
     let revents = ioutgt_uring::ops::poll_add(channel.as_raw_fd(), pollin())?.await?;
-    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is in error or
-    // hung up with no data (device removed/torn down), fail loudly rather than
-    // letting the drain spin on a fd that will never carry an event again.
+    consume(revents, channel, cq)
+}
+
+/// Handle one comp-channel readiness (`revents`, e.g. from a multishot
+/// `poll_add`): fail loudly on error/hangup (device removed/torn down — the fd
+/// will never carry an event again), otherwise consume + ack the queued
+/// event(s) and re-arm `cq`. The caller drains the CQ afterwards; because the
+/// re-arm happens before that drain, a completion racing the re-arm re-signals
+/// the channel, so no wakeup is lost.
+pub fn consume(
+    revents: u32,
+    channel: &CompletionChannel,
+    cq: &GenericCompletionQueue,
+) -> io::Result<()> {
+    // POLL_ADD always reports POLLERR/POLLHUP; only treat it as fatal when there
+    // is no POLLIN alongside.
     if revents & pollin() == 0 && revents & err_hup() != 0 {
         return Err(io::Error::other("completion channel error or hangup"));
     }
