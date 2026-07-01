@@ -376,10 +376,16 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                     + amt(u(wr, "write_done"), u(&wr0, "write_done"))
                     + amt(u(wr, "send_done"), u(&wr0, "send_done"))
                     + amt(u(wr, "recv_done"), u(&wr0, "recv_done"));
+                // Send-queue WRs posted this interval (READ+WRITE+SEND) over the
+                // doorbells rung = submission batch size (1.0 = no WR chaining).
+                let sq_posted_amt = amt(u(wr, "read_posted"), u(&wr0, "read_posted"))
+                    + amt(u(wr, "write_posted"), u(&wr0, "write_posted"))
+                    + amt(u(wr, "send_posted"), u(&wr0, "send_posted"));
                 let _ = writeln!(
                     out,
                     "    wr  read {}{suffix} if {}  write {}{suffix} if {}  \
-                     send {}{suffix} if {}  recv {}{suffix} if {}  batches {}{suffix} ({:.1}/batch)",
+                     send {}{suffix} if {}  recv {}{suffix} if {}  poll {}{suffix} ({:.1}/poll)  \
+                     db {}{suffix} ({:.1} wr/db)",
                     val(u(wr, "read_done"), u(&wr0, "read_done")),
                     u(wr, "read_inflight"),
                     val(u(wr, "write_done"), u(&wr0, "write_done")),
@@ -390,6 +396,8 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                     u(wr, "recv_inflight"),
                     val(u(wr, "poll_batches"), u(&wr0, "poll_batches")),
                     per(done_amt, amt(u(wr, "poll_batches"), u(&wr0, "poll_batches"))),
+                    val(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells")),
+                    per(sq_posted_amt, amt(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells"))),
                 );
             }
         }
@@ -782,12 +790,14 @@ mod tests {
             "write_posted": 0u64, "write_done": 0u64, "write_inflight": 0u64,
             "send_posted": 90u64, "send_done": 90u64, "send_inflight": 0u64,
             "recv_posted": 128u64, "recv_done": 90u64, "recv_inflight": 38u64,
-            "poll_batches": 45u64,
+            "poll_batches": 45u64, "sq_doorbells": 190u64,
         });
         let out = super::render_stat(&data, None);
         assert!(out.contains("wr  read 90 if 10"), "{out}");
         assert!(out.contains("recv 90 if 38"), "{out}");
-        assert!(out.contains("batches 45"), "{out}");
+        assert!(out.contains("poll 45"), "{out}");
+        // 190 send-queue WRs (read 100 + send 90) over 190 doorbells = 1.0 wr/db.
+        assert!(out.contains("db 190 (1.0 wr/db)"), "{out}");
     }
 
     #[test]

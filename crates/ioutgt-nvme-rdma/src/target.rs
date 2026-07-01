@@ -162,6 +162,10 @@ struct RdmaWrStats {
     /// Non-empty CQ polls (completion batches). `*_done / poll_batches` is the
     /// average number of each WR class reaped per batch.
     poll_batches: Cell<u64>,
+    /// Send-queue doorbells rung (`ibv_post_send` calls for READ/WRITE/SEND).
+    /// `(read+write+send)_posted / sq_doorbells` is the submission batch size —
+    /// 1.0 with one WR per post, higher once WRs are chained per doorbell.
+    sq_doorbells: Cell<u64>,
 }
 
 impl RdmaWrStats {
@@ -170,6 +174,15 @@ impl RdmaWrStats {
     fn post(posted: &Cell<u64>, inflight: &Cell<i64>) {
         posted.set(posted.get() + 1);
         inflight.set(inflight.get() + 1);
+    }
+
+    /// Count a send-queue WR post plus the doorbell it rings (one WR per
+    /// `ibv_post_send` today). Once WRs are chained, the doorbell count moves to
+    /// the batched flush and this reverts to [`post`].
+    #[inline]
+    fn sq_post(posted: &Cell<u64>, inflight: &Cell<i64>, doorbells: &Cell<u64>) {
+        Self::post(posted, inflight);
+        doorbells.set(doorbells.get() + 1);
     }
 
     /// Count a completed WR: bump cumulative `done`, drop the live `inflight`.
@@ -197,6 +210,7 @@ impl TransportStats for RdmaWrStats {
             ("recv_done", self.recv_done.get()),
             ("recv_inflight", gauge(&self.recv_inflight)),
             ("poll_batches", self.poll_batches.get()),
+            ("sq_doorbells", self.sq_doorbells.get()),
         ]
     }
 
@@ -211,6 +225,7 @@ impl TransportStats for RdmaWrStats {
             &self.recv_posted,
             &self.recv_done,
             &self.poll_batches,
+            &self.sq_doorbells,
         ] {
             c.set(0);
         }
@@ -383,7 +398,7 @@ impl RdmaQueue {
         // send completes (tag not released until then).
         unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.send_posted, &self.wr.send_inflight);
+        RdmaWrStats::sq_post(&self.wr.send_posted, &self.wr.send_inflight, &self.wr.sq_doorbells);
         Ok(())
     }
 
@@ -407,7 +422,7 @@ impl RdmaQueue {
         // this struct; len is clamped to its size by the caller.
         unsafe { h.setup_sge(lkey, addr, len as u32) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.read_posted, &self.wr.read_inflight);
+        RdmaWrStats::sq_post(&self.wr.read_posted, &self.wr.read_inflight, &self.wr.sq_doorbells);
         Ok(())
     }
 
@@ -447,7 +462,7 @@ impl RdmaQueue {
         // slot stays leased until the WRITE completes (tag not released).
         unsafe { h.setup_sge_list(&sges[..n]) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.write_posted, &self.wr.write_inflight);
+        RdmaWrStats::sq_post(&self.wr.write_posted, &self.wr.write_inflight, &self.wr.sq_doorbells);
         Ok(())
     }
 
@@ -488,7 +503,7 @@ impl RdmaQueue {
         // SEND completes (tag not released until then).
         unsafe { h.setup_sge_list(&sges[..n]) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.read_posted, &self.wr.read_inflight);
+        RdmaWrStats::sq_post(&self.wr.read_posted, &self.wr.read_inflight, &self.wr.sq_doorbells);
         Ok(())
     }
 
