@@ -67,10 +67,14 @@ const WR_KIND_MASK: u64 = 0xff << 40;
 
 /// Reap-loop backstop interval: how long the queue may sit on the comp-channel
 /// event before it defensively re-arms + re-drains the CQ (recovering a rarely
-/// stranded completion). Well under the keep-alive timeout so a stranded
-/// completion can never starve the controller into a host-side reset; only
-/// fires when the queue is otherwise idle, so it costs nothing under load.
-const BACKSTOP: std::time::Duration = std::time::Duration::from_millis(200);
+/// stranded completion). Since the reactor park-probe took over the arming
+/// policy (arm + race-drain at the sleep point), this is a pure safety net
+/// against event-delivery bugs below us (rxe has priors; userspace has no
+/// IB_CQ_REPORT_MISSED_EVENTS to detect a miss) — 1 s keeps it well under the
+/// keep-alive timeout so a stranded completion can never starve the controller
+/// into a host-side reset, and it also paces the KATO watchdog (every 2nd
+/// tick ≈ 2 s).
+const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// SGL descriptor type byte (dptr offset 15). High nibble `0x4` =
 /// `NVME_KEY_SGL_FMT_DATA_DESC` (keyed: host-resident, RDMA READ/WRITE); anything
@@ -757,7 +761,7 @@ impl RdmaQueue {
     }
 
     /// Keep-alive / controller-liveness watchdog, run on the backstop cadence
-    /// (checked every 10th tick ≈ 2 s). The RDMA path has no socket death to
+    /// (checked every 2nd tick ≈ 2 s). The RDMA path has no socket death to
     /// unwind a vanished host, so without this a dead host leaks every QP it
     /// had (observed: an aborted connect left 17 QPs in RTS). Returns `true`
     /// when the queue must tear down:
@@ -769,7 +773,7 @@ impl RdmaQueue {
     ///    queue's teardown removed it), so it follows the controller down.
     fn watchdog(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>) -> bool {
         self.watchdog_tick = self.watchdog_tick.wrapping_add(1);
-        if self.watchdog_tick % 10 != 0 {
+        if self.watchdog_tick % 2 != 0 {
             return false;
         }
         match &ctx.role {
