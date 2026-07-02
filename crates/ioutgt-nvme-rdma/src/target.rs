@@ -431,6 +431,15 @@ impl RdmaQueue {
         // outlives the MR; LocalWrite lets read handlers fill it.
         let pool_mr = unsafe { pd.reg_mr(ptr as usize, len, AccessFlags::LocalWrite) }.map_err(oerr)?;
         let pool_lkey = pool_mr.lkey();
+        // Also register the arena as an io_uring fixed buffer (TCP parity), so
+        // disk IO from pooled slots uses READV_FIXED/WRITEV_FIXED — the kernel
+        // reuses the pre-pinned mapping instead of get_user_pages + IOMMU-
+        // mapping the pages on every IO (measured at ~7% of the io-thread on
+        // 4k randwrite). Best-effort: None (no kernel support / table full)
+        // keeps the plain readv/writev path. Released at run() teardown.
+        if let Some(idx) = ioutgt_uring::register_pool_buffer(ptr, len) {
+            nvme.slots.pool().set_buf_index(idx);
+        }
 
         let nslots = u32::from(sqsize);
         let mut recv_buf = vec![0u8; sqsize as usize * CAPSULE_LEN];
@@ -1200,6 +1209,12 @@ impl RdmaQueue {
             std::mem::forget(slot_tasks);
             std::mem::forget(self);
             return result;
+        }
+        // All ops have drained: release the pool's fixed-buffer slot so the
+        // index is reusable before the queue (and its arena) is freed on
+        // return. The leak branch above intentionally keeps it pinned.
+        if let Some(idx) = self.nvme.slots.pool().take_buf_index() {
+            ioutgt_uring::unregister_pool_buffer(idx);
         }
         result
     }
