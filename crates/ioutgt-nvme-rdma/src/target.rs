@@ -295,6 +295,8 @@ pub struct RdmaQueue {
     /// `rsp_wr_wait_list`); the old treat-as-fatal behavior tore down healthy
     /// queues under full-depth 64k bursts. Preallocated to the queue depth.
     parked: std::collections::VecDeque<Sqe>,
+    /// Backstop ticks since start; rate-gates the keep-alive watchdog.
+    watchdog_tick: u32,
 }
 
 impl Drop for RdmaQueue {
@@ -380,6 +382,7 @@ impl RdmaQueue {
             wr,
             read_batch: Vec::with_capacity(sqsize as usize),
             parked: std::collections::VecDeque::with_capacity(sqsize as usize),
+            watchdog_tick: 0,
         })
     }
 
@@ -583,6 +586,54 @@ impl RdmaQueue {
         // this poll's RECV batch — all on one doorbell.
         self.post_reads_batch()?;
         Ok(false)
+    }
+
+    /// Keep-alive / controller-liveness watchdog, run on the backstop cadence
+    /// (checked every 10th tick ≈ 2 s). The RDMA path has no socket death to
+    /// unwind a vanished host, so without this a dead host leaks every QP it
+    /// had (observed: an aborted connect left 17 QPs in RTS). Returns `true`
+    /// when the queue must tear down:
+    ///  - admin queue: the host has been silent past KATO×2 + grace — mirrors
+    ///    nvmet's keep-alive timer and the TCP path's watchdog (`last_heard`
+    ///    is bumped by every dispatched command; kato 0 = disabled, e.g. a
+    ///    persistent discovery controller);
+    ///  - IO queue: its controller is gone from the registry (the admin
+    ///    queue's teardown removed it), so it follows the controller down.
+    fn watchdog(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>) -> bool {
+        self.watchdog_tick = self.watchdog_tick.wrapping_add(1);
+        if self.watchdog_tick % 10 != 0 {
+            return false;
+        }
+        match &ctx.role {
+            Role::Admin(admin) => {
+                let kato = u64::from(admin.kato_ms.get());
+                if kato == 0 {
+                    return false;
+                }
+                let silent = u64::try_from(admin.last_heard.get().elapsed().as_millis())
+                    .unwrap_or(u64::MAX);
+                if silent > kato * 2 + 5_000 {
+                    tracing::info!(
+                        cntlid = admin.cntlid.get(),
+                        silent_ms = silent,
+                        "nvme-rdma: keep-alive expired; tearing down controller"
+                    );
+                    return true;
+                }
+            }
+            Role::Io(io) => {
+                let cntlid = io.cntlid.get();
+                if cntlid != 0 && !ctx.registry.contains(cntlid) {
+                    tracing::info!(
+                        cntlid,
+                        qid = self.nvme.qid,
+                        "nvme-rdma: controller gone; tearing down io queue"
+                    );
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// On a response WR (WRITE/SEND) completion, decrement the tag's in-flight
@@ -1055,7 +1106,12 @@ impl RdmaQueue {
                         Ok(()) => self.process_cqes(&ctx, &mut comps),
                     };
                     backstop.set(ioutgt_uring::ops::sleep(BACKSTOP)?);
-                    r
+                    // Piggyback the keep-alive / controller-liveness watchdog
+                    // on the backstop cadence (see [`Self::watchdog`]).
+                    match r {
+                        Ok(false) => Ok(self.watchdog(&ctx)),
+                        other => other,
+                    }
                 }
             };
             match step {
@@ -1073,6 +1129,15 @@ impl RdmaQueue {
         // dispatches synchronously, so this is ~instant there.
         tracing::debug!(qid = self.nvme.qid, "nvme-rdma: queue teardown");
         ctx.close();
+        // Tear down the controller when its admin queue dies (TCP parity).
+        // Removed before the drain so the IO queues' watchdogs see it gone and
+        // follow promptly — an abruptly-vanished host sends no per-queue DREQs.
+        if let Role::Admin(admin) = &ctx.role {
+            let cntlid = admin.cntlid.get();
+            if cntlid != 0 && ctx.registry.remove(cntlid).is_some() {
+                tracing::info!(cntlid, "nvme-rdma: controller removed");
+            }
+        }
         let mut waited = 0u32;
         while self.nvme.slots.executing() > 0 && waited < 10_000 {
             match ioutgt_uring::ops::sleep(std::time::Duration::from_millis(2)) {

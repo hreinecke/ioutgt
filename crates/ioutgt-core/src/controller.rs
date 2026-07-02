@@ -329,6 +329,16 @@ impl Registry {
             .remove(&cntlid)
     }
 
+    /// Whether a controller is still live (IO-queue liveness watchdogs poll
+    /// this to follow their controller down when its admin queue is gone).
+    pub fn contains(&self, cntlid: u16) -> bool {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .controllers
+            .contains_key(&cntlid)
+    }
+
     /// Number of live controllers.
     pub fn len(&self) -> usize {
         self.inner
