@@ -236,19 +236,41 @@ struct PendingRead {
 /// accurate across a clear. Reported under `"wr"` in GET_STATS via
 /// [`TransportStats`]. All access is on the owning queue thread (`Cell`).
 #[derive(Debug, Default)]
+struct WrClass {
+    posted: Cell<u64>,
+    done: Cell<u64>,
+    inflight: Cell<i64>,
+}
+
+impl WrClass {
+    /// Count `n` posted WRs: bump the cumulative `posted` and the live gauge.
+    #[inline]
+    fn post_n(&self, n: u64) {
+        self.posted.set(self.posted.get() + n);
+        self.inflight.set(self.inflight.get() + n as i64);
+    }
+
+    #[inline]
+    fn post(&self) {
+        self.post_n(1);
+    }
+
+    /// Count a completed WR: bump cumulative `done`, drop the live gauge.
+    #[inline]
+    fn complete(&self) {
+        self.done.set(self.done.get() + 1);
+        self.inflight.set(self.inflight.get() - 1);
+    }
+}
+
+#[derive(Debug, Default)]
 struct RdmaWrStats {
-    read_posted: Cell<u64>,
-    read_done: Cell<u64>,
-    read_inflight: Cell<i64>,
-    write_posted: Cell<u64>,
-    write_done: Cell<u64>,
-    write_inflight: Cell<i64>,
-    send_posted: Cell<u64>,
-    send_done: Cell<u64>,
-    send_inflight: Cell<i64>,
-    recv_posted: Cell<u64>,
-    recv_done: Cell<u64>,
-    recv_inflight: Cell<i64>,
+    /// Host write-data pulls (RDMA READ), read-data pushes (RDMA WRITE),
+    /// CQE capsules (SEND), and command capsules (RECV).
+    read: WrClass,
+    write: WrClass,
+    send: WrClass,
+    recv: WrClass,
     /// Non-empty CQ polls (completion batches). `*_done / poll_batches` is the
     /// average number of each WR class reaped per batch.
     poll_batches: Cell<u64>,
@@ -259,66 +281,53 @@ struct RdmaWrStats {
 }
 
 impl RdmaWrStats {
-    /// Count a posted WR: bump the cumulative `posted` and the live `inflight`.
+    /// Count a send-queue doorbell (`ibv_post_send`), whatever it batched.
     #[inline]
-    fn post(posted: &Cell<u64>, inflight: &Cell<i64>) {
-        posted.set(posted.get() + 1);
-        inflight.set(inflight.get() + 1);
+    fn doorbell(&self) {
+        self.sq_doorbells.set(self.sq_doorbells.get() + 1);
     }
 
-    /// Count a send-queue WR post plus the doorbell it rings (one WR per
-    /// `ibv_post_send` today). Once WRs are chained, the doorbell count moves to
-    /// the batched flush and this reverts to [`post`].
+    /// Count a single-WR send-queue post plus the doorbell it rings.
     #[inline]
-    fn sq_post(posted: &Cell<u64>, inflight: &Cell<i64>, doorbells: &Cell<u64>) {
-        Self::post(posted, inflight);
-        doorbells.set(doorbells.get() + 1);
+    fn sq_post(&self, class: &WrClass) {
+        class.post();
+        self.doorbell();
     }
 
-    /// Count a completed WR: bump cumulative `done`, drop the live `inflight`.
-    #[inline]
-    fn complete(done: &Cell<u64>, inflight: &Cell<i64>) {
-        done.set(done.get() + 1);
-        inflight.set(inflight.get() - 1);
+    /// The classes with their GET_STATS key names (wire-format stable).
+    fn classes(&self) -> [([&'static str; 3], &WrClass); 4] {
+        [
+            (["read_posted", "read_done", "read_inflight"], &self.read),
+            (["write_posted", "write_done", "write_inflight"], &self.write),
+            (["send_posted", "send_done", "send_inflight"], &self.send),
+            (["recv_posted", "recv_done", "recv_inflight"], &self.recv),
+        ]
     }
 }
 
 impl TransportStats for RdmaWrStats {
     fn snapshot(&self) -> Vec<(&'static str, u64)> {
-        let gauge = |c: &Cell<i64>| u64::try_from(c.get().max(0)).unwrap_or(0);
-        vec![
-            ("read_posted", self.read_posted.get()),
-            ("read_done", self.read_done.get()),
-            ("read_inflight", gauge(&self.read_inflight)),
-            ("write_posted", self.write_posted.get()),
-            ("write_done", self.write_done.get()),
-            ("write_inflight", gauge(&self.write_inflight)),
-            ("send_posted", self.send_posted.get()),
-            ("send_done", self.send_done.get()),
-            ("send_inflight", gauge(&self.send_inflight)),
-            ("recv_posted", self.recv_posted.get()),
-            ("recv_done", self.recv_done.get()),
-            ("recv_inflight", gauge(&self.recv_inflight)),
-            ("poll_batches", self.poll_batches.get()),
-            ("sq_doorbells", self.sq_doorbells.get()),
-        ]
+        let mut out = Vec::with_capacity(14);
+        for (names, class) in self.classes() {
+            let gauge = u64::try_from(class.inflight.get().max(0)).unwrap_or(0);
+            out.extend([
+                (names[0], class.posted.get()),
+                (names[1], class.done.get()),
+                (names[2], gauge),
+            ]);
+        }
+        out.push(("poll_batches", self.poll_batches.get()));
+        out.push(("sq_doorbells", self.sq_doorbells.get()));
+        out
     }
 
     fn reset(&self) {
-        for c in [
-            &self.read_posted,
-            &self.read_done,
-            &self.write_posted,
-            &self.write_done,
-            &self.send_posted,
-            &self.send_done,
-            &self.recv_posted,
-            &self.recv_done,
-            &self.poll_batches,
-            &self.sq_doorbells,
-        ] {
-            c.set(0);
+        for (_, class) in self.classes() {
+            class.posted.set(0);
+            class.done.set(0);
         }
+        self.poll_batches.set(0);
+        self.sq_doorbells.set(0);
     }
 }
 
@@ -490,7 +499,7 @@ impl RdmaQueue {
         // writes the next capsule here.
         unsafe { h.setup_sge(lkey, addr, CAPSULE_LEN as u32) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::post(&self.wr.recv_posted, &self.wr.recv_inflight);
+        self.wr.recv.post();
         Ok(())
     }
 
@@ -524,7 +533,7 @@ impl RdmaQueue {
             }
         }
         g.post().map_err(oerr)?;
-        RdmaWrStats::sq_post(&self.wr.send_posted, &self.wr.send_inflight, &self.wr.sq_doorbells);
+        self.wr.sq_post(&self.wr.send);
         Ok(())
     }
 
@@ -548,7 +557,7 @@ impl RdmaQueue {
         // this struct; len is clamped to its size by the caller.
         unsafe { h.setup_sge(lkey, addr, len as u32) };
         g.post().map_err(oerr)?;
-        RdmaWrStats::sq_post(&self.wr.read_posted, &self.wr.read_inflight, &self.wr.sq_doorbells);
+        self.wr.sq_post(&self.wr.read);
         Ok(())
     }
 
@@ -594,10 +603,8 @@ impl RdmaQueue {
         // ibv_wr_complete); a post error is fatal and tears the queue down, so
         // the not-yet-cleared read_batch residue is harmless.
         g.post().map_err(oerr)?;
-        for _ in 0..reads {
-            RdmaWrStats::post(&stats.read_posted, &stats.read_inflight);
-        }
-        stats.sq_doorbells.set(stats.sq_doorbells.get() + 1);
+        stats.read.post_n(reads);
+        stats.doorbell();
         read_batch.clear();
         Ok(())
     }
@@ -634,10 +641,10 @@ impl RdmaQueue {
                 return Ok(true);
             }
             match wr_kind(id) {
-                WR_RECV => RdmaWrStats::complete(&self.wr.recv_done, &self.wr.recv_inflight),
-                WR_READ => RdmaWrStats::complete(&self.wr.read_done, &self.wr.read_inflight),
-                WR_SEND => RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight),
-                WR_WRITE => RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight),
+                WR_RECV => self.wr.recv.complete(),
+                WR_READ => self.wr.read.complete(),
+                WR_SEND => self.wr.send.complete(),
+                WR_WRITE => self.wr.write.complete(),
                 _ => {}
             }
             match wr_kind(id) {
@@ -751,19 +758,19 @@ impl RdmaQueue {
                 }
                 match wr_kind(id) {
                     k if k == kind => {
-                        let (done, inflight) = match kind {
-                            WR_RECV => (&self.wr.recv_done, &self.wr.recv_inflight),
-                            _ => (&self.wr.read_done, &self.wr.read_inflight),
-                        };
-                        RdmaWrStats::complete(done, inflight);
+                        match kind {
+                            WR_RECV => &self.wr.recv,
+                            _ => &self.wr.read,
+                        }
+                        .complete();
                         return Ok(wr_low(id));
                     }
                     WR_SEND => {
-                        RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight);
+                        self.wr.send.complete();
                         self.on_response_done(wr_low(id));
                     }
                     WR_WRITE => {
-                        RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight);
+                        self.wr.write.complete();
                         self.on_response_done(wr_low(id));
                     }
                     _ => {}
@@ -963,13 +970,9 @@ impl RdmaQueue {
         // that is harmless — a post error is fatal and tears the queue down,
         // discarding the residue. The stats below run only on the Ok path.
         g.post().map_err(oerr)?;
-        for _ in 0..writes {
-            RdmaWrStats::post(&stats.write_posted, &stats.write_inflight);
-        }
-        for _ in 0..sends {
-            RdmaWrStats::post(&stats.send_posted, &stats.send_inflight);
-        }
-        stats.sq_doorbells.set(stats.sq_doorbells.get() + 1);
+        stats.write.post_n(writes);
+        stats.send.post_n(sends);
+        stats.doorbell();
         Ok(())
     }
 
