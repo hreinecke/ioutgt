@@ -70,6 +70,11 @@ pub struct ReactorStats {
     pub write_sqes: u64,
     /// CQEs reaped from the completion ring.
     pub cqes: u64,
+    /// Histogram of backend storage read+write SQEs carried by each ring
+    /// submission (`io_uring_enter`), log2 buckets for 1 / 2 / 3-4 / 5-8 /
+    /// 9-16 / 17+. Submissions carrying no backend IO (pure waits, network
+    /// or poll traffic) are not recorded.
+    pub rw_submit_hist: [u64; 6],
 }
 
 /// The live counters behind [`ReactorStats`]: plain `Cell`s, written
@@ -82,11 +87,34 @@ struct StatCells {
     recv_sqes: Cell<u64>,
     read_sqes: Cell<u64>,
     write_sqes: Cell<u64>,
-    cqes: Cell<u64>,
+    cqes: Cell<u64>,    /// Backend read+write SQEs per submission, log2-bucketed (see
+    /// [`ReactorStats::rw_submit_hist`]).
+    rw_submit_hist: [Cell<u64>; 6],
+    /// `read_sqes + write_sqes` at the previous submission — the delta at
+    /// each submit is that submission's backend-IO batch.
+    last_rw: Cell<u64>,
 }
 
 impl StatCells {
     #[inline]
+    /// Record the backend read/write SQEs this ring submission carries
+    /// (the delta of the typed counters since the previous submission).
+    fn note_submit(&self) {
+        let rw = self.read_sqes.get() + self.write_sqes.get();
+        let batch = rw - self.last_rw.get();
+        self.last_rw.set(rw);
+        let idx = match batch {
+            0 => return,
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            _ => 5,
+        };
+        Self::bump(&self.rw_submit_hist[idx as usize]);
+    }
+
     fn bump(cell: &Cell<u64>) {
         cell.set(cell.get() + 1);
     }
@@ -252,6 +280,7 @@ impl Reactor {
             read_sqes: self.stats.read_sqes.get(),
             write_sqes: self.stats.write_sqes.get(),
             cqes: self.stats.cqes.get(),
+            rw_submit_hist: std::array::from_fn(|i| self.stats.rw_submit_hist[i].get()),
         }
     }
 
@@ -265,6 +294,10 @@ impl Reactor {
         self.stats.read_sqes.set(0);
         self.stats.write_sqes.set(0);
         self.stats.cqes.set(0);
+        for cell in &self.stats.rw_submit_hist {
+            cell.set(0);
+        }
+        self.stats.last_rw.set(0);
     }
 
     /// Count a successfully pushed SQE: the total plus, for network
@@ -317,6 +350,7 @@ impl Reactor {
             }
         }
         // SQ full: flush to the kernel and retry once.
+        self.stats.note_submit();
         ring.submit()?;
         // SAFETY: as above.
         unsafe {
@@ -373,6 +407,7 @@ impl Reactor {
             let timeout = types::Timespec::new().sec(PARK_SAFETY_SECS);
             let args = types::SubmitArgs::new().timespec(&timeout);
             StatCells::bump(&self.stats.parks);
+            self.stats.note_submit();
             let res = self
                 .ring
                 .borrow_mut()

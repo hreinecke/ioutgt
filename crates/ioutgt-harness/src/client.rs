@@ -230,6 +230,30 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
             val(u(ring, "write_sqes"), u(ring0, "write_sqes")),
             val(u(ring, "cqes"), u(ring0, "cqes")),
         );
+        // Backend-IO submission batching (present once the reactor exports
+        // it): how many storage read/write SQEs each io_uring_enter carried.
+        // Suppressed when the thread did no backend ring IO (memory/null
+        // backends, idle threads).
+        const RW_SQ: [(&str, &str); 6] = [
+            ("rw_sq_b1", "1"),
+            ("rw_sq_b2", "2"),
+            ("rw_sq_b4", "<=4"),
+            ("rw_sq_b8", "<=8"),
+            ("rw_sq_b16", "<=16"),
+            ("rw_sq_b32", ">16"),
+        ];
+        let rw_total: u64 = RW_SQ
+            .iter()
+            .map(|(k, _)| amt(u(ring, k), u(ring0, k)))
+            .sum();
+        if rw_total > 0 {
+            let cells = RW_SQ
+                .iter()
+                .map(|(k, label)| format!("{label}:{}", val(u(ring, k), u(ring0, k))))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(out, "  backend rw/submit [{cells}]");
+        }
         for q in thread["queues"].as_array().into_iter().flatten() {
             let q0 = match_queue(&before, q);
             let _ = writeln!(
@@ -626,6 +650,8 @@ mod tests {
         "threads": [{
             "name": "ioutgt-io0", "tid": 42,
             "ring": { "parks": 90, "sqes": 5000, "send_sqes": 2500,
+                      "rw_sq_b1": 30u64, "rw_sq_b2": 40u64, "rw_sq_b4": 15u64,
+                      "rw_sq_b8": 5u64, "rw_sq_b16": 0u64, "rw_sq_b32": 0u64,
                       "recv_sqes": 2400, "read_sqes": 60, "write_sqes": 40,
                       "cqes": 5000 },
             "queues": [{ "cntlid": 1, "qid": 1,
@@ -691,6 +717,11 @@ mod tests {
         // Controller identity first, so the cntlid rows are readable.
         assert!(
             out.starts_with("controller 1: nqn.2026-06.io.ioutgt:test"),
+            "{out}"
+        );
+        // Backend-IO submission batching row from the ring histogram keys.
+        assert!(
+            out.contains("backend rw/submit [1:30 2:40 <=4:15 <=8:5 <=16:0 >16:0]"),
             "{out}"
         );
         assert!(

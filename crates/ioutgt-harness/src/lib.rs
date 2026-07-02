@@ -293,7 +293,10 @@ fn thread_stats_json(
         "ring": { "parks": ring.parks, "sqes": ring.sqes,
                   "send_sqes": ring.send_sqes, "recv_sqes": ring.recv_sqes,
                   "read_sqes": ring.read_sqes, "write_sqes": ring.write_sqes,
-                  "cqes": ring.cqes },
+                  "cqes": ring.cqes,
+                  "rw_sq_b1": ring.rw_submit_hist[0], "rw_sq_b2": ring.rw_submit_hist[1],
+                  "rw_sq_b4": ring.rw_submit_hist[2], "rw_sq_b8": ring.rw_submit_hist[3],
+                  "rw_sq_b16": ring.rw_submit_hist[4], "rw_sq_b32": ring.rw_submit_hist[5] },
         "queues": queues,
         "retired": counters_json(retired),
     })
