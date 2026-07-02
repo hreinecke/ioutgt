@@ -131,6 +131,9 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   fio           [nvmet|ioutgt]  fio on the connected device(s)
   fio_verify    [nvmet|ioutgt]  data-integrity gate: mixed-size (4k-128k) writes
                                 + crc32c read-back verify (FIO_VERIFY_MB/job)
+  ibperf                        RDMA link baseline over the wire (perftest
+                                ib_send/write/read_bw); needs only 'up' — run
+                                before 'fio_perf', like the TCP driver's iperf
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k}
   status                        netns, rdma links, addresses, connected devices
   help                          this message
@@ -354,6 +357,94 @@ cmd_status() {
     echo "  nvmet ($NVMET_NQN): $(find_dev "$NVMET_NQN" || echo none)"
 }
 
+# The RoCEv2 GID index of `ip` on `dev`'s port 1, looked up through `runner`
+# (`run_root` or `ini_exec`, so it works for the netns'd initiator device).
+# perftest needs the explicit index (-x): its default picks the link-local v1
+# GID, which cannot cross an L3-addressed RoCEv2 link.
+run_root() { "$@"; }
+roce_v2_gid_index() {
+    local runner="$1" dev="$2" ip="$3" i g t want
+    # shellcheck disable=SC2046  # word-splitting the octets is the point
+    want=$(printf '0000:0000:0000:0000:0000:ffff:%02x%02x:%02x%02x' $(echo "$ip" | tr '.' ' '))
+    for i in $(seq 0 15); do
+        g=$("$runner" cat "/sys/class/infiniband/$dev/ports/1/gids/$i" 2>/dev/null) || continue
+        t=$("$runner" cat "/sys/class/infiniband/$dev/ports/1/gid_attrs/types/$i" 2>/dev/null) || continue
+        [ "$g" = "$want" ] && [ "$t" = "RoCE v2" ] && { echo "$i"; return 0; }
+    done
+    return 1
+}
+
+# RDMA link baseline over the physical wire: perftest ib_{send,write,read}_bw
+# between the two ports (server on NIC_T in root, client on NIC_I in $NS_I) —
+# the same verbs the NVMe data path uses (SEND for capsules/responses, RDMA
+# WRITE for read data, RDMA READ for write data). The rdma-link sibling of the
+# TCP driver's 'iperf'. Note: unlike the NVMe targets (kernel cm_ids are
+# init_net-pinned, so a same-box NVMe session self-loopbacks on one port),
+# perftest is netns-exec'd userspace — its client really runs on the isolated
+# device, so this is the one RDMA test on this rig whose traffic provably
+# crosses the cable. Needs only 'up' (no start/connect); run it before
+# 'fio_perf' for a transport baseline.
+# Knobs: IBPERF_SECS=5 IBPERF_SIZE=65536 IBPERF_QPS=1 IBPERF_PORT=18515.
+cmd_ibperf() {
+    require_nics
+    for b in ib_send_bw ib_write_bw ib_read_bw; do
+        command -v "$b" >/dev/null 2>&1 || { echo "$b not found (install perftest)"; exit 1; }
+    done
+    local secs="${IBPERF_SECS:-5}" size="${IBPERF_SIZE:-65536}" qps="${IBPERF_QPS:-1}" port="${IBPERF_PORT:-18515}"
+    local ibt ibi xt xi
+    ibt="$(nic_ibdev "$NIC_T")" || fail "no rdma device for $NIC_T — run 'up' first"
+    ibi="$(ini_exec bash -c "basename /sys/class/net/$NIC_I/device/infiniband/*" 2>/dev/null)"
+    [ -n "$ibi" ] && [ "$ibi" != "*" ] || fail "no rdma device for $NIC_I in $NS_I — run 'up' first"
+    xt="$(roce_v2_gid_index run_root "$ibt" "$IP_T")" || fail "no RoCEv2 GID for $IP_T on $ibt"
+    xi="$(roce_v2_gid_index ini_exec "$ibi" "$IP_I")" || fail "no RoCEv2 GID for $IP_I on $ibi in $NS_I"
+    echo ">> perftest over the $NIC_I($ibi,gid$xi) -> $NIC_T($ibt,gid$xt) wire (size=$size qps=$qps ${secs}s/verb)"
+    # perftest's out-of-band TCP handshake lands on the root netns, where
+    # firewalld rejects it ("no route to host") — punch the port for this run
+    # only (runtime rule, removed by the RETURN trap). The TCP driver's iperf
+    # never hits this: its server lives inside a netns, outside firewalld.
+    local fw=0
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd -q --add-port="$port-$((port + 2))/tcp" && fw=1
+    fi
+    local bw spid=""
+    # Single-quoted on purpose: kill the current server + drop the firewall
+    # rule however the function exits.
+    trap 'kill "$spid" 2>/dev/null || true
+          if [ "$fw" = 1 ]; then firewall-cmd -q --remove-port="$port-$((port + 2))/tcp" || true; fi' RETURN
+    local i=0 p
+    for bw in ib_send_bw ib_write_bw ib_read_bw; do
+        # A distinct port per verb: back-to-back runs on one port trip over the
+        # previous server's TIME_WAIT/late exit, and a stale server from an
+        # aborted earlier run would hijack the handshake — evict those too.
+        p=$((port + i)); i=$((i + 1))
+        fuser -k -s "$p/tcp" 2>/dev/null || true
+        case "$bw" in
+            ib_send_bw)  echo "== $bw   (SEND: capsule/response path, client->server)" ;;
+            ib_write_bw) echo "== $bw   (RDMA WRITE: read-data path, client->server)" ;;
+            ib_read_bw)  echo "== $bw   (RDMA READ: write-data path, server->client)" ;;
+        esac
+        # exec in the backgrounded subshell so $! is the server itself; the
+        # server serves this one client and exits.
+        { exec "$bw" -d "$ibt" -x "$xt" -p "$p" -s "$size" -q "$qps" -D "$secs" \
+              --report_gbits >/dev/null 2>&1; } &
+        spid=$!
+        sleep 0.5
+        # Print just the results table, minus perftest's "BW peak" column —
+        # peak is only measured for short iteration-mode runs (<= 20000 iters,
+        # never under -D) and would read a misleading 0.00 here.
+        local out
+        if out="$(ini_exec "$bw" -d "$ibi" -x "$xi" -p "$p" -s "$size" -q "$qps" -D "$secs" \
+            --report_gbits "$IP_T" 2>&1)"; then
+            echo "$out" | awk '
+                /#bytes/ { printf " %-11s%-15s%-21s%s\n", "#bytes", "#iterations", "BW average[Gb/sec]", "MsgRate[Mpps]"; next }
+                /^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9.]+[[:space:]]+[0-9.]+[[:space:]]+[0-9.]+[[:space:]]*$/ { printf " %-11s%-15s%-21s%s\n", $1, $2, $4, $5 }'
+        else
+            echo "   ($bw client failed)"
+        fi
+        wait "$spid" 2>/dev/null || true
+    done
+}
+
 # Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH (the
 # comparison). discover/connect/disconnect/fio/fio_perf come from common.sh.
 case "${1:-}" in
@@ -366,6 +457,7 @@ case "${1:-}" in
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
     fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
+    ibperf)              cmd_ibperf ;;
     fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
     status)              cmd_status ;;
     help|usage)          usage ;;
