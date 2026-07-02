@@ -662,6 +662,7 @@ mod tests {
         let listen_id = ch.create_id()?;
         listen_id.bind_addr(format!("0.0.0.0:{port}").parse().unwrap())?;
         listen_id.listen(1)?;
+        eprintln!("[cm-server] bound + listening on {port}");
 
         let mut held: Option<Held> = None;
         let mut child: Option<Identifier> = None;
@@ -754,7 +755,22 @@ mod tests {
         // (resolving the self-IP with no source can route via `lo`, which has no
         // RDMA device → AddressError).
         let src = SocketAddr::new(dst.ip(), 0);
-        id.resolve_addr(Some(src), dst, Duration::from_secs(5))?;
+        // The rxe RoCEv2 GID for a fresh netdev IP populates asynchronously; a
+        // too-early resolve fails SYNCHRONOUSLY (EADDRNOTAVAIL/ENODEV) rather
+        // than with an AddressError event, so retry both forms.
+        let mut sync_retries = 0u32;
+        loop {
+            match id.resolve_addr(Some(src), dst, Duration::from_secs(5)) {
+                Ok(()) => break,
+                Err(e) if sync_retries < 20 => {
+                    sync_retries += 1;
+                    eprintln!("[cm-client] resolve_addr not ready ({e}); retry {sync_retries}");
+                    ops::sleep(Duration::from_millis(250)).unwrap().await.unwrap();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        eprintln!("[cm-client] resolve_addr({src} -> {dst}) issued");
         let mut held: Option<Held> = None;
         let mut addr_retries = 0u32;
         loop {
@@ -882,10 +898,23 @@ mod tests {
             let dst: SocketAddr = format!("{ip}:{PORT}").parse().unwrap();
             let client = tokio::task::spawn_local(run_client(dst, QID));
 
+            // Whichever side finishes first is checked first, so an early
+            // error surfaces immediately instead of being masked behind the
+            // other side's (now hopeless) wait.
             let combined = async {
-                let sq = server.await.unwrap()?;
-                client.await.unwrap()?;
-                Ok::<u16, io::Error>(sq)
+                let mut server = std::pin::pin!(server);
+                let mut client = std::pin::pin!(client);
+                tokio::select! {
+                    sr = &mut server => {
+                        let sq = sr.unwrap()?;
+                        client.await.unwrap()?;
+                        Ok::<u16, io::Error>(sq)
+                    }
+                    cr = &mut client => {
+                        cr.unwrap()?;
+                        server.await.unwrap()
+                    }
+                }
             };
             // Bound the whole handshake so a CM stall fails loudly (with the
             // per-event log above) instead of hanging the suite.

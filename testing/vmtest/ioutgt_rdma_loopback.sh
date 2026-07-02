@@ -12,10 +12,27 @@ DEV=$(ip -o -4 addr show up scope global 2>/dev/null | awk '{print $2; exit}')
 echo "[rdma] netdev=${DEV:-<none>}"
 [ -n "${DEV:-}" ] && rdma link add rxe0 type rxe netdev "$DEV" 2>&1 || echo "[rdma] rdma link add note: $?"
 rdma link show 2>&1 | head -4
+for _ in $(seq 1 20); do
+	ibv_devinfo 2>/dev/null | grep -q "PORT_ACTIVE" && break
+	sleep 0.5
+done
+# rxe's RoCEv2 GID table enumerates the netdev IPs via async work; for an IP
+# that pre-dates the rxe link it sometimes never syncs, and the CM test's
+# src-bound rdma_resolve_addr then fails ENODEV. Re-adding the IP after the
+# link exists re-triggers the GID notifier (same fix as ioutgt_rdma_connect.sh).
+CIDR=$(ip -o -4 addr show dev "${DEV:-}" scope global 2>/dev/null | awk '{print $4; exit}')
+IP=${CIDR%%/*}
+gid_ready() { show_gids 2>/dev/null | grep -qw "$IP"; }
+if [ -n "${IP:-}" ] && ! gid_ready; then
+	echo "[rdma] GID for $IP missing; re-adding $CIDR on $DEV to trigger GID"
+	ip addr del "$CIDR" dev "$DEV" 2>/dev/null || true
+	ip addr add "$CIDR" dev "$DEV" 2>/dev/null || true
+	for _ in $(seq 1 20); do gid_ready && break; sleep 0.5; done
+fi
 ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
 # The CM loopback test connects to the rxe netdev's own IP; publish it.
-if [ -n "${DEV:-}" ]; then
-	IOUTGT_RXE_IP=$(ip -o -4 addr show dev "$DEV" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+if [ -n "${IP:-}" ]; then
+	IOUTGT_RXE_IP="$IP"
 	export IOUTGT_RXE_IP
 fi
 echo "[rdma] rxe ip=${IOUTGT_RXE_IP:-<none>}"
