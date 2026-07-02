@@ -131,6 +131,12 @@ fn parse_keyed_sgl(sqe: &Sqe) -> KeyedSgl {
     KeyedSgl { addr, len, rkey }
 }
 
+/// The staged transfer length of a validated host-data-in SQE: its keyed-SGL
+/// length clamped to MDTS. Recomputed when a pool-deferred command retries.
+fn staged_len(sqe: &Sqe) -> usize {
+    (parse_keyed_sgl(sqe).len as usize).min(ioutgt_core::MDTS_BYTES as usize)
+}
+
 /// A finished command's response, handed from a slot task (or the reap loop's
 /// validation-failure path) to the reap loop, which owns the QP and posts it.
 struct RdmaResp {
@@ -295,6 +301,15 @@ pub struct RdmaQueue {
     /// `rsp_wr_wait_list`); the old treat-as-fatal behavior tore down healthy
     /// queues under full-depth 64k bursts. Preallocated to the queue depth.
     parked: std::collections::VecDeque<Sqe>,
+    /// Write commands (tag claimed) whose pool lease could not be satisfied.
+    /// The RDMA READ of the host data must land in the registered pool arena,
+    /// so `lease_or_owned`'s private-heap fallback is unusable here; failing
+    /// the command instead (the old behavior) returned DATA_XFER_ERROR with
+    /// DNR — an instant EIO to the host under full-depth write bursts, since
+    /// the pool is deliberately smaller than depth x MDTS. Defer instead
+    /// (SPDK's pending_buf_queue shape) and retry front-only as completions
+    /// release leases. Bounded by the slot count (each entry holds a tag).
+    pool_wait: std::collections::VecDeque<(u16, Sqe)>,
     /// Backstop ticks since start; rate-gates the keep-alive watchdog.
     watchdog_tick: u32,
 }
@@ -382,6 +397,7 @@ impl RdmaQueue {
             wr,
             read_batch: Vec::with_capacity(sqsize as usize),
             parked: std::collections::VecDeque::with_capacity(sqsize as usize),
+            pool_wait: std::collections::VecDeque::with_capacity(sqsize as usize),
             watchdog_tick: 0,
         })
     }
@@ -572,6 +588,17 @@ impl RdmaQueue {
                 _ => {}
             }
         }
+        // Pool leases freed by this poll's response completions un-block
+        // deferred write stages, oldest first (head-of-line, like SPDK's
+        // pending queues — a big front request is not starved by smaller
+        // later ones). Before the parked drain so freed pages go to commands
+        // that already hold tags.
+        while let Some(&(tag, sqe)) = self.pool_wait.front() {
+            if !self.try_stage_write(tag, sqe, staged_len(&sqe)) {
+                break;
+            }
+            self.pool_wait.pop_front();
+        }
         // Tags freed by this poll's response completions un-park waiting
         // commands (oldest first) — before the read-batch flush so a parked
         // write command's host-data READ rides the same doorbell.
@@ -751,26 +778,36 @@ impl RdmaQueue {
             self.fail_recv(ctx, tag, &sqe, status::SGL_INVALID_TYPE | status::DNR);
             return Ok(());
         }
-        let sgl = parse_keyed_sgl(&sqe);
-        let len = (sgl.len as usize).min(ioutgt_core::MDTS_BYTES as usize);
+        let len = staged_len(&sqe);
         if len == 0 {
             self.fail_recv(ctx, tag, &sqe, status::DATA_SGL_LEN_INVALID | status::DNR);
             return Ok(());
         }
-        // Lease a pool buffer for the host write-data. `lease_or_owned` sets the
-        // capacity; io::write/dsm check `data_len()` (the *received* length), so
-        // set it to the SGL-advertised length the RDMA READ will fill.
-        self.nvme.lease_or_owned(tag, len);
-        self.nvme.slots.slot(tag).set_data_len(len as u32);
-        if !self.nvme.slots.slot(tag).data().is_pool() {
-            // Pool momentarily full → the owned fallback is not in the RDMA MR, so
-            // we cannot RDMA into it. Fail cleanly (the host retries).
-            self.fail_recv(ctx, tag, &sqe, status::DATA_XFER_ERROR | status::DNR);
-            return Ok(());
+        if !self.try_stage_write(tag, sqe, len) {
+            // Pool momentarily full: the lease must come from the registered
+            // arena (it is the RDMA READ's local target), so defer — do NOT
+            // fail. Retried by the reap loop as completions release leases
+            // (see `pool_wait`).
+            self.pool_wait.push_back((tag, sqe));
         }
+        Ok(())
+    }
+
+    /// Stage a validated write command: lease its pool buffer, stash the SQE,
+    /// and queue the host-data RDMA READ. `false` (nothing staged) when the
+    /// pool cannot satisfy the lease right now — the caller parks the command
+    /// on `pool_wait` and the reap loop retries it as leases free.
+    fn try_stage_write(&mut self, tag: u16, sqe: Sqe, len: usize) -> bool {
+        if !self.nvme.slots.try_lease(tag, len) {
+            return false;
+        }
+        // io::write/dsm check `data_len()` (the *received* length), so set it
+        // to the SGL-advertised length the RDMA READ will fill.
+        self.nvme.slots.slot(tag).set_data_len(len as u32);
         // Stash the SQE and defer the host-data RDMA READ into read_batch, so all
         // of this CQ poll's write-command reads flush on one doorbell; the slot
         // is submitted when the READ completes (`WR_READ` → submit_pending).
+        let sgl = parse_keyed_sgl(&sqe);
         self.pending_read[tag as usize] = sqe;
         self.read_batch.push(PendingRead {
             tag,
@@ -778,7 +815,7 @@ impl RdmaQueue {
             rkey: sgl.rkey,
             addr: sgl.addr,
         });
-        Ok(())
+        true
     }
 
     /// Submit a deferred write command once its host-data RDMA READ completed —

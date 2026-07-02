@@ -160,6 +160,13 @@ async fn write<B: Backend>(
     // The transport must have delivered exactly the SGL-declared bytes
     // into the buffer it leased while receiving.
     if slot.data_len() != len {
+        tracing::warn!(
+            qid = ctx.queue.qid,
+            tag,
+            data_len = slot.data_len(),
+            len,
+            "write: transport-delivered length mismatch; failing DATA_XFER_ERROR"
+        );
         return err_outcome(ctx, cid, status::DATA_XFER_ERROR | status::DNR);
     }
     let buf = slot.data();

@@ -168,6 +168,21 @@ impl<C: Copy> SlotArray<C> {
         self.slot(tag).set_data(data);
     }
 
+    /// Lease into `tag` from the pool only; `false` when the pool cannot
+    /// satisfy `len` right now. For transports that must land the data in
+    /// the registered pool arena (RDMA), where `lease_or_owned`'s private
+    /// heap fallback is unusable — the caller defers the command and
+    /// retries as completions release leases, instead of failing it.
+    pub fn try_lease(&self, tag: u16, len: usize) -> bool {
+        match self.pool.alloc(len) {
+            Some(data) => {
+                self.slot(tag).set_data(data);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Lease into `tag`, falling back to a private heap buffer when the
     /// pool is momentarily exhausted. Never blocks — the deadlock-free
     /// path for the serial recv loop (write payloads) and admin data. The
