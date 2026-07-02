@@ -701,23 +701,28 @@ fixed-newstyle option haggling on the control thread, routed round-robin.
 
 ### 6.1.2 NVMe/RDMA on the refactored base
 
-NVMe/RDMA (`ioutgt-nvme-rdma`, follow-up plan) reuses `C = Sqe` and
-`W = Completion` (no R2T variant: data movement is transport-posted). The
-wr_id is the slot index, the same TTAG trick. Host writes arrive as keyed
-SGL commands; the transport posts an RDMA READ from host memory into the
-slot and calls `submit` on READ completion. Host reads have dispatch fill the
-slot, then the send path posts an RDMA WRITE from the slot followed by an
+NVMe/RDMA (`ioutgt-nvme-rdma`, built — see `docs/nvme-rdma.md` for the
+as-built detail) reuses `C = Sqe` with its own response work type (no R2T
+variant: data movement is transport-posted). The wr_id encodes
+`kind << 40 | tag/recv-idx` — the same TTAG trick plus a WR-class byte. Host
+writes arrive as keyed SGL commands; the transport posts an RDMA READ from
+host memory into the slot's pool lease and calls `submit` on READ completion
+(parking the command when tags or the pool are transiently exhausted — see
+the backpressure notes in `docs/nvme-rdma.md`). Host reads have dispatch fill
+the slot, then the reap loop posts an RDMA WRITE from the slot followed by an
 RDMA SEND carrying the CQE; QP ordering makes WRITE-before-SEND free.
-`release_tag` fires at the signaled SEND completion — when the NIC is
-provably done with slot pages, matching obligation 5. Slot buffers are
-registered as MRs at queue install (the registered-buffers theme from §9,
-mandatory here). Setup uses an rdma_cm event channel on the control thread;
-qid is read from CONNECT_REQUEST private data and routed `(qid-1) % N` as
-today. The verbs completion-channel fd gets a persistent ring read on the
-queue thread — the same mailbox-doorbell pattern — so one wait primitive
-still rules the thread. `QueueCore<Sqe>`, dispatch, controller model, and discovery
-are all reused unchanged; `PortConfig.trtype = TransportType::Rdma` makes
-discovery advertise the correct TRTYPE.
+`release_tag` fires when both signaled response completions are reaped — when
+the NIC is provably done with slot pages, matching obligation 5. Slot/pool
+buffers are registered as MRs at queue install (the registered-buffers theme
+from §9, mandatory here). Setup uses an rdma_cm event channel on a dedicated
+CM reactor thread (its fd parks on io_uring `POLL_ADD`, which the plain-tokio
+control thread cannot provide); qid is read from CONNECT_REQUEST private data
+and routed `(qid-1) % N` as today. The verbs completion-channel fd is a
+persistent multishot poll on the queue thread — the same mailbox-doorbell
+pattern — so one wait primitive still rules the thread. `QueueCore<Sqe>`,
+dispatch, controller model, and discovery are all reused unchanged;
+`PortConfig.trtype = TransportType::Rdma` makes discovery advertise the
+correct TRTYPE.
 
 ## 6.2 Zero-copy receive: the per-connection provided-buffer ring
 

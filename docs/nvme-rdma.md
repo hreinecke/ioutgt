@@ -142,9 +142,8 @@ transport-neutral CLI of `ioutgt-nvme-tcp` — `--config` (JSON), `--listen`,
 `--io-queue-size`, `--queue-buf-mb`, `--io-threads`, `--no-pin`,
 `--control-socket`, `--idle-teardown-secs` — and builds a `TargetConfig` for
 `ioutgt_harness::spawn`. TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`)
-are absent; the `ctl`/`list`/`stat` client subcommands are not yet wired into
-this binary (the control socket is served, so the TCP binary's clients or a raw
-socket work against it).
+are absent; the `ctl`/`list`/`stat` client subcommands are shared with the TCP
+binary through `ioutgt_harness::client`.
 
 Commands execute on **preallocated per-tag tasks** (one persistent task per slot,
 spawned once at queue install — zero per-command allocation, mirroring the TCP
@@ -179,12 +178,21 @@ at the reactor's park backstop (~1s), so teardown can lag up to ~1s. This is a
 second cross-thread wake channel (the harness's mailbox-only invariant covers the
 data path); routing the stop through the mailbox doorbell would make it prompt.
 
+**Abrupt host loss (no DREQ).** A host that vanishes without disconnecting
+sends nothing the QP or CM would notice — there is no socket death to unwind.
+The reap loop's backstop timer therefore doubles as a keep-alive watchdog
+(every ~10th tick): an admin queue whose host has been silent past KATO×2+5 s
+tears down and removes its controller from the registry (mirroring nvmet's
+keep-alive timer and the TCP path's watchdog), and IO queues whose controller
+has left the registry follow within a couple of seconds — so a dead host's
+QPs, permits and slots all recycle.
+
 **Known v1 divergences (deferred):**
-- *`conns` is pruned only on a graceful `Disconnected`.* An abrupt host loss that
-  surfaces as `TimewaitExit`/`DeviceRemoval`/a CM error leaves the listener's
-  `ConnSlot` in `conns` (the *queue* still tears down via its own stop/flush, so
-  this is listener-side slot accumulation only). The reconnect soak exercises
-  graceful reconnects; a periodic weak-ref sweep would bound the abrupt case.
+- *`conns` is pruned only on a graceful `Disconnected`.* An abrupt host loss
+  leaves the listener's `ConnSlot` in `conns` (the *queue* still tears down via
+  the keep-alive watchdog above, so this is listener-side slot accumulation
+  only). The reconnect soak exercises graceful reconnects; a periodic weak-ref
+  sweep would bound the abrupt case.
 - *`write_read_data` does not validate `data_len` against the host's keyed-SGL
   length.* An undersized host SGL surfaces as an RDMA remote-access-error
   completion (→ queue teardown) rather than a clean NVMe `DATA_XFER_ERROR`. RDMA
@@ -207,12 +215,25 @@ pool-registered segments — **without submitting the slot**. Submission is
 **deferred** to the `WR_READ` completion (`submit_pending`), which wakes the
 slot task to dispatch against the now-filled slot. The READ is a request WR, not
 a response, so it is not counted in `inflight[]` — only the trailing CQE SEND
-gates slot release. Commands the transport cannot satisfy — a non-keyed
-(in-capsule) SGL, a zero-length SGL, or an owned (unregistered) buffer when
-`lease_or_owned` falls back under pool pressure — are failed without dispatch via
-`respond_receiving` + a queued error CQE (`SGL_INVALID_TYPE` /
-`DATA_SGL_LEN_INVALID` / `DATA_XFER_ERROR`), so the host retries rather than the
-queue corrupting or tearing down.
+gates slot release. Malformed commands — a non-keyed (in-capsule) SGL or a
+zero-length SGL — are failed without dispatch via `respond_receiving` + a queued
+error CQE (`SGL_INVALID_TYPE` / `DATA_SGL_LEN_INVALID`).
+
+**Backpressure (park, never drop).** Two transient-full conditions defer the
+command instead of failing it, mirroring nvmet's `rsp_wr_wait_list` / SPDK's
+pending queues (see `docs/rdma-flow-control-nvmet-vs-spdk.md`):
+- *All slot tags held* (`parked`): on RDMA the response SEND delivers the CQE
+  to the host — freeing its SQ slot — before our own SEND completion is reaped
+  and the tag released, so a conforming host at full depth can deliver command
+  N+1 while every tag is busy. The capsule parks and drains oldest-first as
+  tags free; exceeding the negotiated depth outright stays fatal.
+- *Pool pressure* (`pool_wait`): a write's lease must come from the registered
+  arena (it is the RDMA READ's local target; a heap fallback would be
+  unregistered), and the pool is deliberately smaller than depth × MDTS. On
+  `try_lease` failure the command (tag already claimed) parks and the reap
+  loop retries it front-only as completions release leases. The old
+  fail-with-`DATA_XFER_ERROR|DNR` behavior turned every full-depth write burst
+  into immediate host EIOs (mkfs/git-clone writeback failures).
 
 ## Testing
 
@@ -257,9 +278,12 @@ queue corrupting or tearing down.
   - *Setting `netns exclusive` needs a quiesced host.* It returns `EBUSY` if any
     other net namespace exists (e.g. a `systemd PrivateNetwork` service such as
     `polkit`); free them, set the mode, restore.
-  - *Lossless RoCE for writes.* Reads run clean, but a heavy `randwrite` sweep
-    (target-issued RDMA READs) congests an unconfigured link and drops QPs —
-    `rdma connection establishment failed (-104)` reconnect storms on **both**
-    targets, so it is a fabric/flow-control limit (PFC/ECN), not a target bug.
-    Use lower queue depth or configure PFC/ECN for representative write numbers.
-- Verify a link first with `ibv_devinfo` / `rping` / `ib_send_bw`.
+  - *Host network management can destroy the fabric mid-run.* The historical
+    "64k congestion wedge" (keep-alive death ~60 s after connect, `-104`
+    reconnect storms on both targets) was NetworkManager's DHCP loop flushing
+    the test IP/GID — see
+    `docs/rdma-64k-congestion-wedge.md`; the driver's `up` now defends against it.
+- The driver's `fio_verify` verb is the data-integrity gate (mixed 4k–128k
+  writes at pool-exhausting pressure + crc32c read-back) and `ibperf` is the
+  raw link baseline (perftest send/write/read over the wire). Verify a link
+  first with `ibv_devinfo` / `rping` / `ibperf`.
