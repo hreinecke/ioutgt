@@ -42,7 +42,7 @@ pub fn arm(cq: &GenericCompletionQueue) -> io::Result<()> {
 }
 
 /// Consume and acknowledge every currently-queued event on `channel` (which
-/// must be non-blocking — see [`crate::verbs::Rdma::create_comp_channel`]),
+/// must be non-blocking, as the target's channels are),
 /// returning the count. One event may announce several completions, and several
 /// may queue before a wakeup, so this drains until `EAGAIN`. Acks are batched.
 ///

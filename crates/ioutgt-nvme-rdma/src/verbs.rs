@@ -1,11 +1,9 @@
-//! Thin wrappers over the libibverbs primitives the target needs, built on the
-//! safe `sideway` bindings. This assembles the RDMA resource model — device,
-//! protection domain, memory region (lkey/rkey), completion queue, and RC queue
-//! pair with its RESET→INIT→RTR→RTS transitions — that the transport drives.
-//!
-//! sideway exposes no CQ-event wrappers (`ibv_req_notify_cq` / `ibv_get_cq_event`),
-//! so completion reaping here is busy-poll; the reactor-driven (io_uring
-//! `POLL_ADD` on the completion-channel fd) path is layered on separately.
+//! Test-only RC-loopback scaffolding for the rxe gates (`#[cfg(test)]` — the
+//! production path builds its resources in `target`/`cm` directly on sideway):
+//! device open, PD/MR/CQ/QP creation, and a manual RESET→INIT→RTR→RTS loopback
+//! connect. The connect parameters here (MTU, rd_atomic, timeouts) are
+//! hardcoded for a single-host rxe loopback and are NOT what a CM-established
+//! box connection negotiates — do not read them as production behavior.
 
 use std::io;
 use std::sync::Arc;
