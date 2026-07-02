@@ -45,7 +45,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zerocopy::{FromBytes, IntoBytes};
 
-use rdma_mummy_sys::{ibv_qp_ex, ibv_qp_to_qp_ex, ibv_wr_send_inv, ibv_wr_set_sge};
+use rdma_mummy_sys::{
+    ibv_post_recv, ibv_qp_ex, ibv_qp_to_qp_ex, ibv_recv_wr, ibv_wr_send_inv, ibv_wr_set_sge,
+};
 
 use crate::cm::{CmChannel, EventType, Identifier};
 use crate::cmproto::{CM_FMT_1_0, CmRej, CmRep, CmReq, reject_status};
@@ -651,14 +653,30 @@ impl RdmaQueue {
     /// (Re-)post the RECV for capsule buffer `idx`.
     fn post_recv(&mut self, idx: u32) -> io::Result<()> {
         let off = idx as usize * CAPSULE_LEN;
-        let addr = self.recv_buf.as_ptr() as u64 + off as u64;
-        let lkey = self.recv_mr.lkey();
-        let mut g = self.qp.start_post_recv();
-        let h = g.construct_wr(wr(WR_RECV, idx));
-        // SAFETY: the region is registered (recv_mr) and stays valid; the NIC
-        // writes the next capsule here.
-        unsafe { h.setup_sge(lkey, addr, CAPSULE_LEN as u32) };
-        g.post().map_err(oerr)?;
+        let mut sge = ibv_sge {
+            addr: self.recv_buf.as_ptr() as u64 + off as u64,
+            length: CAPSULE_LEN as u32,
+            lkey: self.recv_mr.lkey(),
+        };
+        let mut rwr = ibv_recv_wr {
+            wr_id: wr(WR_RECV, idx),
+            next: std::ptr::null_mut(),
+            sg_list: &mut sge,
+            num_sge: 1,
+        };
+        let mut bad: *mut ibv_recv_wr = std::ptr::null_mut();
+        // Raw ibv_post_recv instead of sideway's PostRecvGuard: the guard heap-
+        // allocates two Vecs per call, and this runs once per command on the
+        // hot path (measured ~2.4% of a saturated io-thread — also a quiet
+        // violation of the zero-steady-state-allocation invariant).
+        // SAFETY: the QP is live; `rwr`/`sge` are valid across the call (the
+        // provider copies them into the RQ before returning); the region is
+        // registered (recv_mr) and stays valid — the NIC writes the next
+        // capsule here.
+        let rc = unsafe { ibv_post_recv(self.qp.qp().as_ptr(), &mut rwr, &mut bad) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
         self.wr.recv.post();
         self.wr.recv_db.record(1);
         Ok(())
