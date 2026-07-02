@@ -287,6 +287,14 @@ pub struct RdmaQueue {
     /// Write-command host-data READs deferred from `handle_recv`, flushed on one
     /// doorbell after each CQ-poll's RECV batch. Reused; sized to the queue depth.
     read_batch: Vec<PendingRead>,
+    /// Commands parked because every slot tag is held. RDMA-only ordering
+    /// window: the response SEND delivers the CQE to the host — freeing its SQ
+    /// slot — before our own SEND completion is reaped and the tag released, so
+    /// a conforming host can deliver the next command while all tags are busy.
+    /// Park it and drain oldest-first as tags free (nvmet parks the same way on
+    /// `rsp_wr_wait_list`); the old treat-as-fatal behavior tore down healthy
+    /// queues under full-depth 64k bursts. Preallocated to the queue depth.
+    parked: std::collections::VecDeque<Sqe>,
 }
 
 impl Drop for RdmaQueue {
@@ -371,6 +379,7 @@ impl RdmaQueue {
             pending_read: vec![Sqe::zeroed(); sqsize as usize],
             wr,
             read_batch: Vec::with_capacity(sqsize as usize),
+            parked: std::collections::VecDeque::with_capacity(sqsize as usize),
         })
     }
 
@@ -560,6 +569,16 @@ impl RdmaQueue {
                 _ => {}
             }
         }
+        // Tags freed by this poll's response completions un-park waiting
+        // commands (oldest first) — before the read-batch flush so a parked
+        // write command's host-data READ rides the same doorbell.
+        while !self.parked.is_empty() {
+            let Some(tag) = self.nvme.claim_tag() else {
+                break;
+            };
+            let sqe = self.parked.pop_front().expect("parked is non-empty");
+            self.route_cmd(ctx, tag, sqe)?;
+        }
         // Flush the write-command host-data READs `handle_recv` collected from
         // this poll's RECV batch — all on one doorbell.
         self.post_reads_batch()?;
@@ -650,9 +669,24 @@ impl RdmaQueue {
         // The capsule buffer is free once the SQE is parsed — re-arm it.
         self.post_recv(idx)?;
         let Some(tag) = self.nvme.claim_tag() else {
-            return Err(io::Error::other("no free tag for command"));
+            // All tags held: park, don't kill (see the `parked` field). A host
+            // can only overrun the parking lot by exceeding the negotiated
+            // queue depth outright — that stays fatal.
+            if self.parked.len() >= self.nslots as usize {
+                return Err(io::Error::other(
+                    "command overflow: host exceeded negotiated queue depth",
+                ));
+            }
+            self.parked.push_back(sqe);
+            return Ok(());
         };
+        self.route_cmd(ctx, tag, sqe)
+    }
 
+    /// Route a claimed command: submit it to its slot task, or (host-data-in)
+    /// lease a pool buffer and post the host-data RDMA READ first. Split from
+    /// [`Self::handle_recv`] so parked commands re-enter here when a tag frees.
+    fn route_cmd(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>, tag: u16, sqe: Sqe) -> io::Result<()> {
         if !host_data_in(&ctx.role, sqe.opcode) {
             self.nvme.submit(tag, sqe);
             return Ok(());
