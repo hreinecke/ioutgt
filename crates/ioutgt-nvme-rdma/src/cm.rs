@@ -43,13 +43,7 @@ use rdma_mummy_sys::{
 use sideway::ibverbs::device_context::DeviceContext;
 use sideway::ibverbs::queue_pair::{QueuePair, QueuePairState};
 
-fn pollin() -> u32 {
-    u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
-}
-
-fn err_hup() -> u32 {
-    u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
-}
+use crate::cq::{err_hup, pollin};
 
 /// Owns the raw event channel; destroyed after every [`Identifier`] created on it
 /// (each holds an `Arc` of this).

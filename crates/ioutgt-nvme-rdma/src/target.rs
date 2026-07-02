@@ -140,6 +140,37 @@ fn staged_len(sqe: &Sqe) -> usize {
     (parse_keyed_sgl(sqe).len as usize).min(ioutgt_core::MDTS_BYTES as usize)
 }
 
+/// Fill `sges` with the slot data's pool-lease segments covering its first
+/// `len` bytes, tagged with `lkey`; returns the sge count. A pool lease spans
+/// at most [`MAX_SEGS`] runs, so the fixed array always suffices, and the
+/// extended post guard copies the list into the WQE at `setup_sge_list`, so
+/// one stack array can be reused across a batch.
+// A run never exceeds the lease length <= MDTS (128 KiB) < u32::MAX.
+#[allow(clippy::cast_possible_truncation)]
+fn fill_sges(
+    data: &ioutgt_core::pool::SlotData,
+    len: usize,
+    lkey: u32,
+    sges: &mut [ibv_sge; MAX_SEGS],
+) -> usize {
+    let mut n = 0usize;
+    let mut remaining = len;
+    for seg in data.segs() {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(seg.len);
+        sges[n] = ibv_sge {
+            addr: seg.ptr as u64,
+            length: take as u32,
+            lkey,
+        };
+        n += 1;
+        remaining -= take;
+    }
+    n
+}
+
 /// The extended-verbs handle of `qp`, for work-request calls sideway does not
 /// wrap. All target QPs are built with `build_ex` (asserted), so the handle is
 /// valid whenever a post-send guard session is open on `qp`.
@@ -543,29 +574,13 @@ impl RdmaQueue {
         let pool_lkey = *pool_lkey;
         let mut reads = 0u64;
         let mut g = qp.start_post_send();
+        let mut sges = [ibv_sge {
+            addr: 0,
+            length: 0,
+            lkey: 0,
+        }; MAX_SEGS];
         for pr in read_batch.iter().copied() {
-            // The extended guard copies each sge list into the WQE at setup, so
-            // this per-iteration stack array is reused safely across the batch.
-            let mut sges = [ibv_sge {
-                addr: 0,
-                length: 0,
-                lkey: 0,
-            }; MAX_SEGS];
-            let mut n = 0usize;
-            let mut remaining = pr.len as usize;
-            for seg in nvme.slots.slot(pr.tag).data().segs() {
-                if remaining == 0 {
-                    break;
-                }
-                let take = remaining.min(seg.len);
-                sges[n] = ibv_sge {
-                    addr: seg.ptr as u64,
-                    length: take as u32,
-                    lkey: pool_lkey,
-                };
-                n += 1;
-                remaining -= take;
-            }
+            let n = fill_sges(&nvme.slots.slot(pr.tag).data(), pr.len as usize, pool_lkey, &mut sges);
             let h = g
                 .construct_wr(wr(WR_READ, u32::from(pr.tag)), WorkRequestFlags::Signaled)
                 .setup_read(pr.rkey, pr.addr);
@@ -719,11 +734,13 @@ impl RdmaQueue {
         }
     }
 
-    /// Park on the completion channel until the next RECV (command capsule)
-    /// completes, returning its buffer index; service response completions
-    /// (release slots) in the meantime.
-    async fn next_recv(&mut self) -> io::Result<u32> {
-        // Bootstrap-only (one Connect capsule), so this one-time buffer is fine.
+    /// Bootstrap-only: park on the completion channel until a completion of
+    /// `kind` (`WR_RECV` for the Connect capsule, `WR_READ` for its keyed-SGL
+    /// connect data) arrives, returning its low bits (the recv buffer index /
+    /// tag). Response completions are serviced (slots released) meanwhile; the
+    /// steady reap loop takes over once [`Self::bootstrap`] returns.
+    async fn await_bootstrap(&mut self, kind: u64) -> io::Result<u32> {
+        // One Connect per queue, so this one-time buffer is fine.
         let mut comps: Vec<(u64, bool)> = Vec::with_capacity(8);
         loop {
             crate::cq::wait(&self.channel, &self.cq).await?;
@@ -733,39 +750,13 @@ impl RdmaQueue {
                     return Err(io::Error::other("RDMA completion error (peer gone?)"));
                 }
                 match wr_kind(id) {
-                    WR_RECV => {
-                        RdmaWrStats::complete(&self.wr.recv_done, &self.wr.recv_inflight);
+                    k if k == kind => {
+                        let (done, inflight) = match kind {
+                            WR_RECV => (&self.wr.recv_done, &self.wr.recv_inflight),
+                            _ => (&self.wr.read_done, &self.wr.read_inflight),
+                        };
+                        RdmaWrStats::complete(done, inflight);
                         return Ok(wr_low(id));
-                    }
-                    WR_SEND => {
-                        RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight);
-                        self.on_response_done(wr_low(id));
-                    }
-                    WR_WRITE => {
-                        RdmaWrStats::complete(&self.wr.write_done, &self.wr.write_inflight);
-                        self.on_response_done(wr_low(id));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Park until the pending connect-data RDMA READ (`WR_READ`) completes,
-    /// servicing any response completions meanwhile. Bootstrap-only.
-    async fn await_read(&mut self) -> io::Result<()> {
-        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(4);
-        loop {
-            crate::cq::wait(&self.channel, &self.cq).await?;
-            self.drain_into(&mut comps);
-            for &(id, ok) in &comps {
-                if !ok {
-                    return Err(io::Error::other("RDMA READ completion error"));
-                }
-                match wr_kind(id) {
-                    WR_READ => {
-                        RdmaWrStats::complete(&self.wr.read_done, &self.wr.read_inflight);
-                        return Ok(());
                     }
                     WR_SEND => {
                         RdmaWrStats::complete(&self.wr.send_done, &self.wr.send_inflight);
@@ -912,37 +903,21 @@ impl RdmaQueue {
         let mut sends = 0u64;
         let qp_ex = qp_ex_of(qp)?;
         let mut g = qp.start_post_send();
+        let mut sges = [ibv_sge {
+            addr: 0,
+            length: 0,
+            lkey: 0,
+        }; MAX_SEGS];
         for resp in batch {
             let tag = resp.tag;
             let mut pending = 1u8;
             if resp.outcome.data_len > 0 {
-                // A pool lease spans at most MAX_SEGS runs; a fixed stack array
-                // holds every sge with no allocation. The extended guard copies
-                // the sges into the WQE at `setup_sge_list`, so reusing this
-                // array across iterations is sound.
-                let mut sges = [ibv_sge {
-                    addr: 0,
-                    length: 0,
-                    lkey: 0,
-                }; MAX_SEGS];
-                let mut n = 0usize;
-                let mut remaining = resp.outcome.data_len as usize;
-                {
-                    let data = nvme.slots.slot(tag).data();
-                    for seg in data.segs() {
-                        if remaining == 0 {
-                            break;
-                        }
-                        let take = remaining.min(seg.len);
-                        sges[n] = ibv_sge {
-                            addr: seg.ptr as u64,
-                            length: take as u32,
-                            lkey: pool_lkey,
-                        };
-                        n += 1;
-                        remaining -= take;
-                    }
-                }
+                let n = fill_sges(
+                    &nvme.slots.slot(tag).data(),
+                    resp.outcome.data_len as usize,
+                    pool_lkey,
+                    &mut sges,
+                );
                 let dst = parse_keyed_sgl(&resp.cmd);
                 let hw = g
                     .construct_wr(wr(WR_WRITE, u32::from(tag)), WorkRequestFlags::Signaled)
@@ -1011,7 +986,7 @@ impl RdmaQueue {
         registry: &Arc<Registry>,
         peer: &str,
     ) -> io::Result<Rc<ConnCtx<AnyBackend>>> {
-        let idx = self.next_recv().await?;
+        let idx = self.await_bootstrap(WR_RECV).await?;
         // `inline_cd` is Some for an in-capsule (IO-queue) connect, None for a
         // keyed-SGL (admin-queue) connect that we must RDMA READ below.
         let (sqe, inline_cd) = {
@@ -1039,7 +1014,7 @@ impl RdmaQueue {
             let sgl = parse_keyed_sgl(&sqe);
             let len = (sgl.len as usize).min(ICD_LEN);
             self.post_read_cdata(&sgl, len)?;
-            self.await_read().await?;
+            self.await_bootstrap(WR_READ).await?;
             Box::new(
                 ConnectData::read_from_bytes(&self.cdata_buf[..ICD_LEN])
                     .map_err(|_| io::Error::other("short connect data"))?,

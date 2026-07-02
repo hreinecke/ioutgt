@@ -24,7 +24,7 @@ pub fn pollin() -> u32 {
     u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
 }
 
-fn err_hup() -> u32 {
+pub(crate) fn err_hup() -> u32 {
     u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
 }
 
