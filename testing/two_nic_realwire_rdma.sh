@@ -266,6 +266,21 @@ cmd_up() {
     in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
     ip netns del "$NS_I" 2>/dev/null || true
 
+    # Defend the test NICs/subnet from the host's network management, which
+    # has produced multi-day debugging wedges on this rig:
+    #  - NetworkManager: an auto-DHCP profile on the (profile-less) test NIC
+    #    re-runs a 45 s DHCP transaction forever; every timeout flushes ALL
+    #    addresses on the device — deleting IP_T and its RoCE GID mid-run.
+    #    Established QPs then retransmit into the void (local_ack_timeout →
+    #    retries_exceeded), keep-alive dies ~45-90 s after connect, and every
+    #    reconnect fails (-104) until the IP is re-added.
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device set "$NIC_T" managed no 2>/dev/null || true
+        nmcli device set "$NIC_I" managed no 2>/dev/null || true
+    fi
+    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
+    ip rule add to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
+
     # Resolve each NIC's rdma device (both NICs are in root now).
     local ibt ibi
     ibt="$(nic_ibdev "$NIC_T")" || fail "no rdma (RoCE) device under /sys/class/net/$NIC_T/device/infiniband — is $NIC_T a RoCE NIC with mlx5_ib loaded?"
@@ -302,6 +317,9 @@ cmd_down() {
     ip netns del "$NS_I" 2>/dev/null || true
     # The target NIC stayed in root; drop the test IP we added to it.
     [ -n "${NIC_T:-}" ] && ip addr del "$IP_T/$PREFIX" dev "$NIC_T" 2>/dev/null || true
+    # Drop the policy-routing guard added by 'up' (NM unmanaged state is kept:
+    # re-managing would let NM's DHCP loop flush the NIC again on the next run).
+    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
     echo "   $NS_I removed; NIC_I + rdma device returned to root; $IP_T removed from ${NIC_T:-NIC_T}."
     echo "   (rdma system netns mode left exclusive; 'rdma system set netns shared' to revert)"
 }
