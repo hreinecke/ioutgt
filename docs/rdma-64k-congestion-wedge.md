@@ -76,7 +76,21 @@ don't read it as wire/fabric behavior.
    (nvmet parity: `rsp_wr_wait_list` + 2× rsp pool; see
    `docs/rdma-flow-control-nvmet-vs-spdk.md`). Overrunning the parking lot
    (a host truly exceeding the negotiated depth) stays fatal.
-2. **No keep-alive enforcement / abrupt-loss reaping** (`ioutgt-nvme-rdma`).
+2. **Write commands hard-failed with `DATA_XFER_ERROR|DNR` under pool pressure**
+   (`ioutgt-nvme-rdma`). The write path leased host-data buffers with
+   `lease_or_owned`, whose private-heap fallback is unusable on RDMA (the
+   buffer is the RDMA READ's local target and must live in the registered
+   arena), so the fallback was detected and the command failed — with DNR, so
+   the host returned EIO immediately (the code comment claimed "the host
+   retries"; DNR means the opposite). The pool is deliberately smaller than
+   depth×MDTS, so any full-depth write burst hit it: `mkfs.xfs` + `git clone`
+   on the device produced writeback errors in seconds; the `fio_verify` gate
+   (8 jobs × qd64 mixed 4k–128k writes + crc32c read-back) reproduces it 1:1
+   (every dmesg `sc 0x4 DNR` matched a pool-exhausted log line). Fixed by
+   deferring instead: a pool-only `try_lease` + a `pool_wait` queue drained
+   front-only by the reap loop as completions release leases (SPDK's
+   `pending_buf_queue` shape; the TCP read path's `lease_await` analog).
+3. **No keep-alive enforcement / abrupt-loss reaping** (`ioutgt-nvme-rdma`).
    The RDMA path has no socket death to unwind a vanished host: an aborted
    connect left a dead controller with 17 QPs in RTS, permanently. Now a
    watchdog on the reap-loop backstop cadence (a) tears down an admin queue
@@ -84,10 +98,10 @@ don't read it as wire/fabric behavior.
    watchdog), (b) removes the controller from the registry at admin teardown
    (TCP parity — was also missing), and (c) tears down IO queues whose
    controller is gone from the registry.
-3. **`IBV_SEND_SOLICITED` on response SENDs** (fixed earlier, commit `51bbe5c`)
+4. **`IBV_SEND_SOLICITED` on response SENDs** (fixed earlier, commit `51bbe5c`)
    — real and independent: without it the host's solicited-armed CQ never
    interrupts and the host sleeps with the CQE unreaped.
-4. **ORD/IRD negotiation** (fixed earlier, commit `6558c66`) — real and
+5. **ORD/IRD negotiation** (fixed earlier, commit `6558c66`) — real and
    independent: accept advertised `initiator_depth=1`, NAKing concurrent
    write-data RDMA READs.
 
