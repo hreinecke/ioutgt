@@ -1463,18 +1463,30 @@ impl RdmaQueue {
                 // so a busy select! cannot starve it) and re-arms + re-drains, so a
                 // stranded completion is recovered within one interval (the
                 // userspace analog of nvmet-rdma's missed-events re-poll).
-                res = backstop.as_mut() => {
-                    res?;
-                    let r = match crate::cq::arm(&self.cq) {
-                        Err(e) => Err(e),
-                        Ok(()) => self.process_cqes(&ctx, &mut comps),
-                    };
-                    backstop.set(ioutgt_uring::ops::sleep(BACKSTOP)?);
-                    // Piggyback the keep-alive / controller-liveness watchdog
-                    // on the backstop cadence (see [`Self::watchdog`]).
-                    match r {
-                        Ok(false) => Ok(self.watchdog(&ctx)),
-                        other => other,
+                // NB: no `?` in this arm — it would return from run() and skip
+                // the remove_park_probe below, leaving a stale probe arming a
+                // dead CQ on this (shared, long-lived) queue thread. Errors
+                // must flow through `step` so every exit passes the removal.
+                res = backstop.as_mut() => match res {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        let r = match crate::cq::arm(&self.cq) {
+                            Err(e) => Err(e),
+                            Ok(()) => self.process_cqes(&ctx, &mut comps),
+                        };
+                        match ioutgt_uring::ops::sleep(BACKSTOP) {
+                            Err(e) => Err(e),
+                            Ok(t) => {
+                                backstop.set(t);
+                                // Piggyback the keep-alive / controller-liveness
+                                // watchdog on the backstop cadence (see
+                                // [`Self::watchdog`]).
+                                match r {
+                                    Ok(false) => Ok(self.watchdog(&ctx)),
+                                    other => other,
+                                }
+                            }
+                        }
                     }
                 }
             };
