@@ -163,8 +163,7 @@ mod tests {
             for (i, b) in send_buf.iter_mut().enumerate() {
                 *b = u8::try_from(i % 251).unwrap_or(0);
             }
-            let all =
-                AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead;
+            let all = AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead;
             // SAFETY: both buffers outlive their MRs and are not moved/resized.
             let send_mr = unsafe { rdma.register(send_buf.as_mut_ptr(), N, all)? };
             // SAFETY: see above.

@@ -133,7 +133,8 @@ impl CmChannel {
     pub fn adopt(&self, event: &Event) -> io::Result<Identifier> {
         debug_assert!(matches!(event.event_type(), EventType::ConnectRequest));
         let raw = event.raw_id();
-        let id = NonNull::new(raw).ok_or_else(|| io::Error::other("connect request without cm_id"))?;
+        let id =
+            NonNull::new(raw).ok_or_else(|| io::Error::other("connect request without cm_id"))?;
         Ok(Identifier {
             inner: Arc::new(IdentifierInner {
                 id,
@@ -151,8 +152,7 @@ impl CmChannel {
             // we own until rdma_ack_cm_event.
             let rc = unsafe { rdma_get_cm_event(self.inner.channel.as_ptr(), &mut raw) };
             if rc == 0 {
-                let event =
-                    NonNull::new(raw).ok_or_else(|| io::Error::other("null CM event"))?;
+                let event = NonNull::new(raw).ok_or_else(|| io::Error::other("null CM event"))?;
                 return Ok(Event { event: Some(event) });
             }
             let err = io::Error::last_os_error();
@@ -219,8 +219,8 @@ fn conn_param(
     cp.rnr_retry_count = 7;
     if !private_data.is_empty() {
         cp.private_data = private_data.as_ptr() as *const c_void;
-        cp.private_data_len =
-            u8::try_from(private_data.len()).map_err(|_| io::Error::other("CM data > 255 bytes"))?;
+        cp.private_data_len = u8::try_from(private_data.len())
+            .map_err(|_| io::Error::other("CM data > 255 bytes"))?;
     }
     Ok(cp)
 }
@@ -241,8 +241,12 @@ impl Identifier {
     /// Bind to a local address (listener side).
     pub fn bind_addr(&self, addr: SocketAddr) -> io::Result<()> {
         // SAFETY: valid id; librdmacm copies the sockaddr synchronously.
-        let rc =
-            unsafe { rdma_bind_addr(self.inner.id.as_ptr(), OsSocketAddr::from(addr).as_mut_ptr()) };
+        let rc = unsafe {
+            rdma_bind_addr(
+                self.inner.id.as_ptr(),
+                OsSocketAddr::from(addr).as_mut_ptr(),
+            )
+        };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -267,14 +271,16 @@ impl Identifier {
         dst: SocketAddr,
         timeout: Duration,
     ) -> io::Result<()> {
-        let timeout_ms =
-            i32::try_from(timeout.as_millis()).map_err(|_| io::Error::other("timeout too large"))?;
+        let timeout_ms = i32::try_from(timeout.as_millis())
+            .map_err(|_| io::Error::other("timeout too large"))?;
         let mut srcaddr = src.map(OsSocketAddr::from);
         // SAFETY: valid id; sockaddrs are copied synchronously.
         let rc = unsafe {
             rdma_resolve_addr(
                 self.inner.id.as_ptr(),
-                srcaddr.as_mut().map_or(std::ptr::null_mut(), |s| s.as_mut_ptr()),
+                srcaddr
+                    .as_mut()
+                    .map_or(std::ptr::null_mut(), |s| s.as_mut_ptr()),
                 OsSocketAddr::from(dst).as_mut_ptr(),
                 timeout_ms,
             )
@@ -288,8 +294,8 @@ impl Identifier {
     /// Resolve the route to the resolved address; completes with a
     /// `RouteResolved` (or `RouteError`) event.
     pub fn resolve_route(&self, timeout: Duration) -> io::Result<()> {
-        let timeout_ms =
-            i32::try_from(timeout.as_millis()).map_err(|_| io::Error::other("timeout too large"))?;
+        let timeout_ms = i32::try_from(timeout.as_millis())
+            .map_err(|_| io::Error::other("timeout too large"))?;
         // SAFETY: valid id whose address is resolved.
         let rc = unsafe { rdma_resolve_route(self.inner.id.as_ptr(), timeout_ms) };
         if rc != 0 {
@@ -365,7 +371,8 @@ impl Identifier {
         } else {
             (
                 reason.as_ptr() as *const c_void,
-                u8::try_from(reason.len()).map_err(|_| io::Error::other("CM reject > 255 bytes"))?,
+                u8::try_from(reason.len())
+                    .map_err(|_| io::Error::other("CM reject > 255 bytes"))?,
             )
         };
         // SAFETY: valid id with a pending connect request; rdma_reject copies
@@ -413,15 +420,17 @@ impl Identifier {
         // SAFETY: reading the `verbs` field of a live cm_id.
         let verbs = unsafe { self.inner.id.as_ref().verbs };
         let ctx = NonNull::new(verbs)?;
-        let mut cache = DEVICE_CONTEXTS.lock().expect("device-context cache poisoned");
-        Some(Arc::clone(cache.entry(verbs as usize).or_insert_with(|| {
-            // SAFETY: layout asserted above; the context outlives every user
-            // (librdmacm keeps it open for the process; the cache leaks the Arc
-            // by design, mirroring sideway).
-            Arc::new(unsafe {
-                std::mem::transmute::<NonNull<ibv_context>, DeviceContext>(ctx)
-            })
-        })))
+        let mut cache = DEVICE_CONTEXTS
+            .lock()
+            .expect("device-context cache poisoned");
+        Some(Arc::clone(cache.entry(verbs as usize).or_insert_with(
+            || {
+                // SAFETY: layout asserted above; the context outlives every user
+                // (librdmacm keeps it open for the process; the cache leaks the Arc
+                // by design, mirroring sideway).
+                Arc::new(unsafe { std::mem::transmute::<NonNull<ibv_context>, DeviceContext>(ctx) })
+            },
+        )))
     }
 }
 
@@ -596,7 +605,11 @@ mod tests {
 
     use crate::oerr;
 
-    type Held = (Arc<ProtectionDomain>, GenericCompletionQueue, GenericQueuePair);
+    type Held = (
+        Arc<ProtectionDomain>,
+        GenericCompletionQueue,
+        GenericQueuePair,
+    );
 
     /// A 64-byte sample command capsule (a stand-in SQE); each byte = its index.
     fn sample_capsule() -> [u8; 64] {
@@ -765,7 +778,10 @@ mod tests {
                 Err(e) if sync_retries < 20 => {
                     sync_retries += 1;
                     eprintln!("[cm-client] resolve_addr not ready ({e}); retry {sync_retries}");
-                    ops::sleep(Duration::from_millis(250)).unwrap().await.unwrap();
+                    ops::sleep(Duration::from_millis(250))
+                        .unwrap()
+                        .await
+                        .unwrap();
                 }
                 Err(e) => return Err(e),
             }
@@ -788,7 +804,10 @@ mod tests {
                     if addr_retries > 5 {
                         return Err(io::Error::other("resolve_addr failed (AddressError x5)"));
                     }
-                    ops::sleep(Duration::from_millis(200)).unwrap().await.unwrap();
+                    ops::sleep(Duration::from_millis(200))
+                        .unwrap()
+                        .await
+                        .unwrap();
                     id.resolve_addr(Some(src), dst, Duration::from_secs(5))?;
                 }
                 EventType::RouteResolved => {
@@ -834,7 +853,11 @@ mod tests {
                         // SEND source is only locally read by the HCA, so it needs
                         // no access flag.
                         unsafe {
-                            pd.reg_mr(send_buf.as_ptr() as usize, send_buf.len(), AccessFlags::none())
+                            pd.reg_mr(
+                                send_buf.as_ptr() as usize,
+                                send_buf.len(),
+                                AccessFlags::none(),
+                            )
                         }
                         .map_err(oerr)?
                     };
@@ -894,7 +917,10 @@ mod tests {
             const QID: u16 = 7;
             let server = tokio::task::spawn_local(run_server(PORT));
             // Let the server bind+listen before the client resolves to it.
-            ops::sleep(Duration::from_millis(100)).unwrap().await.unwrap();
+            ops::sleep(Duration::from_millis(100))
+                .unwrap()
+                .await
+                .unwrap();
             let dst: SocketAddr = format!("{ip}:{PORT}").parse().unwrap();
             let client = tokio::task::spawn_local(run_client(dst, QID));
 

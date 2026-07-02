@@ -1,0 +1,19 @@
+ioutgt-nvme-rdma/src/cm.rs:27:    u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
+ioutgt-nvme-rdma/src/cm.rs:31:    u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
+ioutgt-nvme-rdma/src/cm.rs:35:/// `POLL_ADD`), so CM events are awaited without busy-polling. One per listener
+ioutgt-nvme-rdma/src/cm.rs:55:    /// none is queued (level-triggered `POLL_ADD`, re-issued each empty wakeup).
+ioutgt-nvme-rdma/src/cm.rs:63:                    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is
+ioutgt-nvme-rdma/src/cq.rs:3://! reactor on the channel fd via io_uring `POLL_ADD`, then consume + ack the
+ioutgt-nvme-rdma/src/cq.rs:23:    u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
+ioutgt-nvme-rdma/src/cq.rs:27:    u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
+ioutgt-nvme-rdma/src/cq.rs:86:    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is in error or
+ioutgt-nvme-rdma/src/cq.rs:121:    /// reactor** (arm → `POLL_ADD` park on the channel fd → get/ack event →
+ioutgt-nvme-rdma/src/target.rs:724:                // event (`cq::wait`'s `POLL_ADD`); userspace ibverbs has no
+ioutgt-nvme-rdma/src/transport.rs:5://! parks on its fd via io_uring `POLL_ADD`, which needs an io_uring reactor — so
+ioutgt-nvme-rdma/src/verbs.rs:8://! `POLL_ADD` on the completion-channel fd) path is layered on separately.
+ioutgt-nvme-rdma/src/verbs.rs:107:    /// `IORING_OP_POLL_ADD`) to wake on completions instead of busy-polling.
+ioutgt-uring/src/ops.rs:251:/// `libc::POLLIN`) via `IORING_OP_POLL_ADD` (one-shot). On readiness the op
+ioutgt-uring/tests/poll.rs:1://! IORING_OP_POLL_ADD futures: waking a queue thread's reactor on an arbitrary
+ioutgt-uring/tests/poll.rs:11:    u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
+ioutgt-uring/tests/poll.rs:41:        assert!(events & pollin() != 0, "expected POLLIN, got {events:#x}");
+ioutgt-uring/tests/poll.rs:59:        assert!(events & pollin() != 0, "expected POLLIN, got {events:#x}");

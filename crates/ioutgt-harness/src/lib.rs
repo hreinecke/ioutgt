@@ -64,8 +64,7 @@ pub trait Transport: 'static {
 
     /// Bind the listening endpoint; returns the listener and the actual bound
     /// address (an ephemeral port resolves to the real one).
-    fn bind(cfg: &TargetConfig)
-    -> impl Future<Output = io::Result<(Self::Listener, SocketAddr)>>;
+    fn bind(cfg: &TargetConfig) -> impl Future<Output = io::Result<(Self::Listener, SocketAddr)>>;
 
     /// Accept one raw connection. Used inside a `select!`, so it must be cancel-safe.
     fn accept(listener: &Self::Listener) -> impl Future<Output = io::Result<Self::Raw>>;

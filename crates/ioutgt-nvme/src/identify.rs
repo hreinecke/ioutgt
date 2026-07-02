@@ -119,6 +119,11 @@ pub const SGLS_BYTE_ALIGNED: u32 = 1;
 /// this as mandatory (the keyed SGL carries the host's addr+rkey+len).
 pub const SGLS_KEYED: u32 = 1 << 2;
 
+/// SGLS bit 20: SGL Address field may specify an offset (in-capsule data).
+/// RDMA hosts (`nvme_rdma`'s `NVME_CTRL_SGLS_SAOS` check) refuse to send
+/// inline write payloads unless this is set, whatever IOCCSZ says.
+pub const SGLS_SAOS: u32 = 1 << 20;
+
 /// LBA format descriptor.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
 #[repr(C)]

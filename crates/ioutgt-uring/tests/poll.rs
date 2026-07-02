@@ -53,7 +53,10 @@ fn poll_add_wakes_when_fd_becomes_ready() {
             tokio::task::spawn_local(async move { ops::poll_add(rd, pollin()).unwrap().await });
         // Let the poll park in the reactor (submit_and_wait), then make the fd
         // readable — proving the reactor wakes on the fd, not on a busy spin.
-        ops::sleep(Duration::from_millis(20)).unwrap().await.unwrap();
+        ops::sleep(Duration::from_millis(20))
+            .unwrap()
+            .await
+            .unwrap();
         write_byte(wr);
         let events = waiter.await.unwrap().unwrap();
         assert!(events & pollin() != 0, "expected POLLIN, got {events:#x}");

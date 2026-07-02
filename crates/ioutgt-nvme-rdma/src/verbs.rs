@@ -92,7 +92,9 @@ impl Rdma {
     pub fn create_cq(&self, cqe: u32) -> io::Result<GenericCompletionQueue> {
         let mut builder = self.ctx.create_cq_builder();
         builder.setup_cqe(cqe);
-        Ok(GenericCompletionQueue::from(builder.build_ex().map_err(oerr)?))
+        Ok(GenericCompletionQueue::from(
+            builder.build_ex().map_err(oerr)?,
+        ))
     }
 
     /// Create a completion channel — the fd the reactor parks on (via
@@ -115,7 +117,9 @@ impl Rdma {
     ) -> io::Result<GenericCompletionQueue> {
         let mut builder = self.ctx.create_cq_builder();
         builder.setup_cqe(cqe).setup_comp_channel(channel, 0);
-        Ok(GenericCompletionQueue::from(builder.build_ex().map_err(oerr)?))
+        Ok(GenericCompletionQueue::from(
+            builder.build_ex().map_err(oerr)?,
+        ))
     }
 
     /// Build an RC queue pair bound to the given send/recv completion queues,
@@ -228,9 +232,7 @@ impl Rdma {
 mod tests {
     use super::*;
     use sideway::ibverbs::completion::WorkCompletionStatus;
-    use sideway::ibverbs::queue_pair::{
-        PostSendGuard, SetScatterGatherEntry, WorkRequestFlags,
-    };
+    use sideway::ibverbs::queue_pair::{PostSendGuard, SetScatterGatherEntry, WorkRequestFlags};
 
     #[test]
     fn enumerate_devices_links_and_runs() {
@@ -322,9 +324,7 @@ mod tests {
         }
         {
             let mut g = qp.start_post_send();
-            let h = g
-                .construct_wr(2, WorkRequestFlags::Signaled)
-                .setup_send();
+            let h = g.construct_wr(2, WorkRequestFlags::Signaled).setup_send();
             // SAFETY: send region is registered and lives past the completion.
             unsafe { h.setup_sge(send_mr.lkey(), send_buf.as_ptr() as u64, LEN) };
             g.post().map_err(oerr)?;

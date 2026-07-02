@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use ioutgt_nvme::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use ioutgt_nvme::identify::{
-    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, cmic, nmic, oncs,
+    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, cmic, nmic,
+    oncs,
 };
 use ioutgt_nvme::spec::{Sqe, admin_opcode, cns, feat, log_page};
 use ioutgt_nvme::status;
@@ -197,10 +198,13 @@ fn build_id_ctrl<B: Backend>(
     // MDTS: slot buffer / CAP.MPSMIN(4K) pages: 128K = 2^5 * 4K.
     id.mdts = 5;
     // RDMA hosts require keyed SGL support (the command capsule carries the
-    // host's addr+rkey+len); TCP uses byte-aligned in-capsule SGLs only.
+    // host's addr+rkey+len) plus the address-as-offset bit — nvme-rdma's
+    // use_inline_data is gated on SAOS, so without it the host ignores
+    // IOCCSZ and never sends in-capsule write data. TCP uses byte-aligned
+    // in-capsule SGLs only.
     let mut sgls = SGLS_BYTE_ALIGNED;
     if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
-        sgls |= SGLS_KEYED;
+        sgls |= SGLS_KEYED | SGLS_SAOS;
     }
     id.sgls.set(sgls);
 
@@ -210,12 +214,12 @@ fn build_id_ctrl<B: Backend>(
     } else {
         id.nn.set(subsys.as_ref().map_or(0, |s| s.max_nsid()));
         id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
-        // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA v1
-        // advertises no in-capsule data, so every host moves IO data over a
-        // keyed SGL (target-issued RDMA READ/WRITE) — the only path the RDMA
-        // transport's fixed-size RECV buffers and dispatch implement.
+        // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA
+        // advertises one page of in-capsule data (nvmet parity): small write
+        // payloads then arrive inside the command capsule and skip the
+        // per-write RDMA READ round trip; larger IO stays on keyed SGLs.
         let inline = if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
-            0
+            crate::RDMA_INLINE_DATA_SIZE
         } else {
             crate::INLINE_DATA_SIZE
         };

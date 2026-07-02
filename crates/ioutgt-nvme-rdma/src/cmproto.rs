@@ -65,7 +65,11 @@ impl CmReq {
         if data.len() < Self::WIRE_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("nvme_rdma_cm_req: {} bytes, need {}", data.len(), Self::WIRE_LEN),
+                format!(
+                    "nvme_rdma_cm_req: {} bytes, need {}",
+                    data.len(),
+                    Self::WIRE_LEN
+                ),
             ));
         }
         Ok(CmReq {
@@ -108,7 +112,11 @@ impl CmRep {
         if data.len() < Self::WIRE_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("nvme_rdma_cm_rep: {} bytes, need {}", data.len(), Self::WIRE_LEN),
+                format!(
+                    "nvme_rdma_cm_rep: {} bytes, need {}",
+                    data.len(),
+                    Self::WIRE_LEN
+                ),
             ));
         }
         Ok(CmRep {
@@ -213,7 +221,16 @@ mod tests {
             cntlid: 0xabcd,
         };
         let back = CmReq::parse(&req.to_bytes()).unwrap();
-        assert_eq!((back.recfmt, back.qid, back.hrqsize, back.hsqsize, back.cntlid), (req.recfmt, req.qid, req.hrqsize, req.hsqsize, req.cntlid));
+        assert_eq!(
+            (
+                back.recfmt,
+                back.qid,
+                back.hrqsize,
+                back.hsqsize,
+                back.cntlid
+            ),
+            (req.recfmt, req.qid, req.hrqsize, req.hsqsize, req.cntlid)
+        );
     }
 
     #[test]

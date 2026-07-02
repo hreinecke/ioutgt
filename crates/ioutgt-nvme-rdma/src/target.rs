@@ -31,7 +31,9 @@ use ioutgt_nvme::spec::{Sqe, io_opcode};
 use ioutgt_nvme::status;
 use rdma_mummy_sys::ibv_sge;
 use sideway::ibverbs::AccessFlags;
-use sideway::ibverbs::completion::{CompletionChannel, GenericCompletionQueue, WorkCompletionStatus};
+use sideway::ibverbs::completion::{
+    CompletionChannel, GenericCompletionQueue, WorkCompletionStatus,
+};
 use sideway::ibverbs::device_context::DeviceContext;
 use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::protection_domain::ProtectionDomain;
@@ -46,13 +48,16 @@ use zerocopy::{FromBytes, IntoBytes};
 use rdma_mummy_sys::{ibv_qp_ex, ibv_qp_to_qp_ex, ibv_wr_send_inv, ibv_wr_set_sge};
 
 use crate::cm::{CmChannel, EventType, Identifier};
-use crate::oerr;
 use crate::cmproto::{CM_FMT_1_0, CmRej, CmRep, CmReq, reject_status};
+use crate::oerr;
 
 /// Bytes of an NVMe SQE.
 const SQE_LEN: usize = 64;
-/// Max in-capsule data we accept (the fabrics Connect carries 1024 B).
-const ICD_LEN: usize = 1024;
+/// Max in-capsule data we accept — one page, matching what IOCCSZ advertises
+/// (`ioutgt_core::RDMA_INLINE_DATA_SIZE`, nvmet-rdma's default): write
+/// payloads up to this arrive inside the command capsule (no RDMA READ). The
+/// fabrics Connect data (1024 B) rides the same allowance.
+const ICD_LEN: usize = ioutgt_core::RDMA_INLINE_DATA_SIZE as usize;
 /// RECV capsule buffer: SQE + max in-capsule data.
 const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
 /// Bytes of an NVMe CQE (the response capsule).
@@ -81,6 +86,20 @@ const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(1);
 /// else here is an in-capsule data+offset descriptor (inline).
 const SGL_TYPE_OFFSET: usize = 24 + 15;
 const KEYED_SGL_TYPE_HI: u8 = 0x4;
+/// SGL Data Block descriptor with offset addressing (type nibble 0x0, subtype
+/// 0x1): the payload is in the capsule at `addr` bytes past ICDOFF (we set
+/// ICDOFF = 0). This is what nvme-rdma hosts send for writes that fit the
+/// advertised in-capsule size.
+const INLINE_SGL_TYPE: u8 = 0x01;
+
+/// The in-capsule data descriptor: `addr` is the offset into the in-capsule
+/// region, `len` the payload length (SGL Data Block: addr 8B, len 4B).
+fn parse_inline_sgl(sqe: &Sqe) -> (u64, usize) {
+    let b = sqe.as_bytes();
+    let off = u64::from_le_bytes(b[24..32].try_into().expect("8 bytes"));
+    let len = u32::from_le_bytes(b[32..36].try_into().expect("4 bytes"));
+    (off, len as usize)
+}
 /// SGL descriptor sub-type (type byte low nibble) `0xf` = `NVME_SGL_FMT_INVALIDATE`:
 /// the host fast-registered an MR for this transfer and wants the target to invalidate
 /// its rkey remotely in the response (`nvme_rdma_map_sg_fr`). Honoring it via
@@ -318,10 +337,33 @@ impl ProbeShared {
 /// WRs per read-batch doorbell, WRs per response-batch doorbell, and CQEs per
 /// non-empty poll.
 const HIST_KEYS: [[&str; 6]; 4] = [
-    ["read_db_b1", "read_db_b2", "read_db_b4", "read_db_b8", "read_db_b16", "read_db_b32"],
-    ["resp_db_b1", "resp_db_b2", "resp_db_b4", "resp_db_b8", "resp_db_b16", "resp_db_b32"],
-    ["recv_db_b1", "recv_db_b2", "recv_db_b4", "recv_db_b8", "recv_db_b16", "recv_db_b32"],
-    ["poll_b1", "poll_b2", "poll_b4", "poll_b8", "poll_b16", "poll_b32"],
+    [
+        "read_db_b1",
+        "read_db_b2",
+        "read_db_b4",
+        "read_db_b8",
+        "read_db_b16",
+        "read_db_b32",
+    ],
+    [
+        "resp_db_b1",
+        "resp_db_b2",
+        "resp_db_b4",
+        "resp_db_b8",
+        "resp_db_b16",
+        "resp_db_b32",
+    ],
+    [
+        "recv_db_b1",
+        "recv_db_b2",
+        "recv_db_b4",
+        "recv_db_b8",
+        "recv_db_b16",
+        "recv_db_b32",
+    ],
+    [
+        "poll_b1", "poll_b2", "poll_b4", "poll_b8", "poll_b16", "poll_b32",
+    ],
 ];
 
 #[derive(Debug, Default)]
@@ -370,7 +412,10 @@ impl RdmaWrStats {
     fn classes(&self) -> [([&'static str; 3], &WrClass); 4] {
         [
             (["read_posted", "read_done", "read_inflight"], &self.read),
-            (["write_posted", "write_done", "write_inflight"], &self.write),
+            (
+                ["write_posted", "write_done", "write_inflight"],
+                &self.write,
+            ),
             (["send_posted", "send_done", "send_inflight"], &self.send),
             (["recv_posted", "recv_done", "recv_inflight"], &self.recv),
         ]
@@ -390,9 +435,10 @@ impl TransportStats for RdmaWrStats {
         }
         out.push(("poll_batches", self.poll_batches.get()));
         out.push(("sq_doorbells", self.sq_doorbells.get()));
-        for (keys, hist) in HIST_KEYS
-            .iter()
-            .zip([&self.read_db, &self.resp_db, &self.recv_db, &self.poll])
+        for (keys, hist) in
+            HIST_KEYS
+                .iter()
+                .zip([&self.read_db, &self.resp_db, &self.recv_db, &self.poll])
         {
             for (key, cell) in keys.iter().zip(&hist.0) {
                 out.push((key, cell.get()));
@@ -469,7 +515,7 @@ pub struct RdmaQueue {
     /// Park it and drain oldest-first as tags free (nvmet parks the same way on
     /// `rsp_wr_wait_list`); the old treat-as-fatal behavior tore down healthy
     /// queues under full-depth 64k bursts. Preallocated to the queue depth.
-    parked: std::collections::VecDeque<Sqe>,
+    parked: std::collections::VecDeque<(Sqe, Option<u32>)>,
     /// Write commands (tag claimed) whose pool lease could not be satisfied.
     /// The RDMA READ of the host data must land in the registered pool arena,
     /// so `lease_or_owned`'s private-heap fallback is unusable here; failing
@@ -478,7 +524,7 @@ pub struct RdmaQueue {
     /// the pool is deliberately smaller than depth x MDTS. Defer instead
     /// (SPDK's pending_buf_queue shape) and retry front-only as completions
     /// release leases. Bounded by the slot count (each entry holds a tag).
-    pool_wait: std::collections::VecDeque<(u16, Sqe)>,
+    pool_wait: std::collections::VecDeque<(u16, Sqe, Option<u32>)>,
     /// Backstop ticks since start; rate-gates the keep-alive watchdog.
     watchdog_tick: u32,
 }
@@ -520,7 +566,8 @@ impl RdmaQueue {
         let (ptr, len) = nvme.slots.pool().arena();
         // SAFETY: the pool arena is owned by `nvme` (kept in this struct) and
         // outlives the MR; LocalWrite lets read handlers fill it.
-        let pool_mr = unsafe { pd.reg_mr(ptr as usize, len, AccessFlags::LocalWrite) }.map_err(oerr)?;
+        let pool_mr =
+            unsafe { pd.reg_mr(ptr as usize, len, AccessFlags::LocalWrite) }.map_err(oerr)?;
         let pool_lkey = pool_mr.lkey();
         // Also register the arena as an io_uring fixed buffer (TCP parity), so
         // disk IO from pooled slots uses READV_FIXED/WRITEV_FIXED — the kernel
@@ -536,19 +583,34 @@ impl RdmaQueue {
         let mut recv_buf = vec![0u8; sqsize as usize * CAPSULE_LEN];
         // SAFETY: recv_buf outlives recv_mr (both held in this struct); the NIC
         // writes received capsules into it.
-        let recv_mr =
-            unsafe { pd.reg_mr(recv_buf.as_mut_ptr() as usize, recv_buf.len(), AccessFlags::LocalWrite) }
-                .map_err(oerr)?;
+        let recv_mr = unsafe {
+            pd.reg_mr(
+                recv_buf.as_mut_ptr() as usize,
+                recv_buf.len(),
+                AccessFlags::LocalWrite,
+            )
+        }
+        .map_err(oerr)?;
         let mut resp_buf = vec![0u8; sqsize as usize * CQE_LEN];
         // SAFETY: resp_buf outlives resp_mr; a SEND source is locally read.
-        let resp_mr =
-            unsafe { pd.reg_mr(resp_buf.as_mut_ptr() as usize, resp_buf.len(), AccessFlags::none()) }
-                .map_err(oerr)?;
+        let resp_mr = unsafe {
+            pd.reg_mr(
+                resp_buf.as_mut_ptr() as usize,
+                resp_buf.len(),
+                AccessFlags::none(),
+            )
+        }
+        .map_err(oerr)?;
         let mut cdata_buf = vec![0u8; ICD_LEN];
         // SAFETY: cdata_buf outlives cdata_mr; the NIC writes the RDMA-READ data.
-        let cdata_mr =
-            unsafe { pd.reg_mr(cdata_buf.as_mut_ptr() as usize, cdata_buf.len(), AccessFlags::LocalWrite) }
-                .map_err(oerr)?;
+        let cdata_mr = unsafe {
+            pd.reg_mr(
+                cdata_buf.as_mut_ptr() as usize,
+                cdata_buf.len(),
+                AccessFlags::LocalWrite,
+            )
+        }
+        .map_err(oerr)?;
 
         let wr = Rc::new(RdmaWrStats::default());
         // Report the RDMA WR counters under "wr" in GET_STATS; snapshotted on
@@ -602,7 +664,6 @@ impl RdmaQueue {
         Ok(())
     }
 
-
     /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
     /// (the fabrics Connect data, which on the admin queue is host-resident, not
     /// in-capsule). Completes with a `WR_READ` work completion.
@@ -655,7 +716,12 @@ impl RdmaQueue {
             lkey: 0,
         }; MAX_SEGS];
         for pr in read_batch.iter().copied() {
-            let n = fill_sges(&nvme.slots.slot(pr.tag).data(), pr.len as usize, pool_lkey, &mut sges);
+            let n = fill_sges(
+                &nvme.slots.slot(pr.tag).data(),
+                pr.len as usize,
+                pool_lkey,
+                &mut sges,
+            );
             let h = g
                 .construct_wr(wr(WR_READ, u32::from(pr.tag)), WorkRequestFlags::Signaled)
                 .setup_read(pr.rkey, pr.addr);
@@ -671,7 +737,9 @@ impl RdmaQueue {
         g.post().map_err(oerr)?;
         stats.read.post_n(reads);
         stats.doorbell();
-        stats.read_db.record(usize::try_from(reads).unwrap_or(usize::MAX));
+        stats
+            .read_db
+            .record(usize::try_from(reads).unwrap_or(usize::MAX));
         read_batch.clear();
         Ok(())
     }
@@ -685,7 +753,10 @@ impl RdmaQueue {
         out.append(&mut self.probe.staged.borrow_mut());
         if let Ok(poller) = self.cq.start_poll() {
             for wc in poller {
-                out.push((wc.wr_id(), wc.status() == WorkCompletionStatus::Success as u32));
+                out.push((
+                    wc.wr_id(),
+                    wc.status() == WorkCompletionStatus::Success as u32,
+                ));
             }
         }
     }
@@ -738,8 +809,16 @@ impl RdmaQueue {
         // pending queues — a big front request is not starved by smaller
         // later ones). Before the parked drain so freed pages go to commands
         // that already hold tags.
-        while let Some(&(tag, sqe)) = self.pool_wait.front() {
-            if !self.try_stage_write(tag, sqe, staged_len(&sqe)) {
+        while let Some(&(tag, sqe, inline_idx)) = self.pool_wait.front() {
+            let staged = match inline_idx {
+                Some(idx) => {
+                    let (off, len) = parse_inline_sgl(&sqe);
+                    // Bounds were validated before parking.
+                    self.try_stage_inline(tag, sqe, idx, off as usize, len)?
+                }
+                None => self.try_stage_write(tag, sqe, staged_len(&sqe)),
+            };
+            if !staged {
                 break;
             }
             self.pool_wait.pop_front();
@@ -751,8 +830,8 @@ impl RdmaQueue {
             let Some(tag) = self.nvme.claim_tag() else {
                 break;
             };
-            let sqe = self.parked.pop_front().expect("parked is non-empty");
-            self.route_cmd(ctx, tag, sqe)?;
+            let (sqe, inline_idx) = self.parked.pop_front().expect("parked is non-empty");
+            self.route_cmd(ctx, tag, sqe, inline_idx)?;
         }
         // Flush the write-command host-data READs `handle_recv` collected from
         // this poll's RECV batch — all on one doorbell.
@@ -782,8 +861,8 @@ impl RdmaQueue {
                 if kato == 0 {
                     return false;
                 }
-                let silent = u64::try_from(admin.last_heard.get().elapsed().as_millis())
-                    .unwrap_or(u64::MAX);
+                let silent =
+                    u64::try_from(admin.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
                 if silent > kato * 2 + 5_000 {
                     tracing::info!(
                         cntlid = admin.cntlid.get(),
@@ -877,7 +956,19 @@ impl RdmaQueue {
         // batches but couples each requeue to its own request's response and
         // flushes recvs before sends — if batching is ever retried, start
         // from that shape plus explicit ring slack, and A/B with recv/db.
-        self.post_recv(idx)?;
+        //
+        // Exception: a write whose payload is IN the capsule (non-keyed SGL)
+        // must hold its buffer until the payload is copied into the pool
+        // lease — `try_stage_inline` re-posts it then. Holding is safe for
+        // the ring: the command has no response yet, so the host cannot send
+        // a replacement capsule for its slot (nvmet holds its recv through
+        // processing for the same reason).
+        let inline_idx = (host_data_in(&ctx.role, sqe.opcode)
+            && sqe.as_bytes()[SGL_TYPE_OFFSET] >> 4 != KEYED_SGL_TYPE_HI)
+            .then_some(idx);
+        if inline_idx.is_none() {
+            self.post_recv(idx)?;
+        }
         let Some(tag) = self.nvme.claim_tag() else {
             // All tags held: park, don't kill (see the `parked` field). A host
             // can only overrun the parking lot by exceeding the negotiated
@@ -887,29 +978,49 @@ impl RdmaQueue {
                     "command overflow: host exceeded negotiated queue depth",
                 ));
             }
-            self.parked.push_back(sqe);
+            self.parked.push_back((sqe, inline_idx));
             return Ok(());
         };
-        self.route_cmd(ctx, tag, sqe)
+        self.route_cmd(ctx, tag, sqe, inline_idx)
     }
 
     /// Route a claimed command: submit it to its slot task, or (host-data-in)
     /// lease a pool buffer and post the host-data RDMA READ first. Split from
     /// [`Self::handle_recv`] so parked commands re-enter here when a tag frees.
-    fn route_cmd(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>, tag: u16, sqe: Sqe) -> io::Result<()> {
+    fn route_cmd(
+        &mut self,
+        ctx: &Rc<ConnCtx<AnyBackend>>,
+        tag: u16,
+        sqe: Sqe,
+        inline_idx: Option<u32>,
+    ) -> io::Result<()> {
         if !host_data_in(&ctx.role, sqe.opcode) {
             self.nvme.submit(tag, sqe);
             return Ok(());
         }
 
-        // RDMA v1 advertises no in-capsule data (ioccsz=4), so a conformant host
-        // always sends a keyed SGL here. Reject anything else cleanly rather than
-        // misparse an in-capsule descriptor into a bogus rkey (which would fail
-        // the RDMA READ and tear the queue down).
-        if sqe.as_bytes()[SGL_TYPE_OFFSET] >> 4 != KEYED_SGL_TYPE_HI {
-            self.fail_recv(ctx, tag, &sqe, status::SGL_INVALID_TYPE | status::DNR);
+        if let Some(idx) = inline_idx {
+            // In-capsule write data (IOCCSZ advertises one page): the payload
+            // is in the capsule buffer at `idx`, which handle_recv left
+            // un-reposted for us. Anything other than a data-block/offset
+            // descriptor within the in-capsule bounds is rejected (mirrors
+            // nvmet_rdma_map_sgl_inline); the reject paths re-post the recv
+            // since the payload is not used.
+            let (off, len) = parse_inline_sgl(&sqe);
+            if sqe.as_bytes()[SGL_TYPE_OFFSET] != INLINE_SGL_TYPE {
+                self.fail_recv(ctx, tag, &sqe, status::SGL_INVALID_TYPE | status::DNR);
+                return self.post_recv(idx);
+            }
+            if len == 0 || off.saturating_add(len as u64) > ICD_LEN as u64 {
+                self.fail_recv(ctx, tag, &sqe, status::DATA_SGL_LEN_INVALID | status::DNR);
+                return self.post_recv(idx);
+            }
+            if !self.try_stage_inline(tag, sqe, idx, off as usize, len)? {
+                self.pool_wait.push_back((tag, sqe, Some(idx)));
+            }
             return Ok(());
         }
+
         let len = staged_len(&sqe);
         if len == 0 {
             self.fail_recv(ctx, tag, &sqe, status::DATA_SGL_LEN_INVALID | status::DNR);
@@ -920,9 +1031,50 @@ impl RdmaQueue {
             // arena (it is the RDMA READ's local target), so defer — do NOT
             // fail. Retried by the reap loop as completions release leases
             // (see `pool_wait`).
-            self.pool_wait.push_back((tag, sqe));
+            self.pool_wait.push_back((tag, sqe, None));
         }
         Ok(())
+    }
+
+    /// Stage an in-capsule write: lease the pool buffer, copy the payload out
+    /// of the capsule, submit the slot (the data is already here — no RDMA
+    /// READ), and re-post the capsule RECV its caller held back. `false` when
+    /// the pool cannot satisfy the lease right now — the caller parks the
+    /// command on `pool_wait` (capsule still held) and the reap loop retries.
+    fn try_stage_inline(
+        &mut self,
+        tag: u16,
+        sqe: Sqe,
+        idx: u32,
+        off: usize,
+        len: usize,
+    ) -> io::Result<bool> {
+        if !self.nvme.slots.try_lease(tag, len) {
+            return Ok(false);
+        }
+        let slot = self.nvme.slots.slot(tag);
+        slot.set_data_len(len as u32);
+        // Copy the payload from the capsule into the lease's segments. ~100 ns
+        // for a 4k page — three orders cheaper than the RDMA READ round trip
+        // it replaces.
+        let src = &self.recv_slice(idx)[SQE_LEN + off..SQE_LEN + off + len];
+        let mut copied = 0usize;
+        for seg in slot.data().segs() {
+            if copied == len {
+                break;
+            }
+            let take = (len - copied).min(seg.len);
+            // SAFETY: `seg` is a live pool-lease segment owned by this slot
+            // (leased just above, released only after the response completes);
+            // `src` is the registered capsule buffer, disjoint from the pool.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr().add(copied), seg.ptr, take);
+            }
+            copied += take;
+        }
+        self.nvme.submit(tag, sqe);
+        self.post_recv(idx)?;
+        Ok(true)
     }
 
     /// Stage a validated write command: lease its pool buffer, stash the SQE,
@@ -1061,7 +1213,9 @@ impl RdmaQueue {
         stats.write.post_n(writes);
         stats.send.post_n(sends);
         stats.doorbell();
-        stats.resp_db.record(usize::try_from(writes + sends).unwrap_or(usize::MAX));
+        stats
+            .resp_db
+            .record(usize::try_from(writes + sends).unwrap_or(usize::MAX));
         Ok(())
     }
 
@@ -1091,7 +1245,7 @@ impl RdmaQueue {
                 None
             } else {
                 Some(
-                    ConnectData::read_from_bytes(&s[SQE_LEN..SQE_LEN + ICD_LEN])
+                    ConnectData::read_from_bytes(&s[SQE_LEN..SQE_LEN + size_of::<ConnectData>()])
                         .map_err(|_| io::Error::other("short connect data"))?,
                 )
             };
@@ -1108,7 +1262,7 @@ impl RdmaQueue {
             self.post_read_cdata(&sgl, len)?;
             self.await_bootstrap(WR_READ).await?;
             Box::new(
-                ConnectData::read_from_bytes(&self.cdata_buf[..ICD_LEN])
+                ConnectData::read_from_bytes(&self.cdata_buf[..size_of::<ConnectData>()])
                     .map_err(|_| io::Error::other("short connect data"))?,
             )
         };
@@ -1509,7 +1663,9 @@ pub async fn run_conn(
     let sqsize = u16::try_from((u32::from(conn.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
     let (pd, channel, cq, qp) = build_conn_resources(&dev, sqsize, conn.qid)?;
     conn.id.get_qp_attr(QueuePairState::Init)?.apply(&qp)?;
-    conn.id.get_qp_attr(QueuePairState::ReadyToReceive)?.apply(&qp)?;
+    conn.id
+        .get_qp_attr(QueuePairState::ReadyToReceive)?
+        .apply(&qp)?;
     // librdmacm has already computed this QP's `max_rd_atomic` (the max
     // write-data RDMA READs we can have outstanding) into the RTS attr as
     // min(the request's initiator_depth, device `max_qp_init_rd_atom`). Capture
@@ -1528,7 +1684,11 @@ pub async fn run_conn(
     // mitigation, not a final design choice.
     if conn.qid != 0 {
         rts_attr.setup_timeout(20);
-        tracing::debug!(qid = conn.qid, ack_timeout = 20, "widened IO-queue RC ACK timeout");
+        tracing::debug!(
+            qid = conn.qid,
+            ack_timeout = 20,
+            "widened IO-queue RC ACK timeout"
+        );
     }
     rts_attr.apply(&qp)?;
 
@@ -1563,7 +1723,9 @@ pub async fn run_conn(
     conn.id.accept(qp_num, &rep, 0, initiator_depth)?;
 
     let peer = format!("rdma:qid{}", conn.qid);
-    queue.run(conn.port, conn.registry, peer, conn.stop, on_ctx).await
+    queue
+        .run(conn.port, conn.registry, peer, conn.stop, on_ctx)
+        .await
 }
 
 /// A freshly accepted connection request, pre-QP-build: the cm_id plus the
@@ -1652,9 +1814,7 @@ impl RdmaListener {
                     // parity). Adopt even when rejecting: ownership of the
                     // child cm_id is ours either way; dropping it destroys it.
                     let sts = match CmReq::parse(&event.private_data()) {
-                        Ok(req) if req.recfmt != CM_FMT_1_0 => {
-                            Err(reject_status::INVALID_RECFMT)
-                        }
+                        Ok(req) if req.recfmt != CM_FMT_1_0 => Err(reject_status::INVALID_RECFMT),
                         Ok(req) => Ok(req),
                         Err(_) => Err(reject_status::INVALID_LEN),
                     };
@@ -1715,4 +1875,3 @@ impl RdmaListener {
         }
     }
 }
-

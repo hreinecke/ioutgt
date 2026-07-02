@@ -298,9 +298,15 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                     val(u(wr, "recv_done"), u(&wr0, "recv_done")),
                     u(wr, "recv_inflight"),
                     val(u(wr, "poll_batches"), u(&wr0, "poll_batches")),
-                    per(done_amt, amt(u(wr, "poll_batches"), u(&wr0, "poll_batches"))),
+                    per(
+                        done_amt,
+                        amt(u(wr, "poll_batches"), u(&wr0, "poll_batches"))
+                    ),
                     val(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells")),
-                    per(sq_posted_amt, amt(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells"))),
+                    per(
+                        sq_posted_amt,
+                        amt(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells"))
+                    ),
                 );
                 // Batch-size distributions (present once the transport exports
                 // them): how many WRs shared each doorbell and how many CQEs
@@ -518,7 +524,6 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {

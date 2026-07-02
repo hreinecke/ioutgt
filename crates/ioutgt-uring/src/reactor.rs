@@ -87,7 +87,8 @@ struct StatCells {
     recv_sqes: Cell<u64>,
     read_sqes: Cell<u64>,
     write_sqes: Cell<u64>,
-    cqes: Cell<u64>,    /// Backend read+write SQEs per submission, log2-bucketed (see
+    cqes: Cell<u64>,
+    /// Backend read+write SQEs per submission, log2-bucketed (see
     /// [`ReactorStats::rw_submit_hist`]).
     rw_submit_hist: [Cell<u64>; 6],
     /// `read_sqes + write_sqes` at the previous submission — the delta at
