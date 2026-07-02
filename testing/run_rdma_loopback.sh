@@ -11,9 +11,12 @@ cd "$TOP"
 VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
 VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
 
-cargo test -p ioutgt-nvme-rdma --no-run
-BIN=$(ls -t target/debug/deps/ioutgt_nvme_rdma-* | grep -vE '\.d$' | head -1)
-[ -x "$BIN" ] || { echo "FAIL: no ioutgt-nvme-rdma test binary built"; exit 1; }
+# Take the LIB test harness path from cargo itself: the deps/ glob is ambiguous
+# (the package's clap bin also lands there as ioutgt_nvme_rdma-<hash>, and
+# picking it by mtime hands the guest a binary that rejects --test-threads).
+BIN=$(cargo test -p ioutgt-nvme-rdma --no-run --message-format=json \
+    | jq -r 'select(.executable != null and .target.kind == ["lib"]) | .executable' | tail -1)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "FAIL: no ioutgt-nvme-rdma test binary built"; exit 1; }
 
 # Publish the guest entrypoint into the vmtest tests dir (vmtest runs tests/NAME.sh).
 cp "$TOP/testing/vmtest/ioutgt_rdma_loopback.sh" "$(dirname "$VMTEST")/tests/ioutgt_rdma_loopback.sh"
