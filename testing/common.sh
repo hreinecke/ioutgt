@@ -633,6 +633,61 @@ iothread_cpu() {
 # CPU with smp_call_function IPIs (net_rps_send_ipi) -- a Function-call-interrupt
 # storm for no throughput gain -- and its knobs persist across runs, so the sync
 # clears them every time. irqbalance would fight the pinning, so stop it.
+# The RDMA sibling of tune_target_nic: converge the mlx5 completion-vector
+# IRQs with the pinned io-threads. RoCE traffic never touches the netdev RX
+# queues, so the TCP tuner's ntuple/XPS/RPS/channel steps are no-ops here;
+# what decides locality is the CQ's completion vector — ioutgt-nvme-rdma
+# creates each queue's CQ on vector = qid, whose EQ fires the IRQ labeled
+# "mlx5_comp<qid>@pci:<bdf>" (nic_queue_irqs' mlx5 fallback). Per connected IO
+# queue: push the io-thread's CPU group onto that IRQ, then place the
+# io-thread on the IRQ CPU's HT sibling (same policy/helpers as the TCP tuner).
+tune_target_rdma() {
+    [ -n "${TUNE_NIC:-}" ] || { echo "   (TUNE_NIC unset; skipping IRQ affinity sync)"; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
+    local json rows
+    json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"
+    rows="$(printf '%s' "$json" \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.tid) \(.cpus) \(.group_cpus)"' \
+            2>/dev/null | sort -n -u || true)"
+    if [ -z "$rows" ]; then
+        echo "   (no connected IO queues; run 'connect' first)"; return 0
+    fi
+    systemctl stop irqbalance 2>/dev/null || true
+    echo ">> converging $TUNE_NIC comp-vector IRQ affinity <-> ioutgt io-threads"
+    local qid tid cpus group irqs irq combo eff pushed irqcpu iocpu
+    while read -r qid tid cpus group; do
+        [ -n "$qid" ] || continue
+        # CQ completion vector = qid (crate build_conn_resources).
+        irqs="$(nic_queue_irqs "$TUNE_NIC" "$qid")"
+        if [ -z "$irqs" ]; then
+            echo "   vec$qid (qid $qid): no mlx5_comp IRQ found; skipped"; continue
+        fi
+        combo=""; pushed=""
+        for irq in $irqs; do
+            # 1. push the io-thread's whole CPU group onto the IRQ (valid
+            #    cpulist only -- "*"/"?" means unpinned/unknown).
+            case "$group" in
+                ''|'*'|'?'|*[!0-9,-]*) ;;
+                *) if echo "$group" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null; then
+                       pushed="${pushed:+$pushed,}$irq"
+                   fi ;;
+            esac
+            eff="$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || true)"
+            [ -n "$eff" ] && combo="${combo:+$combo,}$eff"
+        done
+        # 2. place the io-thread on the IRQ CPU's HT sibling.
+        irqcpu="${combo%%[,-]*}"
+        iocpu="$(iothread_cpu "$group" "$irqcpu")"
+        if [ -n "$iocpu" ] && taskset -cp "$iocpu" "$tid" >/dev/null 2>&1; then
+            echo "   vec$qid irq[$(echo $irqs | tr '\n' ' ')] eff=$combo group=$group -> io-thread tid $tid cpu $iocpu (off irq cpu $irqcpu) (was cpu $cpus)"
+        else
+            echo "   vec$qid irq[$(echo $irqs | tr '\n' ' ')] group=$group pushed=[${pushed:-none}]; taskset tid $tid to '${iocpu:-?}' (irq cpu $irqcpu) failed"
+        fi
+    done <<EOF
+$rows
+EOF
+}
+
 tune_target_nic() {
     [ -n "${TUNE_NIC:-}" ] || { echo "   (TUNE_NIC unset; skipping IRQ affinity sync)"; return 0; }
     command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }

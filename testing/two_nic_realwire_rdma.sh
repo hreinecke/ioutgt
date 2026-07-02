@@ -100,6 +100,14 @@ ini_exec() { ip netns exec "$NS_I" "$@"; }
 NVMET_BACKEND="${NVMET_BACKEND:-}"
 IOUTGT_BACKEND="${IOUTGT_BACKEND:-}"
 
+# Whether to touch IRQ affinity after connect. NIC_TUNE=0 skips the
+# comp-vector IRQ <-> io-thread convergence (same knob as the TCP driver;
+# there is no channel/ntuple/XPS tuning here — RoCE bypasses those).
+NIC_TUNE="${NIC_TUNE:-1}"
+# shellcheck disable=SC2034  # consumed by common.sh's tune_target_rdma
+TUNE_NIC="${NIC_T:-}"
+[ "$NIC_TUNE" = 1 ] || TUNE_NIC=""
+
 # ioutgt target-process knobs.
 IOUTGT_SOCK="${IOUTGT_SOCK:-/tmp/ioutgt-realwire-rdma.sock}"
 IOUTGT_PIDFILE="${IOUTGT_PIDFILE:-/tmp/ioutgt-realwire-rdma.pid}"
@@ -142,6 +150,7 @@ Required env: NIC_T, NIC_I (two SEPARATE RoCE cards cabled back-to-back) and the
 started target's backend (IOUTGT_BACKEND / NVMET_BACKEND, a file or bdev).
 Knobs: BACKEND_GB=$BACKEND_GB NR_QUEUES=$NR_QUEUES QUEUE_SIZE=$QUEUE_SIZE
   IP_T=$IP_T IP_I=$IP_I PREFIX=$PREFIX MTU=$MTU  FIO_RW/BS/QD/JOBS/SECS
+  NIC_TUNE=$NIC_TUNE (0 = skip the post-connect comp-vector IRQ affinity sync)
 
 Example:
   export NIC_T=mlx5p1 NIC_I=mlx5p2 IOUTGT_BACKEND=/dev/nvme0n1 NVMET_BACKEND=/dev/nvme1n1
@@ -453,7 +462,10 @@ case "${1:-}" in
     start)               run_for_targets start_one      "${2:-}" ;;
     stop)                run_for_targets stop_one       "${2:-}" ;;
     discover)            run_for_targets discover_one   "${2:-}" ;;
-    connect)             run_for_targets connect_one    "${2:-}" ;;
+    connect)             run_for_targets connect_one    "${2:-}"
+                         # IRQ affinity sync needs the IO queues connected
+                         # (their pthread tids appear in `list`).
+                         case "${2:-}" in ioutgt|"") tune_target_rdma ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
     fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
