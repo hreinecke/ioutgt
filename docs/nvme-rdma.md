@@ -210,12 +210,27 @@ straight from the slot, which over RDMA must be RDMA-READ from the host's keyed
 SGL *before* dispatch. `handle_recv` detects a host-data-in command
 (`host_data_in()`: IO `WRITE`/`DSM`), claims the tag, leases a pool buffer, sets
 the slot's received length (`set_data_len`), stashes the SQE in `pending_read`,
-and posts an RDMA READ (`WR_READ`) of the host's keyed-SGL buffer into the slot's
-pool-registered segments — **without submitting the slot**. Submission is
-**deferred** to the `WR_READ` completion (`submit_pending`), which wakes the
-slot task to dispatch against the now-filled slot. The READ is a request WR, not
-a response, so it is not counted in `inflight[]` — only the trailing CQE SEND
-gates slot release. Malformed commands — a non-keyed (in-capsule) SGL or a
+and moves the host data one of two ways, mirroring nvmet:
+
+- **In-capsule (writes ≤ one page)**: IOCCSZ advertises `RDMA_INLINE_DATA_SIZE`
+  (4 KiB) of in-capsule data plus the SGLS address-as-offset bit (SAOS — the
+  host's `use_inline_data` is gated on that bit, not on IOCCSZ), so nvme-rdma
+  hosts embed small write payloads in the command capsule itself. The payload
+  is copied from the capsule into the pool lease (~100 ns) and the slot is
+  submitted immediately — no RDMA READ, no wire round trip, no extra CQE. The
+  capsule's RECV re-post is deferred until that copy (the `pool_wait`/`parked`
+  queues carry the capsule index), which is ring-safe: the command has no
+  response yet, so the host cannot send a replacement capsule for its slot.
+  This closed the last single-flow 4k-randwrite deficit vs nvmet (proven by a
+  config-equalization control: nvmet with `inline_data_size=0` drops below us).
+- **Keyed SGL (larger writes)**: posts an RDMA READ (`WR_READ`) of the host's
+  buffer into the slot's pool-registered segments — **without submitting the
+  slot**. Submission is **deferred** to the `WR_READ` completion
+  (`submit_pending`), which wakes the slot task to dispatch against the
+  now-filled slot. The READ is a request WR, not a response, so it is not
+  counted in `inflight[]` — only the trailing CQE SEND gates slot release.
+
+Malformed commands — a bad in-capsule descriptor, an out-of-bounds offset, or a
 zero-length SGL — are failed without dispatch via `respond_receiving` + a queued
 error CQE (`SGL_INVALID_TYPE` / `DATA_SGL_LEN_INVALID`).
 
