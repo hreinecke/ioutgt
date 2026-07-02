@@ -148,6 +148,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   connect       [nvmet|ioutgt]  nvme connect; wait for the namespace device
   disconnect    [nvmet|ioutgt]  nvme disconnect
   fio           [nvmet|ioutgt]  fio on the connected device(s)
+  fio_verify    [nvmet|ioutgt]  data-integrity gate: mixed-size (4k-128k) writes
+                                + crc32c read-back verify (FIO_VERIFY_MB/job)
   iperf                         raw-TCP iperf3 over the wire (server@NIC_T, client@NIC_I);
                                 link-only baseline, run before 'fio_perf'
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k},
@@ -358,6 +360,7 @@ case "${1:-}" in
                          case "${2:-}" in ioutgt|"") tune_target_nic ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
+    fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
     iperf)               cmd_iperf ;;
     fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
     status)              cmd_status ;;

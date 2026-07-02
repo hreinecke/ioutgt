@@ -79,6 +79,15 @@ FIO_BS="${FIO_BS:-4k}"
 FIO_QD="${FIO_QD:-32}"
 FIO_JOBS="${FIO_JOBS:-4}"
 FIO_SECS="${FIO_SECS:-30}"
+# fio_verify knobs — deliberately separate from the perf knobs: the gate must
+# run at a pressure that reproduces buffer-pool exhaustion (8 jobs x qd64 of
+# mixed-size writes is what surfaced the RDMA write-path DNR failures; 1 job
+# at default qd sails through). Jobs are laid out contiguously, so the device
+# must hold FIO_VERIFY_JOBS x FIO_VERIFY_MB (the 2 GiB default backing file
+# fits the defaults exactly).
+FIO_VERIFY_MB="${FIO_VERIFY_MB:-256}"
+FIO_VERIFY_JOBS="${FIO_VERIFY_JOBS:-8}"
+FIO_VERIFY_QD="${FIO_VERIFY_QD:-64}"
 
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }; }
 
@@ -326,6 +335,30 @@ fio_one() {
     fio --name=nvmetcp --filename="$dev" --rw="$FIO_RW" --bs="$FIO_BS" \
         --iodepth="$FIO_QD" --numjobs="$FIO_JOBS" --ioengine=io_uring \
         --direct=1 --runtime="$FIO_SECS" --time_based --group_reporting
+}
+
+# Data-integrity gate: sequential writes of MIXED block sizes (4k..128k — up
+# to MDTS, which fio_perf never exercises and filesystem writeback does) with
+# crc32c read-back verification interleaved via verify_backlog, so writes and
+# verify-reads stress the target's buffer pool concurrently (the fs-workload
+# shape that surfaced write failures fio_perf missed). Each job gets a private
+# FIO_VERIFY_MB region (offset_increment), so verification is overlap-safe.
+# Any write error (e.g. a target failing commands under pool pressure) or
+# verify mismatch fails the run loudly (verify_fatal).
+fio_verify_one() {
+    local port nqn; read -r port nqn < <(target_params "${1:-}") || exit 1
+    local dev; dev=$(find_dev "$nqn") || { echo "no connected device for $1 ($nqn); run 'connect $1' first"; exit 1; }
+    echo ">> fio verify on $dev [$1]  (write bsrange=4k-128k qd=$FIO_VERIFY_QD jobs=$FIO_VERIFY_JOBS ${FIO_VERIFY_MB}MiB/job + crc32c read-back)"
+    if fio --name=verify --filename="$dev" --rw=write --bsrange=4k-128k \
+        --iodepth="$FIO_VERIFY_QD" --numjobs="$FIO_VERIFY_JOBS" --ioengine=io_uring \
+        --direct=1 --size="${FIO_VERIFY_MB}m" --offset_increment="${FIO_VERIFY_MB}m" \
+        --verify=crc32c --verify_fatal=1 --verify_backlog=64 \
+        --group_reporting; then
+        echo "   fio verify [$1]: PASS"
+    else
+        echo "   fio verify [$1]: FAIL (write error or data mismatch — see fio output / dmesg)"
+        return 1
+    fi
 }
 
 # fio terse v4 field indices (1-based, ';'-separated); see fio HOWTO and

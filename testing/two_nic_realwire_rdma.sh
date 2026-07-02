@@ -129,6 +129,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   connect       [nvmet|ioutgt]  nvme connect -t rdma; wait for the namespace
   disconnect    [nvmet|ioutgt]  nvme disconnect
   fio           [nvmet|ioutgt]  fio on the connected device(s)
+  fio_verify    [nvmet|ioutgt]  data-integrity gate: mixed-size (4k-128k) writes
+                                + crc32c read-back verify (FIO_VERIFY_MB/job)
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k}
   status                        netns, rdma links, addresses, connected devices
   help                          this message
@@ -363,6 +365,7 @@ case "${1:-}" in
     connect)             run_for_targets connect_one    "${2:-}" ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
+    fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
     fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
     status)              cmd_status ;;
     help|usage)          usage ;;
