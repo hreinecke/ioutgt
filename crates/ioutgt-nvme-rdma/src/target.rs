@@ -1178,10 +1178,15 @@ impl RdmaQueue {
                     },
                 },
                 Some(resp) = responses.next() => {
-                    // Collect this wake's response and any siblings queued in the
-                    // same wake, then post them all on one doorbell.
+                    // Collect this wake's response and any siblings, then post
+                    // them all on one doorbell. The first push wakes this task
+                    // before its sibling slot tasks (woken by the same
+                    // completion batch) have run, so yield once to let them
+                    // dispatch and push before collecting — without it ~95% of
+                    // response doorbells carry a single SEND (stat batch row).
                     resp_batch.clear();
                     resp_batch.push(resp);
+                    tokio::task::yield_now().await;
                     while let Some(rr) = responses.try_next() {
                         resp_batch.push(rr);
                     }
