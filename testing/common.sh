@@ -782,9 +782,14 @@ EOF
 # its $TUNE_NIC RX IRQ effective CPU, with the separation verdict (OK = io-thread
 # on a different logical CPU than its RX IRQ; SAME-CPU = the capping
 # co-location). Reads only globals (/proc/irq, /proc/interrupts, ioutgt ctl).
+# With TUNE_COMP_VECTOR=1 (the RDMA driver), a queue's IRQ index is its CQ
+# completion vector (= qid, the mlx5_comp<qid> IRQ); default (TCP) is the
+# netdev channel (= qid-1).
 tune_status() {
     [ -n "${TUNE_NIC:-}" ] || return 0
-    echo "== $TUNE_NIC queue IRQ vs ioutgt io-thread (live) affinity =="
+    local what="queue"
+    [ "${TUNE_COMP_VECTOR:-0}" = 1 ] && what="comp-vector"
+    echo "== $TUNE_NIC $what IRQ vs ioutgt io-thread (live) affinity =="
     # `is-active` exits non-zero (and still prints the state) when not running.
     echo "  irqbalance: $(systemctl is-active irqbalance 2>/dev/null || true)"
     local rows
@@ -797,7 +802,7 @@ tune_status() {
     local qid tid cpus group nicq irqs irq eff verdict mism=0 noirq=0 ircpu
     while read -r qid tid cpus group; do
         [ -n "$qid" ] || continue
-        nicq=$((qid - 1))
+        if [ "${TUNE_COMP_VECTOR:-0}" = 1 ]; then nicq=$qid; else nicq=$((qid - 1)); fi
         irqs="$(nic_queue_irqs "$TUNE_NIC" "$nicq")"
         eff=""
         for irq in $irqs; do

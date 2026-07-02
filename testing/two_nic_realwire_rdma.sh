@@ -107,6 +107,10 @@ NIC_TUNE="${NIC_TUNE:-1}"
 # shellcheck disable=SC2034  # consumed by common.sh's tune_target_rdma
 TUNE_NIC="${NIC_T:-}"
 [ "$NIC_TUNE" = 1 ] || TUNE_NIC=""
+# A queue's IRQ index is its CQ completion vector (= qid) here, not the
+# netdev channel — steers tune_status's lookup (common.sh).
+# shellcheck disable=SC2034
+TUNE_COMP_VECTOR=1
 
 # ioutgt target-process knobs.
 IOUTGT_SOCK="${IOUTGT_SOCK:-/tmp/ioutgt-realwire-rdma.sock}"
@@ -364,6 +368,7 @@ cmd_status() {
     echo "== connected devices =="
     echo "  ioutgt ($IOUTGT_NQN): $(find_dev "$IOUTGT_NQN" || echo none)"
     echo "  nvmet ($NVMET_NQN): $(find_dev "$NVMET_NQN" || echo none)"
+    tune_status
 }
 
 # The RoCEv2 GID index of `ip` on `dev`'s port 1, looked up through `runner`
