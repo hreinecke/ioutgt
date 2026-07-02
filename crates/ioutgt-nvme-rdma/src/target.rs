@@ -8,8 +8,10 @@
 //! (the [`Cqe`]) → release the slot and re-arm the RECV. Mirrors the
 //! `ioutgt-nvme-tcp` `run_queue`, swapping its PDU staging for verbs.
 //!
-//! Single-threaded (one reactor thread owns the QP/CQ/MR pool); not yet wired
-//! into the harness pool. Completions are reaped reactor-driven via [`crate::cq`].
+//! Each connection is single-threaded (its queue thread owns the QP/CQ/MR
+//! pool); the harness routes connections to queue threads by qid
+//! ([`crate::transport`]). Completions are reaped reactor-driven via
+//! [`crate::cq`].
 
 use std::cell::Cell;
 use std::io;
@@ -116,8 +118,8 @@ struct KeyedSgl {
 }
 
 /// Whether `opcode` on this queue carries host→controller data the target must
-/// pull (RDMA READ) before dispatch. v1 has no write-data path, so these are
-/// failed; admin commands in the connect/discovery path carry no host data.
+/// pull (RDMA READ) into a pool lease before dispatch. Admin commands in the
+/// connect/discovery path carry no host data.
 fn host_data_in(role: &Role<AnyBackend>, opcode: u8) -> bool {
     matches!(role, Role::Io(_)) && matches!(opcode, io_opcode::WRITE | io_opcode::DSM)
 }
@@ -1395,7 +1397,7 @@ pub async fn run_conn(
     // mitigation, not a final design choice.
     if conn.qid != 0 {
         rts_attr.setup_timeout(20);
-        tracing::warn!(qid = conn.qid, ack_timeout = 20, "widened IO-queue RC ACK timeout");
+        tracing::debug!(qid = conn.qid, ack_timeout = 20, "widened IO-queue RC ACK timeout");
     }
     rts_attr.apply(&qp)?;
 
@@ -1576,42 +1578,3 @@ impl RdmaListener {
     }
 }
 
-/// Listen for NVMe/RDMA connections on `listen` and drive each to a controller.
-///
-/// Focused-v1: a single reactor thread owns the listener and every queue. Each
-/// accepted connection ([`RdmaListener::accept`]) becomes an [`RdmaConn`] and is
-/// spawned on the same thread via [`run_conn`] (which builds the QP, accepts, and
-/// runs the queue). The CM channel multiplexes all cm_ids; data completions are
-/// reaped per queue via its completion channel. Teardown is best-effort — see
-/// `docs/nvme-rdma.md`. This is the seam the harness `Transport` will split:
-/// `bind`/`accept` on the listener, `run_conn` on a queue thread.
-pub async fn serve(
-    listen: SocketAddr,
-    port: Arc<PortConfig<AnyBackend>>,
-    registry: Arc<Registry>,
-) -> io::Result<()> {
-    let mut listener = RdmaListener::bind(listen).await?;
-    loop {
-        let raw = listener.accept().await?;
-        let conn = RdmaConn {
-            id: raw.id,
-            qid: raw.qid,
-            hsqsize: raw.hsqsize,
-            port: Arc::clone(&port),
-            registry: Arc::clone(&registry),
-            permit: None,
-            stop: raw.stop,
-        };
-        tokio::task::spawn_local(async move {
-            // A failure inside run_conn (QP build / accept / run) only logs — the
-            // host times out rather than getting a CM reject. Rare resource paths;
-            // the common reject (CmReq parse) happens in `RdmaListener::accept`,
-            // and the queue-thread model cannot reject post-handshake either.
-            // serve() has no stats/AER registry to hook; the harness passes a
-            // real on_ctx in run_queue.
-            if let Err(e) = run_conn(conn, |_| {}).await {
-                tracing::warn!("nvme-rdma queue ended: {e}");
-            }
-        });
-    }
-}
