@@ -278,6 +278,37 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                     val(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells")),
                     per(sq_posted_amt, amt(u(wr, "sq_doorbells"), u(&wr0, "sq_doorbells"))),
                 );
+                // Batch-size distributions (present once the transport exports
+                // them): how many WRs shared each doorbell and how many CQEs
+                // each non-empty poll reaped — the averages above can hide a
+                // bimodal mix (many 1-WR doorbells + a few huge ones).
+                if wr.get("poll_b1").is_some() {
+                    let hist = |prefix: &str| {
+                        const BUCKETS: [(&str, &str); 6] = [
+                            ("b1", "1"),
+                            ("b2", "2"),
+                            ("b4", "<=4"),
+                            ("b8", "<=8"),
+                            ("b16", "<=16"),
+                            ("b32", ">16"),
+                        ];
+                        BUCKETS
+                            .iter()
+                            .map(|(k, label)| {
+                                let key = format!("{prefix}_{k}");
+                                format!("{label}:{}", val(u(wr, &key), u(&wr0, &key)))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "    batch  read/db [{}]  resp/db [{}]  cqe/poll [{}]",
+                        hist("read_db"),
+                        hist("resp_db"),
+                        hist("poll"),
+                    );
+                }
             }
         }
         // Retired row. In rate mode, diffing `retired` alone would
@@ -621,6 +652,33 @@ mod tests {
         assert!(out.contains("poll 45"), "{out}");
         // 190 send-queue WRs (read 100 + send 90) over 190 doorbells = 1.0 wr/db.
         assert!(out.contains("db 190 (1.0 wr/db)"), "{out}");
+        // No batch histogram keys -> no batch row.
+        assert!(!out.contains("batch  read/db"), "{out}");
+    }
+
+    #[test]
+    fn render_stat_shows_batch_histograms() {
+        let mut data = stat_sample();
+        data["threads"][0]["queues"][0]["wr"] = serde_json::json!({
+            "read_posted": 100u64, "read_done": 90u64, "read_inflight": 10u64,
+            "write_posted": 0u64, "write_done": 0u64, "write_inflight": 0u64,
+            "send_posted": 90u64, "send_done": 90u64, "send_inflight": 0u64,
+            "recv_posted": 128u64, "recv_done": 90u64, "recv_inflight": 38u64,
+            "poll_batches": 45u64, "sq_doorbells": 190u64,
+            "read_db_b1": 60u64, "read_db_b2": 20u64, "read_db_b4": 0u64,
+            "read_db_b8": 0u64, "read_db_b16": 0u64, "read_db_b32": 0u64,
+            "resp_db_b1": 50u64, "resp_db_b2": 10u64, "resp_db_b4": 5u64,
+            "resp_db_b8": 0u64, "resp_db_b16": 0u64, "resp_db_b32": 0u64,
+            "poll_b1": 10u64, "poll_b2": 15u64, "poll_b4": 12u64,
+            "poll_b8": 8u64, "poll_b16": 0u64, "poll_b32": 0u64,
+        });
+        let out = super::render_stat(&data, None);
+        assert!(
+            out.contains("batch  read/db [1:60 2:20 <=4:0 <=8:0 <=16:0 >16:0]"),
+            "{out}"
+        );
+        assert!(out.contains("resp/db [1:50 2:10 <=4:5"), "{out}");
+        assert!(out.contains("cqe/poll [1:10 2:15 <=4:12 <=8:8"), "{out}");
     }
 
     #[test]

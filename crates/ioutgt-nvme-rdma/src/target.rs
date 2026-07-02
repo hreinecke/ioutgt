@@ -260,6 +260,38 @@ impl WrClass {
     }
 }
 
+/// Log2-bucketed batch-size histogram — buckets for 1, 2, 3-4, 5-8, 9-16 and
+/// 17+ items — cheap enough for the hot path (one branch + one Cell bump).
+/// Exposed through GET_STATS so `stat` can show the *distribution* of
+/// submission and completion batch sizes, not just their averages.
+#[derive(Debug, Default)]
+struct BatchHist([Cell<u64>; 6]);
+
+impl BatchHist {
+    #[inline]
+    fn record(&self, n: usize) {
+        let idx = match n {
+            0 => return,
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            _ => 5,
+        };
+        self.0[idx].set(self.0[idx].get() + 1);
+    }
+}
+
+/// GET_STATS key names for the three batch histograms (wire-format stable):
+/// WRs per read-batch doorbell, WRs per response-batch doorbell, and CQEs per
+/// non-empty poll.
+const HIST_KEYS: [[&str; 6]; 3] = [
+    ["read_db_b1", "read_db_b2", "read_db_b4", "read_db_b8", "read_db_b16", "read_db_b32"],
+    ["resp_db_b1", "resp_db_b2", "resp_db_b4", "resp_db_b8", "resp_db_b16", "resp_db_b32"],
+    ["poll_b1", "poll_b2", "poll_b4", "poll_b8", "poll_b16", "poll_b32"],
+];
+
 #[derive(Debug, Default)]
 struct RdmaWrStats {
     /// Host write-data pulls (RDMA READ), read-data pushes (RDMA WRITE),
@@ -275,6 +307,13 @@ struct RdmaWrStats {
     /// `(read+write+send)_posted / sq_doorbells` is the submission batch size —
     /// 1.0 with one WR per post, higher once WRs are chained per doorbell.
     sq_doorbells: Cell<u64>,
+    /// WRs chained per read-batch doorbell (`post_reads_batch`).
+    read_db: BatchHist,
+    /// WRs chained per response-batch doorbell (`post_responses_batch`;
+    /// a response is 1 SEND, or WRITE+SEND when it carries read data).
+    resp_db: BatchHist,
+    /// CQEs reaped per non-empty CQ poll.
+    poll: BatchHist,
 }
 
 impl RdmaWrStats {
@@ -315,6 +354,14 @@ impl TransportStats for RdmaWrStats {
         }
         out.push(("poll_batches", self.poll_batches.get()));
         out.push(("sq_doorbells", self.sq_doorbells.get()));
+        for (keys, hist) in HIST_KEYS
+            .iter()
+            .zip([&self.read_db, &self.resp_db, &self.poll])
+        {
+            for (key, cell) in keys.iter().zip(&hist.0) {
+                out.push((key, cell.get()));
+            }
+        }
         out
     }
 
@@ -325,6 +372,11 @@ impl TransportStats for RdmaWrStats {
         }
         self.poll_batches.set(0);
         self.sq_doorbells.set(0);
+        for hist in [&self.read_db, &self.resp_db, &self.poll] {
+            for cell in &hist.0 {
+                cell.set(0);
+            }
+        }
     }
 }
 
@@ -578,6 +630,7 @@ impl RdmaQueue {
         g.post().map_err(oerr)?;
         stats.read.post_n(reads);
         stats.doorbell();
+        stats.read_db.record(usize::try_from(reads).unwrap_or(usize::MAX));
         read_batch.clear();
         Ok(())
     }
@@ -605,6 +658,7 @@ impl RdmaQueue {
         self.drain_into(comps);
         if !comps.is_empty() {
             self.wr.poll_batches.set(self.wr.poll_batches.get() + 1);
+            self.wr.poll.record(comps.len());
         }
         // `comps` is a local buffer (disjoint from `self`), so iterating it while
         // calling `&mut self` handlers is sound.
@@ -952,6 +1006,7 @@ impl RdmaQueue {
         stats.write.post_n(writes);
         stats.send.post_n(sends);
         stats.doorbell();
+        stats.resp_db.record(usize::try_from(writes + sends).unwrap_or(usize::MAX));
         Ok(())
     }
 

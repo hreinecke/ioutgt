@@ -148,6 +148,11 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
                                 before 'fio_perf', like the TCP driver's iperf
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k}
   status                        netns, rdma links, addresses, connected devices
+  stat          [args...]       ioutgt per-queue counters (passthrough to the
+                                binary's stat client; e.g. 'stat --clear',
+                                'stat -i 1'). WR + batch-histogram rows
+                                show submission (wr/doorbell) + completion
+                                (cqe/poll) batching
   help                          this message
 
 Required env: NIC_T, NIC_I (two SEPARATE RoCE cards cabled back-to-back) and the
@@ -467,6 +472,8 @@ case "${1:-}" in
     start)               run_for_targets start_one      "${2:-}" ;;
     stop)                run_for_targets stop_one       "${2:-}" ;;
     discover)            run_for_targets discover_one   "${2:-}" ;;
+    stat)                shift
+                         exec "$IOUTGT_BIN" stat --socket "$IOUTGT_SOCK" "$@" ;;
     connect)             run_for_targets connect_one    "${2:-}"
                          # IRQ affinity sync needs the IO queues connected
                          # (their pthread tids appear in `list`).
