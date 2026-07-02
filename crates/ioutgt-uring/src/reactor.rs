@@ -138,6 +138,10 @@ impl Default for RingConfig {
     }
 }
 
+/// A transport park-probe: drains a foreign completion source before the
+/// thread sleeps (see [`Reactor::add_park_probe`]).
+type ParkProbe = Box<dyn Fn() -> bool>;
+
 /// Thread-local io_uring reactor.
 ///
 /// Created via [`crate::QueueRuntime`]; ops reach it through the
@@ -150,6 +154,13 @@ pub struct Reactor {
     ring: RefCell<IoUring>,
     slab: RefCell<Slab<OpEntry>>,
     stats: StatCells,
+    /// Transport park-probes (`add_park_probe`), run by [`Self::park`] before
+    /// each sleep. A probe drains its own completion source (e.g. an RDMA CQ)
+    /// and wakes tasks; returning `true` means it produced work and the park
+    /// must not sleep. Returning `false` promises the probe armed its own
+    /// wakeup (an event on an fd with a registered ring op) first.
+    park_probes: RefCell<Vec<(u64, ParkProbe)>>,
+    next_probe_id: Cell<u64>,
     /// Free indices into the ring's fixed-buffer table. Empty when the
     /// kernel lacks `READV_FIXED`/`WRITEV_FIXED` or sparse buffer
     /// registration — then [`Self::register_buffer`] returns `None` and the
@@ -226,6 +237,8 @@ impl Reactor {
                 ring: RefCell::new(ring),
                 slab: RefCell::new(Slab::with_capacity(config.cq_entries as usize)),
                 stats: StatCells::default(),
+                park_probes: RefCell::new(Vec::new()),
+                next_probe_id: Cell::new(0),
                 free_bufs: RefCell::new(free_bufs),
                 fixed_supported,
                 free_files: RefCell::new(free_files),
@@ -266,6 +279,34 @@ impl Reactor {
 
     /// Number of in-flight (not yet reaped-and-consumed) operations.
     /// Primarily for tests and teardown assertions.
+    /// Register a transport park-probe (see the field doc on `park_probes`);
+    /// returns an id for [`Self::remove_park_probe`]. The probe MUST be
+    /// removed before the resources it polls are torn down.
+    pub fn add_park_probe(&self, probe: ParkProbe) -> u64 {
+        let id = self.next_probe_id.get();
+        self.next_probe_id.set(id + 1);
+        self.park_probes.borrow_mut().push((id, probe));
+        id
+    }
+
+    /// Remove a probe registered by [`Self::add_park_probe`].
+    pub fn remove_park_probe(&self, id: u64) {
+        self.park_probes.borrow_mut().retain(|(pid, _)| *pid != id);
+    }
+
+    /// Run every park-probe; `true` if any produced work (the park must not
+    /// sleep). All probes run even after one reports work, so every
+    /// connection's completion source is drained per park cycle.
+    fn run_park_probes(&self) -> bool {
+        let probes = self.park_probes.borrow();
+        let mut work = false;
+        for (_, probe) in probes.iter() {
+            work |= probe();
+        }
+        work
+    }
+
+    /// In-flight op count in the slab (kernel-visible ops).
     pub fn pending_ops(&self) -> usize {
         self.slab_ref().len()
     }
@@ -398,6 +439,14 @@ impl Reactor {
             // CQEs may already be sitting in the ring (inline completions
             // posted during an SQ-full flush): consume before sleeping.
             if self.reap() > 0 {
+                return;
+            }
+            // Transport park-probes: drain foreign completion sources (RDMA
+            // CQs) right here, at the only place this thread sleeps. A probe
+            // that produced work woke its task, so return to the scheduler
+            // instead of sleeping; a probe returning false has armed its own
+            // wakeup, making the submit_and_wait below safe.
+            if self.run_park_probes() {
                 return;
             }
             if self.slab_ref().is_empty() {

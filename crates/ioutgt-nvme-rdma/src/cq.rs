@@ -87,13 +87,13 @@ pub async fn wait(channel: &CompletionChannel, cq: &GenericCompletionQueue) -> i
     consume(revents, channel, cq)
 }
 
-/// Handle one comp-channel readiness (`revents`, e.g. from a multishot
-/// `poll_add`): fail loudly on error/hangup (device removed/torn down — the fd
-/// will never carry an event again), otherwise consume + ack the queued
-/// event(s) and re-arm `cq`. The caller drains the CQ afterwards; because the
-/// re-arm happens before that drain, a completion racing the re-arm re-signals
-/// the channel, so no wakeup is lost.
-pub fn consume(
+/// Validate a comp-channel poll result (`revents`, e.g. from a multishot
+/// `poll_add`) and acknowledge its queued events — without re-arming the CQ.
+/// Fails loudly on error/hangup with no POLLIN (device removed/torn down — the
+/// fd will never carry an event again). The reap loop uses this because its
+/// reactor park-probe owns the arming policy (arm only when going to sleep);
+/// [`consume`] layers the re-arm on top for event-driven callers.
+pub fn acknowledge(
     revents: u32,
     channel: &CompletionChannel,
     cq: &GenericCompletionQueue,
@@ -104,6 +104,18 @@ pub fn consume(
         return Err(io::Error::other("completion channel error or hangup"));
     }
     drain_events(channel, cq)?;
+    Ok(())
+}
+
+/// [`acknowledge`] + re-arm `cq`. The caller drains the CQ afterwards; because
+/// the re-arm happens before that drain, a completion racing the re-arm
+/// re-signals the channel, so no wakeup is lost.
+pub fn consume(
+    revents: u32,
+    channel: &CompletionChannel,
+    cq: &GenericCompletionQueue,
+) -> io::Result<()> {
+    acknowledge(revents, channel, cq)?;
     arm(cq)?;
     Ok(())
 }

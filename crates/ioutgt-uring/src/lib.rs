@@ -56,6 +56,25 @@ pub fn reset_reactor_stats() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Register a park-probe on the current thread's reactor: a callback run by
+/// the park hook before each sleep, letting a transport drain a foreign
+/// completion source (e.g. an RDMA CQ) with no fd round-trip while the thread
+/// is busy. Return `true` if the probe produced work (park then skips the
+/// sleep); returning `false` promises the probe armed its own wakeup first.
+/// Returns a handle id for [`remove_park_probe`]; the probe MUST be removed
+/// before the resources it polls are torn down. Errors if the thread has no
+/// live reactor.
+pub fn add_park_probe(probe: Box<dyn Fn() -> bool>) -> std::io::Result<u64> {
+    Ok(reactor::Reactor::current()?.add_park_probe(probe))
+}
+
+/// Remove a probe registered by [`add_park_probe`] (no-op without a reactor).
+pub fn remove_park_probe(id: u64) {
+    if let Ok(r) = reactor::Reactor::current() {
+        r.remove_park_probe(id);
+    }
+}
+
 /// Pin `ptr..ptr+len` as one fixed buffer on the current thread's reactor,
 /// returning its index — `Some` means `READV_FIXED`/`WRITEV_FIXED` are usable
 /// against it, `None` means fall back to plain readv/writev. Used to register

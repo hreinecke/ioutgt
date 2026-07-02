@@ -13,7 +13,7 @@
 //! ([`crate::transport`]). Completions are reaped reactor-driven via
 //! [`crate::cq`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -283,6 +283,33 @@ impl BatchHist {
     }
 }
 
+/// State shared between the reap loop and its reactor park-probe: completions
+/// the probe drained while the loop was between wakes, and the waker that
+/// tells the loop they exist. Single-threaded (`Rc` + `RefCell`).
+#[derive(Default)]
+struct ProbeShared {
+    /// `(wr_id, success)` pairs the probe pulled off the CQ; consumed by
+    /// `drain_into` ahead of the live CQ on the next `process_cqes`.
+    staged: RefCell<Vec<(u64, bool)>>,
+    /// Reap-loop waker, registered by `staged_ready` when `staged` is empty.
+    waker: RefCell<Option<std::task::Waker>>,
+}
+
+impl ProbeShared {
+    /// Resolve once `staged` is non-empty (the probe parked completions).
+    async fn staged_ready(self: &Rc<Self>) {
+        std::future::poll_fn(|cx| {
+            if self.staged.borrow().is_empty() {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await
+    }
+}
+
 /// GET_STATS key names for the three batch histograms (wire-format stable):
 /// WRs per read-batch doorbell, WRs per response-batch doorbell, and CQEs per
 /// non-empty poll.
@@ -395,7 +422,7 @@ impl TransportStats for RdmaWrStats {
 /// drains the comp channel so destroying the CQ cannot block.
 pub struct RdmaQueue {
     qp: GenericQueuePair,
-    cq: GenericCompletionQueue,
+    cq: Rc<GenericCompletionQueue>,
     channel: Arc<CompletionChannel>,
     /// MR over the data pool arena (local key for RDMA WRITE sges); dropped
     /// before `nvme`, which owns the arena memory.
@@ -428,6 +455,9 @@ pub struct RdmaQueue {
     /// Write-command host-data READs deferred from `handle_recv`, flushed on one
     /// doorbell after each CQ-poll's RECV batch. Reused; sized to the queue depth.
     read_batch: Vec<PendingRead>,
+    /// Park-probe rendezvous (see [`ProbeShared`]); the probe itself is
+    /// registered by [`Self::run`] and removed at its exits.
+    probe: Rc<ProbeShared>,
     /// Commands parked because every slot tag is held. RDMA-only ordering
     /// window: the response SEND delivers the CQE to the host — freeing its SQ
     /// slot — before our own SEND completion is reaped and the tag released, so
@@ -471,7 +501,7 @@ impl RdmaQueue {
         sqhd_disabled: bool,
         pd: Arc<ProtectionDomain>,
         channel: Arc<CompletionChannel>,
-        cq: GenericCompletionQueue,
+        cq: Rc<GenericCompletionQueue>,
         qp: GenericQueuePair,
         queue_buf_bytes: usize,
     ) -> io::Result<RdmaQueue> {
@@ -540,6 +570,7 @@ impl RdmaQueue {
             pending_read: vec![Sqe::zeroed(); sqsize as usize],
             wr,
             read_batch: Vec::with_capacity(sqsize as usize),
+            probe: Rc::new(ProbeShared::default()),
             parked: std::collections::VecDeque::with_capacity(sqsize as usize),
             pool_wait: std::collections::VecDeque::with_capacity(sqsize as usize),
             watchdog_tick: 0,
@@ -645,6 +676,9 @@ impl RdmaQueue {
     /// reused `out` buffer (cleared first), so the steady IO path allocates none.
     fn drain_into(&self, out: &mut Vec<(u64, bool)>) {
         out.clear();
+        // Completions the park-probe already pulled off the CQ come first
+        // (they are older than anything still queued).
+        out.append(&mut self.probe.staged.borrow_mut());
         if let Ok(poller) = self.cq.start_poll() {
             for wc in poller {
                 out.push((wc.wr_id(), wc.status() == WorkCompletionStatus::Success as u32));
@@ -1180,6 +1214,48 @@ impl RdmaQueue {
         // `sleep` rebuilt its timer op every wake and never survived to elapse
         // under load, which is exactly how a stranded completion wedged the queue.
         let mut backstop = std::pin::pin!(ioutgt_uring::ops::sleep(BACKSTOP)?);
+        // Reactor park-probe: drain this queue's CQ at the reactor's sleep
+        // point — under load completions are reaped with no comp-channel
+        // event, no read(2) and no poll round-trip per batch (measured ~16%
+        // of a saturated io-thread). Going to sleep, the probe arms the CQ
+        // and race-drains once (arm-before-drain), so the sleep always has a
+        // wake source; while awake it never arms, so no events are generated.
+        // The probe only stages + wakes; processing stays in this loop.
+        let probe_id = {
+            let shared = Rc::clone(&self.probe);
+            let cq = Rc::clone(&self.cq);
+            ioutgt_uring::add_park_probe(Box::new(move || {
+                let mut staged = shared.staged.borrow_mut();
+                let drain = |staged: &mut Vec<(u64, bool)>| {
+                    if let Ok(poller) = cq.start_poll() {
+                        for wc in poller {
+                            staged.push((
+                                wc.wr_id(),
+                                wc.status() == WorkCompletionStatus::Success as u32,
+                            ));
+                        }
+                    }
+                };
+                drain(&mut staged);
+                if staged.is_empty() {
+                    // Nothing pending: arm so a completion during the coming
+                    // sleep raises an event for the multishot poll, then
+                    // re-check the race window.
+                    if crate::cq::arm(&cq).is_err() {
+                        return true; // never sleep on a broken CQ
+                    }
+                    drain(&mut staged);
+                }
+                if staged.is_empty() {
+                    false
+                } else {
+                    if let Some(w) = shared.waker.borrow_mut().take() {
+                        w.wake();
+                    }
+                    true
+                }
+            }))?
+        };
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields
         // Ok(false) to keep going, Ok(true) to stop, or Err for a fatal error.
@@ -1189,11 +1265,18 @@ impl RdmaQueue {
                     // Multishot ended (fd closed/cancelled): peer gone, tear down.
                     None => Ok(true),
                     Some(Err(e)) => Err(e),
-                    Some(Ok(revents)) => match crate::cq::consume(revents, &self.channel, &self.cq) {
+                    // Acknowledge without re-arming: the park-probe arms the
+                    // CQ exactly when the thread goes to sleep, so an event
+                    // (and its read(2)) happens at most once per idle
+                    // transition instead of once per completion batch.
+                    Some(Ok(revents)) => match crate::cq::acknowledge(revents, &self.channel, &self.cq) {
                         Err(e) => Err(e),
                         Ok(()) => self.process_cqes(&ctx, &mut comps),
                     },
                 },
+                // The park-probe staged completions while we were between
+                // wakes: process them (drain_into consumes `staged` first).
+                () = self.probe.staged_ready() => self.process_cqes(&ctx, &mut comps),
                 Some(resp) = responses.next() => {
                     // Collect this wake's response and any siblings, then post
                     // them all on one doorbell. The first push wakes this task
@@ -1243,6 +1326,11 @@ impl RdmaQueue {
                 Err(e) => break Err(e),
             }
         };
+
+        // The probe polls the CQ from the reactor; remove it before any
+        // teardown of the resources it touches (both the normal drop and the
+        // wedged-backend leak path below).
+        ioutgt_uring::remove_park_probe(probe_id);
 
         // Teardown: resolve parked AERs, then drain in-flight dispatches before
         // returning (returning drops `self` → the QP and the pool arena). A slot
@@ -1446,7 +1534,7 @@ pub async fn run_conn(
         false,
         pd,
         channel,
-        cq,
+        Rc::new(cq),
         qp,
         conn.port.queue_buf_bytes,
     )?;
