@@ -459,6 +459,7 @@ dependencies = [
  "ioutgt-nvme",
  "ioutgt-uring",
  "libc",
+ "os_socketaddr",
  "rdma-mummy-sys",
  "sideway",
  "tokio",

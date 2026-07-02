@@ -2,26 +2,46 @@
 //! host's [`crate::cmproto::CmReq`], build the queue pair on the connection's
 //! device, and `accept` (with a [`crate::cmproto::CmRep`]) or `reject`.
 //!
-//! sideway drives the CM (its `EventChannel`/`Identifier` give the cm_id's
-//! `DeviceContext` via `get_device_context()` and the CM-derived QP attrs via
-//! `get_qp_attr()`), but does not wrap the operations that carry private data.
-//! Those are done here over `rdma-mummy-sys` through sideway's two raw
-//! escape-hatch accessors (`Event::event()`, `Identifier::id()` — the ioutgt
-//! vendor patch). All NVMe-specific knowledge stays in this crate.
+//! Self-contained over `rdma-mummy-sys` (librdmacm FFI): [`CmChannel`] owns the
+//! event channel (its fd parks on the reactor), [`Identifier`] owns a `rdma_cm_id`,
+//! and [`Event`] owns one event until acked. sideway is used for the verbs
+//! side only — the single bridge is [`Identifier::get_device_context`], which turns
+//! the cm_id's `ibv_context` into a sideway `DeviceContext` (see the layout
+//! assertion there). All NVMe-specific knowledge stays in this crate.
+//!
+//! Types and methods deliberately mirror `sideway::rdmacm` names
+//! (`Identifier`, `Event`, `EventType` variants, `get_qp_attr`,
+//! `get_device_context`, `setup_timeout`, `max_read_atomic`, …) so that a
+//! future switch back to upstream sideway — once it grows CM private-data /
+//! reject / SEND_WITH_INV APIs — is a mechanical import swap. The deltas to
+//! map then: `CmChannel::adopt(&event)` ⇢ `event.cm_id()`,
+//! `attr.apply(&qp)` ⇢ `qp.modify(&attr)`, `Identifier` ⇢ `Arc<Identifier>`.
+//!
+//! Identity rule: a raw `rdma_cm_id` pointer from an event is only ever (a)
+//! adopted into a [`Identifier`] on `ConnectRequest` (librdmacm hands us ownership
+//! there) or (b) compared by value against live [`Identifier`]s. It is never
+//! dereferenced for other event types — after we destroy an id, a late event
+//! (e.g. `TimewaitExit`) may still carry the stale pointer.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::os::fd::RawFd;
+use std::ptr::NonNull;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
-use rdma_mummy_sys::{rdma_accept, rdma_conn_param, rdma_connect, rdma_reject};
-use sideway::rdmacm::communication_manager::{
-    Event, EventChannel, EventType, GetEventErrorKind, Identifier, PortSpace,
+use os_socketaddr::OsSocketAddr;
+use rdma_mummy_sys::{
+    ibv_context, ibv_modify_qp, ibv_qp_attr, rdma_accept, rdma_ack_cm_event, rdma_bind_addr,
+    rdma_cm_event, rdma_cm_event_type, rdma_cm_id, rdma_conn_param, rdma_connect,
+    rdma_create_event_channel, rdma_create_id, rdma_destroy_event_channel, rdma_destroy_id,
+    rdma_disconnect, rdma_establish, rdma_event_channel, rdma_get_cm_event, rdma_init_qp_attr,
+    rdma_listen, rdma_port_space, rdma_reject, rdma_resolve_addr, rdma_resolve_route,
 };
-
-fn oerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::other(format!("{e:?}"))
-}
+use sideway::ibverbs::device_context::DeviceContext;
+use sideway::ibverbs::queue_pair::{QueuePair, QueuePairState};
 
 fn pollin() -> u32 {
     u32::try_from(libc::POLLIN).expect("POLLIN fits u32")
@@ -31,81 +51,164 @@ fn err_hup() -> u32 {
     u32::try_from(libc::POLLERR).unwrap_or(0) | u32::try_from(libc::POLLHUP).unwrap_or(0)
 }
 
+/// Owns the raw event channel; destroyed after every [`Identifier`] created on it
+/// (each holds an `Arc` of this).
+struct ChannelInner {
+    channel: NonNull<rdma_event_channel>,
+}
+
+// SAFETY: librdmacm event channels are plain fds + heap state; the operations
+// used here (get event, create id, destroy) are thread-safe in librdmacm, and
+// destruction is sequenced after all ids via the Arc.
+unsafe impl Send for ChannelInner {}
+// SAFETY: as above; &self methods delegate to thread-safe librdmacm calls.
+unsafe impl Sync for ChannelInner {}
+
+impl Drop for ChannelInner {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from rdma_create_event_channel and every
+        // cm_id created on this channel holds an Arc of self, so none remain.
+        unsafe { rdma_destroy_event_channel(self.channel.as_ptr()) };
+    }
+}
+
 /// A non-blocking RDMA-CM event channel whose fd the reactor parks on (io_uring
 /// `POLL_ADD`), so CM events are awaited without busy-polling. One per listener
 /// (and one per active connect on the client side).
 pub struct CmChannel {
-    channel: Arc<EventChannel>,
+    inner: Arc<ChannelInner>,
 }
 
 impl CmChannel {
     /// Create a non-blocking CM event channel.
     pub fn new() -> io::Result<CmChannel> {
-        let channel = EventChannel::new().map_err(oerr)?;
-        channel.set_nonblocking(true)?;
-        Ok(CmChannel { channel })
+        // SAFETY: plain constructor FFI; null means failure (errno set).
+        let raw = unsafe { rdma_create_event_channel() };
+        let channel = NonNull::new(raw).ok_or_else(io::Error::last_os_error)?;
+        // SAFETY: the channel's fd is valid; O_NONBLOCK makes rdma_get_cm_event
+        // return EAGAIN instead of blocking the reactor thread.
+        let rc = unsafe {
+            let fd = channel.as_ref().fd;
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                -1
+            } else {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
+            }
+        };
+        let inner = Arc::new(ChannelInner { channel });
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(CmChannel { inner })
     }
 
-    /// Create an RC (`PortSpace::Tcp`) cm_id on this channel.
-    pub fn create_id(&self) -> io::Result<Arc<Identifier>> {
-        self.channel.create_id(PortSpace::Tcp).map_err(oerr)
+    fn fd(&self) -> RawFd {
+        // SAFETY: the channel is valid for self's lifetime; fd is a plain field.
+        unsafe { self.inner.channel.as_ref().fd }
+    }
+
+    /// Create an RC (`RDMA_PS_TCP`) cm_id on this channel.
+    pub fn create_id(&self) -> io::Result<Identifier> {
+        let mut raw: *mut rdma_cm_id = std::ptr::null_mut();
+        // SAFETY: valid channel; librdmacm fills `raw` on success. No user
+        // context — identity is the pointer itself.
+        let rc = unsafe {
+            rdma_create_id(
+                self.inner.channel.as_ptr(),
+                &mut raw,
+                std::ptr::null_mut(),
+                rdma_port_space::RDMA_PS_TCP,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let id = NonNull::new(raw).ok_or_else(|| io::Error::other("rdma_create_id: null id"))?;
+        Ok(Identifier {
+            inner: Arc::new(IdentifierInner {
+                id,
+                _channel: Arc::clone(&self.inner),
+            }),
+        })
+    }
+
+    /// Adopt the child cm_id delivered by a `ConnectRequest` event (librdmacm
+    /// hands its ownership to the event's consumer). Must be called at most
+    /// once per connect request; the returned [`Identifier`] destroys it on drop.
+    pub fn adopt(&self, event: &Event) -> io::Result<Identifier> {
+        debug_assert!(matches!(event.event_type(), EventType::ConnectRequest));
+        let raw = event.raw_id();
+        let id = NonNull::new(raw).ok_or_else(|| io::Error::other("connect request without cm_id"))?;
+        Ok(Identifier {
+            inner: Arc::new(IdentifierInner {
+                id,
+                _channel: Arc::clone(&self.inner),
+            }),
+        })
     }
 
     /// Await the next CM event, parking the reactor on the channel fd whenever
     /// none is queued (level-triggered `POLL_ADD`, re-issued each empty wakeup).
     pub async fn next_event(&self) -> io::Result<Event> {
         loop {
-            match self.channel.get_cm_event() {
-                Ok(event) => return Ok(event),
-                Err(e) if matches!(e.0, GetEventErrorKind::NoEvent) => {
-                    let revents =
-                        ioutgt_uring::ops::poll_add(self.channel.as_raw_fd(), pollin())?.await?;
-                    // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is
-                    // in error/hangup with no readable event, fail rather than
-                    // respin (librdmacm normally surfaces problems as events, but
-                    // guard the livelock anyway).
-                    if revents & pollin() == 0 && revents & err_hup() != 0 {
-                        return Err(io::Error::other("CM event channel error or hangup"));
-                    }
-                }
-                Err(e) => return Err(oerr(e)),
+            let mut raw: *mut rdma_cm_event = std::ptr::null_mut();
+            // SAFETY: valid non-blocking channel; on success `raw` is the event
+            // we own until rdma_ack_cm_event.
+            let rc = unsafe { rdma_get_cm_event(self.inner.channel.as_ptr(), &mut raw) };
+            if rc == 0 {
+                let event =
+                    NonNull::new(raw).ok_or_else(|| io::Error::other("null CM event"))?;
+                return Ok(Event { event: Some(event) });
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+            let revents = ioutgt_uring::ops::poll_add(self.fd(), pollin())?.await?;
+            // POLL_ADD always reports POLLERR/POLLHUP; if the channel fd is
+            // in error/hangup with no readable event, fail rather than
+            // respin (librdmacm normally surfaces problems as events, but
+            // guard the livelock anyway).
+            if revents & pollin() == 0 && revents & err_hup() != 0 {
+                return Err(io::Error::other("CM event channel error or hangup"));
             }
         }
     }
 }
 
-/// Copy out the inbound CM private data carried by `event` (the connecting
-/// host's `nvme_rdma_cm_req` on a connect request). Copied, not borrowed, so the
-/// caller may `ack` the event afterwards (which frees the underlying buffer).
-pub fn private_data(event: &Event) -> Vec<u8> {
-    // Only connection-management events have the `conn` arm of the param union
-    // active; reading it for any other event type would be union UB. (The
-    // vendored `Event::event()` is `unsafe` precisely to push this check here.)
-    if !matches!(
-        event.event_type(),
-        EventType::ConnectRequest | EventType::ConnectResponse
-    ) {
-        return Vec::new();
-    }
-    // SAFETY: `event()` is valid until the Event is acked/dropped; the type
-    // check above guarantees the `conn` arm is active, and its private_data/_len
-    // describe the inbound buffer.
-    unsafe {
-        let ev = event.event().as_ptr();
-        let conn = &(*ev).param.conn;
-        if conn.private_data.is_null() || conn.private_data_len == 0 {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(
-                conn.private_data as *const u8,
-                conn.private_data_len as usize,
-            )
-            .to_vec()
-        }
+/// Owns one `rdma_cm_id`; destroyed on the last clone's drop.
+struct IdentifierInner {
+    id: NonNull<rdma_cm_id>,
+    /// Keeps the event channel alive at least as long as the id (librdmacm
+    /// requires ids destroyed before their channel).
+    _channel: Arc<ChannelInner>,
+}
+
+// SAFETY: librdmacm cm_id operations are thread-safe, and a cm_id is moved
+// (not shared mutably) across threads here: the CM reactor thread accepts it,
+// a queue thread drives it. Same guarantee sideway declares for `Identifier`.
+unsafe impl Send for IdentifierInner {}
+// SAFETY: as above — all &self operations delegate to thread-safe librdmacm.
+unsafe impl Sync for IdentifierInner {}
+
+impl Drop for IdentifierInner {
+    fn drop(&mut self) {
+        // SAFETY: we own the id (created or adopted exactly once); librdmacm
+        // requires any queued events to be acked first, which [`Event`]'s
+        // ack-on-drop guarantees for events already retrieved.
+        unsafe { rdma_destroy_id(self.id.as_ptr()) };
     }
 }
 
-/// Fill the common RC `rdma_conn_param` fields shared by accept and connect.
+/// A clonable owner of an `rdma_cm_id` (conceptually a socket). Cheap to clone
+/// (`Arc`); the id is destroyed when the last clone drops.
+#[derive(Clone)]
+pub struct Identifier {
+    inner: Arc<IdentifierInner>,
+}
+
+/// The RC-tuned `rdma_conn_param` shared by accept and connect.
 fn conn_param(
     qp_num: u32,
     private_data: &[u8],
@@ -128,60 +231,357 @@ fn conn_param(
     Ok(cp)
 }
 
-/// Accept a connect request on `id`, binding the (already RTS) queue pair
-/// `qp_num` and returning `reply` (an encoded [`crate::cmproto::CmRep`]).
-pub fn accept(
-    id: &Identifier,
-    qp_num: u32,
-    reply: &[u8],
-    responder_resources: u8,
-    initiator_depth: u8,
-) -> io::Result<()> {
-    let mut cp = conn_param(qp_num, reply, responder_resources, initiator_depth)?;
-    // SAFETY: `id()` is valid for the Identifier's lifetime; rdma_accept copies
-    // the private data synchronously, so `reply` need only outlive this call.
-    let rc = unsafe { rdma_accept(id.id().as_ptr(), &mut cp) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+/// The per-`ibv_context` `DeviceContext` cache: contexts are owned by
+/// librdmacm (never closed here) and every caller for the same raw context
+/// must get the same `Arc` (mirrors sideway's own `get_device_context`).
+static DEVICE_CONTEXTS: LazyLock<Mutex<HashMap<usize, Arc<DeviceContext>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl Identifier {
+    /// Whether `raw` (an event's id pointer) is this id. Pointer comparison
+    /// only — see the module identity rule.
+    pub fn is_raw(&self, raw: *mut rdma_cm_id) -> bool {
+        self.inner.id.as_ptr() == raw
     }
-    Ok(())
+
+    /// Bind to a local address (listener side).
+    pub fn bind_addr(&self, addr: SocketAddr) -> io::Result<()> {
+        // SAFETY: valid id; librdmacm copies the sockaddr synchronously.
+        let rc =
+            unsafe { rdma_bind_addr(self.inner.id.as_ptr(), OsSocketAddr::from(addr).as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Start listening (after [`bind_addr`](Self::bind_addr)).
+    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+        // SAFETY: valid bound id.
+        let rc = unsafe { rdma_listen(self.inner.id.as_ptr(), backlog) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Resolve `dst` to an RDMA device (client side); completes with an
+    /// `AddressResolved` (or `AddressError`) event.
+    pub fn resolve_addr(
+        &self,
+        src: Option<SocketAddr>,
+        dst: SocketAddr,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let timeout_ms =
+            i32::try_from(timeout.as_millis()).map_err(|_| io::Error::other("timeout too large"))?;
+        let mut srcaddr = src.map(OsSocketAddr::from);
+        // SAFETY: valid id; sockaddrs are copied synchronously.
+        let rc = unsafe {
+            rdma_resolve_addr(
+                self.inner.id.as_ptr(),
+                srcaddr.as_mut().map_or(std::ptr::null_mut(), |s| s.as_mut_ptr()),
+                OsSocketAddr::from(dst).as_mut_ptr(),
+                timeout_ms,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Resolve the route to the resolved address; completes with a
+    /// `RouteResolved` (or `RouteError`) event.
+    pub fn resolve_route(&self, timeout: Duration) -> io::Result<()> {
+        let timeout_ms =
+            i32::try_from(timeout.as_millis()).map_err(|_| io::Error::other("timeout too large"))?;
+        // SAFETY: valid id whose address is resolved.
+        let rc = unsafe { rdma_resolve_route(self.inner.id.as_ptr(), timeout_ms) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Complete an active-side connection whose QP is externally managed
+    /// (after moving it to RTS on `ConnectResponse`).
+    pub fn establish(&self) -> io::Result<()> {
+        // SAFETY: valid id in the connect-response state.
+        let rc = unsafe { rdma_establish(self.inner.id.as_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Disconnect (sends the DREQ, or the DREP when answering one).
+    pub fn disconnect(&self) -> io::Result<()> {
+        // SAFETY: valid connected id.
+        let rc = unsafe { rdma_disconnect(self.inner.id.as_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Accept a connect request, binding the (already RTS) queue pair `qp_num`
+    /// and returning `reply` (an encoded [`crate::cmproto::CmRep`]).
+    pub fn accept(
+        &self,
+        qp_num: u32,
+        reply: &[u8],
+        responder_resources: u8,
+        initiator_depth: u8,
+    ) -> io::Result<()> {
+        let mut cp = conn_param(qp_num, reply, responder_resources, initiator_depth)?;
+        // SAFETY: valid id with a pending connect request; rdma_accept copies
+        // the private data synchronously, so `reply` need only outlive this call.
+        let rc = unsafe { rdma_accept(self.inner.id.as_ptr(), &mut cp) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Initiate a connect (client side), binding the INIT queue pair `qp_num`
+    /// and sending `request` (an encoded [`crate::cmproto::CmReq`]).
+    pub fn connect(
+        &self,
+        qp_num: u32,
+        request: &[u8],
+        responder_resources: u8,
+        initiator_depth: u8,
+    ) -> io::Result<()> {
+        let mut cp = conn_param(qp_num, request, responder_resources, initiator_depth)?;
+        // SAFETY: valid route-resolved id; rdma_connect copies the private data
+        // synchronously.
+        let rc = unsafe { rdma_connect(self.inner.id.as_ptr(), &mut cp) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Reject a connect request, returning `reason` (an encoded
+    /// [`crate::cmproto::CmRej`]) to the host.
+    pub fn reject(&self, reason: &[u8]) -> io::Result<()> {
+        let (ptr, len) = if reason.is_empty() {
+            (std::ptr::null(), 0u8)
+        } else {
+            (
+                reason.as_ptr() as *const c_void,
+                u8::try_from(reason.len()).map_err(|_| io::Error::other("CM reject > 255 bytes"))?,
+            )
+        };
+        // SAFETY: valid id with a pending connect request; rdma_reject copies
+        // the private data synchronously.
+        let rc = unsafe { rdma_reject(self.inner.id.as_ptr(), ptr, len) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The CM-derived queue-pair attributes for transitioning to `state`
+    /// (librdmacm's `rdma_init_qp_attr`), applied with [`QueuePairAttribute::apply`].
+    pub fn get_qp_attr(&self, state: QueuePairState) -> io::Result<QueuePairAttribute> {
+        // SAFETY: a zeroed ibv_qp_attr is a valid input; librdmacm fills the
+        // fields named by the returned mask.
+        let mut attr: ibv_qp_attr = unsafe { std::mem::zeroed() };
+        attr.qp_state = state as u32;
+        let mut mask = 0i32;
+        // SAFETY: valid id in a CM state that defines attributes for `state`.
+        let rc = unsafe { rdma_init_qp_attr(self.inner.id.as_ptr(), &mut attr, &mut mask) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(QueuePairAttribute { attr, mask })
+    }
+
+    /// The sideway `DeviceContext` for the device this connection landed on
+    /// (`cm_id->verbs`), or `None` before address resolution binds a device.
+    ///
+    /// This is the one bridge from the raw CM layer into sideway's verbs
+    /// layer, pending an upstream API. sideway 0.4.3's `DeviceContext` is a
+    /// single-field struct over `NonNull<ibv_context>` (asserted below; a
+    /// one-field struct cannot be field-reordered), and `sideway` is pinned
+    /// `=0.4.3` in Cargo.toml so an upgrade revisits this. The context is
+    /// owned by librdmacm — cached per pointer and never closed, exactly like
+    /// sideway's own `get_device_context`.
+    pub fn get_device_context(&self) -> Option<Arc<DeviceContext>> {
+        const _: () = assert!(
+            std::mem::size_of::<DeviceContext>() == std::mem::size_of::<NonNull<ibv_context>>()
+        );
+        const _: () = assert!(
+            std::mem::align_of::<DeviceContext>() == std::mem::align_of::<NonNull<ibv_context>>()
+        );
+        // SAFETY: reading the `verbs` field of a live cm_id.
+        let verbs = unsafe { self.inner.id.as_ref().verbs };
+        let ctx = NonNull::new(verbs)?;
+        let mut cache = DEVICE_CONTEXTS.lock().expect("device-context cache poisoned");
+        Some(Arc::clone(cache.entry(verbs as usize).or_insert_with(|| {
+            // SAFETY: layout asserted above; the context outlives every user
+            // (librdmacm keeps it open for the process; the cache leaks the Arc
+            // by design, mirroring sideway).
+            Arc::new(unsafe {
+                std::mem::transmute::<NonNull<ibv_context>, DeviceContext>(ctx)
+            })
+        })))
+    }
 }
 
-/// Initiate a connect on `id` (client side), binding the INIT queue pair
-/// `qp_num` and sending `request` (an encoded [`crate::cmproto::CmReq`]).
-pub fn connect(
-    id: &Identifier,
-    qp_num: u32,
-    request: &[u8],
-    responder_resources: u8,
-    initiator_depth: u8,
-) -> io::Result<()> {
-    let mut cp = conn_param(qp_num, request, responder_resources, initiator_depth)?;
-    // SAFETY: `id()` is valid; rdma_connect copies the private data synchronously.
-    let rc = unsafe { rdma_connect(id.id().as_ptr(), &mut cp) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+/// CM-derived QP attributes + mask from [`Identifier::get_qp_attr`].
+pub struct QueuePairAttribute {
+    attr: ibv_qp_attr,
+    mask: i32,
 }
 
-/// Reject a connect request on `id`, returning `reason` (an encoded
-/// [`crate::cmproto::CmRej`]) to the host.
-pub fn reject(id: &Identifier, reason: &[u8]) -> io::Result<()> {
-    let (ptr, len) = if reason.is_empty() {
-        (std::ptr::null(), 0u8)
-    } else {
-        (
-            reason.as_ptr() as *const c_void,
-            u8::try_from(reason.len()).map_err(|_| io::Error::other("CM reject > 255 bytes"))?,
-        )
-    };
-    // SAFETY: `id()` is valid; rdma_reject copies the private data synchronously.
-    let rc = unsafe { rdma_reject(id.id().as_ptr(), ptr, len) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+impl QueuePairAttribute {
+    /// The negotiated `max_rd_atomic` (outstanding RDMA READs this QP may
+    /// initiate) — what the CM accept reply must advertise as initiator_depth.
+    pub fn max_read_atomic(&self) -> u8 {
+        self.attr.max_rd_atomic
     }
-    Ok(())
+
+    /// Override the RC ACK timeout (4.096us × 2^t) before applying.
+    pub fn setup_timeout(&mut self, t: u8) {
+        self.attr.timeout = t;
+    }
+
+    /// Apply to `qp` (raw `ibv_modify_qp` with the CM-provided mask).
+    pub fn apply(&self, qp: &impl QueuePair) -> io::Result<()> {
+        // SAFETY: qp's raw handle is valid for its lifetime; attr/mask came
+        // from rdma_init_qp_attr (ibv_modify_qp reads attr, never stores it).
+        let rc = unsafe {
+            ibv_modify_qp(
+                qp.qp().as_ptr(),
+                &self.attr as *const ibv_qp_attr as *mut ibv_qp_attr,
+                self.mask,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        Ok(())
+    }
+}
+
+/// The CM event types this target handles; everything else lands in `Other`
+/// (acked and ignored/logged by the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // names mirror librdmacm's RDMA_CM_EVENT_*
+pub enum EventType {
+    AddressResolved,
+    AddressError,
+    RouteResolved,
+    ConnectRequest,
+    ConnectResponse,
+    Rejected,
+    Established,
+    Disconnected,
+    DeviceRemoval,
+    Other(u32),
+}
+
+impl From<u32> for EventType {
+    fn from(v: u32) -> EventType {
+        use rdma_cm_event_type as t;
+        match v {
+            t::RDMA_CM_EVENT_ADDR_RESOLVED => EventType::AddressResolved,
+            t::RDMA_CM_EVENT_ADDR_ERROR => EventType::AddressError,
+            t::RDMA_CM_EVENT_ROUTE_RESOLVED => EventType::RouteResolved,
+            t::RDMA_CM_EVENT_CONNECT_REQUEST => EventType::ConnectRequest,
+            t::RDMA_CM_EVENT_CONNECT_RESPONSE => EventType::ConnectResponse,
+            t::RDMA_CM_EVENT_REJECTED => EventType::Rejected,
+            t::RDMA_CM_EVENT_ESTABLISHED => EventType::Established,
+            t::RDMA_CM_EVENT_DISCONNECTED => EventType::Disconnected,
+            t::RDMA_CM_EVENT_DEVICE_REMOVAL => EventType::DeviceRemoval,
+            other => EventType::Other(other),
+        }
+    }
+}
+
+/// One retrieved CM event, owned until acked (dropping acks as a backstop;
+/// librdmacm frees the event and anything it references at ack).
+pub struct Event {
+    event: Option<NonNull<rdma_cm_event>>,
+}
+
+impl Event {
+    fn raw(&self) -> NonNull<rdma_cm_event> {
+        self.event.expect("event valid until ack/drop")
+    }
+
+    /// The event type.
+    pub fn event_type(&self) -> EventType {
+        // SAFETY: the event is valid until acked.
+        EventType::from(unsafe { self.raw().as_ref().event })
+    }
+
+    /// The event status (e.g. the reject reason code on `Rejected`).
+    pub fn status(&self) -> i32 {
+        // SAFETY: the event is valid until acked.
+        unsafe { self.raw().as_ref().status }
+    }
+
+    /// The raw cm_id this event refers to. Identity/adoption only — see the
+    /// module identity rule.
+    pub fn raw_id(&self) -> *mut rdma_cm_id {
+        // SAFETY: the event is valid until acked; `id` is a plain field.
+        unsafe { self.raw().as_ref().id }
+    }
+
+    /// Copy out the inbound CM private data (the connecting host's
+    /// `nvme_rdma_cm_req` on a connect request). Copied, not borrowed, so the
+    /// caller may `ack` afterwards (which frees the underlying buffer).
+    pub fn private_data(&self) -> Vec<u8> {
+        // Only connection-management events have the `conn` arm of the param
+        // union active; reading it for any other event type would be union UB.
+        if !matches!(
+            self.event_type(),
+            EventType::ConnectRequest | EventType::ConnectResponse
+        ) {
+            return Vec::new();
+        }
+        // SAFETY: the event is valid until acked; the type check above
+        // guarantees the `conn` arm is active, and its private_data/_len
+        // describe the inbound buffer.
+        unsafe {
+            let conn = &self.raw().as_ref().param.conn;
+            if conn.private_data.is_null() || conn.private_data_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(
+                    conn.private_data as *const u8,
+                    conn.private_data_len as usize,
+                )
+                .to_vec()
+            }
+        }
+    }
+
+    /// Acknowledge and free the event (one-to-one with retrieval; drop is the
+    /// backstop for early-return paths). Infallible, but keeps sideway's
+    /// `Result` signature so call sites survive a switch-back unchanged.
+    pub fn ack(mut self) -> io::Result<()> {
+        self.ack_inner();
+        Ok(())
+    }
+
+    fn ack_inner(&mut self) {
+        if let Some(event) = self.event.take() {
+            // SAFETY: the event was retrieved by rdma_get_cm_event and not yet
+            // acked (the Option guards double-ack).
+            unsafe { rdma_ack_cm_event(event.as_ptr()) };
+        }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        self.ack_inner();
+    }
 }
 
 #[cfg(test)]
@@ -192,15 +592,17 @@ mod tests {
     use ioutgt_uring::{QueueRuntime, RingConfig, ops};
     use sideway::ibverbs::AccessFlags;
     use sideway::ibverbs::completion::{GenericCompletionQueue, WorkCompletionStatus};
-    use sideway::ibverbs::device_context::DeviceContext;
     use sideway::ibverbs::memory_region::MemoryRegion;
     use sideway::ibverbs::protection_domain::ProtectionDomain;
     use sideway::ibverbs::queue_pair::{
-        GenericQueuePair, PostSendGuard, QueuePair, QueuePairState, SendOperationFlags,
-        SetScatterGatherEntry, WorkRequestFlags,
+        GenericQueuePair, PostSendGuard, SendOperationFlags, SetScatterGatherEntry,
+        WorkRequestFlags,
     };
     use std::net::SocketAddr;
-    use std::time::Duration;
+
+    fn oerr<E: std::error::Error>(e: E) -> io::Error {
+        io::Error::other(format!("{e:?}"))
+    }
 
     type Held = (Arc<ProtectionDomain>, GenericCompletionQueue, GenericQueuePair);
 
@@ -266,13 +668,11 @@ mod tests {
     async fn run_server(port: u16) -> io::Result<u16> {
         let ch = CmChannel::new()?;
         let listen_id = ch.create_id()?;
-        listen_id
-            .bind_addr(format!("0.0.0.0:{port}").parse().unwrap())
-            .map_err(oerr)?;
-        listen_id.listen(1).map_err(oerr)?;
+        listen_id.bind_addr(format!("0.0.0.0:{port}").parse().unwrap())?;
+        listen_id.listen(1)?;
 
         let mut held: Option<Held> = None;
-        let mut child: Option<Arc<Identifier>> = None;
+        let mut child: Option<Identifier> = None;
         let mut seen_qid = None;
         // Backing for the pre-posted command-capsule RECV (must outlive its MR).
         let mut recv_buf = vec![0u8; 64];
@@ -283,19 +683,16 @@ mod tests {
             eprintln!("[cm-server] event {et:?}");
             match et {
                 EventType::ConnectRequest => {
-                    let req = CmReq::parse(&private_data(&event))?;
+                    let req = CmReq::parse(&event.private_data())?;
                     seen_qid = Some(req.qid);
-                    let id = event.cm_id().ok_or_else(|| io::Error::other("no child cm_id"))?;
+                    let id = ch.adopt(&event)?;
                     let ctx = id
                         .get_device_context()
                         .ok_or_else(|| io::Error::other("no device context"))?;
-                    let (pd, cq, mut qp) = build_qp(&ctx)?;
-                    qp.modify(&id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
-                        .map_err(oerr)?;
-                    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
-                        .map_err(oerr)?;
-                    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
-                        .map_err(oerr)?;
+                    let (pd, cq, qp) = build_qp(&ctx)?;
+                    id.get_qp_attr(QueuePairState::Init)?.apply(&qp)?;
+                    id.get_qp_attr(QueuePairState::ReadyToReceive)?.apply(&qp)?;
+                    id.get_qp_attr(QueuePairState::ReadyToSend)?.apply(&qp)?;
                     // Pre-post a RECV for the host's first command capsule, so it
                     // is ready before the connection establishes.
                     // SAFETY: recv_buf is a live, stable, owned buffer that
@@ -309,6 +706,7 @@ mod tests {
                         )
                     }
                     .map_err(oerr)?;
+                    let mut qp = qp;
                     {
                         let mut g = qp.start_post_recv();
                         let h = g.construct_wr(1);
@@ -322,10 +720,10 @@ mod tests {
                         crqsize: req.hsqsize,
                     }
                     .to_bytes();
-                    accept(&id, qp.qp_number(), &rep, 1, 1)?;
+                    id.accept(qp.qp_number(), &rep, 1, 1)?;
                     held = Some((pd, cq, qp));
                     child = Some(id);
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                 }
                 EventType::Established => {
                     // Reap the host's command capsule (the client sends it now)
@@ -336,21 +734,21 @@ mod tests {
                     assert_eq!(recv_buf, sample_capsule(), "command capsule round-trip");
                     // recv_mr is held in the outer scope (kept alive structurally).
                     let _keep = &recv_mr;
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                 }
                 EventType::Disconnected => {
                     // Client finished and tore the connection down — done.
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                     drop(held);
                     drop(child);
                     return Ok(seen_qid.expect("qid set before disconnect"));
                 }
                 EventType::DeviceRemoval => {
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                     return Err(io::Error::other("server CM event DeviceRemoval"));
                 }
                 _ => {
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                 }
             }
         }
@@ -364,7 +762,7 @@ mod tests {
         // (resolving the self-IP with no source can route via `lo`, which has no
         // RDMA device → AddressError).
         let src = SocketAddr::new(dst.ip(), 0);
-        id.resolve_addr(Some(src), dst, Duration::from_secs(5)).map_err(oerr)?;
+        id.resolve_addr(Some(src), dst, Duration::from_secs(5))?;
         let mut held: Option<Held> = None;
         let mut addr_retries = 0u32;
         loop {
@@ -373,25 +771,24 @@ mod tests {
             eprintln!("[cm-client] event {et:?}");
             match et {
                 EventType::AddressResolved => {
-                    id.resolve_route(Duration::from_secs(5)).map_err(oerr)?;
-                    event.ack().map_err(oerr)?;
+                    id.resolve_route(Duration::from_secs(5))?;
+                    event.ack()?;
                 }
                 EventType::AddressError => {
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                     addr_retries += 1;
                     if addr_retries > 5 {
                         return Err(io::Error::other("resolve_addr failed (AddressError x5)"));
                     }
                     ops::sleep(Duration::from_millis(200)).unwrap().await.unwrap();
-                    id.resolve_addr(Some(src), dst, Duration::from_secs(5)).map_err(oerr)?;
+                    id.resolve_addr(Some(src), dst, Duration::from_secs(5))?;
                 }
                 EventType::RouteResolved => {
                     let ctx = id
                         .get_device_context()
                         .ok_or_else(|| io::Error::other("no device context"))?;
-                    let (pd, cq, mut qp) = build_qp(&ctx)?;
-                    qp.modify(&id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
-                        .map_err(oerr)?;
+                    let (pd, cq, qp) = build_qp(&ctx)?;
+                    id.get_qp_attr(QueuePairState::Init)?.apply(&qp)?;
                     let req = CmReq {
                         recfmt: CM_FMT_1_0,
                         qid,
@@ -399,25 +796,25 @@ mod tests {
                         hsqsize: 127,
                         cntlid: 0xffff,
                     };
-                    connect(&id, qp.qp_number(), &req.to_bytes(), 1, 1)?;
+                    id.connect(qp.qp_number(), &req.to_bytes(), 1, 1)?;
                     held = Some((pd, cq, qp));
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                 }
                 EventType::ConnectResponse => {
                     // Validate the target's accept reply (the reverse private-data
                     // direction): the server set crqsize = our hsqsize.
-                    let rep = CmRep::parse(&private_data(&event))?;
+                    let rep = CmRep::parse(&event.private_data())?;
                     assert_eq!(rep.crqsize, 127, "server crqsize round-trip");
                     // Active side with an externally-managed QP: move it to RTS
                     // and `establish()` — that completes the handshake; there is
                     // NO separate Established event on the active side.
-                    let qp = &mut held.as_mut().expect("qp built before response").2;
-                    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
-                        .map_err(oerr)?;
-                    qp.modify(&id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?)
-                        .map_err(oerr)?;
-                    id.establish().map_err(oerr)?;
-                    event.ack().map_err(oerr)?;
+                    {
+                        let qp = &held.as_ref().expect("qp built before response").2;
+                        id.get_qp_attr(QueuePairState::ReadyToReceive)?.apply(qp)?;
+                        id.get_qp_attr(QueuePairState::ReadyToSend)?.apply(qp)?;
+                    }
+                    id.establish()?;
+                    event.ack()?;
                     // Send a command capsule over the established QP (capsule
                     // transport check); wait for the send to complete before
                     // tearing the connection down.
@@ -446,23 +843,23 @@ mod tests {
                     drop(send_buf);
                     // Connected. Tearing down here disconnects, which the server
                     // sees as Disconnected (its cue that we are done).
-                    id.disconnect().map_err(oerr)?;
+                    id.disconnect()?;
                     drop(held);
                     return Ok(());
                 }
                 EventType::Established => {
                     // Not expected for the active side, but harmless: done.
-                    event.ack().map_err(oerr)?;
-                    id.disconnect().map_err(oerr)?;
+                    event.ack()?;
+                    id.disconnect()?;
                     drop(held);
                     return Ok(());
                 }
                 EventType::Rejected => {
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                     return Err(io::Error::other("client connect rejected"));
                 }
                 other => {
-                    event.ack().map_err(oerr)?;
+                    event.ack()?;
                     return Err(io::Error::other(format!("client CM event {other:?}")));
                 }
             }

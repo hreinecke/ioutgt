@@ -37,12 +37,13 @@ use sideway::ibverbs::queue_pair::{
     GenericQueuePair, PostSendGuard, QueuePair, QueuePairState, SendOperationFlags,
     SetScatterGatherEntry, WorkRequestFlags,
 };
-use sideway::rdmacm::communication_manager::{EventType, Identifier};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::cm::{CmChannel, accept, private_data, reject};
+use rdma_mummy_sys::{ibv_qp_ex, ibv_qp_to_qp_ex, ibv_wr_send_inv, ibv_wr_set_sge};
+
+use crate::cm::{CmChannel, EventType, Identifier};
 use crate::cmproto::{CM_FMT_1_0, CmRep, CmReq};
 
 /// Bytes of an NVMe SQE.
@@ -135,6 +136,44 @@ fn parse_keyed_sgl(sqe: &Sqe) -> KeyedSgl {
 /// length clamped to MDTS. Recomputed when a pool-deferred command retries.
 fn staged_len(sqe: &Sqe) -> usize {
     (parse_keyed_sgl(sqe).len as usize).min(ioutgt_core::MDTS_BYTES as usize)
+}
+
+/// The extended-verbs handle of `qp`, for work-request calls sideway does not
+/// wrap. All target QPs are built with `build_ex` (asserted), so the handle is
+/// valid whenever a post-send guard session is open on `qp`.
+fn qp_ex_of(qp: &GenericQueuePair) -> io::Result<std::ptr::NonNull<ibv_qp_ex>> {
+    debug_assert!(matches!(qp, GenericQueuePair::Extended(_)));
+    // SAFETY: the raw qp handle is valid for qp's lifetime; ibv_qp_to_qp_ex is
+    // pointer arithmetic recovering the ibv_qp_ex an extended QP embeds.
+    std::ptr::NonNull::new(unsafe { ibv_qp_to_qp_ex(qp.qp().as_ptr()) })
+        .ok_or_else(|| io::Error::other("not an extended QP"))
+}
+
+/// Emit a `SEND_WITH_INV` work request into the extended-QP work-request
+/// session the surrounding sideway post guard opened (`ibv_wr_start` ..
+/// `ibv_wr_complete`). sideway 0.4.3 has no `setup_send_with_inv`; until the
+/// upstream PR lands, this makes the two raw calls the missing method would
+/// (same shape, so the call sites survive a switch-back unchanged).
+///
+/// # Safety
+///
+/// A post guard must be live on the (extended) QP `qp_ex` belongs to, with the
+/// current work request's id/flags already set via `construct_wr` and no
+/// opcode issued for it yet; the sge must reference registered memory that
+/// stays valid until the send completes.
+unsafe fn wr_send_with_inv(
+    qp_ex: std::ptr::NonNull<ibv_qp_ex>,
+    invalidate_rkey: u32,
+    lkey: u32,
+    addr: u64,
+    len: u32,
+) {
+    // SAFETY: caller contract above; these are the extended-verbs calls
+    // `setup_send_with_inv` + `setup_sge` would make.
+    unsafe {
+        ibv_wr_send_inv(qp_ex.as_ptr(), invalidate_rkey);
+        ibv_wr_set_sge(qp_ex.as_ptr(), lkey, addr, len);
+    }
 }
 
 /// A finished command's response, handed from a slot task (or the reap loop's
@@ -432,6 +471,7 @@ impl RdmaQueue {
         self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
         let addr = self.resp_buf.as_ptr() as u64 + off as u64;
         let lkey = self.resp_mr.lkey();
+        let qp_ex = qp_ex_of(&self.qp)?;
         let mut g = self.qp.start_post_send();
         // Solicited so the host's solicited-armed CQ raises a completion
         // interrupt for the response (see post_responses_batch).
@@ -439,13 +479,17 @@ impl RdmaQueue {
             wr(WR_SEND, tag),
             WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
         );
-        let h = match invalidate_rkey {
-            Some(rkey) => wrh.setup_send_with_inv(rkey),
-            None => wrh.setup_send(),
-        };
-        // SAFETY: the staging region is registered and stays valid until the
-        // send completes (tag not released until then).
-        unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
+        match invalidate_rkey {
+            // SAFETY: guard live on this (extended) QP, wr id/flags set just
+            // above; the staging region is registered and stays valid until
+            // the send completes (tag not released until then).
+            Some(rkey) => unsafe { wr_send_with_inv(qp_ex, rkey, lkey, addr, CQE_LEN as u32) },
+            None => {
+                let h = wrh.setup_send();
+                // SAFETY: staging region registered + valid as above.
+                unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
+            }
+        }
         g.post().map_err(oerr)?;
         RdmaWrStats::sq_post(&self.wr.send_posted, &self.wr.send_inflight, &self.wr.sq_doorbells);
         Ok(())
@@ -864,6 +908,7 @@ impl RdmaQueue {
         let pool_lkey = *pool_lkey;
         let mut writes = 0u64;
         let mut sends = 0u64;
+        let qp_ex = qp_ex_of(qp)?;
         let mut g = qp.start_post_send();
         for resp in batch {
             let tag = resp.tag;
@@ -918,13 +963,19 @@ impl RdmaQueue {
                 wr(WR_SEND, u32::from(tag)),
                 WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
             );
-            let hs = match invalidate_rkey_for(&resp.cmd) {
-                Some(rkey) => ws.setup_send_with_inv(rkey),
-                None => ws.setup_send(),
-            };
-            // SAFETY: the staging region is registered and stays valid until the
-            // SEND completes (tag not released until then).
-            unsafe { hs.setup_sge(resp_lkey, cqe_addr, CQE_LEN as u32) };
+            match invalidate_rkey_for(&resp.cmd) {
+                // SAFETY: guard live on this (extended) QP, wr id/flags set just
+                // above; the staging region is registered and stays valid until
+                // the SEND completes (tag not released until then).
+                Some(rkey) => unsafe {
+                    wr_send_with_inv(qp_ex, rkey, resp_lkey, cqe_addr, CQE_LEN as u32)
+                },
+                None => {
+                    let hs = ws.setup_send();
+                    // SAFETY: staging region registered + valid as above.
+                    unsafe { hs.setup_sge(resp_lkey, cqe_addr, CQE_LEN as u32) };
+                }
+            }
             sends += 1;
             inflight[tag as usize] = pending;
         }
@@ -1272,14 +1323,14 @@ const MAX_DATA_SGE: u32 = MAX_SEGS as u32;
 const ADMIN_QUEUE_DEPTH: u32 = 32;
 
 /// An accepted connection handed off to be driven to completion. Every field is
-/// `Send` — the cm_id is `Send`/`Sync` (sideway declares it; librdmacm cm_id ops
+/// `Send` — the cm_id is `Send`/`Sync` (librdmacm cm_id ops
 /// are thread-safe), the rest are `Arc`s — so this can cross a mailbox to a queue
 /// thread. This is the shape the harness `Transport::Conn` will take: the CM
 /// listener produces it, and [`run_conn`] (the reactor-bound work) consumes it.
 pub struct RdmaConn {
     /// The accepted CM identifier: its device context builds the QP, its
     /// CM-derived attrs drive INIT→RTS, and `rdma_accept` replies on it.
-    pub id: Arc<Identifier>,
+    pub id: Identifier,
     /// NVMe-oF queue id (0 = admin); routes the connection to a queue thread.
     pub qid: u16,
     /// Host SQ size, 0-based (the queue holds `hsqsize + 1`, clamped).
@@ -1323,17 +1374,15 @@ pub async fn run_conn(
         u32::from(conn.port.io_queue_size).max(1)
     };
     let sqsize = u16::try_from((u32::from(conn.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
-    let (pd, channel, cq, mut qp) = build_conn_resources(&dev, sqsize, conn.qid)?;
-    qp.modify(&conn.id.get_qp_attr(QueuePairState::Init).map_err(oerr)?)
-        .map_err(oerr)?;
-    qp.modify(&conn.id.get_qp_attr(QueuePairState::ReadyToReceive).map_err(oerr)?)
-        .map_err(oerr)?;
+    let (pd, channel, cq, qp) = build_conn_resources(&dev, sqsize, conn.qid)?;
+    conn.id.get_qp_attr(QueuePairState::Init)?.apply(&qp)?;
+    conn.id.get_qp_attr(QueuePairState::ReadyToReceive)?.apply(&qp)?;
     // librdmacm has already computed this QP's `max_rd_atomic` (the max
     // write-data RDMA READs we can have outstanding) into the RTS attr as
     // min(the request's initiator_depth, device `max_qp_init_rd_atom`). Capture
     // it so the CM accept reply advertises the *same* value as the QP holds —
     // see the `accept` call below.
-    let mut rts_attr = conn.id.get_qp_attr(QueuePairState::ReadyToSend).map_err(oerr)?;
+    let mut rts_attr = conn.id.get_qp_attr(QueuePairState::ReadyToSend)?;
     let initiator_depth = rts_attr.max_read_atomic();
     // Widen the IO queues' RC ACK timeout to 4.096us * 2^20 (~4.3s).
     // librdmacm derives a short timeout from the CM path; under sustained large
@@ -1348,7 +1397,7 @@ pub async fn run_conn(
         rts_attr.setup_timeout(20);
         tracing::warn!(qid = conn.qid, ack_timeout = 20, "widened IO-queue RC ACK timeout");
     }
-    qp.modify(&rts_attr).map_err(oerr)?;
+    rts_attr.apply(&qp)?;
 
     let mut queue = RdmaQueue::new(
         conn.qid,
@@ -1378,7 +1427,7 @@ pub async fn run_conn(
     // (qd > 1) the host NAK'd the 2nd+ read → transport retry exhaustion → QP
     // error → connection reset (reconnect storm). responder_resources is 0: an
     // nvme-rdma host never issues RDMA reads against the target.
-    accept(&conn.id, qp_num, &rep, 0, initiator_depth)?;
+    conn.id.accept(qp_num, &rep, 0, initiator_depth)?;
 
     let peer = format!("rdma:qid{}", conn.qid);
     queue.run(conn.port, conn.registry, peer, conn.stop, on_ctx).await
@@ -1390,7 +1439,7 @@ pub async fn run_conn(
 /// caller turns it into an [`RdmaConn`] (adding port/registry) for [`run_conn`].
 pub struct RdmaRaw {
     /// The accepted CM identifier (see [`RdmaConn::id`]).
-    pub id: Arc<Identifier>,
+    pub id: Identifier,
     /// NVMe-oF queue id (0 = admin).
     pub qid: u16,
     /// Host SQ size, 0-based.
@@ -1403,7 +1452,7 @@ pub struct RdmaRaw {
 /// A live accepted connection the listener tracks: its cm_id (kept alive +
 /// matched against later CM events) and the stop signal to end its queue.
 struct ConnSlot {
-    id: Arc<Identifier>,
+    id: Identifier,
     stop: Arc<Notify>,
 }
 
@@ -1415,7 +1464,7 @@ struct ConnSlot {
 pub struct RdmaListener {
     ch: CmChannel,
     /// The listening cm_id — kept alive for the channel's lifetime.
-    _listen_id: Arc<Identifier>,
+    _listen_id: Identifier,
     /// Live accepted connections; entries are pruned on `Disconnected` (which
     /// also fires the connection's stop signal), bounding this across reconnects.
     conns: Vec<ConnSlot>,
@@ -1444,10 +1493,10 @@ impl RdmaListener {
                     }
                     ioutgt_uring::ops::sleep(std::time::Duration::from_millis(250))?.await?;
                 }
-                Err(e) => return Err(oerr(e)),
+                Err(e) => return Err(e),
             }
         }
-        listen_id.listen(128).map_err(oerr)?;
+        listen_id.listen(128)?;
         tracing::info!("nvme-rdma listening on {listen}");
         Ok(RdmaListener {
             ch,
@@ -1464,16 +1513,19 @@ impl RdmaListener {
         loop {
             let event = self.ch.next_event().await?;
             match event.event_type() {
-                EventType::ConnectRequest => match CmReq::parse(&private_data(&event)) {
+                EventType::ConnectRequest => match CmReq::parse(&event.private_data()) {
                     Ok(req) => {
-                        let Some(id) = event.cm_id() else {
-                            tracing::warn!("nvme-rdma connect request without cm_id");
-                            event.ack().map_err(oerr)?;
-                            continue;
+                        let id = match self.ch.adopt(&event) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::warn!("nvme-rdma connect request without cm_id: {e}");
+                                event.ack().map_err(oerr)?;
+                                continue;
+                            }
                         };
                         let stop = Arc::new(Notify::new());
                         self.conns.push(ConnSlot {
-                            id: Arc::clone(&id),
+                            id: id.clone(),
                             stop: Arc::clone(&stop),
                         });
                         event.ack().map_err(oerr)?;
@@ -1486,8 +1538,10 @@ impl RdmaListener {
                     }
                     Err(e) => {
                         tracing::warn!("nvme-rdma rejecting connect: {e}");
-                        if let Some(id) = event.cm_id() {
-                            let _ = reject(&id, &[]);
+                        // Adopt even though we reject: ownership of the child
+                        // cm_id is ours either way, and dropping it destroys it.
+                        if let Ok(id) = self.ch.adopt(&event) {
+                            let _ = id.reject(&[]);
                         }
                         event.ack().map_err(oerr)?;
                     }
@@ -1499,15 +1553,17 @@ impl RdmaListener {
                 // queue's own clone (in its RdmaConn) drops when its reap loop ends
                 // on the flushed completions, so the cm_id is destroyed then.
                 EventType::Disconnected => {
-                    if let Some(id) = event.cm_id() {
-                        // Send the DREP, then fire this connection's stop signal so
-                        // its reap loop ends (our manually-built QP isn't
-                        // cm_id-associated, so rdma_disconnect doesn't flush it),
-                        // and drop the slot — bounding `conns` across reconnects.
-                        let _ = id.disconnect();
-                        if let Some(pos) = self.conns.iter().position(|c| Arc::ptr_eq(&c.id, &id)) {
-                            self.conns.swap_remove(pos).stop.notify_one();
-                        }
+                    // Match by raw pointer (never dereferenced): only a cm_id we
+                    // still hold alive can compare equal. Send the DREP, fire the
+                    // connection's stop signal so its reap loop ends (our
+                    // manually-built QP isn't cm_id-associated, so
+                    // rdma_disconnect doesn't flush it), and drop the slot —
+                    // bounding `conns` across reconnects.
+                    let raw = event.raw_id();
+                    if let Some(pos) = self.conns.iter().position(|c| c.id.is_raw(raw)) {
+                        let slot = self.conns.swap_remove(pos);
+                        let _ = slot.id.disconnect();
+                        slot.stop.notify_one();
                     }
                     event.ack().map_err(oerr)?;
                 }

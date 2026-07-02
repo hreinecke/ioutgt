@@ -29,6 +29,7 @@ ioutgt-uring = { workspace = true }
 sideway = { workspace = true }
 # Raw FFI for the CQ-event calls sideway does not wrap (req_notify/get/ack).
 rdma-mummy-sys = { workspace = true }
+os_socketaddr = "0.2"
 libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -10,7 +10,8 @@
 //! Everything reactor-bound (QP build, `rdma_accept`, the queue's completion
 //! reaping) stays in [`run_conn`], invoked from `run_queue` on a queue thread.
 //! The cm_id crosses CM-thread → control-thread → queue-thread as `Send` data
-//! ([`RdmaRaw`]/[`RdmaConn`]); sideway declares `Identifier: Send + Sync`.
+//! ([`RdmaRaw`]/[`RdmaConn`]); `cm::Identifier` is `Send + Sync` (librdmacm
+//! cm_id operations are thread-safe).
 
 use std::io;
 use std::net::SocketAddr;

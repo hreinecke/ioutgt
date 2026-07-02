@@ -46,6 +46,42 @@ rdma-core dev box:
 bindgen, so it needs only the already-present `libibverbs` / `librdmacm` dev
 headers.
 
+### CM layer: rdma-mummy-sys directly (sideway is verbs-only)
+
+sideway's **verbs** API is sufficient as-is, but its **RDMA-CM** API is not: an
+NVMe target must read the connecting host's CM private data (the
+`nvme_rdma_cm_req` carrying the `qid`), return reply private data
+(`nvme_rdma_cm_rep`), and `reject` bad connects — none of which sideway's
+`Event` / `ConnectionParameter` expose, with no raw escape hatch. (An earlier
+iteration vendored sideway with two raw-accessor patches; the vendor tree was
+7k lines carried for ~8 patched lines and was retired.)
+
+So `cm.rs` drives the CM **directly over `rdma-mummy-sys`** (sideway's own FFI
+backend — types unify), which exports the complete librdmacm surface. Its
+types and method names deliberately mirror sideway's (`Identifier`, `Event`,
+`EventType`, `get_qp_attr`, `get_device_context`, …) so a future switch back
+to upstream sideway — once it grows the CM private-data/reject APIs — is a
+mechanical import swap. Three seams to know:
+
+- **`DeviceContext` bridge**: a CM connection's QP is built on the
+  `ibv_context` the connection landed on (`cm_id->verbs`, owned by librdmacm).
+  `Identifier::get_device_context()` turns it into a sideway `DeviceContext`
+  with a layout-asserted transmute (single-field struct in sideway 0.4.3;
+  `sideway = "=0.4.3"` is pinned so an upgrade revisits this) behind the same
+  per-pointer leak-cache upstream keeps.
+- **QP transitions**: `get_qp_attr` wraps `rdma_init_qp_attr`; the returned
+  attrs apply with raw `ibv_modify_qp` through sideway's public `qp()` raw
+  accessor (no sideway-attribute bridging).
+- **`SEND_WITH_INV`**: sideway 0.4.3 has no `setup_send_with_inv`; the
+  response path emits that one work request with the raw extended-verbs pair
+  (`ibv_wr_send_inv` + `ibv_wr_set_sge`) inside the sideway post-guard session
+  (`target.rs::wr_send_with_inv`; extended QPs only, which all target QPs are).
+
+All three seams are earmarked for an upstream PR to RDMA-Rust/sideway
+(`Event::private_data()`, `ConnectionParameter::setup_private_data`,
+`Identifier::reject`, `setup_send_with_inv`, pre-established `DeviceContext`
+access); each shrinks `cm.rs`/`target.rs` when it lands.
+
 ## Reactor integration
 
 Event-driven (the project's one-io_uring-per-thread model): the ibverbs
