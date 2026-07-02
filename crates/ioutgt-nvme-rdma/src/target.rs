@@ -46,7 +46,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use rdma_mummy_sys::{ibv_qp_ex, ibv_qp_to_qp_ex, ibv_wr_send_inv, ibv_wr_set_sge};
 
 use crate::cm::{CmChannel, EventType, Identifier};
-use crate::cmproto::{CM_FMT_1_0, CmRep, CmReq};
+use crate::cmproto::{CM_FMT_1_0, CmRej, CmRep, CmReq, reject_status};
 
 /// Bytes of an NVMe SQE.
 const SQE_LEN: usize = 64;
@@ -1515,39 +1515,46 @@ impl RdmaListener {
         loop {
             let event = self.ch.next_event().await?;
             match event.event_type() {
-                EventType::ConnectRequest => match CmReq::parse(&event.private_data()) {
-                    Ok(req) => {
-                        let id = match self.ch.adopt(&event) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::warn!("nvme-rdma connect request without cm_id: {e}");
-                                event.ack().map_err(oerr)?;
-                                continue;
-                            }
-                        };
-                        let stop = Arc::new(Notify::new());
-                        self.conns.push(ConnSlot {
-                            id: id.clone(),
-                            stop: Arc::clone(&stop),
-                        });
-                        event.ack().map_err(oerr)?;
-                        return Ok(RdmaRaw {
-                            id,
-                            qid: req.qid,
-                            hsqsize: req.hsqsize,
-                            stop,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("nvme-rdma rejecting connect: {e}");
-                        // Adopt even though we reject: ownership of the child
-                        // cm_id is ours either way, and dropping it destroys it.
-                        if let Ok(id) = self.ch.adopt(&event) {
-                            let _ = id.reject(&[]);
+                EventType::ConnectRequest => {
+                    // Reject with the proper `nvme_rdma_cm_rej` status so the
+                    // host logs the reason instead of a bare reject (nvmet
+                    // parity). Adopt even when rejecting: ownership of the
+                    // child cm_id is ours either way; dropping it destroys it.
+                    let sts = match CmReq::parse(&event.private_data()) {
+                        Ok(req) if req.recfmt != CM_FMT_1_0 => {
+                            Err(reject_status::INVALID_RECFMT)
                         }
-                        event.ack().map_err(oerr)?;
+                        Ok(req) => Ok(req),
+                        Err(_) => Err(reject_status::INVALID_LEN),
+                    };
+                    match (sts, self.ch.adopt(&event)) {
+                        (Ok(req), Ok(id)) => {
+                            let stop = Arc::new(Notify::new());
+                            self.conns.push(ConnSlot {
+                                id: id.clone(),
+                                stop: Arc::clone(&stop),
+                            });
+                            event.ack().map_err(oerr)?;
+                            return Ok(RdmaRaw {
+                                id,
+                                qid: req.qid,
+                                hsqsize: req.hsqsize,
+                                stop,
+                            });
+                        }
+                        (Err(sts), id) => {
+                            tracing::warn!(sts, "nvme-rdma rejecting connect request");
+                            if let Ok(id) = id {
+                                let _ = id.reject(&CmRej::new(sts).to_bytes());
+                            }
+                            event.ack().map_err(oerr)?;
+                        }
+                        (Ok(_), Err(e)) => {
+                            tracing::warn!("nvme-rdma connect request without cm_id: {e}");
+                            event.ack().map_err(oerr)?;
+                        }
                     }
-                },
+                }
                 EventType::Established => event.ack().map_err(oerr)?,
                 // The host tore the connection down: drop our keep-alive cm_id
                 // clone so it isn't retained for the process lifetime (bounds
