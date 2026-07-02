@@ -286,9 +286,10 @@ impl BatchHist {
 /// GET_STATS key names for the three batch histograms (wire-format stable):
 /// WRs per read-batch doorbell, WRs per response-batch doorbell, and CQEs per
 /// non-empty poll.
-const HIST_KEYS: [[&str; 6]; 3] = [
+const HIST_KEYS: [[&str; 6]; 4] = [
     ["read_db_b1", "read_db_b2", "read_db_b4", "read_db_b8", "read_db_b16", "read_db_b32"],
     ["resp_db_b1", "resp_db_b2", "resp_db_b4", "resp_db_b8", "resp_db_b16", "resp_db_b32"],
+    ["recv_db_b1", "recv_db_b2", "recv_db_b4", "recv_db_b8", "recv_db_b16", "recv_db_b32"],
     ["poll_b1", "poll_b2", "poll_b4", "poll_b8", "poll_b16", "poll_b32"],
 ];
 
@@ -312,6 +313,10 @@ struct RdmaWrStats {
     /// WRs chained per response-batch doorbell (`post_responses_batch`;
     /// a response is 1 SEND, or WRITE+SEND when it carries read data).
     resp_db: BatchHist,
+    /// RECV WRs per repost doorbell (the recv queue's doorbell, not counted in
+    /// `sq_doorbells`). Always singletons BY DESIGN — see the RNR note in
+    /// `handle_recv`; this column is the canary that keeps it that way.
+    recv_db: BatchHist,
     /// CQEs reaped per non-empty CQ poll.
     poll: BatchHist,
 }
@@ -356,7 +361,7 @@ impl TransportStats for RdmaWrStats {
         out.push(("sq_doorbells", self.sq_doorbells.get()));
         for (keys, hist) in HIST_KEYS
             .iter()
-            .zip([&self.read_db, &self.resp_db, &self.poll])
+            .zip([&self.read_db, &self.resp_db, &self.recv_db, &self.poll])
         {
             for (key, cell) in keys.iter().zip(&hist.0) {
                 out.push((key, cell.get()));
@@ -372,7 +377,7 @@ impl TransportStats for RdmaWrStats {
         }
         self.poll_batches.set(0);
         self.sq_doorbells.set(0);
-        for hist in [&self.read_db, &self.resp_db, &self.poll] {
+        for hist in [&self.read_db, &self.resp_db, &self.recv_db, &self.poll] {
             for cell in &hist.0 {
                 cell.set(0);
             }
@@ -558,6 +563,7 @@ impl RdmaQueue {
         unsafe { h.setup_sge(lkey, addr, CAPSULE_LEN as u32) };
         g.post().map_err(oerr)?;
         self.wr.recv.post();
+        self.wr.recv_db.record(1);
         Ok(())
     }
 
@@ -821,7 +827,18 @@ impl RdmaQueue {
     fn handle_recv(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>, idx: u32) -> io::Result<()> {
         let sqe = Sqe::read_from_bytes(&self.recv_slice(idx)[..SQE_LEN])
             .map_err(|_| io::Error::other("short command capsule"))?;
-        // The capsule buffer is free once the SQE is parsed — re-arm it.
+        // The capsule buffer is free once the SQE is parsed — re-arm it NOW,
+        // one doorbell per capsule. Deferring reposts to the cycle tail (to
+        // chain them on one doorbell, SPDK-style) was tried and REVERTED: a
+        // reproducible 168k-vs-174k (-3.4%) on 4k randwrite qd128, mlx5 +
+        // null_blk, four runs each. NOT an RNR problem (host-side
+        // rnr_nak_retry_err delta was 0 under both builds — the ring never
+        // went empty); the mechanism is unestablished, plausibly the later
+        // repost delaying the host's next capsule down a zero-slack pipeline.
+        // nvmet also re-posts per op (before each response, rdma.c); SPDK
+        // batches but couples each requeue to its own request's response and
+        // flushes recvs before sends — if batching is ever retried, start
+        // from that shape plus explicit ring slack, and A/B with recv/db.
         self.post_recv(idx)?;
         let Some(tag) = self.nvme.claim_tag() else {
             // All tags held: park, don't kill (see the `parked` field). A host

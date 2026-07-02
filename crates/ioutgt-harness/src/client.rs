@@ -303,9 +303,10 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                     };
                     let _ = writeln!(
                         out,
-                        "    batch  read/db [{}]  resp/db [{}]  cqe/poll [{}]",
+                        "    batch  read/db [{}]  resp/db [{}]  recv/db [{}]  cqe/poll [{}]",
                         hist("read_db"),
                         hist("resp_db"),
+                        hist("recv_db"),
                         hist("poll"),
                     );
                 }
@@ -669,6 +670,8 @@ mod tests {
             "read_db_b8": 0u64, "read_db_b16": 0u64, "read_db_b32": 0u64,
             "resp_db_b1": 50u64, "resp_db_b2": 10u64, "resp_db_b4": 5u64,
             "resp_db_b8": 0u64, "resp_db_b16": 0u64, "resp_db_b32": 0u64,
+            "recv_db_b1": 40u64, "recv_db_b2": 25u64, "recv_db_b4": 0u64,
+            "recv_db_b8": 0u64, "recv_db_b16": 0u64, "recv_db_b32": 0u64,
             "poll_b1": 10u64, "poll_b2": 15u64, "poll_b4": 12u64,
             "poll_b8": 8u64, "poll_b16": 0u64, "poll_b32": 0u64,
         });
@@ -678,6 +681,7 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("resp/db [1:50 2:10 <=4:5"), "{out}");
+        assert!(out.contains("recv/db [1:40 2:25"), "{out}");
         assert!(out.contains("cqe/poll [1:10 2:15 <=4:12 <=8:8"), "{out}");
     }
 
