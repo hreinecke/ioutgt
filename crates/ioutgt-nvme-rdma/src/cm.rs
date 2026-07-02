@@ -594,9 +594,7 @@ mod tests {
     };
     use std::net::SocketAddr;
 
-    fn oerr<E: std::error::Error>(e: E) -> io::Error {
-        io::Error::other(format!("{e:?}"))
-    }
+    use crate::oerr;
 
     type Held = (Arc<ProtectionDomain>, GenericCompletionQueue, GenericQueuePair);
 

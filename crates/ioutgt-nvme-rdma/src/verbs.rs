@@ -19,13 +19,7 @@ use sideway::ibverbs::queue_pair::{
     GenericQueuePair, QueuePair, QueuePairAttribute, QueuePairState, SendOperationFlags,
 };
 
-// Render via `Debug`, not `Display`: most sideway errors are `thiserror`
-// structs whose `Display` is a fixed string with the real errno hidden in a
-// `#[error(transparent)]` source — `Debug` keeps the kind/errno chain, which is
-// what makes an RDMA bring-up failure (EINVAL/ENOMEM/EPERM) diagnosable.
-fn oerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::other(format!("{e:?}"))
-}
+use crate::oerr;
 
 /// The RDMA devices the host exposes, by name. Empty when no provider is
 /// present — no HCA and no soft-RoCE (`rxe`) configured — which is the expected

@@ -126,14 +126,8 @@ fn main() -> std::io::Result<()> {
             } => return stat_target(socket, *interval, *clear),
         }
     }
-    let config = match &args.config {
-        Some(path) => {
-            let mut config = TargetConfig::from_file(path)?;
-            // RDMA has no recv ring; force it off even if the shared config sets
-            // recv_buf_mb (which would also flip file backends to O_DIRECT).
-            config.recv_buf_bytes = 0;
-            config
-        }
+    let mut config = match &args.config {
+        Some(path) => TargetConfig::from_file(path)?,
         None => {
             let mut config = TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
             config.listen = args.listen;
@@ -141,7 +135,6 @@ fn main() -> std::io::Result<()> {
             config.pin_threads = !args.no_pin;
             config.io_queue_size = args.io_queue_size;
             config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
-            config.recv_buf_bytes = 0; // RDMA has no recv ring.
             config.idle_teardown = (args.idle_teardown_secs != 0)
                 .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
             config.control_socket = Some(args.control_socket);
@@ -157,6 +150,9 @@ fn main() -> std::io::Result<()> {
             config
         }
     };
+    // RDMA has no recv ring; force it off even if the shared config schema set
+    // recv_buf_mb (which would also flip file backends to O_DIRECT).
+    config.recv_buf_bytes = 0;
 
     let addr = ioutgt_harness::spawn::<RdmaTransport>(config)?;
     eprintln!("ioutgt-nvme-rdma listening on {addr}");

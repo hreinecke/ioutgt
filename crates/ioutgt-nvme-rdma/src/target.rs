@@ -27,7 +27,7 @@ use ioutgt_core::queue::{QueueCore, TransportStats};
 use ioutgt_core::slotq::SendList;
 use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::fabrics::ConnectData;
-use ioutgt_nvme::spec::{Cqe, Sqe, io_opcode};
+use ioutgt_nvme::spec::{Sqe, io_opcode};
 use ioutgt_nvme::status;
 use rdma_mummy_sys::ibv_sge;
 use sideway::ibverbs::AccessFlags;
@@ -46,6 +46,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use rdma_mummy_sys::{ibv_qp_ex, ibv_qp_to_qp_ex, ibv_wr_send_inv, ibv_wr_set_sge};
 
 use crate::cm::{CmChannel, EventType, Identifier};
+use crate::oerr;
 use crate::cmproto::{CM_FMT_1_0, CmRej, CmRep, CmReq, reject_status};
 
 /// Bytes of an NVMe SQE.
@@ -102,10 +103,6 @@ fn wr_kind(id: u64) -> u64 {
 }
 fn wr_low(id: u64) -> u32 {
     (id & 0xffff_ffff) as u32
-}
-
-fn oerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::other(format!("{e:?}"))
 }
 
 /// A host RDMA target region from a command SQE's keyed SGL data block
@@ -503,39 +500,6 @@ impl RdmaQueue {
         Ok(())
     }
 
-    /// SEND the 16-byte CQE response capsule for `tag` from the staging buffer. When
-    /// `invalidate_rkey` is `Some` (the command's keyed SGL requested it), use
-    /// `SEND_WITH_INV` so the host's rkey is invalidated remotely instead of the host
-    /// posting a per-IO local-invalidate WR (whose extra completion, on the comp vector
-    /// the host shares between admin + IO, otherwise overloads the host's CQ softirq).
-    fn send_cqe(&mut self, tag: u32, cqe: Cqe, invalidate_rkey: Option<u32>) -> io::Result<()> {
-        let off = tag as usize * CQE_LEN;
-        self.resp_buf[off..off + CQE_LEN].copy_from_slice(cqe.as_bytes());
-        let addr = self.resp_buf.as_ptr() as u64 + off as u64;
-        let lkey = self.resp_mr.lkey();
-        let qp_ex = qp_ex_of(&self.qp)?;
-        let mut g = self.qp.start_post_send();
-        // Solicited so the host's solicited-armed CQ raises a completion
-        // interrupt for the response (see post_responses_batch).
-        let wrh = g.construct_wr(
-            wr(WR_SEND, tag),
-            WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
-        );
-        match invalidate_rkey {
-            // SAFETY: guard live on this (extended) QP, wr id/flags set just
-            // above; the staging region is registered and stays valid until
-            // the send completes (tag not released until then).
-            Some(rkey) => unsafe { wr_send_with_inv(qp_ex, rkey, lkey, addr, CQE_LEN as u32) },
-            None => {
-                let h = wrh.setup_send();
-                // SAFETY: staging region registered + valid as above.
-                unsafe { h.setup_sge(lkey, addr, CQE_LEN as u32) };
-            }
-        }
-        g.post().map_err(oerr)?;
-        self.wr.sq_post(&self.wr.send);
-        Ok(())
-    }
 
     /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
     /// (the fabrics Connect data, which on the admin queue is host-resident, not
@@ -641,18 +605,24 @@ impl RdmaQueue {
                 return Ok(true);
             }
             match wr_kind(id) {
-                WR_RECV => self.wr.recv.complete(),
-                WR_READ => self.wr.read.complete(),
-                WR_SEND => self.wr.send.complete(),
-                WR_WRITE => self.wr.write.complete(),
-                _ => {}
-            }
-            match wr_kind(id) {
-                WR_RECV => self.handle_recv(ctx, wr_low(id))?,
+                WR_RECV => {
+                    self.wr.recv.complete();
+                    self.handle_recv(ctx, wr_low(id))?;
+                }
                 // A write-data RDMA READ finished: the slot is filled, so submit
                 // it to wake its slot task.
-                WR_READ => self.submit_pending(wr_low(id) as u16),
-                WR_SEND | WR_WRITE => self.on_response_done(wr_low(id)),
+                WR_READ => {
+                    self.wr.read.complete();
+                    self.submit_pending(wr_low(id) as u16);
+                }
+                WR_SEND => {
+                    self.wr.send.complete();
+                    self.on_response_done(wr_low(id));
+                }
+                WR_WRITE => {
+                    self.wr.write.complete();
+                    self.on_response_done(wr_low(id));
+                }
                 _ => {}
             }
         }
@@ -1052,8 +1022,7 @@ impl RdmaQueue {
         let cmd = nvme.await_command(tag).await;
         let outcome = dispatch::execute(&ctx, tag, &cmd).await;
         nvme.begin_respond(tag);
-        self.send_cqe(u32::from(tag), outcome.cqe, invalidate_rkey_for(&sqe))?;
-        self.inflight[tag as usize] = 1;
+        self.post_responses_batch(&[RdmaResp { tag, cmd, outcome }])?;
         Ok(ctx)
     }
 
@@ -1319,10 +1288,10 @@ pub struct RdmaConn {
     pub port: Arc<PortConfig<AnyBackend>>,
     /// The controller registry (shared across this port's queues).
     pub registry: Arc<Registry>,
-    /// Live-connection accounting permit (harness path); held for the
-    /// connection's lifetime and dropped when its queue ends, so the active
-    /// count + idle-teardown track it. `None` on the bare `serve()` path.
-    pub permit: Option<ioutgt_core::permit::ConnPermit>,
+    /// Live-connection accounting permit; held for the connection's lifetime
+    /// and dropped when its queue ends, so the harness's active count +
+    /// idle-teardown track it.
+    pub permit: ioutgt_core::permit::ConnPermit,
     /// Fired by the CM listener on this connection's `Disconnected` event; the
     /// reap loop ([`RdmaQueue::run`]) selects on it and ends the queue (our
     /// manually-built QP isn't cm_id-associated, so `rdma_disconnect` doesn't

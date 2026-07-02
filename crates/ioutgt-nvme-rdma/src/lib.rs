@@ -6,6 +6,14 @@
 //! the reactor, RDMA-CM connection acceptance, the per-queue reap loop) and
 //! reuses everything else through the harness and `ioutgt-core`.
 
+// Render via `Debug`, not `Display`: most sideway errors are `thiserror`
+// structs whose `Display` is a fixed string with the real errno hidden in a
+// `#[error(transparent)]` source — `Debug` keeps the kind/errno chain, which is
+// what makes an RDMA bring-up failure (EINVAL/ENOMEM/EPERM) diagnosable.
+pub(crate) fn oerr<E: std::error::Error>(e: E) -> std::io::Error {
+    std::io::Error::other(format!("{e:?}"))
+}
+
 pub mod cm;
 pub mod cmproto;
 pub mod cq;

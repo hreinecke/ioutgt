@@ -121,7 +121,7 @@ impl Transport for RdmaTransport {
                 hsqsize: raw.hsqsize,
                 port,
                 registry,
-                permit: Some(permit),
+                permit,
                 stop: raw.stop,
             },
         ))
