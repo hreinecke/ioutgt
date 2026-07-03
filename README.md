@@ -74,21 +74,26 @@ backends, same host kernel driver for both targets; collected via
 
 **NVMe/RDMA** (100 GbE mlx5, RoCEv2)
 
-| phase | ioutgt | kernel nvmet | delta |
-|-------|--------|--------------|-------|
-| 4k randread | 165.2k IOPS | 160.9k IOPS | +2.7% |
-| 4k randwrite | 176.8k IOPS | 179.1k IOPS | −1.3% |
-| 64k randread | 5948 MiB/s | 4297 MiB/s | **+38%** |
-| 64k randwrite | 5803 MiB/s | 4044 MiB/s | **+44%** |
+| phase | ioutgt IOPS | ioutgt BW | nvmet IOPS | nvmet BW | ioutgt vs nvmet |
+|-------|------------|-----------|------------|----------|-----------------|
+| 4k randread | 165.2k | 645 MiB/s | 160.9k | 629 MiB/s | +2.7% |
+| 4k randwrite | 176.8k | 691 MiB/s | 179.1k | 700 MiB/s | −1.3% |
+| 64k randread | 95.2k | 5948 MiB/s | 68.7k | 4297 MiB/s | **+38.6%** |
+| 64k randwrite | 92.9k | 5803 MiB/s | 64.7k | 4044 MiB/s | **+43.6%** |
 
 **NVMe/TCP** (same wire)
 
-| phase | ioutgt | kernel nvmet | delta |
-|-------|--------|--------------|-------|
-| 4k randread | 242.9k IOPS | 115.0k IOPS | **+111%** |
-| 4k randwrite | 242.4k IOPS | 116.8k IOPS | **+108%** |
-| 64k randread | 3289 MiB/s | 1792 MiB/s | **+84%** |
-| 64k randwrite | 2124 MiB/s | 1072 MiB/s | **+98%** |
+| phase | ioutgt IOPS | ioutgt BW | nvmet IOPS | nvmet BW | ioutgt vs nvmet |
+|-------|------------|-----------|------------|----------|-----------------|
+| 4k randread | 242.9k | 949 MiB/s | 115.0k | 449 MiB/s | **+111.2%** |
+| 4k randwrite | 242.4k | 947 MiB/s | 116.8k | 456 MiB/s | **+107.5%** |
+| 64k randread | 52.6k | 3289 MiB/s | 28.7k | 1792 MiB/s | **+83.3%** |
+| 64k randwrite | 34.0k | 2124 MiB/s | 17.2k | 1072 MiB/s | **+97.7%** |
+
+For scale: the backing SSD does 122k IOPS (7.6 GiB/s) at 64k random
+locally, and the raw wire carries 98 Gb/s (`ibperf`) — the single-job
+64k numbers are one queue thread driving ~80% of the drive's 64k
+ceiling through one QP.
 
 ## Roadmap
 
