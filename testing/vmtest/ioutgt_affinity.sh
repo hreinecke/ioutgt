@@ -71,6 +71,18 @@ ioutgt_run_affinity() {
         { cat "$log"; vt_die "expected $io_threads 'io queue affinity' lines"; }
     grep 'io queue affinity' "$log" >&2
 
+    # The queue-thread pool spawns lazily on the first accept: poke one
+    # TCP connection and hold it open so the ioutgt-io* threads exist
+    # (and outlive the idle grace period) while we inspect them.
+    exec 3<>/dev/tcp/127.0.0.1/14420 || vt_die "cannot connect to 127.0.0.1:14420"
+    for i in $(seq 50); do
+        grep -qx "ioutgt-io0" /proc/"$pid"/task/*/comm 2>/dev/null && break
+        kill -0 "$pid" 2>/dev/null || { cat "$log"; vt_die "target died"; }
+        sleep 0.2
+    done
+    grep -qx "ioutgt-io0" /proc/"$pid"/task/*/comm 2>/dev/null ||
+        vt_die "io threads did not spawn after a connection"
+
     local -a node_threads=()
     for i in $(seq 0 $((nodes - 1))); do node_threads[i]=0; done
     local all_grp_cpus=""
@@ -159,11 +171,16 @@ want: $(tr '\n' ' ' <<<"$want")"
         if [ "$qid" -eq 0 ]; then
             [ "$cpus" = "*" ] || vt_die "admin queue cpus '$cpus', expected *"
         else
+            # `list` renders the whole affinity group with the pinned
+            # CPU bracketed (e.g. "[0],1"); /proc carries just the
+            # pinned CPU.
+            local act
+            act=$(sed -n 's/.*\[\([0-9]*\)\].*/\1/p' <<<"$cpus")
+            [ -n "$act" ] ||
+                vt_die "qid $qid: no bracketed active cpu in '$cpus'"
             allowed=$(awk '/Cpus_allowed_list/{print $2}' "/proc/$pid/task/$tid/status")
-            [ "$cpus" = "$allowed" ] ||
-                vt_die "qid $qid tid $tid: list says '$cpus', /proc says '$allowed'"
-            [[ "$cpus" =~ ^[0-9]+$ ]] ||
-                vt_die "qid $qid: expected one pinned cpu, got '$cpus'"
+            [ "$act" = "$allowed" ] ||
+                vt_die "qid $qid tid $tid: list says active '$act' ('$cpus'), /proc says '$allowed'"
         fi
         checked=$((checked + 1))
     done < <(sed -n 's/^  queues: //p' <<<"$listing" | tr '|' '\n' |
