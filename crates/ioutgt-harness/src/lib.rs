@@ -675,6 +675,27 @@ fn build_stats_sources<C: Send + 'static>(
     sources
 }
 
+/// Refuse to take over a control-socket path that a running instance owns.
+///
+/// A stale file from a dead instance refuses the connect (or is not a
+/// socket at all) and is safe to unlink and rebind; a successful connect
+/// means another target is serving this path — hijacking it would orphan
+/// that instance's listener on an unlinked inode and leave OUR file dead
+/// once we exit, a doubly-confusing failure (the survivor's clients get
+/// ECONNREFUSED while `ss` still shows it listening).
+fn refuse_live_socket(path: &std::path::Path) -> io::Result<()> {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "control socket {} is owned by a running instance",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Bind and serve the runtime control API on `path`, wiring its stats and
 /// namespace-change hooks to the (possibly-down) pool through `senders`.
 /// Must run on the control thread's `LocalSet` (uses `spawn_local`).
@@ -686,6 +707,7 @@ fn spawn_control_api<C: Send + 'static>(
     io_groups: &[String],
     io_threads: usize,
 ) -> io::Result<()> {
+    refuse_live_socket(path)?;
     // The API mutates served storage (ADD/REMOVE_NAMESPACE): owner-only.
     // Prefer a private dir (the CLI defaults to $XDG_RUNTIME_DIR) over
     // world-writable /tmp, where a pre-bound squatter could intercept first.
@@ -939,4 +961,30 @@ pub fn spawn<T: Transport>(config: TargetConfig) -> io::Result<SocketAddr> {
     addr_rx
         .recv()
         .map_err(|_| io::Error::other("control thread died during bind"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_live_socket;
+
+    #[test]
+    fn socket_probe_distinguishes_live_stale_missing() {
+        let dir = std::env::temp_dir().join(format!("ioutgt-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ctl.sock");
+
+        // Missing: nothing to protect.
+        assert!(refuse_live_socket(&path).is_ok());
+
+        // Live: a bound listener owns the path — must refuse.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let err = refuse_live_socket(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        // Stale: listener gone, file left behind — safe to take over.
+        drop(listener);
+        assert!(refuse_live_socket(&path).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
