@@ -237,10 +237,10 @@ enum DecodeState {
 /// Incremental header decoder. Feed bytes; when [`PduDecoder::feed`]
 /// reports completion, call [`PduDecoder::take`].
 pub struct PduDecoder {
-    hdr_digest: bool,
     /// ICReq/ICResp must arrive before digests are enabled; the transport
     /// constructs the decoder per connection after negotiation, except the
     /// handshake decoder which uses `hdr_digest = false`.
+    hdr_digest: bool,
     buf: [u8; MAX_HDR],
     have: usize,
     need: usize,
@@ -463,20 +463,25 @@ fn put_hdgst(buf: &mut [u8], hlen: usize) -> usize {
     hlen + 4
 }
 
-/// Encode an ICReq (host role; used by the test client).
-pub fn encode_icreq(buf: &mut [u8], hdgst: bool, ddgst: bool, maxr2t: u32) -> usize {
-    let mut digest_bits = 0;
+/// Pack the negotiated digest flags for an ICReq/ICResp `digest` byte.
+fn digest_bits(hdgst: bool, ddgst: bool) -> u8 {
+    let mut bits = 0;
     if hdgst {
-        digest_bits |= DIGEST_HDGST;
+        bits |= DIGEST_HDGST;
     }
     if ddgst {
-        digest_bits |= DIGEST_DDGST;
+        bits |= DIGEST_DDGST;
     }
+    bits
+}
+
+/// Encode an ICReq (host role; used by the test client).
+pub fn encode_icreq(buf: &mut [u8], hdgst: bool, ddgst: bool, maxr2t: u32) -> usize {
     let pdu = IcReq {
         hdr: common(pdu_type::ICREQ, 0, 128, 0, 128),
         pfv: U16::new(PFV_1_0),
         hpda: 0,
-        digest: digest_bits,
+        digest: digest_bits(hdgst, ddgst),
         maxr2t: U32::new(maxr2t),
         rsvd: [0; 112],
     };
@@ -486,18 +491,11 @@ pub fn encode_icreq(buf: &mut [u8], hdgst: bool, ddgst: bool, maxr2t: u32) -> us
 
 /// Encode an ICResp granting the negotiated digests.
 pub fn encode_icresp(buf: &mut [u8], hdgst: bool, ddgst: bool, maxdata: u32) -> usize {
-    let mut digest_bits = 0;
-    if hdgst {
-        digest_bits |= DIGEST_HDGST;
-    }
-    if ddgst {
-        digest_bits |= DIGEST_DDGST;
-    }
     let pdu = IcResp {
         hdr: common(pdu_type::ICRESP, 0, 128, 0, 128),
         pfv: U16::new(PFV_1_0),
         cpda: 0,
-        digest: digest_bits,
+        digest: digest_bits(hdgst, ddgst),
         maxdata: U32::new(maxdata),
         rsvd: [0; 112],
     };
@@ -547,6 +545,49 @@ pub fn encode_capsule_resp(buf: &mut [u8], cqe: &Cqe, hdgst: bool) -> usize {
     if hdgst { put_hdgst(buf, 24) } else { 24 }
 }
 
+/// Encode an H2C/C2H DataPdu header (shared 24-byte layout); `base_flags`
+/// carries the direction-specific bits (DATA_LAST, DATA_SUCCESS). Payload
+/// (and DDGST when enabled) follows.
+#[allow(clippy::too_many_arguments)]
+fn encode_data_pdu(
+    buf: &mut [u8],
+    pdu_type: u8,
+    base_flags: u8,
+    cid: u16,
+    ttag: u16,
+    data_offset: u32,
+    data_length: u32,
+    hdgst: bool,
+    ddgst: bool,
+) -> usize {
+    let hdgst_len = u32::from(hdgst) * 4;
+    let ddgst_len = u32::from(ddgst) * 4;
+    let mut flags = base_flags;
+    if hdgst {
+        flags |= pdu_flags::HDGST;
+    }
+    if ddgst {
+        flags |= pdu_flags::DDGST;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let pdu = DataPdu {
+        hdr: common(
+            pdu_type,
+            flags,
+            24,
+            (24 + hdgst_len) as u8,
+            24 + hdgst_len + data_length + ddgst_len,
+        ),
+        cid: U16::new(cid),
+        ttag: U16::new(ttag),
+        data_offset: U32::new(data_offset),
+        data_length: U32::new(data_length),
+        rsvd: [0; 4],
+    };
+    buf[..24].copy_from_slice(pdu.as_bytes());
+    if hdgst { put_hdgst(buf, 24) } else { 24 }
+}
+
 /// Encode a C2HData header; payload (and DDGST when enabled) follows.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_c2h_data(
@@ -559,38 +600,24 @@ pub fn encode_c2h_data(
     hdgst: bool,
     ddgst: bool,
 ) -> usize {
-    let hdgst_len = u32::from(hdgst) * 4;
-    let ddgst_len = u32::from(ddgst) * 4;
-    let mut flags = 0;
-    if hdgst {
-        flags |= pdu_flags::HDGST;
-    }
-    if ddgst {
-        flags |= pdu_flags::DDGST;
-    }
+    let mut base_flags = 0;
     if last {
-        flags |= pdu_flags::DATA_LAST;
+        base_flags |= pdu_flags::DATA_LAST;
     }
     if success {
-        flags |= pdu_flags::DATA_SUCCESS;
+        base_flags |= pdu_flags::DATA_SUCCESS;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let pdu = DataPdu {
-        hdr: common(
-            pdu_type::C2H_DATA,
-            flags,
-            24,
-            (24 + hdgst_len) as u8,
-            24 + hdgst_len + data_length + ddgst_len,
-        ),
-        cid: U16::new(cid),
-        ttag: U16::new(0),
-        data_offset: U32::new(data_offset),
-        data_length: U32::new(data_length),
-        rsvd: [0; 4],
-    };
-    buf[..24].copy_from_slice(pdu.as_bytes());
-    if hdgst { put_hdgst(buf, 24) } else { 24 }
+    encode_data_pdu(
+        buf,
+        pdu_type::C2H_DATA,
+        base_flags,
+        cid,
+        0,
+        data_offset,
+        data_length,
+        hdgst,
+        ddgst,
+    )
 }
 
 /// Encode an R2T requesting `length` bytes at `offset` for `ttag`.
@@ -628,35 +655,18 @@ pub fn encode_h2c_data(
     hdgst: bool,
     ddgst: bool,
 ) -> usize {
-    let hdgst_len = u32::from(hdgst) * 4;
-    let ddgst_len = u32::from(ddgst) * 4;
-    let mut flags = 0;
-    if hdgst {
-        flags |= pdu_flags::HDGST;
-    }
-    if ddgst {
-        flags |= pdu_flags::DDGST;
-    }
-    if last {
-        flags |= pdu_flags::DATA_LAST;
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    let pdu = DataPdu {
-        hdr: common(
-            pdu_type::H2C_DATA,
-            flags,
-            24,
-            (24 + hdgst_len) as u8,
-            24 + hdgst_len + data_length + ddgst_len,
-        ),
-        cid: U16::new(cid),
-        ttag: U16::new(ttag),
-        data_offset: U32::new(data_offset),
-        data_length: U32::new(data_length),
-        rsvd: [0; 4],
-    };
-    buf[..24].copy_from_slice(pdu.as_bytes());
-    if hdgst { put_hdgst(buf, 24) } else { 24 }
+    let base_flags = if last { pdu_flags::DATA_LAST } else { 0 };
+    encode_data_pdu(
+        buf,
+        pdu_type::H2C_DATA,
+        base_flags,
+        cid,
+        ttag,
+        data_offset,
+        data_length,
+        hdgst,
+        ddgst,
+    )
 }
 
 /// Encode a C2HTermReq. We never attach the offending header copy.
