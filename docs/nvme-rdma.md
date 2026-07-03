@@ -178,6 +178,21 @@ at the reactor's park backstop (~1s), so teardown can lag up to ~1s. This is a
 second cross-thread wake channel (the harness's mailbox-only invariant covers the
 data path); routing the stop through the mailbox doorbell would make it prompt.
 
+**Poll mode (`--poll`).** Opt-in adaptive busy-polling for latency: while a
+queue has commands in flight (any slot tag claimed, plus a 200 µs grace so
+low-depth workloads' inter-command gaps don't re-pay the event wake), the
+reactor's park hook spins — draining the CQ via the park-probe on every pass
+and entering the kernel with `GETEVENTS` so `DEFER_TASKRUN` completions
+(backend IO, control mailbox) keep flowing — instead of sleeping on
+comp-channel events. A genuinely idle queue stops burning its core within the
+grace and falls back to the event-driven sleep; the next capsule's comp event
+resumes the spin. The admin queue never spins (its parked AER holds a slot
+for the controller lifetime, and keep-alive latency does not merit a core).
+Measured effect (single job 4k, SSD): qd1 randread 52.6 → 43.1 µs, randwrite
+39.5 → 29.4 µs; qd128 unchanged (host-bound). Operational note: a spinning
+io-thread owns its core — benchmark clients must not share a converged
+io-thread CPU.
+
 **Abrupt host loss (no DREQ).** A host that vanishes without disconnecting
 sends nothing the QP or CM would notice — there is no socket death to unwind.
 The reap loop's backstop timer therefore doubles as a keep-alive watchdog
