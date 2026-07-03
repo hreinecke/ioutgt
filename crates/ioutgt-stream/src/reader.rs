@@ -397,7 +397,6 @@ mod tests {
         rt.block_on(async move {
             // 256 KiB ring → two 128 KiB buffers.
             let ring: Rc<BufRing> = BufRing::new(9, 256 * 1024).unwrap();
-            let buf_size = ring.buf_size() as usize;
 
             let mut reader = StreamReader::new_ring(a.as_raw_fd(), ring.clone());
 
@@ -459,7 +458,6 @@ mod tests {
             );
 
             let _ = sender.join();
-            let _ = buf_size;
         });
     }
 
