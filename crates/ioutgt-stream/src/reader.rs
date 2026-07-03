@@ -392,6 +392,12 @@ mod tests {
     /// the drain path.
     #[test]
     fn ring_drain_calls_recv_done_not_provide() {
+        // Push well over one buffer so the kernel fills bid0 to the brim
+        // and moves on.
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 6;
+        const TOTAL: usize = 5 + CHUNKS * CHUNK; // "hello" + the chunks
+
         let (a, b) = socketpair();
         let rt = QueueRuntime::new(RingConfig::default()).unwrap();
         rt.block_on(async move {
@@ -415,12 +421,12 @@ mod tests {
             // window; consume it and feed more. We track how much of buffer 0
             // has been consumed via the bid changing.
             reader.consume(first_len);
+            let mut consumed = first_len;
             let sender = std::thread::spawn(move || {
-                // Push well over one buffer so the kernel fills bid0 to the
-                // brim and moves on. A background thread avoids socket-buffer
-                // backpressure deadlocking the single-threaded reactor.
-                let chunk = vec![0xABu8; 64 * 1024];
-                for _ in 0..6 {
+                // A background thread avoids socket-buffer backpressure
+                // deadlocking the single-threaded reactor.
+                let chunk = vec![0xABu8; CHUNK];
+                for _ in 0..CHUNKS {
                     send_all(&b, &chunk);
                 }
                 b
@@ -435,6 +441,7 @@ mod tests {
                     (bid.unwrap(), win.len())
                 };
                 reader.consume(win_len);
+                consumed += win_len;
                 if cur != bid0 {
                     break;
                 }
@@ -457,6 +464,21 @@ mod tests {
                 "bid0 must be provided to the kernel once the last borrow is released"
             );
 
+            // Drain everything the sender pushed BEFORE joining it. Under
+            // DEFER_TASKRUN, socket bytes move into ring buffers only while
+            // this thread drives the reactor; the sender's blocking writes
+            // outsize the socketpair queue, so joining first deadlocks: the
+            // sender waits on queue space, and this thread waits on the
+            // sender.
+            while consumed < TOTAL {
+                let win_len = {
+                    let (win, _bid) = reader.fill_with_bid().await.unwrap();
+                    assert!(!win.is_empty(), "unexpected EOF mid-drain");
+                    win.len()
+                };
+                reader.consume(win_len);
+                consumed += win_len;
+            }
             let _ = sender.join();
         });
     }
