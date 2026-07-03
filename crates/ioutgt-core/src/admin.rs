@@ -161,7 +161,6 @@ fn build_id_ctrl<B: Backend>(
     match subsys.as_ref() {
         Some(s) => {
             ascii_pad(&mut id.sn, &s.serial);
-            ascii_pad(&mut id.subnqn, &s.nqn);
             // subnqn is NUL-terminated, not space-padded.
             nul_terminate(&mut id.subnqn, &s.nqn);
         }

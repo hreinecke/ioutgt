@@ -75,11 +75,6 @@ impl RegisterState {
         CcEffect::None
     }
 
-    /// Latch a fatal error (CSTS.CFS), e.g. keep-alive expiry.
-    pub fn fatal_error(&mut self) {
-        self.csts |= ioutgt_nvme::fabrics::csts::CFS;
-    }
-
     /// CSTS.RDY is set.
     pub fn ready(&self) -> bool {
         self.csts & ioutgt_nvme::fabrics::csts::RDY != 0
