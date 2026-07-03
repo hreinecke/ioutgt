@@ -971,7 +971,7 @@ API change (development machine is single-node).
 | M13 | shared recv byte-source | done — buffered scratch + `ops::recv` (`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail (`read_direct`) extracted to `ioutgt-stream::StreamReader`; NVMe/TCP keeps the PDU phase machine |
 | M14 | multi-transport harness | done — spawn, queue-thread pool, control server and clients extracted to `ioutgt-harness` behind a `Transport` trait; both binaries share them |
 | M15 | NVMe/RDMA transport | done — `ioutgt-nvme-rdma` (`sideway` verbs, `rdma-mummy-sys` CM); kernel-host interop on rxe (VM gates) and mlx5 (box); crc32c data-integrity gates green |
-| M16 | NVMe/RDMA performance | done — pool arena as io_uring fixed buffer, reactor park-probe (CQ polled at the sleep point), in-capsule write data (IOCCSZ + SGLS SAOS, nvmet parity); wins every single-job fio_perf phase vs nvmet-rdma on the test box |
+| M16 | NVMe/RDMA performance | done — pool arena as io_uring fixed buffer, reactor park-probe (CQ polled at the sleep point), in-capsule write data (IOCCSZ + SGLS SAOS, nvmet parity); matches or beats nvmet-rdma on every single-job fio_perf phase on the test box (64k +38-44%, 4k within ±3%) |
 | M17 | adaptive `--poll` | done — busy-poll while commands are in flight (+200 µs grace), event-driven when idle; qd1 latency −20-30%, admin queue exempt |
 
 ## 14. Risks
