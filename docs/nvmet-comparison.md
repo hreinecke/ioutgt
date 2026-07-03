@@ -234,7 +234,7 @@ workqueue of its own; TCP I/O is per-queue `io_work` on one shared global
 `nvmet_tcp_wq`, and the controller's subsystem is chosen at Connect via
 `nvmet_find_get_subsys`. The one divergence is placement policy, not
 granularity: nvmet steers each queue's `io_work` to the socket's RX CPU
-(`sk_incoming_cpu`) dynamically, whereas ioutgt uses a fixed `group_cpus_evenly`
+(`sk_incoming_cpu`) dynamically, whereas ioutgt uses a fixed `spread_cpus`
 pinning with deterministic qid→thread hashing.
 
 **Benefits.** The "no locks on the hot path" claim is checkable by

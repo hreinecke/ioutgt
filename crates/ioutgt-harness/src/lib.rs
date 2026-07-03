@@ -28,7 +28,7 @@ use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
-use ioutgt_cpus::{CpuTopology, group_cpus_evenly};
+use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{error, info, warn};
@@ -96,7 +96,7 @@ pub struct TargetConfig {
     pub io_threads: usize,
     pub allow_hdgst: bool,
     pub allow_ddgst: bool,
-    /// Pin each IO queue thread to one CPU of its `group_cpus_evenly`
+    /// Pin each IO queue thread to one CPU of its `spread_cpus`
     /// group (disable in tests).
     pub pin_threads: bool,
     /// Busy-poll the transport's completion sources on the IO queue threads
@@ -436,8 +436,9 @@ fn make_admin_thread<T: Transport>(
 
 /// For each IO queue thread, the CPU it is pinned to and the full online CPU
 /// group it belongs to. CPUs are grouped evenly per NUMA/cluster/SMT locality
-/// (the kernel `group_cpus_evenly` spread, i.e. what nvme-tcp queues see on the
-/// host side), one group per IO thread; the thread is pinned to (and reported
+/// (`spread_cpus` — same spirit as the managed-IRQ spread nvme-tcp host queues
+/// get, though not bit-identical to any particular kernel's grouping), one
+/// group per IO thread; the thread is pinned to (and reported
 /// as "active" on) the group's first online CPU, while the whole group is
 /// surfaced (as a kernel cpulist, e.g. `"0-1,32-33"`) so the harness can steer
 /// NIC IRQ affinity across it. Returns `(active_cpu, group_cpulist)` per thread
@@ -450,11 +451,11 @@ fn io_thread_cpus(io_threads: usize) -> (Vec<Option<usize>>, Vec<String>) {
             return (vec![None; io_threads], vec!["*".to_owned(); io_threads]);
         }
     };
-    let groups = group_cpus_evenly(io_threads, &topo);
+    let groups = spread_cpus(io_threads, &topo);
     let mut cpus = Vec::with_capacity(io_threads);
     let mut group_lists = Vec::with_capacity(io_threads);
     for i in 0..io_threads {
-        // groups can run out when io_threads > possible CPUs; a group of
+        // groups come back empty when io_threads > possible CPUs; a group of
         // only-offline CPUs yields no pinnable CPU.
         let group = groups.get(i);
         let online = group.map(|g| g.and(&topo.online));

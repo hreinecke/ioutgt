@@ -1,7 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-only
-
-//! Growable CPU bitset mirroring the kernel `cpumask` operations that
-//! `group_cpus_evenly()` relies on.
+//! Growable CPU bitset with the mask operations the grouping and the
+//! topology reader rely on.
 
 use std::fmt;
 use std::io;
@@ -10,8 +8,7 @@ const BITS_PER_WORD: usize = u64::BITS as usize;
 
 /// A set of CPU ids backed by a growable bit vector.
 ///
-/// Mirrors the subset of kernel `cpumask` operations used by
-/// `lib/group_cpus.c`. Sets grow on demand; all binary operations
+/// Sets grow on demand; all binary operations
 /// accept operands of different lengths.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct CpuSet {
@@ -47,7 +44,7 @@ impl CpuSet {
             .is_some_and(|w| w & (1u64 << (cpu % BITS_PER_WORD)) != 0)
     }
 
-    /// Number of CPUs in the set (kernel `cpumask_weight`).
+    /// Number of CPUs in the set.
     pub fn weight(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
@@ -57,7 +54,7 @@ impl CpuSet {
         self.words.iter().all(|&w| w == 0)
     }
 
-    /// Lowest CPU in the set (kernel `cpumask_first`).
+    /// Lowest CPU in the set.
     pub fn first(&self) -> Option<usize> {
         self.iter().next()
     }
@@ -81,7 +78,7 @@ impl CpuSet {
         })
     }
 
-    /// `self & other` (kernel `cpumask_and`).
+    /// `self & other`.
     pub fn and(&self, other: &CpuSet) -> CpuSet {
         CpuSet {
             words: self
@@ -93,7 +90,7 @@ impl CpuSet {
         }
     }
 
-    /// `self | other` (kernel `cpumask_or`).
+    /// `self | other`.
     pub fn or(&self, other: &CpuSet) -> CpuSet {
         let mut words = vec![0u64; self.words.len().max(other.words.len())];
         for (i, w) in words.iter_mut().enumerate() {
@@ -102,7 +99,7 @@ impl CpuSet {
         CpuSet { words }
     }
 
-    /// `self & !other` (kernel `cpumask_andnot`).
+    /// `self & !other`.
     pub fn andnot(&self, other: &CpuSet) -> CpuSet {
         CpuSet {
             words: self
@@ -114,7 +111,7 @@ impl CpuSet {
         }
     }
 
-    /// Whether the sets share any CPU (kernel `cpumask_intersects`).
+    /// Whether the sets share any CPU.
     pub fn intersects(&self, other: &CpuSet) -> bool {
         self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
     }

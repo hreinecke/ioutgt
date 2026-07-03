@@ -64,7 +64,7 @@ Controller Process
 │
 ├── Admin Queue Thread         pinned; own ring; admin queues of all ctrls
 │
-└── IO Queue Threads 0..N-1    pinned, one CPU from group_cpus_evenly
+└── IO Queue Threads 0..N-1    pinned, one CPU from spread_cpus
                                group i (§11); own ring; own memory;
                                own command slots; own send/recv machines
 ```
@@ -98,8 +98,8 @@ crate depends only on layers below it. The two main leaves are
 deliberately opposite in character: `ioutgt-nvme` is **sans-IO** (pure
 bytes ↔ structs, no sockets, no async, fuzzable in isolation) and
 `ioutgt-uring` is **pure IO** (op futures and the reactor, zero protocol
-knowledge). A third small leaf, `ioutgt-cpus`, is a userspace port of
-the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`): the grouping
+knowledge). A third small leaf, `ioutgt-cpus`, groups CPUs evenly per
+NUMA / cluster / SMT locality (`spread_cpus`): the grouping
 algorithm is pure (driven by a `CpuTopology` value, synthetic in tests),
 with sysfs reading confined to `CpuTopology::from_sysfs()`.
 
@@ -160,7 +160,7 @@ management via `rdma-mummy-sys`; see `docs/nvme-rdma.md`).
 | `ioutgt-core` | NVMe model + dispatch + `slotq` engine | nvme |
 | `ioutgt-nvme` | sans-IO codec | — |
 | `ioutgt-uring` | reactor + op futures + `sendbatch` | — |
-| `ioutgt-cpus` | userspace `group_cpus_evenly()` | — |
+| `ioutgt-cpus` | locality-aware even CPU grouping | — |
 
 ### 4.1 Assembly: what `spawn_target()` wires up
 
@@ -916,14 +916,15 @@ synchronous data leases never block.
 ## 11. CPU affinity and NUMA
 
 By default (`pin_threads` on; opt out with `--no-pin` or
-`"pin_threads": false`), IO queue thread placement uses `ioutgt-cpus`,
-a userspace port of the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`):
-all possible CPUs are grouped evenly per NUMA / cluster / SMT locality
-(present CPUs spread first, groups apportioned to nodes by CPU-count
-ratio, cluster-aligned when possible, SMT-sibling-first fill — the same
-spread managed IRQs and therefore host-side nvme queues get), one group
-per IO thread, and each thread is pinned to its group's first online
-CPU. A group with no online CPU (or sysfs failure) leaves that thread
+`"pin_threads": false`), IO queue thread placement uses `ioutgt-cpus`
+(`spread_cpus`, an ioutgt-original algorithm): all possible CPUs are
+grouped evenly per NUMA / cluster / SMT locality (group seats
+apportioned to nodes largest-remainder by present-CPU weight, nodes
+packed in cluster-major SMT-atom order with present CPUs spread first —
+the same locality properties managed IRQs and therefore host-side nvme
+queues get, though not bit-identical to the kernel's grouping), one
+group per IO thread, and each thread is pinned to its group's first
+online CPU. A group with no online CPU (or sysfs failure) leaves that thread
 unpinned with a warning; the admin thread is never pinned. Combined with
 the deterministic qid→thread routing `(n-1) % N`, this lines the host's
 per-CPU queues up with topology-aware target cores. Slot arrays and

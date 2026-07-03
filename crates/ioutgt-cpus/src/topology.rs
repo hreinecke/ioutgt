@@ -1,14 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
-
-//! CPU topology snapshot read from sysfs — the userspace stand-in for
-//! the kernel topology masks consumed by `group_cpus_evenly()`.
+//! CPU topology snapshot read from sysfs — the possible/present/online
+//! masks plus per-CPU node, cluster, and SMT-sibling data that
+//! [`spread_cpus`](crate::spread_cpus) consumes.
 
 use std::io;
 use std::path::Path;
 
 use crate::CpuSet;
 
-/// CPU topology snapshot: the masks `group_cpus_evenly` consumes.
+/// CPU topology snapshot: the masks [`spread_cpus`](crate::spread_cpus)
+/// consumes.
 ///
 /// Normally built from sysfs via [`CpuTopology::from_sysfs`]; tests
 /// construct synthetic instances directly.

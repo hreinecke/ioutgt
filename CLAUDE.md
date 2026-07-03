@@ -37,7 +37,7 @@ profile keeps `debug = true` for perf/flamegraph work.
 ```sh
 testing/run_interop.sh            # full matrix: discover/connect, fio --verify, fs stage
 testing/run_interop.sh ioutgt_fio # only the fio data-integrity stage
-testing/run_affinity.sh           # multi-NUMA guest: group_cpus_evenly placement (default-on)
+testing/run_affinity.sh           # multi-NUMA guest: spread_cpus placement (default-on)
 ```
 
 Requires the external vmtest harness (`https://github.com/ublk-org/vmtest`, config
@@ -76,8 +76,9 @@ end to end in `docs/stream-sender.md`). The frontends compose these:
 `SendList<SendWork>` as `NvmeTcpQueue` and drives `StreamSender`),
 `ioutgt-backend`, and `ioutgt-control`. The `ioutgt` binary assembles
 everything in `spawn_target()` (`crates/ioutgt/src/lib.rs`). The last
-leaf, `ioutgt-cpus`, ports the kernel's `group_cpus_evenly()` for
-topology-aware IO-thread pinning (used only by the binary).
+leaf, `ioutgt-cpus`, provides locality-aware even CPU grouping
+(`spread_cpus`) for topology-aware IO-thread pinning (used only by the
+binary).
 
 Threading: a control thread on plain Tokio does accept + ICReq handshake
 + first-Connect parse, then routes the socket by qid to a pinned queue

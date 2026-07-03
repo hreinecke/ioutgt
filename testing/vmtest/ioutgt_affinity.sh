@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # Guest-side CPU-affinity test: run ioutgt (pinning is default-on)
 # guest (vmtest.conf: VMTEST_NUMA_NODES > 1) and verify the userspace
-# group_cpus_evenly placement against the guest's /sys topology:
+# spread_cpus placement against the guest's /sys topology:
 #   - one affinity group per IO thread, each group inside ONE NUMA node
 #   - groups pairwise disjoint and covering every possible CPU
 #   - every node serves at least one IO thread

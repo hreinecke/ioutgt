@@ -1,29 +1,22 @@
-// SPDX-License-Identifier: GPL-2.0-only
-
-//! Userspace port of the kernel's `group_cpus_evenly()`
-//! (`lib/group_cpus.c`).
+//! Locality-aware even CPU grouping for IO-thread pinning.
 //!
-//! **License**: unlike the rest of the workspace (MIT OR Apache-2.0),
-//! this crate is GPL-2.0-only — `group.rs` is a derivative of the
-//! kernel's GPL-2.0 `lib/group_cpus.c` (see the copyright notices
-//! there and `LICENSE` in this crate).
+//! [`spread_cpus`] partitions all possible CPUs into `n` groups that
+//! respect NUMA / cluster / SMT boundaries and spread present CPUs as
+//! evenly as possible, so pinning IO-queue thread `i` into group `i`
+//! places threads the way locality-aware IRQ spreading places host
+//! nvme queues. The algorithm is ioutgt's own (see `spread.rs` for the
+//! full contract); its exact assignments are not guaranteed to match
+//! any particular kernel's managed-IRQ grouping — only the locality
+//! and evenness properties are.
 //!
-//! Groups all possible CPUs evenly per NUMA / cluster / SMT locality:
-//! present CPUs are spread first, then possible-but-not-present ones,
-//! groups are apportioned to NUMA nodes by CPU-count ratio, kept
-//! cluster-aligned when possible, and filled SMT-sibling-first. The
-//! result is the same grouping the kernel computes for managed IRQ
-//! spreading (and thus what `nvme-tcp` queues see), so pinning queue
-//! thread `i` into group `i` aligns target threads with host queues.
-//!
-//! Like `ioutgt-nvme`, this crate is a pure leaf: the algorithm
-//! ([`group_cpus_evenly`]) only consumes a [`CpuTopology`] value;
-//! sysfs access is confined to [`CpuTopology::from_sysfs`].
+//! Like `ioutgt-nvme`, this crate is a pure leaf: [`spread_cpus`] only
+//! consumes a [`CpuTopology`] value; sysfs access is confined to
+//! [`CpuTopology::from_sysfs`].
 
 mod cpuset;
-mod group;
+mod spread;
 mod topology;
 
 pub use cpuset::CpuSet;
-pub use group::group_cpus_evenly;
+pub use spread::spread_cpus;
 pub use topology::CpuTopology;
