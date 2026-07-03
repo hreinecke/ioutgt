@@ -156,6 +156,27 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
     };
     let suffix = if prev.is_some() { "/s" } else { "" };
 
+    // Shared 6-bucket batch-size histogram: `<prefix>_b1 … <prefix>_b32`
+    // rendered as "label:val …" (backend rw/submit, RDMA WR batch rows).
+    const BUCKETS: [(&str, &str); 6] = [
+        ("b1", "1"),
+        ("b2", "2"),
+        ("b4", "<=4"),
+        ("b8", "<=8"),
+        ("b16", "<=16"),
+        ("b32", ">16"),
+    ];
+    let hist = |src: &serde_json::Value, src0: &serde_json::Value, prefix: &str| -> String {
+        BUCKETS
+            .iter()
+            .map(|(bucket, label)| {
+                let key = format!("{prefix}_{bucket}");
+                format!("{label}:{}", val(u(src, &key), u(src0, &key)))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
     let find_thread = |name: &str| -> Option<&serde_json::Value> {
         prev?.0["threads"]
             .as_array()?
@@ -234,25 +255,15 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
         // it): how many storage read/write SQEs each io_uring_enter carried.
         // Suppressed when the thread did no backend ring IO (memory/null
         // backends, idle threads).
-        const RW_SQ: [(&str, &str); 6] = [
-            ("rw_sq_b1", "1"),
-            ("rw_sq_b2", "2"),
-            ("rw_sq_b4", "<=4"),
-            ("rw_sq_b8", "<=8"),
-            ("rw_sq_b16", "<=16"),
-            ("rw_sq_b32", ">16"),
-        ];
-        let rw_total: u64 = RW_SQ
+        let rw_total: u64 = BUCKETS
             .iter()
-            .map(|(k, _)| amt(u(ring, k), u(ring0, k)))
+            .map(|(bucket, _)| {
+                let key = format!("rw_sq_{bucket}");
+                amt(u(ring, &key), u(ring0, &key))
+            })
             .sum();
         if rw_total > 0 {
-            let cells = RW_SQ
-                .iter()
-                .map(|(k, label)| format!("{label}:{}", val(u(ring, k), u(ring0, k))))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(out, "  backend rw/submit [{cells}]");
+            let _ = writeln!(out, "  backend rw/submit [{}]", hist(ring, ring0, "rw_sq"));
         }
         for q in thread["queues"].as_array().into_iter().flatten() {
             let q0 = match_queue(&before, q);
@@ -313,31 +324,13 @@ fn render_stat(data: &serde_json::Value, prev: Option<(&serde_json::Value, f64)>
                 // each non-empty poll reaped — the averages above can hide a
                 // bimodal mix (many 1-WR doorbells + a few huge ones).
                 if wr.get("poll_b1").is_some() {
-                    let hist = |prefix: &str| {
-                        const BUCKETS: [(&str, &str); 6] = [
-                            ("b1", "1"),
-                            ("b2", "2"),
-                            ("b4", "<=4"),
-                            ("b8", "<=8"),
-                            ("b16", "<=16"),
-                            ("b32", ">16"),
-                        ];
-                        BUCKETS
-                            .iter()
-                            .map(|(k, label)| {
-                                let key = format!("{prefix}_{k}");
-                                format!("{label}:{}", val(u(wr, &key), u(&wr0, &key)))
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    };
                     let _ = writeln!(
                         out,
                         "    batch  read/db [{}]  resp/db [{}]  recv/db [{}]  cqe/poll [{}]",
-                        hist("read_db"),
-                        hist("resp_db"),
-                        hist("recv_db"),
-                        hist("poll"),
+                        hist(wr, &wr0, "read_db"),
+                        hist(wr, &wr0, "resp_db"),
+                        hist(wr, &wr0, "recv_db"),
+                        hist(wr, &wr0, "poll"),
                     );
                 }
             }

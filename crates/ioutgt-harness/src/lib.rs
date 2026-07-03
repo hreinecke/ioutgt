@@ -307,6 +307,36 @@ fn thread_stats_json(
     })
 }
 
+/// Build a queue thread's io_uring runtime, logging and returning `None`
+/// on failure (the thread then exits without running its mailbox loop).
+fn queue_runtime(name: &str) -> Option<QueueRuntime> {
+    match QueueRuntime::new(RingConfig::default()) {
+        Ok(rt) => Some(rt),
+        Err(err) => {
+            warn!(thread = %name, "queue runtime failed: {err}");
+            None
+        }
+    }
+}
+
+/// Answer a queue thread's stats request: prune dead queues, send the JSON
+/// snapshot, then zero every counter if `clear` was set. Runs on the owning
+/// thread (the only place its `Cell` counters may be touched).
+fn reply_thread_stats(
+    name: &str,
+    queues: &RefCell<Vec<Rc<QueueStats>>>,
+    retired: &mut QueueStatsSnapshot,
+    reply: StatsRequest,
+    clear: bool,
+) {
+    prune_dead_queues(queues, retired);
+    let borrowed = queues.borrow();
+    let _ = reply.send(thread_stats_json(name, &borrowed, retired));
+    if clear {
+        clear_thread_stats(&borrowed, retired);
+    }
+}
+
 /// Create an IO queue thread's mailbox and return its sender plus a
 /// deferred spawn closure (the ring/runtime/OS thread are built only when
 /// the closure runs). IO queue threads receive connections and stats
@@ -318,12 +348,8 @@ fn make_io_thread<T: Transport>(
     let (tx, mut rx): IoMailbox<T::Conn> = mailbox()?;
     let spawn: PendingThread = Box::new(move || {
         spawn_pinned(name.clone(), core_id, move || {
-            let rt = match QueueRuntime::new(RingConfig::default()) {
-                Ok(rt) => rt,
-                Err(err) => {
-                    warn!(thread = %name, "queue runtime failed: {err}");
-                    return;
-                }
+            let Some(rt) = queue_runtime(&name) else {
+                return;
             };
             rt.block_on(async move {
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -339,12 +365,7 @@ fn make_io_thread<T: Transport>(
                             tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
                         Ok(IoMsg::Stats { reply, clear }) => {
-                            prune_dead_queues(&queues, &mut retired);
-                            let queues = queues.borrow();
-                            let _ = reply.send(thread_stats_json(&name, &queues, &retired));
-                            if clear {
-                                clear_thread_stats(&queues, &mut retired);
-                            }
+                            reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
                         Ok(IoMsg::Shutdown) => return,
                         Err(err) => {
@@ -368,12 +389,8 @@ fn make_admin_thread<T: Transport>(
     let (tx, mut rx): AdminMailbox<T::Conn> = mailbox()?;
     let spawn: PendingThread = Box::new(move || {
         spawn_pinned(name.clone(), None, move || {
-            let rt = match QueueRuntime::new(RingConfig::default()) {
-                Ok(rt) => rt,
-                Err(err) => {
-                    warn!(thread = %name, "queue runtime failed: {err}");
-                    return;
-                }
+            let Some(rt) = queue_runtime(&name) else {
+                return;
             };
             rt.block_on(async move {
                 let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
@@ -402,12 +419,7 @@ fn make_admin_thread<T: Transport>(
                             });
                         }
                         Ok(AdminMsg::Stats { reply, clear }) => {
-                            prune_dead_queues(&queues, &mut retired);
-                            let queues = queues.borrow();
-                            let _ = reply.send(thread_stats_json(&name, &queues, &retired));
-                            if clear {
-                                clear_thread_stats(&queues, &mut retired);
-                            }
+                            reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
                         Ok(AdminMsg::Shutdown) => return,
                         Err(err) => {

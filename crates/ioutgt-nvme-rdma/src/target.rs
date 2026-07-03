@@ -1424,56 +1424,58 @@ impl RdmaQueue {
             let spin_nvme = Rc::clone(&self.nvme);
             let spin_last = Rc::clone(&last_active);
             let spin = poll.then(|| {
-                Box::new(move || {
-                    !spin_nvme.slots.idle() || spin_last.get().elapsed() < SPIN_GRACE
-                }) as Box<dyn Fn() -> bool>
+                Box::new(move || !spin_nvme.slots.idle() || spin_last.get().elapsed() < SPIN_GRACE)
+                    as Box<dyn Fn() -> bool>
             });
             let probe_nvme = Rc::clone(&self.nvme);
-            ioutgt_uring::add_park_probe(Box::new(move || {
-                let mut staged = shared.staged.borrow_mut();
-                let drain = |staged: &mut Vec<(u64, bool)>| {
-                    if let Ok(poller) = cq.start_poll() {
-                        for wc in poller {
-                            staged.push((
-                                wc.wr_id(),
-                                wc.status() == WorkCompletionStatus::Success as u32,
-                            ));
+            ioutgt_uring::add_park_probe(
+                Box::new(move || {
+                    let mut staged = shared.staged.borrow_mut();
+                    let drain = |staged: &mut Vec<(u64, bool)>| {
+                        if let Ok(poller) = cq.start_poll() {
+                            for wc in poller {
+                                staged.push((
+                                    wc.wr_id(),
+                                    wc.status() == WorkCompletionStatus::Success as u32,
+                                ));
+                            }
                         }
-                    }
-                };
-                drain(&mut staged);
-                if poll && !staged.is_empty() {
-                    last_active.set(std::time::Instant::now());
-                }
-                // Arm whenever this pass may end in a sleep: event mode
-                // always; poll mode whenever the queue is idle — deliberately
-                // IGNORING the spin grace here. The spin predicate is
-                // re-evaluated after this probe with a later timestamp, so
-                // gating the arm on the same grace check could disagree
-                // across the 200 us boundary and let the pass sleep with the
-                // CQ unarmed (a ~1 s backstop stall on the next capsule —
-                // review finding). Arming strictly more often than the
-                // predicate sleeps closes the race; the cost is at most one
-                // spurious comp event per idle transition while grace-
-                // spinning, which the fd poll simply drains.
-                if staged.is_empty() && (!poll || probe_nvme.slots.idle()) {
-                    // Nothing pending: arm so a completion during the coming
-                    // sleep raises an event for the multishot poll, then
-                    // re-check the race window.
-                    if crate::cq::arm(&cq).is_err() {
-                        return true; // never sleep on a broken CQ
-                    }
+                    };
                     drain(&mut staged);
-                }
-                if !staged.is_empty() {
-                    if let Some(w) = shared.waker.borrow_mut().take() {
-                        w.wake();
+                    if poll && !staged.is_empty() {
+                        last_active.set(std::time::Instant::now());
                     }
-                    true
-                } else {
-                    false
-                }
-            }), spin)?
+                    // Arm whenever this pass may end in a sleep: event mode
+                    // always; poll mode whenever the queue is idle — deliberately
+                    // IGNORING the spin grace here. The spin predicate is
+                    // re-evaluated after this probe with a later timestamp, so
+                    // gating the arm on the same grace check could disagree
+                    // across the 200 us boundary and let the pass sleep with the
+                    // CQ unarmed (a ~1 s backstop stall on the next capsule —
+                    // review finding). Arming strictly more often than the
+                    // predicate sleeps closes the race; the cost is at most one
+                    // spurious comp event per idle transition while grace-
+                    // spinning, which the fd poll simply drains.
+                    if staged.is_empty() && (!poll || probe_nvme.slots.idle()) {
+                        // Nothing pending: arm so a completion during the coming
+                        // sleep raises an event for the multishot poll, then
+                        // re-check the race window.
+                        if crate::cq::arm(&cq).is_err() {
+                            return true; // never sleep on a broken CQ
+                        }
+                        drain(&mut staged);
+                    }
+                    if !staged.is_empty() {
+                        if let Some(w) = shared.waker.borrow_mut().take() {
+                            w.wake();
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }),
+                spin,
+            )?
         };
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields
