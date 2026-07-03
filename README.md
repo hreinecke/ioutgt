@@ -5,38 +5,26 @@ written in Rust. It speaks **NVMe/TCP** and **NVMe/RDMA** today; the
 architecture is transport-independent and designed to grow NBD and iSCSI
 behind the same core.
 
-## Motivation
+## io_uring keeps going
 
-### io_uring keeps going
+I/O Batch Processing
 
-io_uring is where Linux IO development happens: multishot operations,
-`DEFER_TASKRUN`, provided-buffer rings, registered files and buffers,
-zero-copy send and receive — new capabilities land every kernel cycle.
-A userspace target built directly on io_uring picks these up as they
-ship, with one wait primitive (`io_uring_enter`) driving sockets, disks
-and timers alike.
+Continuous performance optimization
 
-### Why Rust
+New features are constantly emerging (multishot, net recv zero copy,
+iopoll, io-uring slots in future, dmabuf read/write in future, ...)
 
-A storage target runs for months holding other people's data, which
-makes the classic tradeoff painful: C is fast but every buffer lifetime
-is on you; garbage-collected languages are safe but pause. Rust removes
-the tradeoff — the invariants this design depends on (buffers outliving
-DMA, no allocation on the IO path, connection state never crossing
-threads) are enforced by the compiler, at zero runtime cost, while
-async/await keeps a fully pipelined state machine readable.
+## Rust
 
-### Why userspace (compared with kernel nvmet)
+Memory safe modern programming language
 
-The kernel target is excellent, but living in the kernel has costs:
-features arrive with kernel releases, a bug can take the machine down,
-and profiling or patching means kernel work. A userspace target deploys
-like any other binary — upgrade with a restart, crash in isolation,
-profile with `perf` on a normal process, tune per deployment (CPU
-pinning, adaptive polling). And it does not cost performance: on our
-test box, ioutgt matches or beats kernel nvmet on every single-job
-`fio_perf` phase, on both transports — up to 2× on NVMe/TCP (numbers
-below).
+Async/.await
+
+## userspace (compared with kernel nvme target)
+
+Easy to develop and maintain
+
+Crash in isolation
 
 ## Design highlights
 
@@ -102,11 +90,9 @@ ceiling through one QP.
   TCP transports — the evidence points at the host-side driver (kernel
   `nvme-rdma` submits per-command with no `queue_rqs`/`commit_rqs`
   batching, unlike `nvme-tcp`/`nvme-pci`).
-- In-band authentication (NVMe DH-HMAC-CHAP).
-- TLS for NVMe/TCP.
+- In-band authentication.
 - Cleanup and code simplification passes.
-- Improve `--poll` (io_uring `IOPOLL` for the backend once the uverbs
-  event fd grows `read_iter`; hybrid polling).
+- Performance optimization.
 - More targets behind the same core: NBD, iSCSI.
 
 ## Workspace layout
