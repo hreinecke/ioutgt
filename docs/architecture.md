@@ -85,31 +85,49 @@ mailbox (MPSC queue + eventfd doorbell, watched by a persistent multishot
 read on the ring). Queue-thread handles are deliberately not `Send`; the
 mailbox sender is the only exported handle.
 
+The NVMe/RDMA binary has the same shape with two differences: the
+listener is an `rdma_cm` event channel driven by a dedicated CM reactor
+thread (its fd parks on io_uring `POLL_ADD`, which the plain-Tokio
+control thread cannot provide), and accepted queues reach the same
+admin/IO threads through the shared `ioutgt-harness` pool.
+
 ## 4. Crate map and cross-crate call flow
 
-The workspace is nine crates forming a strict dependency DAG — every
-crate depends only on layers below it, and the main two leaves are
+The workspace is eleven crates forming a strict dependency DAG — every
+crate depends only on layers below it. The two main leaves are
 deliberately opposite in character: `ioutgt-nvme` is **sans-IO** (pure
 bytes ↔ structs, no sockets, no async, fuzzable in isolation) and
 `ioutgt-uring` is **pure IO** (op futures and the reactor, zero protocol
 knowledge). A third small leaf, `ioutgt-cpus`, is a userspace port of
 the kernel's `group_cpus_evenly()` (`lib/group_cpus.c`): the grouping
 algorithm is pure (driven by a `CpuTopology` value, synthetic in tests),
-with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
-`ioutgt` binary uses it (§11).
+with sysfs reading confined to `CpuTopology::from_sysfs()`.
+
+Two crates sit above the frontends: `ioutgt-harness` is the shared
+binary harness — config loading, `spawn()`, the queue-thread pool,
+control server and the `ctl`/`list`/`stat` clients — parameterized over
+a `Transport` trait so the NVMe/TCP and NVMe/RDMA binaries are thin
+wrappers around the same machinery. `ioutgt-nvme-rdma` is both the
+RDMA transport library and its binary (verbs via `sideway`, connection
+management via `rdma-mummy-sys`; see `docs/nvme-rdma.md`).
 
 **Crate map — the dependency DAG**
 
 ```text
-  app       ┌──────────────────────────────────────────────────────┐
-            │ ioutgt — binary; loads TargetConfig, spawn_target()  │
-            │ spawns all threads, owns the TCP accept loop         │
-            └──────────────────────────────────────────────────────┘
-  frontends ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt-control          │  │ ioutgt-nvme-tcp         │
-            │ JSON config schema,     │  │ ICReq handshake, recv/  │
-            │ UDS control server      │  │ send loops, slot tasks  │
+  binaries  ┌─────────────────────────┐  ┌─────────────────────────┐
+            │ ioutgt (NVMe/TCP)       │  │ ioutgt-nvme-rdma        │
             └─────────────────────────┘  └─────────────────────────┘
+  harness   ┌──────────────────────────────────────────────────────┐
+            │ ioutgt-harness — config, spawn(), queue-thread pool, │
+            │ control server + ctl/list/stat clients (Transport-   │
+            │ generic; both binaries are thin wrappers)            │
+            └──────────────────────────────────────────────────────┘
+  frontends ┌───────────────┐ ┌───────────────┐ ┌──────────────────┐
+            │ ioutgt-control│ │ ioutgt-nvme-  │ │ ioutgt-nvme-rdma │
+            │ JSON schema,  │ │ tcp: ICReq,   │ │ lib: CM, verbs   │
+            │ UDS control   │ │ recv/send     │ │ QP/CQ, reap loop │
+            │ server        │ │ loops, slots  │ │ (nvme-rdma.md)   │
+            └───────────────┘ └───────────────┘ └──────────────────┘
   shared    ┌─────────────────────────┐  ┌─────────────────────────┐
             │ ioutgt-backend          │  │ ioutgt-stream           │
             │ AnyBackend:             │  │ ZC gather-send harness  │
@@ -132,7 +150,9 @@ with sysfs reading confined to `CpuTopology::from_sysfs()`. Only the
 
 | Crate | Role | Depends on (workspace) |
 |-------|------|------------------------|
-| `ioutgt` | binary + assembly | all eight |
+| `ioutgt` | NVMe/TCP binary + assembly | all others |
+| `ioutgt-nvme-rdma` | NVMe/RDMA transport + binary | harness, core, backend, control, nvme, uring |
+| `ioutgt-harness` | shared binary harness (spawn, queue-thread pool, control server, stat client) | core, backend, control, cpus, uring |
 | `ioutgt-control` | config + UDS control plane | core, backend |
 | `ioutgt-nvme-tcp` | NVMe/TCP transport | core, stream, nvme, uring |
 | `ioutgt-backend` | storage backends | core, uring |
@@ -949,6 +969,10 @@ API change (development machine is single-node).
 | M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§6.1) |
 | M12 | shared send harness | done — ZC gather-send machinery extracted to `ioutgt-stream::StreamSender` behind a per-transport staging closure; NVMe/TCP keeps only PDU encoding |
 | M13 | shared recv byte-source | done — buffered scratch + `ops::recv` (`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail (`read_direct`) extracted to `ioutgt-stream::StreamReader`; NVMe/TCP keeps the PDU phase machine |
+| M14 | multi-transport harness | done — spawn, queue-thread pool, control server and clients extracted to `ioutgt-harness` behind a `Transport` trait; both binaries share them |
+| M15 | NVMe/RDMA transport | done — `ioutgt-nvme-rdma` (`sideway` verbs, `rdma-mummy-sys` CM); kernel-host interop on rxe (VM gates) and mlx5 (box); crc32c data-integrity gates green |
+| M16 | NVMe/RDMA performance | done — pool arena as io_uring fixed buffer, reactor park-probe (CQ polled at the sleep point), in-capsule write data (IOCCSZ + SGLS SAOS, nvmet parity); wins every single-job fio_perf phase vs nvmet-rdma on the test box |
+| M17 | adaptive `--poll` | done — busy-poll while commands are in flight (+200 µs grace), event-driven when idle; qd1 latency −20-30%, admin queue exempt |
 
 ## 14. Risks
 
