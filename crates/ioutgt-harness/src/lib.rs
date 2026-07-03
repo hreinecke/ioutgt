@@ -99,6 +99,10 @@ pub struct TargetConfig {
     /// Pin each IO queue thread to one CPU of its `group_cpus_evenly`
     /// group (disable in tests).
     pub pin_threads: bool,
+    /// Busy-poll the transport's completion sources on the IO queue threads
+    /// instead of sleeping on events (`--poll`): trades one core per IO
+    /// thread for per-IO latency. Transport-interpreted; TCP ignores it.
+    pub poll: bool,
     /// Zero-copy sends (SENDMSG_ZC) with notification-gated buffer
     /// reuse.
     pub send_zc: bool,
@@ -142,6 +146,7 @@ impl TargetConfig {
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
             mem_write_delay_us: 0,
+            poll: false,
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
                 serial: "IOUTGT0001".into(),
@@ -172,6 +177,7 @@ impl TargetConfig {
             idle_teardown: (file.idle_teardown_secs != 0)
                 .then(|| Duration::from_secs(file.idle_teardown_secs)),
             mem_write_delay_us: 0,
+            poll: false,
             subsystems: file.subsystems,
         })
     }
@@ -533,6 +539,7 @@ fn build_port(
         io_queue_size: config.io_queue_size,
         queue_buf_bytes: config.queue_buf_bytes,
         recv_buf_bytes: config.recv_buf_bytes,
+        poll: config.poll,
         subsystems,
     }))
 }

@@ -83,6 +83,14 @@ const WR_KIND_MASK: u64 = 0xff << 40;
 /// tick ≈ 2 s).
 const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Poll-mode spin-down hysteresis: after the queue drains idle, keep spinning
+/// this long before falling back to the event-driven sleep. Covers the
+/// inter-command gaps of low-depth workloads (qd1 at ~20k IOPS has ~30 us
+/// gaps — sleeping in them would re-pay the event wake on every command and
+/// forfeit most of the poll latency win), while a genuinely idle queue stops
+/// burning its core within this window.
+const SPIN_GRACE: std::time::Duration = std::time::Duration::from_micros(200);
+
 /// SGL descriptor type byte (dptr offset 15). High nibble `0x4` =
 /// `NVME_KEY_SGL_FMT_DATA_DESC` (keyed: host-resident, RDMA READ/WRITE); anything
 /// else here is an in-capsule data+offset descriptor (inline).
@@ -1400,6 +1408,27 @@ impl RdmaQueue {
         let probe_id = {
             let shared = Rc::clone(&self.probe);
             let cq = Rc::clone(&self.cq);
+            // Poll mode (`--poll`): while commands are in flight (any tag
+            // claimed), the spin predicate keeps the reactor from sleeping —
+            // the CQ is busy-polled at park cadence and completions never
+            // wait for an event. The moment the queue drains idle (all tags
+            // free — the admin queue between keep-alives, an idle
+            // connection), the probe arms the CQ and the thread sleeps
+            // event-driven; the next capsule's comp event resumes the spin.
+            // One core per IO thread only while it is doing IO. The admin
+            // queue (qid 0) never spins: its parked Async Event Request holds
+            // a slot for the controller lifetime (so `idle()` is never true
+            // there), and keep-alive latency does not merit a core.
+            let poll = port.poll && self.nvme.qid != 0;
+            let last_active = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+            let spin_nvme = Rc::clone(&self.nvme);
+            let spin_last = Rc::clone(&last_active);
+            let spin = poll.then(|| {
+                Box::new(move || {
+                    !spin_nvme.slots.idle() || spin_last.get().elapsed() < SPIN_GRACE
+                }) as Box<dyn Fn() -> bool>
+            });
+            let probe_nvme = Rc::clone(&self.nvme);
             ioutgt_uring::add_park_probe(Box::new(move || {
                 let mut staged = shared.staged.borrow_mut();
                 let drain = |staged: &mut Vec<(u64, bool)>| {
@@ -1413,7 +1442,21 @@ impl RdmaQueue {
                     }
                 };
                 drain(&mut staged);
-                if staged.is_empty() {
+                if poll && !staged.is_empty() {
+                    last_active.set(std::time::Instant::now());
+                }
+                // Arm whenever this pass may end in a sleep: event mode
+                // always; poll mode whenever the queue is idle — deliberately
+                // IGNORING the spin grace here. The spin predicate is
+                // re-evaluated after this probe with a later timestamp, so
+                // gating the arm on the same grace check could disagree
+                // across the 200 us boundary and let the pass sleep with the
+                // CQ unarmed (a ~1 s backstop stall on the next capsule —
+                // review finding). Arming strictly more often than the
+                // predicate sleeps closes the race; the cost is at most one
+                // spurious comp event per idle transition while grace-
+                // spinning, which the fd poll simply drains.
+                if staged.is_empty() && (!poll || probe_nvme.slots.idle()) {
                     // Nothing pending: arm so a completion during the coming
                     // sleep raises an event for the multishot poll, then
                     // re-check the race window.
@@ -1422,15 +1465,15 @@ impl RdmaQueue {
                     }
                     drain(&mut staged);
                 }
-                if staged.is_empty() {
-                    false
-                } else {
+                if !staged.is_empty() {
                     if let Some(w) = shared.waker.borrow_mut().take() {
                         w.wake();
                     }
                     true
+                } else {
+                    false
                 }
-            }))?
+            }), spin)?
         };
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields

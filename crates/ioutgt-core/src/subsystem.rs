@@ -180,6 +180,10 @@ pub struct PortConfig<B> {
     /// recv draws chunks from it, retaining write payloads zero-copy; memory
     /// scales as (connections × this).
     pub recv_buf_bytes: usize,
+    /// Poll mode: the transport busy-polls its completion sources on the
+    /// queue thread instead of sleeping on events (one core per IO thread,
+    /// SPDK-style; latency over CPU). Wired from the binary's `--poll`.
+    pub poll: bool,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }

@@ -34,6 +34,10 @@ thread_local! {
 /// 1 Hz rather than 10 Hz.
 const PARK_SAFETY_SECS: u64 = 1;
 
+/// `IORING_ENTER_GETEVENTS` for the raw spin-mode enter (the io-uring crate
+/// only sets it when `want > 0`, but DEFER_TASKRUN needs it to post CQEs).
+const ENTER_GETEVENTS: u32 = 1;
+
 /// Classifies a submitted SQE for the per-type counters. Most ops are
 /// `Other`; network send/recv and backend storage read/write are split
 /// out so the stats expose the op mix.
@@ -143,6 +147,11 @@ impl Default for RingConfig {
 /// thread sleeps (see [`Reactor::add_park_probe`]).
 type ParkProbe = Box<dyn Fn() -> bool>;
 
+/// Spin predicate for a park-probe: evaluated on every park pass; `true`
+/// keeps the thread busy-spinning (poll mode with IO in flight), `false`
+/// lets it sleep (the probe must have armed a wake source by then).
+type SpinWhile = Box<dyn Fn() -> bool>;
+
 /// Thread-local io_uring reactor.
 ///
 /// Created via [`crate::QueueRuntime`]; ops reach it through the
@@ -160,7 +169,7 @@ pub struct Reactor {
     /// and wakes tasks; returning `true` means it produced work and the park
     /// must not sleep. Returning `false` promises the probe armed its own
     /// wakeup (an event on an fd with a registered ring op) first.
-    park_probes: RefCell<Vec<(u64, ParkProbe)>>,
+    park_probes: RefCell<Vec<(u64, ParkProbe, Option<SpinWhile>)>>,
     next_probe_id: Cell<u64>,
     /// Free indices into the ring's fixed-buffer table. Empty when the
     /// kernel lacks `READV_FIXED`/`WRITEV_FIXED` or sparse buffer
@@ -283,28 +292,44 @@ impl Reactor {
     /// Register a transport park-probe (see the field doc on `park_probes`);
     /// returns an id for [`Self::remove_park_probe`]. The probe MUST be
     /// removed before the resources it polls are torn down.
-    pub fn add_park_probe(&self, probe: ParkProbe) -> u64 {
+    /// `spin`: an optional predicate evaluated on every park pass — while it
+    /// returns `true`, [`Self::park`] busy-spins (reap + probes in a loop)
+    /// instead of sleeping: the poll-mode trade of one core for latency,
+    /// scoped to when the transport actually has work in flight. When it
+    /// returns `false` the probe must have armed a wake source before
+    /// letting the pass reach the sleep. The park hook is the *real* parker
+    /// here: it must not return without a woken waker, because returning
+    /// puts the thread on tokio's condvar, which ring CQEs cannot wake.
+    pub fn add_park_probe(&self, probe: ParkProbe, spin: Option<SpinWhile>) -> u64 {
         let id = self.next_probe_id.get();
         self.next_probe_id.set(id + 1);
-        self.park_probes.borrow_mut().push((id, probe));
+        self.park_probes.borrow_mut().push((id, probe, spin));
         id
     }
 
     /// Remove a probe registered by [`Self::add_park_probe`].
     pub fn remove_park_probe(&self, id: u64) {
-        self.park_probes.borrow_mut().retain(|(pid, _)| *pid != id);
+        self.park_probes.borrow_mut().retain(|(pid, _, _)| *pid != id);
     }
 
-    /// Run every park-probe; `true` if any produced work (the park must not
-    /// sleep). All probes run even after one reports work, so every
-    /// connection's completion source is drained per park cycle.
+    /// Run every park-probe; `true` if any produced work (woke a waker).
+    /// All probes run even after one reports work, so every connection's
+    /// completion source is drained per park cycle.
     fn run_park_probes(&self) -> bool {
         let probes = self.park_probes.borrow();
         let mut work = false;
-        for (_, probe) in probes.iter() {
+        for (_, probe, _) in probes.iter() {
             work |= probe();
         }
         work
+    }
+
+    /// Whether any registered probe's spin predicate demands spin right now.
+    fn spin_requested(&self) -> bool {
+        self.park_probes
+            .borrow()
+            .iter()
+            .any(|(_, _, spin)| spin.as_ref().is_some_and(|f| f()))
     }
 
     /// In-flight op count in the slab (kernel-visible ops).
@@ -449,6 +474,38 @@ impl Reactor {
             // wakeup, making the submit_and_wait below safe.
             if self.run_park_probes() {
                 return;
+            }
+            if self.spin_requested() {
+                // Poll mode: never sleep — spin until something wakes a waker;
+                // only then may this hook return (returning without a woken
+                // waker would put the thread on tokio's condvar, which nothing
+                // here can wake). Each pass must enter the kernel with
+                // GETEVENTS even when the SQ is empty: with DEFER_TASKRUN,
+                // completions (backend IO, mailbox doorbells) are only posted
+                // to the CQ by the submitter's own GETEVENTS enter — without
+                // it the CQ stays empty forever and only the ibv-CQ probes
+                // would ever produce work. min_complete = 0 keeps the enter
+                // non-blocking; queued SQEs ride the same syscall.
+                let to_submit = {
+                    let mut ring = self.ring.borrow_mut();
+                    let n = ring.submission().len();
+                    u32::try_from(n).unwrap_or(u32::MAX)
+                };
+                if to_submit > 0 {
+                    self.stats.note_submit();
+                }
+                // SAFETY: no extended-arg pointer is passed (`None`), and the
+                // ring fd is live for the duration of the call.
+                let _ = unsafe {
+                    self.ring.borrow_mut().submitter().enter::<libc::sigset_t>(
+                        to_submit,
+                        0,
+                        ENTER_GETEVENTS,
+                        None,
+                    )
+                };
+                std::hint::spin_loop();
+                continue;
             }
             if self.slab_ref().is_empty() {
                 // Nothing in flight: nothing a CQE wait could wake.

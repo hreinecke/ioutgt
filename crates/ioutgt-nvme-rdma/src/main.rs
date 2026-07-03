@@ -59,6 +59,13 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     idle_teardown_secs: u64,
 
+    /// Busy-poll RDMA completions on the IO queue threads instead of sleeping
+    /// on comp-channel events, in exchange for per-IO latency (SPDK-style).
+    /// Adaptive: a thread spins only while its queue has commands in flight
+    /// and sleeps event-driven when idle.
+    #[arg(long)]
+    poll: bool,
+
     /// Unix socket path for the runtime control API.
     #[arg(long, default_value_os_t = default_control_socket())]
     control_socket: std::path::PathBuf,
@@ -133,6 +140,7 @@ fn main() -> std::io::Result<()> {
             config.listen = args.listen;
             config.io_threads = args.io_threads;
             config.pin_threads = !args.no_pin;
+            config.poll = args.poll;
             config.io_queue_size = args.io_queue_size;
             config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
             config.idle_teardown = (args.idle_teardown_secs != 0)
@@ -153,6 +161,9 @@ fn main() -> std::io::Result<()> {
     // RDMA has no recv ring; force it off even if the shared config schema set
     // recv_buf_mb (which would also flip file backends to O_DIRECT).
     config.recv_buf_bytes = 0;
+    if args.poll {
+        config.poll = true;
+    }
 
     let addr = ioutgt_harness::spawn::<RdmaTransport>(config)?;
     eprintln!("ioutgt-nvme-rdma listening on {addr}");

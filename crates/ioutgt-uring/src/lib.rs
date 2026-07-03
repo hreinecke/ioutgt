@@ -64,8 +64,15 @@ pub fn reset_reactor_stats() -> std::io::Result<()> {
 /// Returns a handle id for [`remove_park_probe`]; the probe MUST be removed
 /// before the resources it polls are torn down. Errors if the thread has no
 /// live reactor.
-pub fn add_park_probe(probe: Box<dyn Fn() -> bool>) -> std::io::Result<u64> {
-    Ok(reactor::Reactor::current()?.add_park_probe(probe))
+/// With a `spin` predicate, the park hook busy-spins for as long as the
+/// predicate returns `true` (poll mode: one core traded for latency, scoped
+/// to when IO is actually in flight) instead of sleeping; on `false` the
+/// probe must have armed its own wake source.
+pub fn add_park_probe(
+    probe: Box<dyn Fn() -> bool>,
+    spin: Option<Box<dyn Fn() -> bool>>,
+) -> std::io::Result<u64> {
+    Ok(reactor::Reactor::current()?.add_park_probe(probe, spin))
 }
 
 /// Remove a probe registered by [`add_park_probe`] (no-op without a reactor).
