@@ -73,9 +73,11 @@ struct Args {
     #[arg(long, default_value = "memory")]
     backend: String,
 
-    /// Unix socket path for the runtime control API.
-    #[arg(long, default_value_os_t = default_control_socket())]
-    control_socket: std::path::PathBuf,
+    /// Unix socket path for the runtime control API. Also honored by the
+    /// client subcommands (`ctl`/`list`/`stat`) when their `--socket` is not
+    /// given.
+    #[arg(long)]
+    control_socket: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -97,9 +99,10 @@ fn default_control_socket() -> std::path::PathBuf {
 enum Command {
     /// Send one JSON request to a running target's control socket.
     Ctl {
-        /// Control socket path.
-        #[arg(long, default_value_os_t = default_control_socket())]
-        socket: std::path::PathBuf,
+        /// Control socket path (defaults to `--control-socket`, then the
+        /// per-user default path).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
         /// Request JSON, e.g. '{"op":"LIST_NAMESPACE"}'.
         request: String,
     },
@@ -107,15 +110,17 @@ enum Command {
     /// (queues, threads, namespaces).
     #[command(alias = "list-ctrl")]
     List {
-        /// Control socket path.
-        #[arg(long, default_value_os_t = default_control_socket())]
-        socket: std::path::PathBuf,
+        /// Control socket path (defaults to `--control-socket`, then the
+        /// per-user default path).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
     },
     /// Per-thread ring and per-queue IO counters from a running target.
     Stat {
-        /// Control socket path.
-        #[arg(long, default_value_os_t = default_control_socket())]
-        socket: std::path::PathBuf,
+        /// Control socket path (defaults to `--control-socket`, then the
+        /// per-user default path).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
         /// Repeat every N seconds, printing per-interval rates.
         #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..))]
         interval: Option<u64>,
@@ -134,14 +139,23 @@ fn main() -> std::io::Result<()> {
 
     let args = Args::parse();
     if let Some(command) = &args.command {
+        // A client's socket: its own --socket, else the top-level
+        // --control-socket, else the per-user default — so
+        // `<bin> --control-socket X stat` reaches the same path a server
+        // started with `--control-socket X` is serving.
+        let sock = |own: &Option<std::path::PathBuf>| {
+            own.clone()
+                .or_else(|| args.control_socket.clone())
+                .unwrap_or_else(default_control_socket)
+        };
         match command {
-            Command::Ctl { socket, request } => return ctl(socket, request),
-            Command::List { socket } => return list_target(socket),
+            Command::Ctl { socket, request } => return ctl(&sock(socket), request),
+            Command::List { socket } => return list_target(&sock(socket)),
             Command::Stat {
                 socket,
                 interval,
                 clear,
-            } => return stat_target(socket, *interval, *clear),
+            } => return stat_target(&sock(socket), *interval, *clear),
         }
     }
 
@@ -161,7 +175,8 @@ fn main() -> std::io::Result<()> {
             config.recv_buf_bytes = args.recv_buf_mb.saturating_mul(1024 * 1024);
             config.idle_teardown = (args.idle_teardown_secs != 0)
                 .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
-            config.control_socket = Some(args.control_socket);
+            config.control_socket =
+                Some(args.control_socket.unwrap_or_else(default_control_socket));
             config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
                 "memory" => ioutgt_control::config::BackendConfig::Memory {
                     size_mb: args.mem_size_mb,
