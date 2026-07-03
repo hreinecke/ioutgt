@@ -287,8 +287,6 @@ impl Reactor {
         self.slab.borrow()
     }
 
-    /// Number of in-flight (not yet reaped-and-consumed) operations.
-    /// Primarily for tests and teardown assertions.
     /// Register a transport park-probe (see the field doc on `park_probes`);
     /// returns an id for [`Self::remove_park_probe`]. The probe MUST be
     /// removed before the resources it polls are torn down.
@@ -309,7 +307,9 @@ impl Reactor {
 
     /// Remove a probe registered by [`Self::add_park_probe`].
     pub fn remove_park_probe(&self, id: u64) {
-        self.park_probes.borrow_mut().retain(|(pid, _, _)| *pid != id);
+        self.park_probes
+            .borrow_mut()
+            .retain(|(pid, _, _)| *pid != id);
     }
 
     /// Run every park-probe; `true` if any produced work (woke a waker).

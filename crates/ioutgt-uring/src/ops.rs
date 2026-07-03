@@ -568,8 +568,8 @@ pub unsafe fn sendmsg_zc_raw(fd: RawFd, msg: *const libc::msghdr) -> io::Result<
 /// The kernel reuses that buffer's registration — no per-send page-pin or
 /// IOMMU map, unlike [`sendmsg_zc_raw`]. Two CQEs (send result, then notif),
 /// same as [`SendZcOp`]; REPORT_USAGE is requested. Requires kernel
-/// `IORING_SEND_VECTORIZED` support — probe with
-/// [`crate::send_vectored_fixed_supported`] before use.
+/// `IORING_SEND_VECTORIZED` support; a kernel without it fails the send with
+/// `EOPNOTSUPP`, which the caller detects and falls back from.
 ///
 /// # Safety
 ///
