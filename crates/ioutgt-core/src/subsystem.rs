@@ -44,6 +44,32 @@ pub struct Namespace<B> {
     pub uuid: [u8; 16],
 }
 
+/// Derive a namespace's 16-byte UUID (Identify CNS 03h descriptor) from its
+/// owning subsystem NQN and its NSID.
+///
+/// The NVMe host dedups namespaces by this identifier across the *whole host*,
+/// not per subsystem — so it must be unique per `(subsystem, nsid)`, otherwise
+/// two ioutgt subsystems serving the same NSID collide and the host keeps only
+/// one block device (`ignoring nsid N because of duplicate IDs`). This is how
+/// nvmet behaves too (each namespace gets its own `device_uuid`).
+///
+/// Deterministic — stable across restarts so persistent naming and multipath
+/// stay consistent: an FNV-1a hash of the NQN fills the high 8 bytes, a marker
+/// byte follows, and the NSID occupies the low 4 bytes.
+pub fn namespace_uuid(nqn: &str, nsid: u32) -> [u8; 16] {
+    // FNV-1a, 64-bit: deterministic and dependency-free.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in nqn.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut uuid = [0u8; 16];
+    uuid[0..8].copy_from_slice(&hash.to_be_bytes());
+    uuid[8] = 0x80;
+    uuid[12..16].copy_from_slice(&nsid.to_be_bytes());
+    uuid
+}
+
 /// Immutable namespace-table snapshot.
 pub type NsMap<B> = Arc<BTreeMap<u32, Arc<Namespace<B>>>>;
 
@@ -192,5 +218,39 @@ impl<B: Backend> PortConfig<B> {
     /// Look up a subsystem by NQN.
     pub fn subsystem(&self, nqn: &str) -> Option<&Arc<Subsystem<B>>> {
         self.subsystems.get(nqn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::namespace_uuid;
+
+    #[test]
+    fn namespace_uuid_is_deterministic() {
+        assert_eq!(
+            namespace_uuid("nqn.2026-06.io.ioutgt:a", 1),
+            namespace_uuid("nqn.2026-06.io.ioutgt:a", 1),
+        );
+    }
+
+    #[test]
+    fn namespace_uuid_differs_by_subsystem_and_nsid() {
+        let a1 = namespace_uuid("nqn.2026-06.io.ioutgt:a", 1);
+        let b1 = namespace_uuid("nqn.2026-06.io.ioutgt:b", 1);
+        let a2 = namespace_uuid("nqn.2026-06.io.ioutgt:a", 2);
+        // Same nsid, different subsystem must not collide (the host dedups by
+        // this identifier across the whole host — the two-ioutgt-target case).
+        assert_ne!(a1, b1);
+        // Same subsystem, different nsid also distinct.
+        assert_ne!(a1, a2);
+        // Never the all-zero UUID (which the host treats as "no identifier").
+        assert_ne!(a1, [0u8; 16]);
+    }
+
+    #[test]
+    fn namespace_uuid_encodes_nsid_in_low_bytes() {
+        let u = namespace_uuid("nqn.2026-06.io.ioutgt:a", 0x0102_0304);
+        assert_eq!(&u[12..16], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(u[8], 0x80);
     }
 }

@@ -206,13 +206,13 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 Ok(backend) => backend,
                 Err(err) => return Response::err(err),
             };
-            let mut uuid = [0u8; 16];
-            uuid[..4].copy_from_slice(&nsid.to_be_bytes());
-            uuid[8] = 0x80;
             let ns = Namespace {
                 nsid,
                 backend: Arc::new(backend),
-                uuid,
+                // Derived from the resolved subsystem NQN (not the request's
+                // optional selector) so runtime-added namespaces match the
+                // config path and stay unique per subsystem.
+                uuid: ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid),
             };
             if let Err(err) = subsys.add_namespace(ns) {
                 return Response::err(err);

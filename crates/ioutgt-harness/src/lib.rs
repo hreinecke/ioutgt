@@ -523,15 +523,12 @@ fn build_port(
             {
                 m.set_write_delay_us(config.mem_write_delay_us);
             }
-            let mut uuid = [0u8; 16];
-            uuid[..4].copy_from_slice(&ns.nsid.to_be_bytes());
-            uuid[8] = 0x80;
             namespaces.insert(
                 ns.nsid,
                 Arc::new(Namespace {
                     nsid: ns.nsid,
                     backend: Arc::new(backend),
-                    uuid,
+                    uuid: ioutgt_core::subsystem::namespace_uuid(&spec.nqn, ns.nsid),
                 }),
             );
         }
