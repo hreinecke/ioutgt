@@ -147,10 +147,10 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                 Ok(entry) => {
                     io.cntlid.set(cntlid);
                     ctx.queue.stats.cntlid.set(cntlid);
-                    if !entry.is_discovery() {
-                        if let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn) {
-                            let _ = io.subsys.set(Arc::clone(subsys));
-                        }
+                    if !entry.is_discovery()
+                        && let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn)
+                    {
+                        let _ = io.subsys.set(Arc::clone(subsys));
                     }
                     debug!(cntlid, qid = ctx.queue.qid, "io queue connected");
                     Outcome::status(ctx.cqe(u32::from(cntlid), cid, status::SUCCESS))

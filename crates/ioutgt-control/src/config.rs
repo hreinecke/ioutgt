@@ -192,13 +192,12 @@ impl FileConfig {
                 }
                 if let BackendConfig::Memory { size_mb } | BackendConfig::Null { size_mb } =
                     &ns.backend
+                    && *size_mb == 0
                 {
-                    if *size_mb == 0 {
-                        return Err(format!(
-                            "{}: nsid {}: size_mb must be > 0",
-                            subsys.nqn, ns.nsid
-                        ));
-                    }
+                    return Err(format!(
+                        "{}: nsid {}: size_mb must be > 0",
+                        subsys.nqn, ns.nsid
+                    ));
                 }
             }
         }

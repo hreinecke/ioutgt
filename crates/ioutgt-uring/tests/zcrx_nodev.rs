@@ -160,7 +160,8 @@ fn zcrx_nodev_loopback_copy() {
     //    Crate quirk: RecvZc::build() unconditionally ORs IORING_RECV_MULTISHOT
     //    into ioprio — there is no single-shot RecvZc via the safe builder. With
     //    a bounded len it still terminates once `len` bytes are consumed.
-    let sqe = opcode::RecvZc::new(types::Fd(server.as_raw_fd()), PAYLOAD.len() as u32)
+    let len = u32::try_from(PAYLOAD.len()).expect("test payload fits u32");
+    let sqe = opcode::RecvZc::new(types::Fd(server.as_raw_fd()), len)
         .ifq(zcrx_id)
         .build()
         .user_data(0x5043_5243); // 'ZCRX'-ish

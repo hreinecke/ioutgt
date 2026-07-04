@@ -899,18 +899,18 @@ async fn control_loop<T: Transport>(
             return;
         }
     };
-    if let Some(path) = &config.control_socket {
-        if let Err(err) = spawn_control_api(
+    if let Some(path) = &config.control_socket
+        && let Err(err) = spawn_control_api(
             path,
             &port,
             &registry,
             &senders,
             &io_groups,
             config.io_threads,
-        ) {
-            let _ = addr_tx.send(Err(err));
-            return;
-        }
+        )
+    {
+        let _ = addr_tx.send(Err(err));
+        return;
     }
 
     let _ = addr_tx.send(Ok(local));

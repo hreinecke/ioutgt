@@ -878,7 +878,7 @@ impl RdmaQueue {
     ///    queue's teardown removed it), so it follows the controller down.
     fn watchdog(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>) -> bool {
         self.watchdog_tick = self.watchdog_tick.wrapping_add(1);
-        if self.watchdog_tick % 2 != 0 {
+        if !self.watchdog_tick.is_multiple_of(2) {
             return false;
         }
         match &ctx.role {

@@ -302,7 +302,7 @@ fn worker(
                             ttag,
                             offset,
                             length,
-                        } => {
+                        }
                             // The TX thread owns the socket writes;
                             // forward the solicitation.
                             if event_tx
@@ -313,10 +313,9 @@ fn worker(
                                     length,
                                 })
                                 .is_err()
-                            {
+                            => {
                                 return;
                             }
-                        }
                         _ => {}
                     }
                 }

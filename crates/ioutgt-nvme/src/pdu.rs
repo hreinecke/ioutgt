@@ -327,10 +327,10 @@ impl PduDecoder {
             pdu_type::CAPSULE_RESP | pdu_type::R2T => Some(header_wire),
             _ => None,
         };
-        if let Some(exact) = exact {
-            if plen != exact {
-                return Err(PduError::hdr_field(4));
-            }
+        if let Some(exact) = exact
+            && plen != exact
+        {
+            return Err(PduError::hdr_field(4));
         }
         // A data digest with no data to digest is malformed.
         let ddgst = hdr.flags & pdu_flags::DDGST != 0;

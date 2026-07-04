@@ -415,10 +415,9 @@ impl Backend for FileBackend {
             ] {
                 if let Ok(op) =
                     ops::fallocate(self.backend_fd(), mode, self.offset(range.slba), len)
+                    && op.await.is_ok()
                 {
-                    if op.await.is_ok() {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
             }
         }
