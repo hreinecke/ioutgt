@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # common.sh — shared helpers for the NVMe target drivers
-# (two_nic_realwire.sh, local_tgt.sh). Sourced, never executed. The fabric is
+# (two_nic_realwire_tcp.sh, local_tgt.sh). Sourced, never executed. The fabric is
 # selected by TRANSPORT=tcp|rdma (default tcp); see the knobs section.
 #
 # The sourcing script supplies the transport context; these helpers stay

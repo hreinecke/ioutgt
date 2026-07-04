@@ -15,7 +15,7 @@
 #     └─────────────────┘  the wire └─────────────────┘
 #
 # iperf3 then runs a server in NS_A and a client in NS_B, so every byte
-# crosses the physical link. This is the same wiring `two_nic_realwire.sh`
+# crosses the physical link. This is the same wiring `two_nic_realwire_tcp.sh`
 # uses for the NVMe/TCP tests; this script is the standalone link
 # benchmark (no target involved).
 #

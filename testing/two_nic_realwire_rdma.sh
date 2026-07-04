@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # two_nic_realwire_rdma.sh — the NVMe/RDMA (RoCEv2) sibling of
-# two_nic_realwire.sh: run an NVMe/RDMA target and initiator on ONE host but
+# two_nic_realwire_tcp.sh: run an NVMe/RDMA target and initiator on ONE host but
 # force the traffic across two real RoCE NICs (real hardware offload), for both
 # the in-kernel nvmet-rdma target and ioutgt-nvme-rdma, so the two can be
 # compared back to back on the same wire.

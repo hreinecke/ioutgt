@@ -2,12 +2,12 @@
 #
 # local_tgt.sh — run an NVMe/TCP target and initiator on ONE host over
 # loopback (127.0.0.1), for either the Linux kernel nvmet-tcp target or
-# ioutgt. The localhost sibling of two_nic_realwire.sh: same subcommand
+# ioutgt. The localhost sibling of two_nic_realwire_tcp.sh: same subcommand
 # CLI, but no network namespaces / NICs — everything stays on lo.
 #
 # Each target has its own hardcoded port + NQN + backend, so both can run
 # at once and a single env setup drives everything. Backends are file/bdev
-# only (matching two_nic_realwire.sh):
+# only (matching two_nic_realwire_tcp.sh):
 #   ioutgt : 14420  nqn...:ioutgt   IOUTGT_BACKEND (default: a /tmp file)
 #   nvmet  : 24420  nqn...:nvmet    NVMET_BACKEND  (default: a /tmp file)
 #
@@ -41,7 +41,7 @@ NVMET_NQN="nqn.2026-06.io.localtgt:nvmet"
 HOSTNQN="nqn.2026-06.io.localtgt:host"
 
 # Per-target backing: a regular file or block device only (file-backend
-# only, matching two_nic_realwire.sh). A missing non-/dev path is
+# only, matching two_nic_realwire_tcp.sh). A missing non-/dev path is
 # auto-created at BACKEND_GB; a /dev/* path must already exist.
 IOUTGT_BACKEND="${IOUTGT_BACKEND:-/tmp/local_tgt-ioutgt.img}"
 NVMET_BACKEND="${NVMET_BACKEND:-/tmp/local_tgt-nvmet.img}"

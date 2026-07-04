@@ -6,7 +6,7 @@ CPUs. Each section gives the **motivation**, the **principle**, and the
 **exact commands** to enable/disable/inspect it.
 
 This is the background behind the affinity work in
-`testing/two_nic_realwire.sh` and `docs/perf-notes.md`. The single
+`testing/two_nic_realwire_tcp.sh` and `docs/perf-notes.md`. The single
 organising idea:
 
 > Modern NICs have many hardware queues, each with its own IRQ on some CPU.
@@ -153,7 +153,7 @@ large CAL-interrupt storm (`net_rps_send_ipi`, ~33k/s) for no throughput
 gain. The `rps_flow_cnt`/`rps_sock_flow_entries` knobs **persist across
 runs**, so a stale config keeps generating IPIs. Prefer explicit hardware
 `ntuple` rules (§6) for deterministic, IPI-free RX placement; this is what
-`two_nic_realwire.sh` does (and it clears RFS every sync).
+`two_nic_realwire_tcp.sh` does (and it clears RFS every sync).
 
 **Commands.**
 ```sh
@@ -349,7 +349,7 @@ whole flow on *C* with no IPIs:
 5. **Offloads** (§8–9): `gro on`, `gso/tso on` to cut per-packet CPU on both
    directions.
 
-`testing/two_nic_realwire.sh` automates 1–5 for the ioutgt target NIC: it
+`testing/two_nic_realwire_tcp.sh` automates 1–5 for the ioutgt target NIC: it
 reads each io-thread's CPU and its connection's peer port from `ioutgt list`,
 aligns the queue IRQs to each io-thread's NUMA group, sets XPS, disables
 RPS/RFS, and installs one ntuple rule per connection (`its src-port → its
@@ -384,7 +384,7 @@ are send-heavy on the target — are unaffected by the choice. nvmet shows the
 *same* lottery (it does no pinning, so its `io_work` lands on its own IRQ CPU at
 random), which is why its write number swings widely run to run.
 
-`two_nic_realwire.sh` does this: `iothread_cpu()` pins each io-thread to its
+`two_nic_realwire_tcp.sh` does this: `iothread_cpu()` pins each io-thread to its
 RX-IRQ CPU's HT sibling (falling back to a different physical core when SMT is
 off); `status` reports `separation: OK` when every io-thread is on a different
 CPU than its RX IRQ. NUMA locality is secondary — a far node measured just as
