@@ -12,15 +12,22 @@
 # (the vmtest --rwdir 9p mount, $VMTEST_DATA_DIR).
 #
 # Modes:
-#   HOST  (run with no args): builds the ioutgt-nvme-tcp + ioutgt-nvme-rdma
-#         binaries, copies this script into the vmtest tests dir, and launches
-#         the guest. vmtest re-invokes it inside the guest as:
-#             ioutgt_xfstests --guest <tcp-bin> <rdma-bin> [check args...]
-#   GUEST (--guest <tcp-bin> <rdma-bin> [check args...]): does the real work.
+#   HOST  (run directly): builds the ioutgt-nvme-tcp + ioutgt-nvme-rdma
+#         binaries (ioutgt mode), copies this script into the vmtest tests
+#         dir, and launches the guest. vmtest re-invokes it inside the guest:
+#             ioutgt_xfstests --guest <ioutgt|nvmet> <tcp-bin> <rdma-bin> [check args...]
+#   GUEST (--guest ...): does the real work.
 #
-# Any arguments are passed through verbatim to xfstests `./check` (default
-# `-g quick` when none are given), e.g.:
-#   testing/vmtest/ioutgt_xfstests.sh                 # ./check -g quick
+# An optional FIRST argument selects the target implementation serving the
+# two disks — `ioutgt` (default, our userspace targets) or `nvmet` (the
+# in-kernel target via configfs). Same guest, same NQNs, same backing files,
+# same fabrics either way, so a test failing under one target but not the
+# other isolates the target implementation (the generic/794 baseline).
+# All remaining arguments pass through verbatim to xfstests `./check`
+# (default `-g quick` when none are given), e.g.:
+#   testing/vmtest/ioutgt_xfstests.sh                 # ioutgt, ./check -g quick
+#   testing/vmtest/ioutgt_xfstests.sh nvmet           # nvmet baseline, -g quick
+#   testing/vmtest/ioutgt_xfstests.sh nvmet generic/794
 #   testing/vmtest/ioutgt_xfstests.sh -g auto         # a different group
 #   testing/vmtest/ioutgt_xfstests.sh generic/013 generic/020
 #   testing/vmtest/ioutgt_xfstests.sh -x dio -g quick # exclude a group
@@ -30,9 +37,10 @@
 #   IOUTGT_XFSTESTS_TIMEOUT (outer VM wall-clock cap, default 90m).
 # Guest knobs (env): IMG_SIZE (default 8G), RUST_LOG (default info).
 # Artifacts: xfstests results/ (check.log, per-test .full/.out.bad) is copied
-# to $VMTEST_DATA_DIR/tmp/xfstests-results, and the two target logs live at
-# $VMTEST_DATA_DIR/tmp/ioutgt-xfstests-{tcp,rdma}.log — all survive VM
-# shutdown, including a wedge killed from outside by the run timeout.
+# to $VMTEST_DATA_DIR/tmp/xfstests-results-<mode> (per mode, so an
+# ioutgt-vs-nvmet A/B keeps both sides), and in ioutgt mode the two target
+# logs live at $VMTEST_DATA_DIR/tmp/ioutgt-xfstests-{tcp,rdma}.log — all
+# survive VM shutdown, including a wedge killed from outside by the timeout.
 
 set -u
 
@@ -41,8 +49,20 @@ set -u
 # --------------------------------------------------------------------------
 if [ "${1:-}" != "--guest" ]; then
 	set -euo pipefail
-	# Everything on the host command line is forwarded to `./check` (default
-	# -g quick). Captured before we touch the positional params below.
+	# Optional first arg selects the target implementation backing the two
+	# NVMe disks: our userspace targets (ioutgt, default) or the in-kernel
+	# nvmet — same guest, same backing files, same fabrics, so a test that
+	# fails on one but not the other isolates the target implementation
+	# (e.g. the generic/794 gap-data baseline).
+	MODE=ioutgt
+	case "${1:-}" in
+	ioutgt | nvmet)
+		MODE="$1"
+		shift
+		;;
+	esac
+	# Everything else on the host command line is forwarded to `./check`
+	# (default -g quick). Captured before we touch the positionals below.
 	CHECK_ARGS=("$@")
 	[ ${#CHECK_ARGS[@]} -eq 0 ] && CHECK_ARGS=(-g quick)
 	TOP="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -53,14 +73,18 @@ if [ "${1:-}" != "--guest" ]; then
 	PROFILE_FLAG=""
 	[ "$PROFILE" = release ] && PROFILE_FLAG="--release"
 
-	echo "[host] building targets ($PROFILE)"
-	cargo build $PROFILE_FLAG -p ioutgt --bin ioutgt-nvme-tcp
-	cargo build $PROFILE_FLAG -p ioutgt-nvme-rdma --bin ioutgt-nvme-rdma
-	TCP_BIN="$TOP/target/$PROFILE/ioutgt-nvme-tcp"
-	RDMA_BIN="$TOP/target/$PROFILE/ioutgt-nvme-rdma"
-	for b in "$TCP_BIN" "$RDMA_BIN"; do
-		[ -x "$b" ] || { echo "[host] FAIL: missing binary $b"; exit 1; }
-	done
+	TCP_BIN=-
+	RDMA_BIN=-
+	if [ "$MODE" = ioutgt ]; then
+		echo "[host] building targets ($PROFILE)"
+		cargo build $PROFILE_FLAG -p ioutgt --bin ioutgt-nvme-tcp
+		cargo build $PROFILE_FLAG -p ioutgt-nvme-rdma --bin ioutgt-nvme-rdma
+		TCP_BIN="$TOP/target/$PROFILE/ioutgt-nvme-tcp"
+		RDMA_BIN="$TOP/target/$PROFILE/ioutgt-nvme-rdma"
+		for b in "$TCP_BIN" "$RDMA_BIN"; do
+			[ -x "$b" ] || { echo "[host] FAIL: missing binary $b"; exit 1; }
+		done
+	fi
 
 	# vmtest runs tests/NAME.sh; publish this entrypoint under that name. The
 	# guest sees the built binaries at their host absolute paths via 9p.
@@ -73,16 +97,17 @@ if [ "${1:-}" != "--guest" ]; then
 	RUN_TIMEOUT="${IOUTGT_XFSTESTS_TIMEOUT:-90m}"
 	exec timeout --kill-after=30s "$RUN_TIMEOUT" \
 		"$VMTEST" -c "$VMTEST_CONF" run ioutgt_xfstests \
-		--guest "$TCP_BIN" "$RDMA_BIN" "${CHECK_ARGS[@]}"
+		--guest "$MODE" "$TCP_BIN" "$RDMA_BIN" "${CHECK_ARGS[@]}"
 fi
 
 # --------------------------------------------------------------------------
 # GUEST mode.
 # --------------------------------------------------------------------------
 shift # drop --guest
-TCP_BIN="${1:?guest: need tcp binary path as \$1}"
-RDMA_BIN="${2:?guest: need rdma binary path as \$2}"
-shift 2
+MODE="${1:?guest: need mode (ioutgt|nvmet) as \$1}"
+TCP_BIN="${2:?guest: need tcp binary path as \$2}"
+RDMA_BIN="${3:?guest: need rdma binary path as \$3}"
+shift 3
 # Remaining args go straight to `./check` (default -g quick).
 CHECK_ARGS=("$@")
 [ ${#CHECK_ARGS[@]} -eq 0 ] && CHECK_ARGS=(-g quick)
@@ -125,8 +150,14 @@ fail() { log "RESULT: FAIL ($*)"; mark "FAIL $*"; exit 1; }
 mkdir -p "$DATA_DIR/tmp" && : >"$DATA_DIR/tmp/ioutgt_result" || true
 
 [ "$(id -u)" = 0 ]           || fail "must run as root"
-[ -x "$TCP_BIN" ]            || fail "tcp binary not executable: $TCP_BIN"
-[ -x "$RDMA_BIN" ]           || fail "rdma binary not executable: $RDMA_BIN"
+case "$MODE" in
+ioutgt)
+	[ -x "$TCP_BIN" ]  || fail "tcp binary not executable: $TCP_BIN"
+	[ -x "$RDMA_BIN" ] || fail "rdma binary not executable: $RDMA_BIN"
+	;;
+nvmet) ;;
+*) fail "unknown mode '$MODE' (ioutgt|nvmet)" ;;
+esac
 [ -x "$XFSTESTS_DIR/check" ] || fail "no xfstests ./check under $XFSTESTS_DIR"
 # Only kernel-backed tools are mandatory. ibv_devinfo/show_gids (rdma-core /
 # libibverbs-utils) are optional diagnostics — the RoCE datapath is the
@@ -135,6 +166,7 @@ for c in nvme mkfs.xfs rdma truncate; do
 	command -v "$c" >/dev/null || fail "missing required command: $c"
 done
 
+log "target mode: $MODE"
 log "loading modules"
 for m in nvme_tcp nvme_rdma rdma_rxe; do modprobe "$m" 2>&1 || true; done
 
@@ -192,20 +224,78 @@ setup_rxe
 # Distinct NQNs give the two namespaces distinct UUIDs (ioutgt derives the
 # namespace UUID from subsystem-NQN + nsid), so the NVMe host — which dedups
 # namespaces by UUID across the whole host — keeps both as separate devices.
-log "starting NVMe/TCP  target -> $TCP_ADDR:$TCP_PORT (backend $TCP_IMG)"
-RUST_LOG="$RUST_LOG" RUST_BACKTRACE=1 "$TCP_BIN" \
-	--listen "$TCP_ADDR:$TCP_PORT" --subsys-nqn "$TCP_NQN" \
-	--backend "$TCP_IMG" >"$TCP_LOG" 2>&1 &
-TCP_PID=$!
-log "starting NVMe/RDMA target -> $RXE_IP:$RDMA_PORT (backend $RDMA_IMG)"
-RUST_LOG="$RUST_LOG" RUST_BACKTRACE=1 "$RDMA_BIN" \
-	--listen "$RXE_IP:$RDMA_PORT" --subsys-nqn "$RDMA_NQN" \
-	--backend "$RDMA_IMG" >"$RDMA_LOG" 2>&1 &
-RDMA_PID=$!
-# sed -u: line-buffered even with stdout on a pipe — otherwise target log
-# lines sit in sed's block buffer and never reach the console live.
-tail -f "$TCP_LOG"  | sed -u 's/^/[tcp] /'  & TCP_TAIL=$!
-tail -f "$RDMA_LOG" | sed -u 's/^/[rdma] /' & RDMA_TAIL=$!
+# --- target bring-up: ioutgt userspace targets OR in-kernel nvmet ---------
+TCP_PID=""
+RDMA_PID=""
+TCP_TAIL=""
+RDMA_TAIL=""
+
+# nvmet mode: one configfs subsystem + file namespace + port per transport,
+# mirroring the ioutgt topology exactly (same NQNs/addresses/backing files),
+# so the rest of the flow — connect, mkfs, ./check — is identical and any
+# result difference isolates the target implementation.
+nvmet_setup_port() { # $1=nqn $2=trtype $3=addr $4=port $5=backing-file
+	local cfg=/sys/kernel/config/nvmet sub port_id portdir
+	sub="$cfg/subsystems/$1"
+	mkdir -p "$sub" || return 1
+	echo 1 >"$sub/attr_allow_any_host"
+	mkdir -p "$sub/namespaces/1"
+	echo -n "$5" >"$sub/namespaces/1/device_path"
+	# Buffered file IO: parity with ioutgt's file backend here (buffered
+	# without a recv-ring), and O_DIRECT on the 9p-backed image is unreliable.
+	echo 1 >"$sub/namespaces/1/buffered_io" 2>/dev/null || true
+	echo 1 >"$sub/namespaces/1/enable" || return 1
+	# Claim a free port id — the configfs port tree is a global singleton.
+	port_id=1
+	while [ -e "$cfg/ports/$port_id" ]; do port_id=$((port_id + 1)); done
+	portdir="$cfg/ports/$port_id"
+	mkdir "$portdir" || return 1
+	echo ipv4 >"$portdir/addr_adrfam"
+	echo "$3" >"$portdir/addr_traddr"
+	echo "$4" >"$portdir/addr_trsvcid"
+	echo "$2" >"$portdir/addr_trtype"
+	# The symlink enables the port (nvmet binds the listener here).
+	ln -s "$sub" "$portdir/subsystems/$1" || return 1
+}
+nvmet_teardown() {
+	local cfg=/sys/kernel/config/nvmet p s
+	for p in "$cfg"/ports/*; do
+		[ -d "$p" ] || continue
+		rm -f "$p"/subsystems/*
+		rmdir "$p"
+	done
+	for s in "$cfg"/subsystems/*; do
+		[ -d "$s" ] || continue
+		rmdir "$s"/namespaces/* "$s"
+	done
+}
+
+if [ "$MODE" = nvmet ]; then
+	for m in nvmet nvmet_tcp nvmet_rdma; do modprobe "$m" 2>&1 || true; done
+	log "starting nvmet-tcp  -> $TCP_ADDR:$TCP_PORT (backend $TCP_IMG)"
+	nvmet_setup_port "$TCP_NQN" tcp "$TCP_ADDR" "$TCP_PORT" "$TCP_IMG" ||
+		fail "nvmet tcp port setup"
+	log "starting nvmet-rdma -> $RXE_IP:$RDMA_PORT (backend $RDMA_IMG)"
+	nvmet_setup_port "$RDMA_NQN" rdma "$RXE_IP" "$RDMA_PORT" "$RDMA_IMG" ||
+		fail "nvmet rdma port setup"
+else
+	log "starting NVMe/TCP  target -> $TCP_ADDR:$TCP_PORT (backend $TCP_IMG)"
+	RUST_LOG="$RUST_LOG" RUST_BACKTRACE=1 "$TCP_BIN" \
+		--listen "$TCP_ADDR:$TCP_PORT" --subsys-nqn "$TCP_NQN" \
+		--backend "$TCP_IMG" >"$TCP_LOG" 2>&1 &
+	TCP_PID=$!
+	log "starting NVMe/RDMA target -> $RXE_IP:$RDMA_PORT (backend $RDMA_IMG)"
+	RUST_LOG="$RUST_LOG" RUST_BACKTRACE=1 "$RDMA_BIN" \
+		--listen "$RXE_IP:$RDMA_PORT" --subsys-nqn "$RDMA_NQN" \
+		--backend "$RDMA_IMG" >"$RDMA_LOG" 2>&1 &
+	RDMA_PID=$!
+	# sed -u: line-buffered even with stdout on a pipe — otherwise target log
+	# lines sit in sed's block buffer and never reach the console live.
+	tail -f "$TCP_LOG" | sed -u 's/^/[tcp] /' &
+	TCP_TAIL=$!
+	tail -f "$RDMA_LOG" | sed -u 's/^/[rdma] /' &
+	RDMA_TAIL=$!
+fi
 
 cleanup() {
 	set +e
@@ -213,10 +303,16 @@ cleanup() {
 	umount "$SCRATCH_MNT" 2>/dev/null
 	nvme disconnect -n "$TCP_NQN"  >/dev/null 2>&1
 	nvme disconnect -n "$RDMA_NQN" >/dev/null 2>&1
-	kill "$TCP_PID" "$RDMA_PID" "$TCP_TAIL" "$RDMA_TAIL" 2>/dev/null
+	if [ "$MODE" = nvmet ]; then
+		nvmet_teardown 2>/dev/null
+	else
+		kill $TCP_PID $RDMA_PID $TCP_TAIL $RDMA_TAIL 2>/dev/null
+		log "--- tcp target log tail ---"
+		tail -n 30 "$TCP_LOG" 2>/dev/null
+		log "--- rdma target log tail ---"
+		tail -n 30 "$RDMA_LOG" 2>/dev/null
+	fi
 	rdma link del rxe0 2>/dev/null
-	log "--- tcp target log tail ---";  tail -n 30 "$TCP_LOG"  2>/dev/null
-	log "--- rdma target log tail ---"; tail -n 30 "$RDMA_LOG" 2>/dev/null
 	rm -f "$TCP_IMG" "$RDMA_IMG"
 }
 trap cleanup EXIT
@@ -230,8 +326,10 @@ wait_listen() { # $1=log $2=pid $3=name
 	done
 	return 1
 }
-wait_listen "$TCP_LOG"  "$TCP_PID"  tcp  || fail "tcp target never listened"
-wait_listen "$RDMA_LOG" "$RDMA_PID" rdma || fail "rdma target never listened"
+if [ "$MODE" = ioutgt ]; then
+	wait_listen "$TCP_LOG"  "$TCP_PID"  tcp  || fail "tcp target never listened"
+	wait_listen "$RDMA_LOG" "$RDMA_PID" rdma || fail "rdma target never listened"
+fi
 
 # --- connect the in-kernel hosts, resolve each namespace by device diff ---
 # The guest already has an emulated PCI NVMe (/dev/nvme0n1); connecting one
@@ -283,11 +381,13 @@ rc=$?
 
 # Preserve the xfstests artifacts (results/: check.log, per-test .full and
 # .out.bad) through the 9p data dir — they live in the guest's /var overlay,
-# which vanishes at shutdown, and on a failure they are the evidence.
+# which vanishes at shutdown, and on a failure they are the evidence. Kept
+# per mode so an ioutgt-vs-nvmet A/B run keeps both sides for diffing.
+RESULTS_KEEP="$DATA_DIR/tmp/xfstests-results-$MODE"
 if [ -d "$XFSTESTS_DIR/results" ]; then
-	rm -rf "$DATA_DIR/tmp/xfstests-results"
-	if cp -r "$XFSTESTS_DIR/results" "$DATA_DIR/tmp/xfstests-results" 2>/dev/null; then
-		log "results preserved at \$VMTEST_DATA_DIR/tmp/xfstests-results"
+	rm -rf "$RESULTS_KEEP"
+	if cp -r "$XFSTESTS_DIR/results" "$RESULTS_KEEP" 2>/dev/null; then
+		log "results preserved at \$VMTEST_DATA_DIR/tmp/${RESULTS_KEEP##*/}"
 	else
 		log "note: failed to copy results/ to the data dir"
 	fi
@@ -295,9 +395,9 @@ fi
 
 if [ "$rc" = 0 ]; then
 	log "RESULT: PASS"
-	mark "PASS xfstests ${CHECK_ARGS[*]}"
+	mark "PASS xfstests[$MODE] ${CHECK_ARGS[*]}"
 else
 	log "RESULT: FAIL (./check rc=$rc)"
-	mark "FAIL xfstests ${CHECK_ARGS[*]} (rc=$rc)"
+	mark "FAIL xfstests[$MODE] ${CHECK_ARGS[*]} (rc=$rc)"
 fi
 exit "$rc"
