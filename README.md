@@ -130,8 +130,11 @@ testing/two_nic_realwire_tcp.sh down
 
 - [`docs/usage.md`](docs/usage.md) — command line, config file, control
   API, host connection, test harnesses.
-- [`docs/architecture.md`](docs/architecture.md) — the architecture
-  specification (thread model, reactor, command-slot lifecycle, PDU flows).
+- [`docs/architecture.md`](docs/architecture.md) — the transport-neutral
+  architecture specification (thread model, reactor, command-slot
+  lifecycle, transport contract).
+- [`docs/nvme-tcp.md`](docs/nvme-tcp.md) — the NVMe/TCP transport: PDU
+  phase machine, gather/zero-copy send, copy budget, recv ring.
 - [`docs/nvme-rdma.md`](docs/nvme-rdma.md) — the NVMe/RDMA transport:
   wire protocol, CM, queue pipeline, poll mode.
 - [`docs/nvmet-comparison.md`](docs/nvmet-comparison.md) — subsystem-by-

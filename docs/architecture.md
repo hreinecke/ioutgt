@@ -339,10 +339,14 @@ as-built statement.
    buffer memory is allocated at this point, once, on the owning thread
    (first-touch NUMA locality).
 
-3. **Recv path**: claim a tag — `claim_tag` for negotiated-depth protocols
-   where overrun is a protocol error (NVMe/TCP, NVMe/RDMA), `await_tag` for
-   server-chosen depth where parking is backpressure (NBD) — fill the slot's
-   command and payload, then `submit`. Failures are graded: a per-command
+3. **Recv path**: obtain a tag, treating exhaustion as backpressure,
+   never as a protocol error — a conforming host at full depth can
+   deliver command N+1 before the target's own send completion frees
+   tag N (both fabrics; nvmet never terms on depth either). Where the
+   intake can block, park it in `await_tag` (NVMe/TCP recv loop, NBD);
+   where it must not, `claim_tag` and park the command in a transport
+   queue instead (NVMe/RDMA's `parked`). Then fill the slot's command
+   and payload and `submit`. Failures are graded: a per-command
    error calls `respond_receiving` and pushes an error work item; a protocol
    violation produces a transport-specific termination signal (C2HTermReq /
    close), never a panic or silent drop.

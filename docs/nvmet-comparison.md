@@ -193,6 +193,21 @@ ZERO_RANGE → PUNCH_HOLE → zero-chunk writes. Slot buffers are
 (the kernel may be DMAing into slot memory) with a deliberate
 leak-on-wedge instead of a use-after-free.
 
+**Direct-IO defaults.** Both targets default to direct IO, but nvmet
+splits it across the two backends via the per-namespace `buffered_io`
+configfs attribute (default `false`, `core.c`): a bdev namespace
+`submit_bio()`s below the page cache — direct *by construction*, no
+buffered mode at all — while a file namespace opens
+`O_RDWR | O_DIRECT` unless `buffered_io` is set (`io-cmd-file.c`).
+`buffered_io=1` is really a backend *selector*: `nvmet_bdev_ns_enable`
+returns `-ENOTBLK`, so a "buffered block device" quietly means the
+file backend over the bdev. ioutgt's single `FileBackend` keeps the
+same default-direct-with-an-opt-out shape but with no buffered opt-in
+— the buffered fallback engages only when the store refuses O_DIRECT
+(e.g. tmpfs), and the mode that took effect is observable via
+`FileBackend::is_direct`. Worth remembering when configuring A/B
+benchmarks.
+
 **Differences.** nvmet submits bios that the block layer may split
 and parallelize; ioutgt issues one ring op per command region
 (resuming short transfers). nvmet's FUA maps to REQ_FUA; ioutgt

@@ -223,8 +223,9 @@ the bytes are cache-hot, never as a cold pass.
 
 Backends add their own copies: file adds **none** (O_DIRECT is the
 default, buffered only as a fallback when the store refuses it — same
-default-direct policy as nvmet); memory adds one per direction; null
-adds none. The data-pool arena is also registered as an io_uring fixed
+default-direct policy as nvmet; the `buffered_io` mapping is in
+`nvmet-comparison.md` §5); memory adds one per direction; null adds
+none. The data-pool arena is also registered as an io_uring fixed
 buffer, so disk IO from pooled slots uses `READV_FIXED`/`WRITEV_FIXED`
 (best-effort; released at teardown).
 
