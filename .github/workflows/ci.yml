@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rdma-mummy-sys generates its bindings against the system rdma-core
+      # headers at build time; it needs clang libs <= 19 (the 24.04 image
+      # ships libclang 18 — see README Requirements).
+      - name: install rdma-core headers
+        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV (1.88) check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rdma-core headers
+        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: workspace tests
+    # The suite's io_uring floor includes incremental provided-buffer rings
+    # (IOU_PBUF_RING_INC, kernel >= 6.12); the 24.04 runner image tops out at
+    # kernel 6.11, so ride the newest image for its kernel. If this label ever
+    # disappears, move to the newest available Ubuntu image with a >= 6.12
+    # kernel.
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: uname -r
+      - name: install rdma-core
+        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev rdma-core
+      # Best effort: a soft-RoCE device makes the rxe gates run for real;
+      # without it (module absent on most cloud kernels) they skip cleanly —
+      # the suite treats "no RDMA device with an active port" as an
+      # environment condition, not a failure.
+      - name: soft-RoCE (best effort)
+        run: |
+          if sudo modprobe rdma_rxe 2>/dev/null; then
+            dev="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+            sudo rdma link add rxe0 type rxe netdev "$dev" && rdma link show
+          else
+            echo "rdma_rxe unavailable; rxe gates will skip"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
