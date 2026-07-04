@@ -691,7 +691,7 @@ mean a path shipped ZC ops without draining, i.e. a use-after-free risk.
    *waits*, never *sends*; short sends loop on the same batch. (This is a
    per-connection rule — a queue thread's single `io_uring_enter` still
    batches this connection's lone send SQE with every other
-   connection's; see `architecture.md` §4.2.2.)
+   connection's; see `nvme-tcp.md`.)
 4. **ZC notification gating.** A payload-carrying tag is released only
    after every notification for its batch is reaped.
 5. **Cancellation/teardown safety.** `run()` drains on every exit before

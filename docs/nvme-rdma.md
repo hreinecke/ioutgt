@@ -1,319 +1,269 @@
 # NVMe/RDMA transport (`ioutgt-nvme-rdma`)
 
-Status: **work in progress** (the crate is currently lib-only). Sibling fabric to
-`ioutgt-nvme-tcp`, to ship as a standalone binary `ioutgt-nvme-rdma`. v1 target: discovery + connect + read/write
-over RC queue pairs, with the host's keyed SGL driving target-issued RDMA READ
-(write data) / RDMA WRITE (read data). Reuses the transport-neutral harness
-(`ioutgt-harness`) and the NVMe model / slot engine / backend (`ioutgt-core`,
-`ioutgt-nvme`) unchanged; only the RDMA-specific pieces are new (memory
-registration, completion-queue draining via the reactor, RDMA-CM connection
-acceptance, the recv/send loops).
+Status: **built** (M15 transport + M16 perf + M17 adaptive `--poll`).
+A standalone binary on the shared `ioutgt-harness` pool; kernel-host
+interop green on soft-RoCE (VM gates) and mlx5 (two-NIC box); matches
+or beats nvmet-rdma on every single-job fio_perf phase on the test box
+(64k +38-44%, 4k within ±3%). Reuses the NVMe model / slot engine /
+dispatch / backends (`ioutgt-core`, `ioutgt-nvme`) unchanged; new here:
+memory registration, CQ draining through the reactor, RDMA-CM
+acceptance, the recv/reap machinery.
 
-## Wire protocol (read & write)
+## Wire protocol
 
-Mirrors kernel `drivers/nvme/target/rdma.c`. The host SENDs a command capsule
-(NVMe SQE + a keyed SGL: `{addr, rkey, length}` naming the host's registered
-buffer); the target moves the data one-sided and SENDs a response capsule (CQE):
+Mirrors kernel `drivers/nvme/target/rdma.c`. The host SENDs a command
+capsule (SQE + keyed SGL `{addr, rkey, len}` naming its registered
+buffer); the target moves data one-sided and SENDs the CQE back.
+No R2T, no C2HData PDUs, no digests.
 
-- **WRITE**: target RECVs the command, leases a pool buffer, posts an **RDMA
-  READ** to pull the write data from host memory into the slot's segments, then
-  runs the command and SENDs the CQE. No R2T / H2CData round-trips.
-- **READ**: target RECVs the command, runs it, posts an **RDMA WRITE** to push
-  the read data into the host buffer, then SENDs the CQE (ordered after the
-  WRITE). No C2HData PDUs.
+```text
+ WRITE (host → target)               READ (target → host)
 
-See <https://ming1.github.io/storage/linux-nvme-target-explained#156-nvme-rdma-wire-protocol-for-read--write>.
+ host ──SEND capsule──► target       host ──SEND capsule──► target
+         claim tag, lease pool buf           claim tag, dispatch,
+         RDMA READ host buf → slot           backend fills slot
+         READ completion → submit            RDMA WRITE slot → host
+         dispatch, backend                   │
+ host ◄──SEND CQE────── target       host ◄──SEND CQE (QP-ordered
+                                             after the WRITE)
+```
 
-## RDMA bindings: `sideway`
+Write data ≤ 4 KiB rides **in the capsule**: IOCCSZ advertises
+`RDMA_INLINE_DATA_SIZE` (4 KiB) and SGLS sets the address-as-offset bit
+(SAOS — what actually gates the host's `use_inline_data`). One ~100 ns
+copy capsule → pool lease, no RDMA READ round-trip; the capsule's RECV
+re-post is deferred until the copy (ring-safe: no response yet, so the
+host can't reuse that SQ slot). This closed the last single-flow
+4k-randwrite deficit vs nvmet.
 
-We use **[`sideway`](https://github.com/RDMA-Rust/sideway)** (safe ibverbs +
-RDMA-CM bindings). It covers everything the target needs — device / PD / MR
-(lkey+rkey) / CQ + completion channel / RC QP / RDMA-CM — and the completion
-channel exposes a `RawFd` (`AsRawFd`), which is exactly what we register in the
-per-thread io_uring via `IORING_OP_POLL_ADD` for event-driven CQ draining.
+Larger writes post an RDMA READ into the slot's pool-registered
+segments **without submitting the slot**; submission is deferred to the
+READ completion (`submit_pending`), which wakes the slot task against
+the now-filled slot. Malformed SGLs (bad descriptor, out-of-bounds
+offset, zero length) fail without dispatch via a queued error CQE
+(`SGL_INVALID_TYPE` / `DATA_SGL_LEN_INVALID`).
 
-The two `*-sys` crates the original plan named do **not** build on a modern
-rdma-core dev box:
+## Bindings: sideway (verbs) + rdma-mummy-sys (CM)
 
-- `ibverbs-sys` (jonhoo) **vendors** rdma-core and builds it with cmake, which
-  needs `libnl-3.0` / `libnl-route-3.0` **dev** packages (not just the runtime
-  libs) — unavailable without root on the dev box.
-- `rdma-sys` (datenlord) links the system libs but pins **bindgen 0.59**, which
-  cannot parse the modern `infiniband/ib_user_ioctl_verbs.h` (anonymous-union
-  ident error).
+**[`sideway`](https://github.com/RDMA-Rust/sideway)** (pinned `=0.4.3`)
+covers verbs: device / PD / MR / CQ + completion channel / RC QP. It
+links system rdma-core via pkg-config with a current bindgen — the
+`*-sys` alternatives don't build on the dev boxes (vendored cmake needs
+libnl dev packages; `rdma-sys` pins a bindgen too old for modern
+headers).
 
-`sideway` links the installed system rdma-core via `pkg-config` with a current
-bindgen, so it needs only the already-present `libibverbs` / `librdmacm` dev
-headers.
+sideway's **CM** API can't do what an NVMe target needs — read
+CONNECT_REQUEST private data (`nvme_rdma_cm_req` carrying the qid),
+reply with private data, `reject` — so `cm.rs` drives librdmacm
+directly over `rdma-mummy-sys` (sideway's own FFI backend; types
+unify), mirroring sideway's naming for a mechanical future swap back.
+Three seams, all earmarked for upstream PRs:
 
-### CM layer: rdma-mummy-sys directly (sideway is verbs-only)
+- `Identifier::get_device_context()` — layout-asserted transmute to a
+  sideway `DeviceContext` (why the `=0.4.3` pin).
+- `get_qp_attr` wraps `rdma_init_qp_attr`; attrs applied via raw
+  `ibv_modify_qp` through sideway's `qp()` accessor.
+- `SEND_WITH_INV` — one raw extended-verbs pair
+  (`target.rs::wr_send_with_inv`); used when the host's SGL requests
+  remote invalidation (`SGL_FMT_INVALIDATE`).
 
-sideway's **verbs** API is sufficient as-is, but its **RDMA-CM** API is not: an
-NVMe target must read the connecting host's CM private data (the
-`nvme_rdma_cm_req` carrying the `qid`), return reply private data
-(`nvme_rdma_cm_rep`), and `reject` bad connects — none of which sideway's
-`Event` / `ConnectionParameter` expose, with no raw escape hatch. (An earlier
-iteration vendored sideway with two raw-accessor patches; the vendor tree was
-7k lines carried for ~8 patched lines and was retired.)
+## Threading: CM thread → control thread → queue thread
 
-So `cm.rs` drives the CM **directly over `rdma-mummy-sys`** (sideway's own FFI
-backend — types unify), which exports the complete librdmacm surface. Its
-types and method names deliberately mirror sideway's (`Identifier`, `Event`,
-`EventType`, `get_qp_attr`, `get_device_context`, …) so a future switch back
-to upstream sideway — once it grows the CM private-data/reject APIs — is a
-mechanical import swap. Three seams to know:
+The binary runs on the shared harness pool via
+`ioutgt_harness::spawn::<RdmaTransport>` — multi-core queues, control
+socket, `ConnPermit`, idle-teardown, same as TCP. One mismatch: the CM
+event channel parks on its fd via io_uring `POLL_ADD`, which the
+plain-Tokio control thread can't provide — so `bind` spawns a dedicated
+CM reactor thread.
 
-- **`DeviceContext` bridge**: a CM connection's QP is built on the
-  `ibv_context` the connection landed on (`cm_id->verbs`, owned by librdmacm).
-  `Identifier::get_device_context()` turns it into a sideway `DeviceContext`
-  with a layout-asserted transmute (single-field struct in sideway 0.4.3;
-  `sideway = "=0.4.3"` is pinned so an upgrade revisits this) behind the same
-  per-pointer leak-cache upstream keeps.
-- **QP transitions**: `get_qp_attr` wraps `rdma_init_qp_attr`; the returned
-  attrs apply with raw `ibv_modify_qp` through sideway's public `qp()` raw
-  accessor (no sideway-attribute bridging).
-- **`SEND_WITH_INV`**: sideway 0.4.3 has no `setup_send_with_inv`; the
-  response path emits that one work request with the raw extended-verbs pair
-  (`ibv_wr_send_inv` + `ibv_wr_set_sge`) inside the sideway post-guard session
-  (`target.rs::wr_send_with_inv`; extended QPs only, which all target QPs are).
+```text
+ CM thread (cm_thread_main,          queue thread (routed by qid)
+ own QueueRuntime)                   ┌─────────────────────────────────┐
+   rdma_cm events:                   │ run_conn:                       │
+   ├─ CONNECT_REQUEST                │   PD / comp-channel / CQ / QP   │
+   │    qid from private data;       │     on the cm_id's own device   │
+   │    malformed recfmt/len →       │     context                     │
+   │    typed rdma_reject.           │   INIT→RTR→RTS (CM attrs)       │
+   │    RdmaRaw ──mpsc──► control    │   prime RECVs + arm CQ          │
+   │    thread (harness routes       │     BEFORE rdma_accept — the    │
+   │    qid 0 → admin,               │     first capsule is never lost │
+   │    qid n → io[(n-1) % N])       │   run(): reap loop + slot tasks │
+   ├─ ESTABLISHED                    └─────────────────────────────────┘
+   └─ DISCONNECTED → DREP, prune
+        conns, fire the conn's stop
+```
 
-All three seams are earmarked for an upstream PR to RDMA-Rust/sideway
-(`Event::private_data()`, `ConnectionParameter::setup_private_data`,
-`Identifier::reject`, `setup_send_with_inv`, pre-established `DeviceContext`
-access); each shrinks `cm.rs`/`target.rs` when it lands.
+A cm_id is created and has its lifecycle events pumped on the CM
+thread but builds its QP and `rdma_accept`s on a queue thread
+(`Identifier: Send + Sync`; librdmacm cm_id ops are thread-safe).
 
-## Reactor integration
-
-Event-driven (the project's one-io_uring-per-thread model): the ibverbs
-completion-channel fd and the RDMA-CM event-channel fd are registered in the
-queue thread's io_uring with `IORING_OP_POLL_ADD`; a readiness CQE wakes the
-thread, which drains `ibv_poll_cq` / processes CM events. Busy-poll is a
-deferred opt-in.
-
-## Threading & the harness Transport
-
-The binary runs on the shared `ioutgt-harness` queue-thread pool (admin thread +
-N IO threads, CPU-pinned) via `ioutgt_harness::spawn::<RdmaTransport>` — the same
-seam the TCP binary uses, bringing multi-core queues, the control socket
-(`ctl`/`list`/`stat`), `ConnPermit`/`MAX_CONNECTIONS`, and idle-teardown.
-
-The one structural mismatch: the CM event channel parks on its fd via io_uring
-`POLL_ADD`, which needs an io_uring reactor, but the harness control thread is
-plain tokio. So `RdmaTransport::bind` spawns a **dedicated CM reactor thread**
-(`cm_thread_main`, its own `QueueRuntime`) that runs the `RdmaListener` and
-forwards each accepted connection — an `RdmaRaw` (cm_id + qid + hsqsize), all
-`Send` — over a bounded tokio mpsc channel to the control thread. `accept` drains
-that channel; `handshake` packages `RdmaRaw` + `ConnPermit` into an `RdmaConn`;
-`run_queue` runs `run_conn` on the routed (by qid) **queue thread**, which is
-where all reactor-bound work happens: build the PD/comp-channel/CQ/QP on the
-**cm_id's own device context**, drive it INIT→RTR→RTS from the CM-derived attrs,
-prime the RECVs and arm the CQ *before* `rdma_accept` (so the host's first
-capsule is never dropped), then run the queue. So one cm_id is created + has its
-lifecycle events (Established/Disconnected) pumped on the CM thread, but builds
-its QP + `rdma_accept`s on a queue thread — sideway declares `Identifier: Send +
-Sync` and librdmacm's cm_id ops are thread-safe. The cm_id is held for the
-process lifetime (clean per-queue teardown is deferred).
-
-`serve()` remains a single-threaded path (CM listener + every queue on one
-io_uring reactor) — a simpler fallback that bypasses the harness.
+Accept-time QP details: admin depth clamped to 32; the reply's
+`initiator_depth` = the QP's real `max_rd_atomic` (a hardcoded value
+here once caused reconnect storms); IO queues widen the RC ACK timeout
+to ~4.3 s (admin stays short to protect keep-alive detection); CQs are
+spread across completion vectors (admin on 0, IO by qid; rxe falls
+back to 0).
 
 ## Queue pipeline (`target.rs`)
 
-`RdmaQueue` joins `QueueCore<Sqe>` with the connection's RDMA resources and three
-registered buffers: the data-pool arena (the local source for read-data RDMA
-WRITEs, `pool_lkey`), the per-slot RECV capsule buffers, and a per-slot CQE
-staging buffer. The pipeline per command:
+`RdmaQueue` joins `QueueCore<Sqe>` with the QP and four MRs:
 
-1. RECV a command capsule → parse the `Sqe` (Connect also carries a 1024-byte
-   in-capsule `ConnectData`) and immediately re-arm that RECV buffer.
-2. `claim_tag` → `submit` → `await_command` → `dispatch::execute` → `Outcome`.
-3. If `data_len > 0` (a read), RDMA WRITE `slot.data().segs()` to the host's
-   keyed SGL (`parse_keyed_sgl`: `addr@0`, `rkey@11` of the 16-byte descriptor
-   in the SQE `dptr` at offset 24).
-4. SEND the CQE capsule.
-5. Release the slot once **both** outstanding response WRs complete, tracked by
-   `inflight[tag]`. Work-request ids encode `kind<<40 | low32` (RECV→recv-buf
-   index, SEND/WRITE→tag), reaped centrally in `run()`'s `cq::wait` drain loop.
+| MR | Covers | Used by |
+|----|--------|---------|
+| pool arena | data pool (also an io_uring fixed buffer) | RDMA READ target, RDMA WRITE source |
+| recv bufs | per-slot command-capsule buffers | RECV |
+| resp bufs | per-slot CQE staging | SEND |
+| cdata buf | admin Connect-data landing zone | RDMA READ (keyed-SGL ConnectData) |
 
-The first capsule on qid 0 bootstraps a controller (`ConnCtx::new_admin`); qid n
-attaches by cntlid (`ConnCtx::new_io`). The binary `ioutgt-nvme-rdma` mirrors the
-transport-neutral CLI of `ioutgt-nvme-tcp` — `--config` (JSON), `--listen`,
-`--subsys-nqn`, `--backend` (memory/null/file), `--mem-size-mb`,
-`--io-queue-size`, `--queue-buf-mb`, `--io-threads`, `--no-pin`,
-`--control-socket`, `--idle-teardown-secs` — and builds a `TargetConfig` for
-`ioutgt_harness::spawn`. TCP-only knobs (digests, `--send-zc`, `--recv-buf-mb`)
-are absent; the `ctl`/`list`/`stat` client subcommands are shared with the TCP
-binary through `ioutgt_harness::client`.
+Work-request ids encode the WR class + owner, the same trick as TCP's
+TTAG = slot index (no lookup maps):
 
-Commands execute on **preallocated per-tag tasks** (one persistent task per slot,
-spawned once at queue install — zero per-command allocation, mirroring the TCP
-frontend). Each loops `await_command → dispatch::execute → begin_respond → push
-the response onto a preallocated `SendList``. Dispatching off the reap loop is
-required, not a perf choice — an Async Event Request (admin opcode 0x0C) is held
-open until an async event fires, so awaiting dispatch inline would stall the whole
-queue on the parked AER; here a parked AER just leaves its one slot task waiting.
-The reap-loop task remains the sole owner of the QP, `inflight[]`, and the
-response/recv buffers (slot tasks only hold `Rc<QueueCore>`/`Rc<ConnCtx>`/the
-`SendList` and post nothing), keeping tag release and WR posting single-owner and
-lock-free. The reap loop `select!`s the CQ against the `SendList`, posting each
-finished response (read-data RDMA WRITE, then the CQE SEND). The per-tag
-`JoinSet` aborts every slot task when it drops at `run` exit.
+```text
+ wr_id = kind << 40 | low32      RECV         → recv-buffer index
+                                 SEND / WRITE → tag
+                                 READ         → tag  (request WR — not
+                                                counted in inflight[])
+```
 
-**Per-queue teardown.** Our QP is built manually + bound via `rdma_accept`'s
-`qp_num`, so it is *not* cm_id-associated — `rdma_disconnect` does not flush it,
-and a host disconnect produces no flushed completions on the queue thread. The
-prompt teardown signal is the CM **Disconnected** event (on the CM thread): its
-arm sends the DREP (`id.disconnect()`), prunes the connection's `ConnSlot` from
-`conns` (so `conns` stays bounded across reconnect churn — passes a reconnect
-soak), and fires the connection's `stop: Arc<Notify>`. The queue thread's reap
-loop `select!`s on `stop` (alongside the CQ and the response queue) and ends on
-it; then a teardown block resolves parked AERs (`ctx.close()`) and drains
-in-flight dispatches (`while executing() > 0`, bounded) before returning — so a
-backend op can't target the pool arena as it's freed.
+The **reap loop** is the sole owner of the QP, `inflight[]`, and the
+recv/response buffers; slot tasks only hold `Rc<QueueCore>` + the
+`SendList` and post nothing. Commands execute on preallocated per-tag
+tasks (as on TCP) — required, not a perf choice: a parked Async Event
+Request would stall inline dispatch, but only idles its own slot task.
 
-The stop signal is delivered with a bare `tokio::sync::Notify` from the CM thread
-into the queue thread, *not* through the queue thread's io_uring mailbox. It is
-never lost (the wake is latched), but on a fully idle queue it is only observed
-at the reactor's park backstop (~1s), so teardown can lag up to ~1s. This is a
-second cross-thread wake channel (the harness's mailbox-only invariant covers the
-data path); routing the stop through the mailbox doorbell would make it prompt.
+```text
+ run() — select! over five arms:
+   comp-channel readiness (multishot POLL_ADD) ─► poll CQ, process CQEs
+   park-probe staged CQEs (--poll spin)        ─► same drain
+   SendList.next()                             ─► post responses
+   stop.notified()                             ─► teardown
+   backstop timer (1 s)                        ─► keep-alive watchdog
+                                                  every 2nd tick ≈ 2 s
+```
 
-**Poll mode (`--poll`).** Opt-in adaptive busy-polling for latency: while a
-queue has commands in flight (any slot tag claimed, plus a 200 µs grace so
-low-depth workloads' inter-command gaps don't re-pay the event wake), the
-reactor's park hook spins — draining the CQ via the park-probe on every pass
-and entering the kernel with `GETEVENTS` so `DEFER_TASKRUN` completions
-(backend IO, control mailbox) keep flowing — instead of sleeping on
-comp-channel events. A genuinely idle queue stops burning its core within the
-grace and falls back to the event-driven sleep; the next capsule's comp event
-resumes the spin. The admin queue never spins (its parked AER holds a slot
-for the controller lifetime, and keep-alive latency does not merit a core).
-Measured effect (single job 4k, SSD): qd1 randread 52.6 → 43.1 µs, randwrite
-39.5 → 29.4 µs; qd128 unchanged (host-bound). Operational note: a spinning
-io-thread owns its core — benchmark clients must not share a converged
-io-thread CPU.
+Doorbells are batched: all RDMA READs from one CQ drain go out on one
+`ibv_post_send`, and all drained responses (WRITE + SEND pairs) on
+another. Per-class WR counts and log2 batch-size histograms are
+exported in `GET_STATS` under `"wr"`.
 
-**Abrupt host loss (no DREQ).** A host that vanishes without disconnecting
-sends nothing the QP or CM would notice — there is no socket death to unwind.
-The reap loop's backstop timer therefore doubles as a keep-alive watchdog
-(every ~10th tick): an admin queue whose host has been silent past KATO×2+5 s
-tears down and removes its controller from the registry (mirroring nvmet's
-keep-alive timer and the TCP path's watchdog), and IO queues whose controller
-has left the registry follow within a couple of seconds — so a dead host's
-QPs, permits and slots all recycle.
+A tag is released only when **both** signaled response WRs (WRITE and
+SEND; SEND alone for data-less commands) have completed —
+`inflight[tag]` — i.e. when the NIC provably no longer references slot
+memory (transport-contract obligation 5). The response SEND carries
+the Solicited flag (host solicited-only CQs take an interrupt) and
+becomes SEND_WITH_INV when the host requested invalidation.
 
-**Known v1 divergences (deferred):**
-- *`conns` is pruned only on a graceful `Disconnected`.* An abrupt host loss
-  leaves the listener's `ConnSlot` in `conns` (the *queue* still tears down via
-  the keep-alive watchdog above, so this is listener-side slot accumulation
-  only). The reconnect soak exercises graceful reconnects; a periodic weak-ref
-  sweep would bound the abrupt case.
-- *`write_read_data` does not validate `data_len` against the host's keyed-SGL
-  length.* An undersized host SGL surfaces as an RDMA remote-access-error
-  completion (→ queue teardown) rather than a clean NVMe `DATA_XFER_ERROR`. RDMA
-  protection prevents any local memory-safety issue.
-- *Over `MAX_CONNECTIONS`, the host times out instead of being rejected.* The
-  harness drops the over-limit `RdmaRaw`; for RDMA that means `rdma_accept` is
-  simply never called (no `rdma_reject`), so the host times out rather than
-  getting a clean CM reject.
-- *`bind` reports the configured listen address verbatim* (no ephemeral-port
-  resolution), so `--listen …:0` would misadvertise port 0 — fine for the fixed
-  RDMA port, unsupported for `:0`.
+## Backpressure: park, never drop
 
-**Write-data path (host→controller).** `io::write`/`io::dsm` read the write data
-straight from the slot, which over RDMA must be RDMA-READ from the host's keyed
-SGL *before* dispatch. `handle_recv` detects a host-data-in command
-(`host_data_in()`: IO `WRITE`/`DSM`), claims the tag, leases a pool buffer, sets
-the slot's received length (`set_data_len`), stashes the SQE in `pending_read`,
-and moves the host data one of two ways, mirroring nvmet:
+Two transient-full conditions defer a command instead of failing it,
+mirroring nvmet's `rsp_wr_wait_list` / SPDK's pending queues (see
+`rdma-flow-control-nvmet-vs-spdk.md`):
 
-- **In-capsule (writes ≤ one page)**: IOCCSZ advertises `RDMA_INLINE_DATA_SIZE`
-  (4 KiB) of in-capsule data plus the SGLS address-as-offset bit (SAOS — the
-  host's `use_inline_data` is gated on that bit, not on IOCCSZ), so nvme-rdma
-  hosts embed small write payloads in the command capsule itself. The payload
-  is copied from the capsule into the pool lease (~100 ns) and the slot is
-  submitted immediately — no RDMA READ, no wire round trip, no extra CQE. The
-  capsule's RECV re-post is deferred until that copy (the `pool_wait`/`parked`
-  queues carry the capsule index), which is ring-safe: the command has no
-  response yet, so the host cannot send a replacement capsule for its slot.
-  This closed the last single-flow 4k-randwrite deficit vs nvmet (proven by a
-  config-equalization control: nvmet with `inline_data_size=0` drops below us).
-- **Keyed SGL (larger writes)**: posts an RDMA READ (`WR_READ`) of the host's
-  buffer into the slot's pool-registered segments — **without submitting the
-  slot**. Submission is **deferred** to the `WR_READ` completion
-  (`submit_pending`), which wakes the slot task to dispatch against the
-  now-filled slot. The READ is a request WR, not a response, so it is not
-  counted in `inflight[]` — only the trailing CQE SEND gates slot release.
+- **`parked` — all slot tags held.** The response SEND frees the
+  host's SQ slot before our own SEND completion releases the tag, so a
+  conforming host at full depth can deliver command N+1 while every
+  tag is busy. Capsules park and drain oldest-first as tags free;
+  exceeding the negotiated depth outright stays fatal.
+- **`pool_wait` — pool lease unavailable.** A write's lease must come
+  from the registered arena (it is the RDMA READ's local target; heap
+  would be unregistered) and the pool is deliberately smaller than
+  depth × MDTS. The command parks (tag already claimed) and retries
+  front-only as completions release leases. The old
+  fail-with-`DATA_XFER_ERROR|DNR` turned full-depth write bursts into
+  host EIOs.
 
-Malformed commands — a bad in-capsule descriptor, an out-of-bounds offset, or a
-zero-length SGL — are failed without dispatch via `respond_receiving` + a queued
-error CQE (`SGL_INVALID_TYPE` / `DATA_SGL_LEN_INVALID`).
+## Teardown and host loss
 
-**Backpressure (park, never drop).** Two transient-full conditions defer the
-command instead of failing it, mirroring nvmet's `rsp_wr_wait_list` / SPDK's
-pending queues (see `docs/rdma-flow-control-nvmet-vs-spdk.md`):
-- *All slot tags held* (`parked`): on RDMA the response SEND delivers the CQE
-  to the host — freeing its SQ slot — before our own SEND completion is reaped
-  and the tag released, so a conforming host at full depth can deliver command
-  N+1 while every tag is busy. The capsule parks and drains oldest-first as
-  tags free; exceeding the negotiated depth outright stays fatal.
-- *Pool pressure* (`pool_wait`): a write's lease must come from the registered
-  arena (it is the RDMA READ's local target; a heap fallback would be
-  unregistered), and the pool is deliberately smaller than depth × MDTS. On
-  `try_lease` failure the command (tag already claimed) parks and the reap
-  loop retries it front-only as completions release leases. The old
-  fail-with-`DATA_XFER_ERROR|DNR` behavior turned every full-depth write burst
-  into immediate host EIOs (mkfs/git-clone writeback failures).
+Our QP is built manually and bound via `rdma_accept`'s `qp_num`, so it
+is *not* cm_id-associated: `rdma_disconnect` doesn't flush it and a
+host disconnect produces no flushed completions. Teardown signals:
+
+- **Graceful (DREQ)**: the CM thread's Disconnected arm sends the DREP,
+  prunes the connection's `ConnSlot` from `conns` (bounded across
+  reconnect churn — soak-tested), and fires the connection's
+  `stop: Arc<Notify>`. The reap loop ends on `stop`, resolves parked
+  AERs (`ctx.close()`), and drains in-flight dispatches
+  (`executing() > 0`, bounded) before freeing — a backend op can't
+  target the pool arena as it's freed. The stop is a bare `Notify`
+  (not the mailbox doorbell), so a fully idle queue may only observe
+  it at the ~1 s park backstop.
+- **Abrupt (host vanishes, no DREQ)**: nothing on the QP or CM
+  notices, so the backstop's keep-alive watchdog (every 2nd tick,
+  ≈ 2 s) covers it: an admin queue silent past KATO×2 + 5 s tears down
+  and removes its controller from the registry; IO queues whose
+  controller has left the registry follow — a dead host's QPs, permits
+  and slots all recycle.
+
+`RdmaQueue::drop` drains the comp channel before destroying the CQ
+(`ibv_destroy_cq` hangs on unacked events); field order in the struct
+is the verbs destruction order and is load-bearing.
+
+## Poll mode (`--poll`)
+
+Opt-in adaptive busy-poll: while a queue has commands in flight (plus
+a 200 µs grace), the reactor's park hook spins — draining the CQ via
+the park-probe each pass and entering the kernel with `GETEVENTS` so
+`DEFER_TASKRUN` completions (backend IO, mailbox) keep flowing —
+instead of sleeping on comp-channel events. An idle queue stops
+burning its core within the grace; the next comp event resumes the
+spin. The admin queue never spins. Measured (single job 4k, SSD): qd1
+randread 52.6 → 43.1 µs, randwrite 39.5 → 29.4 µs; qd128 unchanged.
+A spinning io-thread owns its core — don't share it with benchmark
+clients.
+
+## CLI
+
+Mirrors the TCP binary (`--config`, `--listen`, `--subsys-nqn`,
+`--backend`, `--mem-size-mb`, `--io-queue-size`, `--queue-buf-mb`,
+`--io-threads`, `--no-pin`, `--control-socket`,
+`--idle-teardown-secs`), plus `--poll`; TCP-only knobs (digests,
+`--send-zc`, `--recv-buf-mb`) are absent. The `ctl`/`list`/`stat`
+subcommands are shared through `ioutgt_harness::client`.
+
+## Known v1 divergences (deferred)
+
+- `conns` is pruned only on a graceful Disconnected; an abrupt host
+  loss leaves the listener-side `ConnSlot` (the queue itself tears
+  down via the watchdog). A periodic weak-ref sweep would bound it.
+- `staged_len` clamps to `min(keyed SGL len, MDTS)` but never
+  cross-checks the command's NLB-derived length; an undersized host
+  SGL surfaces as an RDMA remote-access-error completion (→ queue
+  teardown), not a clean NVMe `DATA_XFER_ERROR`. RDMA protection
+  prevents any local memory-safety issue.
+- Over `MAX_CONNECTIONS` the harness drops the connection without
+  `rdma_reject`, so the host times out instead of a clean CM reject.
+  (Malformed connects *do* get a typed reject.)
+- `bind` reports the configured listen address verbatim — `--listen
+  …:0` would misadvertise port 0.
 
 ## Testing
 
-- **v1 bring-up gate**: `testing/run_rdma_connect.sh` builds the binary and runs
-  `testing/vmtest/ioutgt_rdma_connect.sh` in the vmtest guest — soft-RoCE
-  (`rdma_rxe`) on the guest NIC, then the in-kernel nvme-rdma host through
-  `nvme discover` → `connect` → `id-ctrl` → a namespace **write + read-back
-  verify** (`cmp`) → an `fio --verify=crc32c` randwrite pass → `disconnect`.
-  (The guest re-adds the netdev IP after `rdma link add` to force the rxe
-  RoCEv2 GID to populate, which otherwise races bind on some boots.)
-- **A/B correctness gate (VM)**: `testing/run_rdma_compare.sh` builds the
-  release binary and runs `testing/vmtest/ioutgt_rdma_compare.sh` in the guest
-  — soft-RoCE (rxe), then the SAME `testing/local_tgt.sh` verbs with
-  `TRANSPORT=rdma` against BOTH `ioutgt-nvme-rdma` and in-kernel `nvmet-rdma`,
-  asserting a clean `fio --verify=crc32c` on each. Backends are loop block
-  devices (the guest root is tmpfs, which supports neither `O_DIRECT` nor the
-  nvmet file backend). Requires `rdma_rxe`, `nvmet_rdma`, `nvme_rdma`.
-- **Shared harness knob**: `testing/common.sh` selects the fabric with
-  `TRANSPORT=tcp|rdma` (default tcp): it picks the binary
-  (`ioutgt-nvme-$TRANSPORT`), the kernel modules (`nvmet-$TRANSPORT` /
-  `nvme-$TRANSPORT`), the port `addr_trtype`, and `nvme -t`, and forces digests
-  + zero-copy-send off for rdma. Both `local_tgt.sh` and the two-NIC drivers
-  share it.
-- **Box perf (two real mlx5 NICs)**: `testing/two_nic_realwire_rdma.sh` —
-  `rdma system set netns exclusive`, forces RoCE across the physical link, and
-  runs `fio` / `fio_perf` for `ioutgt-nvme-rdma` vs `nvmet-rdma` back to back.
-  *Asymmetric topology*: nvmet-rdma's CM listener is hardcoded to `init_net`
-  (`rdma_create_id(&init_net,…)` / `inet_pton_with_scope(&init_net,…)` in
-  `drivers/nvme/target/rdma.c`), so it can only listen in the root netns —
-  unlike nvmet-tcp (`sock_create` in the writer's netns). The driver therefore
-  keeps the **target** (NIC_T + IP_T + its rdma device) in root and isolates
-  only the **initiator** (NIC_I) in its own netns; the wire is still forced
-  because root reaches the initiator IP only out NIC_T → the physical link.
-  Validated on a two-card mlx5 (CX-6) box: discover/connect/IO over the wire
-  for both targets. Two box gotchas baked into the driver:
-  - *Carrier flap to seat the GID.* Under `netns exclusive`, a freshly-added
-    RoCEv2 GID lands in the sysfs GID table but **not** the rdma_cm GID cache
-    until a netdev **carrier** event fires, so `rdma_bind_addr` returns
-    `EADDRNOTAVAIL` (confirmed identically for ioutgt, nvmet-rdma, *and*
-    `rping`). `rdma_address_nic` does an `ip link down/up` (an IP re-add alone
-    is not enough for mlx5) then re-adds the IP and waits for the GID.
-  - *Setting `netns exclusive` needs a quiesced host.* It returns `EBUSY` if any
-    other net namespace exists (e.g. a `systemd PrivateNetwork` service such as
-    `polkit`); free them, set the mode, restore.
-  - *Host network management can destroy the fabric mid-run.* The historical
-    "64k congestion wedge" (keep-alive death ~60 s after connect, `-104`
-    reconnect storms on both targets) was NetworkManager's DHCP loop flushing
-    the test IP/GID — see
-    `docs/rdma-64k-congestion-wedge.md`; the driver's `up` now defends against it.
-- The driver's `fio_verify` verb is the data-integrity gate (mixed 4k–128k
-  writes at pool-exhausting pressure + crc32c read-back) and `ibperf` is the
-  raw link baseline (perftest send/write/read over the wire). Verify a link
-  first with `ibv_devinfo` / `rping` / `ibperf`.
+| Gate | Script | What it proves |
+|------|--------|----------------|
+| verbs loopback | `testing/run_rdma_loopback.sh` | the verbs layer alone, rxe loopback in the VM |
+| bring-up | `testing/run_rdma_connect.sh` | rxe + kernel host: discover → connect → write/read-back `cmp` → fio verify → disconnect |
+| A/B correctness | `testing/run_rdma_compare.sh` | same driver against ioutgt **and** nvmet-rdma (loop bdev backends; guest tmpfs can't host either file backend) |
+| box perf | `testing/two_nic_realwire_rdma.sh` | two real mlx5 NICs, forced wire, fio/fio_perf vs nvmet-rdma |
+
+`testing/common.sh` selects the fabric via `TRANSPORT=tcp|rdma`
+(binary, kernel modules, `addr_trtype`, `nvme -t`; forces digests +
+zero-copy send off for rdma). The `fio_verify` verb is the
+data-integrity gate (mixed 4k–128k writes at pool-exhausting pressure
++ crc32c read-back); `ibperf` is the raw link baseline.
+
+Box gotchas baked into the two-NIC driver:
+
+- nvmet-rdma's CM listener is hardcoded to `init_net`, so the target
+  stays in the root netns and only the initiator NIC is isolated
+  (`rdma system set netns exclusive` — which needs a quiesced host:
+  any other netns, e.g. systemd `PrivateNetwork`, makes it `EBUSY`).
+- A freshly-added RoCEv2 GID reaches the rdma_cm cache only after a
+  netdev **carrier** event; the driver link-flaps and re-adds the IP,
+  else `rdma_bind_addr` returns `EADDRNOTAVAIL` (identical for ioutgt,
+  nvmet-rdma, and `rping`).
+- Host network management can destroy the fabric mid-run: the
+  historical "64k congestion wedge" was NetworkManager's DHCP loop
+  flushing the test IP/GID — see `rdma-64k-congestion-wedge.md`.
+
+Wire-protocol background:
+<https://ming1.github.io/storage/linux-nvme-target-explained#156-nvme-rdma-wire-protocol-for-read--write>

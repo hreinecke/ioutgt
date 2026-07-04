@@ -1,9 +1,9 @@
 # ioutgt Architecture Specification
 
-Status: as-built specification (M0–M10, plus the post-M10 perf work —
-gather send and direct-to-slot recv — and the M11–M13 transport
-refactors). The milestone table at the end records what shipped;
-`docs/roadmap.md` holds what's next.
+Status: as-built specification through M17. The milestone table at the
+end records what shipped; `docs/roadmap.md` holds what's next. This doc
+covers the transport-neutral engine; the per-transport detail lives in
+[`docs/nvme-tcp.md`](nvme-tcp.md) and [`docs/nvme-rdma.md`](nvme-rdma.md).
 
 ## 1. Mission and goals
 
@@ -223,334 +223,43 @@ query is answered with a zeroed snapshot (it neither blocks nor mis-reports
 threads as unresponsive) and a namespace-change nudge no-ops (no live
 controllers — the edit still lands in the port model for the next connect).
 
-### 4.2 Queue thread: who calls whom inside `run_queue()`
+### 4.2 Queue thread: the per-connection task set
 
-`run_queue()` (`ioutgt-nvme-tcp/src/connection.rs`) is the per-connection
-orchestrator. It builds the queue state — `QueueCore<Sqe>` (core, the
-generic `QueueCore<C>` instantiated for NVMe) wrapped in an
-`NvmeTcpQueue` (transport-side composite of `Rc<QueueCore<Sqe>>` +
-`SendList<SendWork>`) — then spawns the task set whose **only rendezvous
-is `NvmeTcpQueue`** — the recv loop, slot tasks, and send loop never call
-each other directly:
-
-**`run_queue()` — the per-connection task set**
+Every transport's `run_queue()` builds the same shape on the queue
+thread: the generic slot engine (`QueueCore<C>`, core) joined with a
+transport-owned send list, plus one persistent task per slot ("task
+per tag"), a send-side task, and a recv/reap loop running as the task
+body. The tasks never call each other — their only rendezvous is the
+transport's queue type:
 
 ```text
-run_queue(QueueConn)                                   [ioutgt-nvme-tcp]
-  ├─ QueueCore::new(qid, sqsize, …, Sqe::zeroed())     [ioutgt-core]
-  ├─ NvmeTcpQueue::new(…)    (QueueCore<Sqe> +         [ioutgt-nvme-tcp]
-  │                          SendList<SendWork>)
-  ├─ ConnCtx::new_admin() / new_io()                   [ioutgt-core]
-  ├─ spawn_local × sqsize  ── slot tasks ("task per tag"):
-  │     loop { sqe = queue.slots.await_command(tag)    [core slotq]
-  │            out = dispatch::execute(ctx, tag, &sqe) [core → backend]
-  │            queue.slots.begin_respond(tag)          [core slotq]
-  │            queue.send.push(SendWork::Response(…)) }[tcp]
-  ├─ spawn_local send_loop(queue, fd)                  [tcp]
-  ├─ spawn_local keep-alive watchdog (admin only)      [tcp → uring ops::sleep]
-  └─ recv_loop(queue, fd)        (runs as the task body)
+  recv loop ──claim_tag / submit──►┐
+                                   │ QueueCore<C> + send list
+  slot tasks × sqsize              │ (NvmeTcpQueue / RdmaQueue)
+    await_command → dispatch ─────►│
+    → begin_respond → push work ──►│
+                                   │
+  send loop ◄── drain send list ───┘
+    ship batch → release_tag once the kernel/NIC
+    is provably done with the slot memory
 ```
 
-**`NvmeTcpQueue` — the tasks' only rendezvous, command lifecycle left to right**
+The transport-specific halves — task set, wire state machines, data
+movement, copy budget — live in their own docs:
 
-```text
-            recv_loop               NvmeTcpQueue             send_loop
-            (ioutgt-nvme-tcp)     (ioutgt-nvme-tcp)      (ioutgt-nvme-tcp)
-                │            QueueCore<Sqe> │ SendList          │
-  ops::recv ──► │  PduDecoder [nvme]     │                    │
-                │  claim_tag() ────────► │                    │
-                │  solicit() R2T ──────► │ ─ SendWork::R2t ──►│ encode_r2t [nvme]
-                │  submit(tag, sqe) ───► │                    │
-                │                        │ wakes slot task `tag`
-                │                        │  dispatch::execute()
-                │                        │   └ Backend::read/
-                │                        │     write [backend
-                │                        │     → uring read_at/
-                │                        │       write_at]
-                │           begin_respond│
-                │      SendWork::Response│──────────────────► │ SendList::next()
-                │                        │                    │ encode_c2h_data /
-                │                        │                    │ response [nvme]
-                │                        │ ◄─ release_tag() ──│ ops::sendmsg_raw
-                │                        │                    │   [uring]
-```
+- **NVMe/TCP**: [`docs/nvme-tcp.md`](nvme-tcp.md) — PDU recv phase
+  machine, gather/zero-copy send, the copy budget.
+- **NVMe/RDMA**: [`docs/nvme-rdma.md`](nvme-rdma.md) — CM acceptance,
+  keyed-SGL data movement, the reap loop.
 
-#### 4.2.1 `recv_loop`: a resumable PDU state machine
-
-One task drives the protocol-neutral `StreamReader` (`ioutgt-stream`):
-it owns a reused 64 KiB scratch buffer and the `ops::recv` issuing
-(`fill`/`consume`), plus the large-payload direct-into-slot path
-(`read_direct`, below). The NVMe phase machine (three `RecvPhase`
-states) stays here in `ioutgt-nvme-tcp`, decoding PDUs out of the
-reader's window; the reader has no protocol or slot knowledge — the
-same split NBD/RDMA reuse. Each completed recv steps the machine over
-the bytes it brought; any phase can pause mid-PDU and resume on the next
-recv:
-
-**`RecvPhase` machine — Header / Data / Ddgst and every transition**
-
-```text
- ops::recv ─► reused 64 KiB buffer ─► step the phase machine:
-
- ┌────────┐  PduDecoder [nvme] assembles one PDU header
- │ Header │  (headers can straddle recvs), then routes it:
- └────────┘
-   ├─ CapsuleCmd, no data       claim_tag, submit(tag)        ─► Header
-   ├─ CapsuleCmd, host write    claim_tag, solicit() ONE R2T
-   │    (transport SGL)         (TTAG = slot index); payload
-   │                            arrives later as H2CData      ─► Header
-   ├─ CapsuleCmd, in-capsule    claim_tag; payload is next
-   │                            on the stream                 ─► Data
-   ├─ H2CData for a live TTAG   validate offset/length        ─► Data
-   ├─ H2CTermReq from the host  close WITHOUT replying
-   └─ anything else             C2HTermReq, close
-
- ┌────────┐  memcpy recv buffer → slot at (PDU offset + reassembly
- │  Data  │  progress), CRC32C fused into the copy; resumes
- └────────┘  across recvs
-   ├─ buffer drained, H2CData tail ≥ 16 KiB (H2C_DIRECT_MIN;
-   │    never in-capsule): receive the tail straight into the slot
-   │    via MSG_WAITALL raw recv (best-effort — a short recv resumes
-   │    in place), no buffer→slot copy; DDGST re-reads the warm tail
-   ├─ payload done, no DDGST    finish(tag)                   ─► Header
-   └─ payload done, DDGST       4 digest bytes trail          ─► Ddgst
-
- ┌────────┐  collect the 4 trailing bytes, compare to the fused CRC
- │ Ddgst  │
- └────────┘
-   ├─ match                     finish(tag)                   ─► Header
-   └─ mismatch                  fail THIS command only
-        (DATA_XFER_ERROR|DNR, as nvmet; connection lives)     ─► Header
-
- finish(tag) = submit(tag) — wakes the slot task — once the full
-   transfer is present (in-capsule: always; R2T: reassembly offset
-   reached the SGL length). A mid-transfer H2CData just returns to
-   Header to await the next one; one marked `last` with bytes still
-   missing is a protocol violation (DATA_OUT_OF_RANGE term).
-```
-
-Three rules keep this simple and safe:
-
-- **One outstanding recv, ever.** The direct-tail path works because
-  the tail is by definition the next bytes on the TCP stream — the
-  buffer recv simply isn't re-armed until the tail lands, so nothing
-  is reordered and nothing that could have proceeded is delayed.
-  Measured: −44% target cycles/IOP on 128 KiB writes
-  (`docs/perf-notes.md`).
-- **Failures are graded like nvmet's** (§6): a digest mismatch fails
-  just that command; a malformed or out-of-place PDU is a protocol
-  violation → C2HTermReq and close.
-- **The decoder never sees payload.** Only header bytes pass through
-  `PduDecoder` [nvme]; payload bytes go recv-buffer → slot (or
-  kernel → slot), keeping the codec sans-IO and the whole copy budget
-  visible in one place (§4.2.3).
-
-The byte plumbing under this machine — the scratch buffer + `ops::recv`
-(`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail
-(`read_direct`) — is the protocol-neutral `StreamReader` (`ioutgt-stream`),
-reused by every stream transport; only the phase machine above stays in
-NVMe/TCP. The full walkthrough — the window model, the digest seam, and
-the split raw-pointer safety argument, with diagrams — is in
-[`docs/stream-reader.md`](stream-reader.md).
-
-#### 4.2.2 `send_loop`: drain everything, ship one op
-
-The send path is the protocol-neutral `StreamSender` (`ioutgt-stream`),
-reused by every stream transport. Each turn it blocks for one work item,
-greedily drains the rest of the `SendList`, and ships the whole batch as
-a single gather `sendmsg` (`--send-zc`: `SENDMSG_ZC`): PDU headers and
-digests packed into a per-batch arena, read payloads referenced in place
-from the slot buffers (zero copy), byte-contiguous chunks merged so a
-payload-free batch collapses to one iovec. The NVMe/TCP transport
-supplies only a *staging closure* (`stage_send_work` + `release_class`,
-`connection.rs`): given one `SendWork` item, encode its PDUs into the
-arena and return its tag-release class
-(`Staged::{NoRelease, AtCqe, AtNotif}`). The harness drives the loop,
-owns the batches and the ZC-notification lifetime, and never inspects
-the work type — so a future NBD transport reuses it unchanged.
-
-The full walkthrough — every related data structure, staging, shipping,
-short-send resume, and the zero-copy lifecycle, with diagrams — is in
-[`docs/stream-sender.md`](stream-sender.md). Two facts are
-architecturally load-bearing:
-
-- **One send op in flight per connection.** Independent send SQEs on one
-  socket carry no ordering guarantee, so the wire is never pipelined.
-  `StreamSender` double-buffers so a batch's ZC notification (≈ one RTT)
-  overlaps the *next* batch's staging — only the waits overlap, never
-  the sends. The recv side then parks on tag exhaustion (`await_tag`)
-  rather than terminating, and the idle park reaps the oldest batch's
-  notifications (`next_work_reaping`), so tag release never depends on
-  new send work arriving (the anti-deadlock invariant).
-- **`release_tag` timing is the memory-safety line**, not bookkeeping.
-  The kernel reads slot pages for the whole send, so a tag — and with it
-  the slot buffer — is released only once the kernel provably no longer
-  references it: at the send CQE for capsule-only responses, at the ZC
-  notification (≈ the peer's ACK) for payload-carrying ones. Teardown
-  joins the send task, draining pending ZC notifications, before the
-  queue is freed.
-
-"One send op in flight" is a **per-connection** ordering rule, not a
-syscall-count claim — the two batch at different levels. A connection
-contributes at most one send SQE at a time (its one gather `sendmsg`). But
-the queue thread shares one ring across every connection and op type
-on it, and submission is deferred to the park (§ reactor): the send op
-just writes its SQE into the SQ ring (no syscall) and awaits. So a
-single `io_uring_enter` flushes that connection's lone send SQE
-*alongside* every other connection's sends and all the recv/backend
-SQEs queued since the last park — one syscall per idle→busy
-transition, not one per send. Intra-op gather coalesces many PDUs into
-one `SENDMSG`; submission batching coalesces many SQEs into one
-`io_uring_enter`; the per-connection rule only bounds how many send
-SQEs *one socket* adds to that syscall (≤ 1).
-
-**Why `SENDMSG_ZC`, not `MSG_SPLICE_PAGES`.** The in-kernel nvmet target
-sends read payloads with `MSG_SPLICE_PAGES` (`drivers/nvme/target/tcp.c`)
-— true splice, no completion, no memlock charge; ioutgt cannot, for the
-dual of the `release_tag` rule above. `MSG_SPLICE_PAGES` *donates* the
-source pages to the skb (`skb_splice_from_iter` → `iov_iter_extract_pages`
-→ frags) and reclaims them by ref/pin drop when the skb frees post-ACK —
-it signals the sender *nothing*. That works only for a sender that does
-not reuse its source memory and whose pages the stack can truly reclaim:
-nvmet hands over fresh per-command **kernel** pages and lets the last skb
-ref `put_page` them. A userspace target can only *lend* — its slot pool
-is preallocated, reused, mmap'd memory the stack merely *unpins* on
-skb-free (the pages stay mapped in the process, never freed), and the slot
-must be refilled for the next command. Lending needs a transmit-completion
-signal, exactly what `MSG_SPLICE_PAGES` omits and `MSG_ZEROCOPY` supplies
-(a `ubuf_info` callback when the last referencing skb frees —
-`__msg_zerocopy_callback`); `SENDMSG_ZC` is that, delivered by io_uring as
-the notification CQE (`io_uring/notif.c`). So the notif-gated
-`release_tag` is not avoidable overhead but the irreducible price of zero
-copy from a *reusable userspace* buffer — and the choice is moot at the
-ABI: io_uring strips `MSG_INTERNAL_SENDMSG_FLAGS` (⊇ `MSG_SPLICE_PAGES`)
-from user `msg_flags` (`io_uring/net.c`). The *separable* cost is the
-per-send page pin charged to `RLIMIT_MEMLOCK` (`mm_account_pinned_pages`),
-a property of `MSG_ZEROCOPY`'s pinning, not of zero copy itself;
-registered slot buffers (§9, Phase 2) would pin once and amortize it,
-leaving only the notification.
-
-#### 4.2.3 Data copies: one slot, one visible budget
-
-The slot buffer (preallocated per tag: 8 KiB admin, 128 KiB = MDTS io)
-is the single rendezvous for payload bytes; every copy on the path is
-accounted against it:
-
-**Payload byte flow — where the copies are, in both directions**
-
-```text
- Host write (H2C)                     Host read (C2H)
-
- kernel ──ops::recv──► recv buffer    backend fills the slot:
-                        (64 KiB)        file read_at — O_DIRECT DMAs
-    ① memcpy + fused CRC │              into slot pages, zero copy
-    (in-capsule data,    │                       │
-     buffered prefixes)  ▼                       ▼
-   ┌──────────────┐                    ┌──────────────┐
-   │ slot buffer  │ ◄══ ①' H2CData     │ slot buffer  │
-   └──────────────┘     tail ≥ 16 KiB: └──────────────┘
-          │             MSG_WAITALL           │ ② gather iovec
-          │ borrow      straight from         │ references the slot
-          ▼             the kernel —          │ IN PLACE — no copy
-   backend write_at     skips the             ▼
-   on &slot[..len] —    buffer hop     ops::sendmsg_raw ──► kernel
-   no further copy                       kernel user→skb copy;
-                                         --send-zc pins pages instead:
-                                         zero copy, slot reuse gated
-                                         on the notification (§9)
-```
-
-The transport's userspace copy budget:
-
-| Path                                     | Copies | Notes                         |
-|------------------------------------------|--------|-------------------------------|
-| H2C in-capsule / buffered prefix         | 1 (①)  | recv buffer → slot, CRC fused |
-| H2CData tail ≥ `H2C_DIRECT_MIN` (16 KiB) | 0 (①') | lands directly in the slot    |
-| C2H payload                              | 0 (②)  | slot referenced by the iovec  |
-
-Backends add their own: file adds **none** when the open gets O_DIRECT
-— and **O_DIRECT is the default**: `FileBackend::open` opens
-`O_RDWR | O_DIRECT` unconditionally, with no buffered-mode knob (the
-device DMAs against the slot pages). It falls back to buffered IO only
-when the open fails with `EINVAL`/`EOPNOTSUPP` — i.e. the filesystem
-refuses O_DIRECT (e.g. tmpfs) — and then the kernel copies through the
-page cache; any other open error is reported, not silently degraded.
-The mode that took effect is observable via `FileBackend::is_direct`.
-Memory adds one copy per direction (chunk-wise across its 2 MiB
-chunks); null adds none (reads memset the slot — visible when measuring
-protocol overhead with it). The binary's default backend, though, is
-`memory` (`--backend`, `main.rs`); O_DIRECT only matters once you select
-`--backend file`.
-
-This mirrors the kernel nvmet target, where direct IO is also the
-default — but split across two backends keyed by the per-namespace
-`buffered_io` configfs attribute (default `false`,
-`drivers/nvme/target/core.c`). A **block-device** namespace uses
-`nvmet-bdev`, which `submit_bio()`s straight to the device — direct *by
-construction*, below the page cache (no O_DIRECT flag needed, and **no
-buffered mode at all**). A **file** namespace uses `nvmet-file`, which
-opens the backing file `O_RDWR | O_DIRECT` unless `buffered_io` is set
-(`io-cmd-file.c`) — the same default-direct-with-an-opt-out as ioutgt's
-`FileBackend`. On nvmet, `buffered_io=1` is really a backend *selector*:
-`nvmet_bdev_ns_enable` returns `-ENOTBLK`, so a block device falls back to
-the file backend opened as a buffered file (`core.c`: bdev-enable, then
-file-enable on `-ENOTBLK`) — "buffered block device" quietly means "file
-backend over the bdev." ioutgt collapses this to one `FileBackend` that
-serves both a regular file and a block device (the geometry probe differs;
-the O_DIRECT path is identical), with no buffered opt-in.
-
-Two principles behind the budget:
-
-- **The one write-side copy (①) is the product, not waste**: it lets a
-  single flat, MDTS-sized buffer absorb arbitrarily fragmented TCP
-  segments and H2CData splits, so backends never see scatter — and the
-  large tails that dominate bulk writes skip it (①').
-- **CRC32C runs while the bytes are cache-hot**, never as a cold pass
-  later: the recv side accumulates inside the reassembly copy (digest
-  negotiation gates only verification and emission), a direct tail is
-  re-read right after the kernel wrote it, and the send side reads the
-  slot right after the backend filled it.
-
-Everything else on the path is bounded per PDU: header assembly in the
-decoder, the 64-byte SQE stash, and header/digest encoding into the
-send arena.
-
-### 4.3 One IO command end to end
-
-A host `Read` crosses every crate boundary exactly once per hop:
-
-1. **Accept + handshake** (control thread): `setup_connection()` calls
-   `accept_handshake()` then `read_connect()` [tcp]; the parsed
-   `ConnectCommand` [nvme] yields the qid; a `QueueConn` is mailed to the
-   owning queue thread [uring mailbox].
-2. **Install**: `run_queue()` [tcp] builds `QueueCore<Sqe>` + `NvmeTcpQueue` + `ConnCtx`
-   [core/tcp] and spawns the slot tasks; the stashed Connect SQE is the first
-   `claim_tag()`/`submit()`.
-3. **Receive**: `recv_loop` [tcp] awaits `ops::recv` [uring], feeds bytes
-   to `PduDecoder` [nvme], claims a tag and `submit()`s the SQE [core].
-   Writes larger than the inline limit first `solicit()` an R2T (TTAG =
-   slot index) and reassemble H2CData into the slot buffer.
-4. **Dispatch**: the woken slot task calls `dispatch::execute()` [core],
-   which routes fabrics/admin/io; `io::execute` resolves the namespace via
-   the generation-checked `NsCache` and awaits `Backend::read()`
-   [backend], which issues `ops::read_at_raw` straight against the slot
-   buffer on the same thread's ring [uring].
-5. **Respond**: the slot task calls `begin_respond` [core slotq] and pushes a
-   `SendWork::Response` onto `NvmeTcpQueue`'s send list [tcp]; the
-   `StreamSender` send loop [stream] drains the whole list, invokes the
-   transport's staging closure to encode C2HData/response headers [nvme]
-   into the arena with payloads referenced from slot buffers, ships one
-   gather `ops::sendmsg_raw` [uring], then `release_tag()` returns the
-   slot to the freelist (under `--send-zc`, payload-carrying tags wait
-   for the ZC notification instead — §4.2.2).
-
-Boundary summary: **bin→tcp** is the two handshake calls plus
-`run_queue()` itself — the queue threads' entry point, with the
-`on_ctx` hook that registers each connection's stats; **bin/tcp→uring**
-is op futures + mailbox; **tcp→core** is the `QueueCore<Sqe>`/`SlotArray` slot
-API plus `dispatch::execute` (the send list and `SendWork` type are
-transport-owned in `NvmeTcpQueue`); **tcp→stream** is the `StreamSender` send
-harness, driven by the transport's staging closure; **core→backend** is the `Backend` trait behind
+Crate seams, with NVMe/TCP as the example: **bin→tcp** is the two
+handshake calls plus `run_queue()` itself — the queue threads' entry
+point, with the `on_ctx` hook that registers each connection's stats;
+**bin/tcp→uring** is op futures + mailbox; **tcp→core** is the
+`QueueCore<Sqe>`/`SlotArray` slot API plus `dispatch::execute` (the
+send list and `SendWork` type are transport-owned in `NvmeTcpQueue`);
+**tcp→stream** is the `StreamSender`/`StreamReader` harness, driven by
+transport closures; **core→backend** is the `Backend` trait behind
 `Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
 add/remove + the NS-changed nudge, while GET_STATS reaches the queue
 threads through binary-injected `StatsSource` closures over the same
@@ -593,65 +302,19 @@ preallocated slots; maintenance mode) and a **fully custom executor**
 `select!`/`JoinHandle`/ecosystem for free — only the wait primitive needs
 replacing).
 
-## 6. NVMe/TCP transport
+## 6. Transports
 
-State machines mirror `drivers/nvme/target/tcp.c`:
+Two production transports share the engine; each has an as-built doc.
+The obligations any transport must meet are the contract in §6.1.
 
-**Wire state machines — recv phases and the ordered send list**
-
-```text
-recv:  PduHeader ──→ Data ──→ DataDigest ──→ (back to PduHeader)
-                 └────────────── Error → C2HTermReq → close
-
-send (per command, items on an ordered queue-local send list):
-       C2HData hdr → C2HData payload → DataDigest
-       R2T
-       Response capsule
-```
-
-- **Handshake**: ICReq validated (PFV 1.0, HPDA 0), ICResp advertises
-  MAXH2CDATA = 16 MiB and negotiated HDGST/DDGST (CRC32C).
-- **Reads**: C2HData segmented per MDTS/SGL; optional `c2h_success`
-  optimization (SUCCESS flag on final C2HData elides the response capsule)
-  behind a config flag.
-- **Writes**: in-capsule data up to 16 KiB inline (IOCCSZ advertises
-  (64 + 16384)/16); larger transfers via R2T with TTAG = slot index. Phase
-  1 allows one outstanding R2T per command (as nvmet does).
-- **Digests**: incremental CRC32C (Castagnoli, hardware-accelerated).
-- **Errors**: malformed PDUs produce C2HTermReq with the spec'd FES codes,
-  never a panic or silent close; backend errors map via an errno→NVMe-SC
-  table copied from nvmet semantics (`io::nvme_status`, a free function —
-  not a `Backend`-trait method, since the trait is transport-neutral).
-- **Send batching (M9) + gather**: the send task drains the entire
-  completion/R2T queue into one gather SENDMSG — headers in a small
-  arena, payloads referenced from slot buffers — because send SQEs on
-  one socket have no ordering guarantee, so batching (not op
-  pipelining) is how the per-response park cycle was removed (one
-  `io_uring_enter` per batch in each direction; 4.2× on 4K reads, then
-  +22% on 128K reads from dropping the staging copy, see
-  `docs/perf-notes.md`).
-
-The transport boundary is a pair of abstractions so phase-2 optimizations
-and future transports slot in without touching protocol logic:
-
-- `RecvSource` — yields borrowed byte chunks to the codec. Phase 1: plain
-  single-shot `RECV` into a per-connection recv buffer, with a
-  payload bypass as built: large H2C tails skip the buffer and land
-  in the slot via `MSG_WAITALL` raw recv (§4.2.3). Phase 2 (as built,
-  opt-in via `--recv-buf-mb`, §6.2): multishot recv with a per-connection
-  provided-buffer ring — irreconcilable with the bypass on one connection
-  (the kernel picks the buffer), so it is a per-connection strategy choice. (RECV_ZC requires NIC header-data
-  split; deferred to real-NIC benchmarking.)
-- Send side — queue tasks emit `SendWork` onto the ordered send list;
-  the per-connection sender ships vectored `SENDMSG` gather batches
-  (as built). With `--send-zc`, batches go out as `SENDMSG_ZC` over
-  the same iovecs: double-buffered batches keep staging through the
-  notification RTT, payload tags release on the notif (capsule-only
-  tags still at the send CQE), the idle park polls the oldest batch's
-  notifs alongside the send-list drain so tag release never depends on
-  new work arriving, and pin-budget failures (per-user
-  `RLIMIT_MEMLOCK`) fall back to the copying SENDMSG per batch (as
-  built, opt-in).
+- **NVMe/TCP** ([`docs/nvme-tcp.md`](nvme-tcp.md)) — PDU phase machine
+  mirroring nvmet's, in-capsule ≤ 16 KiB + single-R2T writes, CRC32C
+  digests, batch-drained gather send with opt-in `SENDMSG_ZC`, opt-in
+  per-connection provided-buffer recv ring (`--recv-buf-mb`).
+- **NVMe/RDMA** ([`docs/nvme-rdma.md`](nvme-rdma.md)) — keyed-SGL
+  one-sided data movement (target-posted RDMA READ/WRITE), rdma_cm
+  acceptance on a dedicated CM reactor thread, batched WR doorbells,
+  adaptive `--poll`.
 
 ## 6.1 Transport contract
 
@@ -744,73 +407,6 @@ dispatch, controller model, and discovery are all reused unchanged;
 `PortConfig.trtype = TransportType::Rdma` makes discovery advertise the
 correct TRTYPE.
 
-## 6.2 Zero-copy receive: the per-connection provided-buffer ring
-
-`--recv-buf-mb N` (default 0 = off) turns on the Phase-2 receive path: a
-provided-buffer multishot RECV ring per IO connection
-(`ioutgt-uring/src/bufring.rs`). The kernel fills app-registered memory as
-data arrives — no per-recv submission, no copy into a scratch buffer — and an
-H2C write payload is handed to the backend `WRITE_FIXED` straight from ring
-memory. Admin queues skip it (qid 0 carries no bulk write payload); without
-`IOU_PBUF_RING_INC` (≈ kernel 6.12) the connection transparently falls back to
-the classic scratch-recv path (§9), logging a one-line `debug!`.
-
-**Two fixed sub-buffers, filled incrementally.** Each ring is one page-aligned
-arena split into exactly two sub-buffers of `recv_buf_mb / 2`, each registered
-as an io_uring fixed buffer so the backend can `WRITE_FIXED` it. The ring
-carries `IOU_PBUF_RING_INC`: the kernel fills *one* sub-buffer across many recv
-completions — advancing an internal offset, emitting a variable-length chunk
-per CQE (`IORING_CQE_F_BUF_MORE` set while room remains), advancing `head` only
-when the buffer fills. So a whole H2C payload accumulates *contiguously* in one
-fixed buffer — exactly what a single-`buf_index` `WRITE_FIXED` needs. Two is the
-minimum that double-buffers: one sub-buffer is the active recv target while the
-other drains in-flight writes.
-
-**Per-connection, not shared — for correctness.** A recv CQE reports only
-`(bid, len)`, not the consume offset; the consumer tracks it. With one consumer
-per ring that offset is authoritative; sharing one ring across the connections
-multiplexed onto an io-thread would desync it — their slot tasks do not drain
-CQEs in completion order, so one connection would read another's bytes. So each
-ring-enabled connection owns its ring: its own `bgid` (thread-local allocator)
-and its own two fixed buffers. Contention is keyed on *controller* count, not
-queue count — the target offers `io_threads` IO queues per controller (a
-bijection onto the io-threads), so a shared ring was only ever at risk with ≥ 2
-controllers; per-connection ownership makes it moot regardless.
-
-**Retain + borrow lifecycle.** When an H2C write payload fits the current
-sub-buffer it is retained in place (via `SlotData::ring()`, a lease carrying the
-fixed-buffer index) rather than copied, and the backend `WRITE_FIXED`s from that
-region. A sub-buffer must not return to the kernel while a write still reads it,
-so each retained payload *borrows* its sub-buffer; a sub-buffer is re-provided
-only once recv is done with it *and* all borrows have drained (the
-`pending`/`awaiting` refcount in `bufring.rs`). A payload that would straddle
-the two sub-buffers falls back to the copy path — correctness never depends on
-retention.
-
-**Back-pressure, no stalls.** With both sub-buffers out (one filling, one
-borrowed by a slow write) the multishot drains and posts `-ENOBUFS`; the recv
-loop parks in `wait_for_provide` rather than busy re-arming, which would spin the
-reactor and starve the very slot tasks whose write completions return buffers. It
-wakes when a completing write releases its borrow. Invariant: a write's
-completion never waits on recv, so progress is guaranteed. The park is gated on a
-provide-generation snapshot taken at *arm* time, not park time — the kernel can
-exhaust and re-provide every buffer before userspace observes the queued
-`-ENOBUFS`, so snapshotting at park would block forever (see
-`BufRing::wait_for_provide`).
-
-**Cost, ceilings, and why it is off by default.** Memory is pre-pinned per
-connection (the zero-allocation-on-the-IO-path invariant forbids per-command
-allocation), so it scales as *connections × recv_buf_mb* — the inverse of kernel
-nvmet, which allocates per-command on demand. Two ceilings bound it, both with
-graceful fallback to classic recv: the per-io-thread fixed-buffer table (64
-slots, ~3 per connection counting the pool arena) and the process
-`RLIMIT_MEMLOCK` (all ring memory is pinned — on a tight memlock the ring
-silently will not engage, so confirm the `recv ring engaged` log line). It is off
-by default because the win is copy-elision and freed io-thread CPU, not headline
-throughput: at depth the link and disk already bound a single queue, so on real
-100GbE + NVMe the ring measured perf-neutral; its payoff shows at high connection
-counts where copy bandwidth competes.
-
 ## 7. Core model
 
 **Object model — Port / Subsystem / Namespace, and the per-Connect Controller**
@@ -884,10 +480,11 @@ roadmap item.
 
 | Concern | As built |
 |---------|----------|
-| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 8 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. Separately, `--recv-buf-mb` (default 0 = off) sizes the **per-connection** provided-buffer receive ring for zero-copy receive — each ring-enabled connection owns its own ring (its own `bgid` from a thread-local pool + 2 fixed-buffer sub-buffers), so memory scales as (connections × size); left off, recv uses the classic per-recv scratch path. Per-connection (not shared) for correctness — see §6.2. |
-| Recv | Classic single-shot RECV → 64 KiB scratch → copy into the slot for headers and small payloads; H2C write tails ≥ 16 KiB are received **straight into the slot's pooled segments** (`MSG_WAITALL`, per-segment — contiguous or scattered), i.e. zero-copy receive, then written by the file backend's vectored `WRITEV`. (The opt-in `--recv-buf-mb` per-connection provided-buffer ring + multishot RECV is the alternative zero-copy path — NVMe/TCP interleaves PDU headers with payload so ring chunks straddle PDU/command boundaries, making chunk-retention into the slot lower-value than receiving straight into the pooled slot.) |
-| Send | Batch-drain into one gather `SENDMSG` (header arena + slot-payload iovecs, contiguous or scattered); opt-in `--send-zc`: `SENDMSG_ZC` per batch, slot reuse gated on the notification CQE, `RLIMIT_MEMLOCK` pin failures fall back to copy. |
-| Disk | Vectored `READV`/`WRITEV` over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §8). |
+| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 8 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. The arena is registered as an io_uring fixed buffer (and, on RDMA, as an MR). |
+| Recv (TCP) | Classic single-shot RECV → 64 KiB scratch → copy into the slot; H2C write tails ≥ 16 KiB land **straight into the slot's pooled segments** (one scatter `recvmsg`/`MSG_WAITALL`). Opt-in `--recv-buf-mb`: per-connection provided-buffer ring. Details: `docs/nvme-tcp.md`. |
+| Send (TCP) | Batch-drain into one gather `SENDMSG`; opt-in `--send-zc` (`SENDMSG_ZC`, slot reuse gated on the notification CQE, size-gated, copy fallback). Details: `docs/nvme-tcp.md`. |
+| Data movement (RDMA) | Target-posted RDMA READ/WRITE against the registered pool arena; in-capsule write data ≤ 4 KiB. Details: `docs/nvme-rdma.md`. |
+| Disk | Vectored `READV`/`WRITEV` (`_FIXED` when the lease is pooled) over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §8). |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split; bundles; second IOPOLL ring. |
 
 MDTS is 128 KiB on IO queues; the admin queue sizes its pool so its
@@ -973,7 +570,7 @@ API change (development machine is single-node).
 | M14 | multi-transport harness | done — spawn, queue-thread pool, control server and clients extracted to `ioutgt-harness` behind a `Transport` trait; both binaries share them |
 | M15 | NVMe/RDMA transport | done — `ioutgt-nvme-rdma` (`sideway` verbs, `rdma-mummy-sys` CM); kernel-host interop on rxe (VM gates) and mlx5 (box); crc32c data-integrity gates green |
 | M16 | NVMe/RDMA performance | done — pool arena as io_uring fixed buffer, reactor park-probe (CQ polled at the sleep point), in-capsule write data (IOCCSZ + SGLS SAOS, nvmet parity); matches or beats nvmet-rdma on every single-job fio_perf phase on the test box (64k +38-44%, 4k within ±3%) |
-| M17 | adaptive `--poll` | done — busy-poll while commands are in flight (+200 µs grace), event-driven when idle; qd1 latency −20-30%, admin queue exempt |
+| M17 | adaptive `--poll` (RDMA binary only) | done — busy-poll while commands are in flight (+200 µs grace), event-driven when idle; qd1 latency −20-30%, admin queue exempt |
 
 ## 14. Risks
 

@@ -387,7 +387,7 @@ Mechanism (perf `-g`, this kernel has **`init_on_alloc` on**):
   copy, identical for both targets. ioutgt can't take this path: its
   payload buffers are reused preallocated slots (zero-steady-state-alloc
   invariant) that need a TX-completion signal `MSG_SPLICE_PAGES` doesn't
-  give — see architecture.md §4.2.2.
+  give — see the zero-copy send notes in nvme-tcp.md.
 
 **Why a real NIC doesn't show this** (confirmed by Ming: real-NIC A/B copy
 shows no gap). Two loopback-only effects compound exactly here:
