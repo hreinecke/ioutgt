@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # vmtest-desc: NVMe/RDMA A/B — ioutgt-nvme-rdma vs in-kernel nvmet-rdma over
 #              soft-RoCE, both driven through testing/ (common.sh TRANSPORT=rdma)
 # vmtest-requires: root nvme-cli fio

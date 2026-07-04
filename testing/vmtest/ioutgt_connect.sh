@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # Guest-side M4 interop test: nvme discover/connect/identify/disconnect
 # against an ioutgt target running on the host (slirp: 10.0.2.2).
 #

@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # vmtest-desc: ioutgt NVMe/RDMA `nvme connect` bring-up over soft-RoCE (rxe)
 # vmtest-requires: root
 #

@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # Guest-side CPU-affinity test: run ioutgt (pinning is default-on)
 # guest (vmtest.conf: VMTEST_NUMA_NODES > 1) and verify the userspace
 # spread_cpus placement against the guest's /sys topology:

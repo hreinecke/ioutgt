@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # vmtest-desc: ioutgt NVMe/RDMA verbs rxe-loopback functional test
 # vmtest-requires: root
 set -u

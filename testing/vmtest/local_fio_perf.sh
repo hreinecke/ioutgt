@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0
 # vmtest-desc: local_tgt.sh fio_perf sweep against ioutgt (all in guest)
 # vmtest-requires: root nvme-cli fio
 #
