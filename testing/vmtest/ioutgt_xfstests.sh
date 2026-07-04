@@ -30,7 +30,9 @@
 #   IOUTGT_XFSTESTS_TIMEOUT (outer VM wall-clock cap, default 90m).
 # Guest knobs (env): IMG_SIZE (default 8G), RUST_LOG (default info).
 # Artifacts: xfstests results/ (check.log, per-test .full/.out.bad) is copied
-# to $VMTEST_DATA_DIR/tmp/xfstests-results, surviving VM shutdown.
+# to $VMTEST_DATA_DIR/tmp/xfstests-results, and the two target logs live at
+# $VMTEST_DATA_DIR/tmp/ioutgt-xfstests-{tcp,rdma}.log — all survive VM
+# shutdown, including a wedge killed from outside by the run timeout.
 
 set -u
 
@@ -100,8 +102,11 @@ XFSTESTS_DIR="/var/lib/xfstests"
 # writable, and /mnt is NOT among them — so put the mount points under /tmp.
 TEST_MNT=/tmp/ioutgt-xfstests/test
 SCRATCH_MNT=/tmp/ioutgt-xfstests/scratch
-TCP_LOG=/tmp/ioutgt-xfstests-tcp.log
-RDMA_LOG=/tmp/ioutgt-xfstests-rdma.log
+# Target logs go to the 9p data dir, not guest /tmp: if the run wedges and the
+# VM is killed from outside (the outer timeout), the guest cleanup never runs
+# and a tmpfs log would vanish — but these survive for postmortem.
+TCP_LOG="$DATA_DIR/tmp/ioutgt-xfstests-tcp.log"
+RDMA_LOG="$DATA_DIR/tmp/ioutgt-xfstests-rdma.log"
 RUST_LOG="${RUST_LOG:-info}"
 
 log()  { echo "[xfstests] $*"; }
@@ -176,8 +181,9 @@ setup_rxe() {
 	}
 	for _ in $(seq 1 40); do gid_ready && break; sleep 0.5; done
 	gid_ready || log "WARNING: RoCEv2 GID for $RXE_IP still absent; rdma bind may fail"
+	log "rxe setup done (gid $(gid_ready && echo ok || echo MISSING))"
 	command -v ibv_devinfo >/dev/null &&
-		ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
+		timeout 10 ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
 	command -v show_gids >/dev/null && show_gids 2>/dev/null | grep -w "$RXE_IP"
 }
 setup_rxe
@@ -196,8 +202,10 @@ RUST_LOG="$RUST_LOG" RUST_BACKTRACE=1 "$RDMA_BIN" \
 	--listen "$RXE_IP:$RDMA_PORT" --subsys-nqn "$RDMA_NQN" \
 	--backend "$RDMA_IMG" >"$RDMA_LOG" 2>&1 &
 RDMA_PID=$!
-tail -f "$TCP_LOG"  | sed 's/^/[tcp] /'  & TCP_TAIL=$!
-tail -f "$RDMA_LOG" | sed 's/^/[rdma] /' & RDMA_TAIL=$!
+# sed -u: line-buffered even with stdout on a pipe — otherwise target log
+# lines sit in sed's block buffer and never reach the console live.
+tail -f "$TCP_LOG"  | sed -u 's/^/[tcp] /'  & TCP_TAIL=$!
+tail -f "$RDMA_LOG" | sed -u 's/^/[rdma] /' & RDMA_TAIL=$!
 
 cleanup() {
 	set +e
