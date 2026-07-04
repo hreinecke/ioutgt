@@ -94,4 +94,42 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # TEMPORARY diagnostics for the rxe QP-create EINVAL seen on this
+      # image (the same tests pass on Fedora 43 / kernel 7.0 rxe and in the
+      # VM gate). Captures kernel/userspace versions, device caps, a
+      # basic-QP pingpong control, and an strace of the failing test: a
+      # kernel-side EINVAL shows as a failing uverbs ioctl/write/mmap in
+      # the trace; a userspace librxe rejection shows no failing syscall.
+      # Never fails the job — the cargo test step below stays the gate.
+      - name: rxe diagnostics (best effort)
+        run: |
+          set +e
+          sudo apt-get install -y strace ibverbs-utils >/dev/null 2>&1
+          echo "== versions =="
+          uname -r
+          dpkg -l | grep -E "rdma-core|ibverbs|infiniband" || true
+          echo "== rdma link =="
+          rdma link show || true
+          echo "== ibv_devinfo =="
+          ibv_devinfo -v 2>&1 | head -60 || true
+          echo "== basic-QP pingpong control =="
+          (ibv_rc_pingpong -d rxe0 -g 1 >/tmp/pp-server.log 2>&1 &)
+          sleep 1
+          if ibv_rc_pingpong -d rxe0 -g 1 127.0.0.1 >/tmp/pp-client.log 2>&1; then
+            echo "basic-QP pingpong OK"
+          else
+            echo "basic-QP pingpong FAILED:"
+            tail -3 /tmp/pp-server.log /tmp/pp-client.log
+          fi
+          echo "== strace of rxe_loopback_send_write_read =="
+          BIN=$(cargo test -p ioutgt-nvme-rdma --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null) | .executable' | grep ioutgt_nvme_rdma | head -1)
+          echo "test binary: $BIN"
+          strace -f -e trace=openat,read,write,ioctl,mmap -o /tmp/rxe.strace \
+            "$BIN" rxe_loopback_send_write_read --test-threads=1 --nocapture || true
+          echo "-- syscalls returning EINVAL --"
+          grep -n "EINVAL" /tmp/rxe.strace | tail -10 || echo "(none — EINVAL originated in userspace librxe)"
+          echo "-- strace tail --"
+          tail -30 /tmp/rxe.strace
+          true
       - run: cargo test --workspace
