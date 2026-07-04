@@ -58,24 +58,43 @@ pub struct Rdma {
 }
 
 impl Rdma {
-    /// Open the first RDMA device whose port is ACTIVE and allocate a
-    /// protection domain, or `None` when no usable device is present (RDMA
-    /// unavailable — not an error). Devices with a down port are skipped,
-    /// not errors: an HCA whose netdev is down/unaddressed (e.g. test-rig
-    /// ports between runs) only exposes a link-local GID, and routing
-    /// through it fails the RTR transition with "network unreachable" —
-    /// an environment condition, exactly like an empty device list.
+    /// Open the device for the rxe gates: the first ACTIVE-port `rxe*`
+    /// device, else the first ACTIVE-port device of any name, else `None`
+    /// (RDMA unavailable — a skip, not an error).
+    ///
+    /// Both filters are load-bearing environment handling:
+    /// - Down ports are skipped, not errors: an HCA whose netdev is
+    ///   down/unaddressed (test-rig ports between runs) only exposes a
+    ///   link-local GID and fails the RTR transition with "network
+    ///   unreachable".
+    /// - `rxe*` is preferred over other ACTIVE devices: a GitHub Azure
+    ///   runner exposes an accelerated-networking mlx5 VF that enumerates
+    ///   before rxe0, reports ACTIVE, creates PDs/CQs/MRs — and then fails
+    ///   RC QP creation with a kernel-side EINVAL (Azure VFs do not do
+    ///   user RDMA). These are soft-RoCE gates; pick the rxe device when
+    ///   one exists.
     pub fn open_first() -> io::Result<Option<Rdma>> {
         let list = DeviceList::new().map_err(oerr)?;
+        let mut fallback = None;
         for dev in list.iter() {
+            let name = dev.name();
             let ctx = dev.open().map_err(oerr)?;
             if ctx.query_port(1).map_err(oerr)?.port_state() != PortState::Active {
                 continue;
             }
-            let pd = ctx.alloc_pd().map_err(oerr)?;
-            return Ok(Some(Rdma { ctx, pd, port: 1 }));
+            if name.starts_with("rxe") {
+                let pd = ctx.alloc_pd().map_err(oerr)?;
+                return Ok(Some(Rdma { ctx, pd, port: 1 }));
+            }
+            if fallback.is_none() {
+                fallback = Some(ctx);
+            }
         }
-        Ok(None)
+        let Some(ctx) = fallback else {
+            return Ok(None);
+        };
+        let pd = ctx.alloc_pd().map_err(oerr)?;
+        Ok(Some(Rdma { ctx, pd, port: 1 }))
     }
 
     /// Register `[ptr, ptr+len)` as a memory region with the given access,
