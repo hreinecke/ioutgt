@@ -290,17 +290,19 @@ cmd_up() {
     ip netns del "$NS_I" 2>/dev/null || true
 
     # Defend the test NICs/subnet from the host's network management, which
-    # has produced multi-day debugging wedges on this rig:
-    #  - NetworkManager: an auto-DHCP profile on the (profile-less) test NIC
-    #    re-runs a 45 s DHCP transaction forever; every timeout flushes ALL
-    #    addresses on the device — deleting IP_T and its RoCE GID mid-run.
-    #    Established QPs then retransmit into the void (local_ack_timeout →
-    #    retries_exceeded), keep-alive dies ~45-90 s after connect, and every
-    #    reconnect fails (-104) until the IP is re-added.
+    # has produced multi-day debugging wedges on this rig: an auto-DHCP
+    # NetworkManager profile on the (profile-less) test NIC re-runs a 45 s
+    # DHCP transaction forever; every timeout flushes ALL addresses on the
+    # device — deleting IP_T and its RoCE GID mid-run. Established QPs then
+    # retransmit into the void (local_ack_timeout → retries_exceeded),
+    # keep-alive dies ~45-90 s after connect, and every reconnect fails
+    # (-104) until the IP is re-added.
     if command -v nmcli >/dev/null 2>&1; then
         nmcli device set "$NIC_T" managed no 2>/dev/null || true
         nmcli device set "$NIC_I" managed no 2>/dev/null || true
     fi
+    # Pin the test subnet to the main routing table, ahead of any
+    # policy-routing rules the host may carry.
     ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
     ip rule add to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
 

@@ -1,7 +1,7 @@
 # The "RDMA 64k congestion wedge" — actual root cause: host network management
 
-Status: **RESOLVED** (July 2026). The recurring controller wedge on the mlx5 box
-(<dev-box>, `testing/two_nic_realwire_rdma.sh` / `rdma2.sh`) that was
+Status: **RESOLVED** (July 2026). The recurring controller wedge on the mlx5
+dev box (`testing/two_nic_realwire_rdma.sh`) that was
 investigated for weeks as a RoCE congestion problem was **not a congestion,
 flow-control, or ioutgt/nvmet bug at all**. It was the host's network
 management stack destroying the test fabric out from under the RDMA session.
@@ -109,7 +109,7 @@ don't read it as wire/fabric behavior.
 
 - Idle connect soak: keep-alives healthy past 3 min (previously fatal at
   +45–90 s).
-- Full `rdma2.sh fio_perf` sweep (both targets, 4k/64k × randread/randwrite,
+- Full `two_nic_realwire_rdma.sh fio_perf` sweep (both targets, 4k/64k × randread/randwrite,
   qd=128): all 8 phases complete. ioutgt ≈ 157k/167k 4k IOPS, 6.3 GiB/s 64k
   randread; nvmet ≈ 156k/171k, 7.0/5.8 GiB/s.
 - The one mid-sweep error recovery observed (qid 5/8/9 tag exhaustion, §3.1)
@@ -139,7 +139,7 @@ don't read it as wire/fabric behavior.
    because nvmet-vs-ioutgt A/B isolated target-specific behavior — the A/B
    method was right even while the environment was lying.
 
-## Appendix: persistent box config (<dev-box>)
+## Appendix: persistent dev-box config
 
 - `/etc/NetworkManager/conf.d/99-rdma-test-unmanaged.conf` — **the fix**; keep.
 - `ip rule pref 5000 to 192.168.50.0/24 lookup main` — added by `up`, dropped by
