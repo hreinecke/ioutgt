@@ -146,16 +146,16 @@ mod tests {
     /// A self-connected RC QP whose completions are reaped **through the
     /// reactor** (arm → `POLL_ADD` park on the channel fd → get/ack event →
     /// drain), not by busy-polling: post a RECV + a SEND and confirm both
-    /// completions arrive via the event path with the payload intact. Skips
-    /// when no RDMA device is present; runs against soft-RoCE (rxe) in the VM.
+    /// completions arrive via the event path with the payload intact. Runs
+    /// against soft-RoCE only (rxe, see `Rdma::open_rxe`); skips when no
+    /// active rxe device is present.
     #[test]
     fn rxe_reactor_event_send_recv() -> io::Result<()> {
-        let Some(rdma) = Rdma::open_first()? else {
-            eprintln!(
-                "skip rxe_reactor: no RDMA device with an active port (configure rdma_rxe to run)"
-            );
+        let Some(rdma) = Rdma::open_rxe()? else {
+            eprintln!("skip rxe_reactor: no active rxe device (configure rdma_rxe to run)");
             return Ok(());
         };
+        eprintln!("rxe_reactor: running on {}", rdma.device);
         let rt = QueueRuntime::new(RingConfig::default())?;
         rt.block_on(async move {
             const LEN: u32 = 4096;

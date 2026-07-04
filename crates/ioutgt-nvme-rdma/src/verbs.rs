@@ -55,46 +55,45 @@ pub struct Rdma {
     pub pd: Arc<ProtectionDomain>,
     /// IB port number (RoCE devices expose a single port, 1).
     pub port: u8,
+    /// The opened device's name (e.g. `rxe0`), so the gates can report
+    /// which device actually served the run.
+    pub device: String,
 }
 
 impl Rdma {
-    /// Open the device for the rxe gates: the first ACTIVE-port `rxe*`
-    /// device, else the first ACTIVE-port device of any name, else `None`
-    /// (RDMA unavailable — a skip, not an error).
+    /// Open the first ACTIVE-port soft-RoCE (`rxe*`) device for the rxe
+    /// gates, or `None` when none is present (a skip, not an error). The
+    /// gates run ONLY on rxe — no fallback to other devices:
+    /// - their connect parameters (MTU, rd_atomic, timeouts) are hardcoded
+    ///   for single-host rxe loopback (module docs above);
+    /// - other ACTIVE devices can be unusable in ways that surface only
+    ///   later: a GitHub Azure runner's accelerated-networking mlx5 VF
+    ///   enumerates before rxe0, creates PDs/CQs/MRs, then fails RC QP
+    ///   creation with a kernel-side EINVAL, and an unaddressed HCA port
+    ///   fails the RTR transition with "network unreachable".
     ///
-    /// Both filters are load-bearing environment handling:
-    /// - Down ports are skipped, not errors: an HCA whose netdev is
-    ///   down/unaddressed (test-rig ports between runs) only exposes a
-    ///   link-local GID and fails the RTR transition with "network
-    ///   unreachable".
-    /// - `rxe*` is preferred over other ACTIVE devices: a GitHub Azure
-    ///   runner exposes an accelerated-networking mlx5 VF that enumerates
-    ///   before rxe0, reports ACTIVE, creates PDs/CQs/MRs — and then fails
-    ///   RC QP creation with a kernel-side EINVAL (Azure VFs do not do
-    ///   user RDMA). These are soft-RoCE gates; pick the rxe device when
-    ///   one exists.
-    pub fn open_first() -> io::Result<Option<Rdma>> {
+    /// The chosen device name rides in [`Rdma::device`] so the gates can
+    /// print which device actually served the run.
+    pub fn open_rxe() -> io::Result<Option<Rdma>> {
         let list = DeviceList::new().map_err(oerr)?;
-        let mut fallback = None;
         for dev in list.iter() {
-            let name = dev.name();
+            let device = dev.name();
+            if !device.starts_with("rxe") {
+                continue;
+            }
             let ctx = dev.open().map_err(oerr)?;
             if ctx.query_port(1).map_err(oerr)?.port_state() != PortState::Active {
                 continue;
             }
-            if name.starts_with("rxe") {
-                let pd = ctx.alloc_pd().map_err(oerr)?;
-                return Ok(Some(Rdma { ctx, pd, port: 1 }));
-            }
-            if fallback.is_none() {
-                fallback = Some(ctx);
-            }
+            let pd = ctx.alloc_pd().map_err(oerr)?;
+            return Ok(Some(Rdma {
+                ctx,
+                pd,
+                port: 1,
+                device,
+            }));
         }
-        let Some(ctx) = fallback else {
-            return Ok(None);
-        };
-        let pd = ctx.alloc_pd().map_err(oerr)?;
-        Ok(Some(Rdma { ctx, pd, port: 1 }))
+        Ok(None)
     }
 
     /// Register `[ptr, ptr+len)` as a memory region with the given access,
@@ -295,18 +294,18 @@ mod tests {
         Err(io::Error::other(format!("wr {wr_id} never completed")))
     }
 
-    /// Self-connected RC QP over a real device (soft-RoCE `rxe` in the test
-    /// environment): SEND/RECV moves a capsule-sized message, RDMA WRITE pushes
-    /// data into a remote-keyed region, RDMA READ pulls it back. Skips when no
-    /// RDMA device is present so the suite still passes on a plain dev box.
+    /// Self-connected RC QP over soft-RoCE (`rxe` only — see
+    /// [`Rdma::open_rxe`]): SEND/RECV moves a capsule-sized message, RDMA
+    /// WRITE pushes data into a remote-keyed region, RDMA READ pulls it
+    /// back. Skips when no active rxe device is present so the suite still
+    /// passes on a plain dev box.
     #[test]
     fn rxe_loopback_send_write_read() -> io::Result<()> {
-        let Some(rdma) = Rdma::open_first()? else {
-            eprintln!(
-                "skip rxe_loopback: no RDMA device with an active port (configure rdma_rxe to run)"
-            );
+        let Some(rdma) = Rdma::open_rxe()? else {
+            eprintln!("skip rxe_loopback: no active rxe device (configure rdma_rxe to run)");
             return Ok(());
         };
+        eprintln!("rxe_loopback: running on {}", rdma.device);
 
         const LEN: u32 = 4096;
         const N: usize = LEN as usize;
