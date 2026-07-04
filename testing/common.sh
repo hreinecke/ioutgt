@@ -852,6 +852,51 @@ $rows
 EOF
 }
 
+# RDMA initiator-side twin of tune_initiator_tcp, for the same reason with a
+# different mechanism. On the same-box rig rdma_cm resolves BOTH endpoints
+# onto the device owning the target GID (self-loopback), so the kernel
+# initiator's per-queue CQs land on $TUNE_NIC's own comp vectors: initiator
+# qid n polls on vector n-1, whose IRQ the default spread (or the target
+# pass above) points wherever -- measured cross-socket, and worth -35% on
+# single-job 4k randread (165K -> 254K once placed). There is no RSS and no
+# reconnect lottery here (the vector choice is deterministic), just a
+# static misplacement.
+#
+# Placement: the SMT sibling of the LOWEST hctx CPU. RDMA has no io_work
+# consumer (the HCA DMAs the data), so the CQ softirq wants a core that is
+# node-local to the submitter without sharing its core: same-CPU measured
+# 186K, same-core 228K, same-node-different-core 254K. Runs after
+# tune_target_rdma; on shared vectors (target qid n = vector n, initiator
+# qid n+1 = vector n) the initiator's immovable blk-mq map wins the vector,
+# and only single-job runs keep the two hot vectors disjoint anyway.
+tune_initiator_rdma() {
+    [ -n "${TUNE_NIC:-}" ] ||
+        { echo "   (TUNE_NIC unset; skipping initiator CQ placement)"; return 0; }
+    local nqn="$1" dev mqdir h i qid irq hcpus low rxcpu
+    dev="$(find_dev "$nqn" || true)"
+    [ -n "$dev" ] ||
+        { echo "   (no device for $nqn; skipping initiator CQ placement)"; return 0; }
+    mqdir="$(mq_debug_dir "$dev" || true)"
+    [ -n "$mqdir" ] ||
+        { echo "   (no blk-mq debugfs map for $dev; skipping initiator CQ placement)"; return 0; }
+    echo ">> placing initiator CQ-vector IRQs ($dev) into their hctx CPU sets"
+    for h in "$mqdir"/hctx*; do
+        i="${h##*hctx}"; qid=$((i + 1))
+        # Initiator qid = hctx index + 1 uses CQ completion vector = hctx index.
+        irq="$(nic_queue_irqs "$TUNE_NIC" "$i" | head -1)"
+        [ -n "$irq" ] || { echo "   vec$i: no mlx5_comp IRQ found; skipped"; continue; }
+        hcpus="$(ls "$h" 2>/dev/null | sed -n 's/^cpu//p' | sort -n)"
+        low="$(echo "$hcpus" | sed -n 1p)"
+        [ -n "$low" ] || { echo "   vec$i: empty hctx$i CPU set; skipped"; continue; }
+        rxcpu="$(tr ',' '\n' <"/sys/devices/system/cpu/cpu$low/topology/thread_siblings_list" \
+            2>/dev/null | grep -vx "$low" | head -1)"
+        [ -n "$rxcpu" ] || rxcpu="$(echo "$hcpus" | sed -n 2p)"
+        [ -n "$rxcpu" ] || rxcpu="$low"
+        echo "$rxcpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+        echo "   vec$i (initiator qid $qid): irq$irq -> cpu $rxcpu (hctx $(echo $hcpus | tr ' ' ','))"
+    done
+}
+
 # Show, per IO queue, the io-thread's LIVE affinity (from `ioutgt list`) beside
 # its $TUNE_NIC RX IRQ effective CPU, with the separation verdict (OK = io-thread
 # on a different logical CPU than its RX IRQ; SAME-CPU = the capping

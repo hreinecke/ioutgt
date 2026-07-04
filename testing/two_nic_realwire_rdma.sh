@@ -477,7 +477,15 @@ case "${1:-}" in
     connect)             run_for_targets connect_one    "${2:-}"
                          # IRQ affinity sync needs the IO queues connected
                          # (their pthread tids appear in `list`).
-                         case "${2:-}" in ioutgt|"") tune_target_rdma ;; esac ;;
+                         case "${2:-}" in ioutgt|"") tune_target_rdma ;; esac
+                         # Initiator CQ vectors are per connected controller;
+                         # both connections share hctx maps, so idempotent.
+                         case "${2:-}" in
+                             ioutgt) tune_initiator_rdma "$IOUTGT_NQN" ;;
+                             nvmet)  tune_initiator_rdma "$NVMET_NQN" ;;
+                             "")     tune_initiator_rdma "$IOUTGT_NQN"
+                                     tune_initiator_rdma "$NVMET_NQN" ;;
+                         esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
     fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
