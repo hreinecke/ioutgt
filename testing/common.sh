@@ -778,6 +778,80 @@ $rows
 EOF
 }
 
+# blk-mq debugfs dir holding a block device's hctx map. With native NVMe
+# multipath the map lives under the hidden per-controller node
+# (nvmeXnY -> nvmeXcZnY), not the head itself.
+mq_debug_dir() {
+    local name="${1#/dev/}" cand
+    for cand in "$name" $(cd /sys/kernel/debug/block 2>/dev/null &&
+            ls -d "${name%n*}"c*n"${name##*n}" 2>/dev/null); do
+        [ -d "/sys/kernel/debug/block/$cand/hctx0" ] &&
+            { echo "/sys/kernel/debug/block/$cand"; return 0; }
+    done
+    return 1
+}
+
+# Initiator-side twin of tune_target_nic's ntuple steering: deliver each
+# connection's inbound flow (the C2H read-data stream) on $TUNE_NIC_INI to
+# queue qid-1, with that queue's IRQ pointed INTO the connection's blk-mq
+# hctx CPU set. Without this the data flow lands on a per-connect
+# RSS-random NIC_I queue -- machine-wide on a multi-node box -- and
+# single-job randread swings 10-15% with every reconnect while randwrite
+# (already steered on the target side) stays flat. aRFS cannot fix it:
+# nvme-tcp consumes its sockets via read_sock from kernel io_work, which
+# never records RFS flows, so accelerated RFS never steers ULP traffic.
+#
+# The IRQ lands on the SECOND-lowest hctx CPU: the lowest is what nvme-tcp
+# typically picks as queue->io_cpu, and RX softirq measured best beside the
+# io_work CPU, not on it. Needs debugfs for the hctx map; skips otherwise.
+tune_initiator_tcp() {
+    [ -n "${TUNE_NIC_INI:-}" ] ||
+        { echo "   (TUNE_NIC_INI unset; skipping initiator RX steering)"; return 0; }
+    command -v jq >/dev/null 2>&1 ||
+        { echo "   (jq not found; skipping initiator RX steering)"; return 0; }
+    local rows dev mqdir
+    rows="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null \
+        | jq -r '.data.controllers[]?.queues[]? | select(.qid >= 1) | "\(.qid) \(.peer)"' \
+            2>/dev/null | sort -n -u || true)"
+    [ -n "$rows" ] || { echo "   (no connected IO queues; run 'connect' first)"; return 0; }
+    dev="$(find_dev "$IOUTGT_NQN" || true)"
+    mqdir="$([ -n "$dev" ] && mq_debug_dir "$dev" || true)"
+    [ -n "$mqdir" ] ||
+        { echo "   (no blk-mq debugfs map for ${dev:-?}; skipping initiator RX steering)"; return 0; }
+    ini_exec ethtool -K "$TUNE_NIC_INI" ntuple on >/dev/null 2>&1 || true
+    # Stale rules carry previous connects' ports; subshell so the TUNE_NS
+    # override (nic_* helpers act on the initiator netns) does not leak.
+    (TUNE_NS="${TUNE_NS_INI:-}" && nic_clear_ntuple "$TUNE_NIC_INI")
+    # Same softirq hygiene as the target side: no software RPS/RFS IPIs.
+    ini_exec bash -c '
+        for q in /sys/class/net/'"$TUNE_NIC_INI"'/queues/rx-*; do
+            echo 0 > "$q/rps_flow_cnt" 2>/dev/null
+            echo 0 > "$q/rps_cpus" 2>/dev/null
+        done' 2>/dev/null || true
+    echo ">> steering each flow's C2H RX on $TUNE_NIC_INI into its hctx CPU set"
+    local qid peer sport nicq irq hcpus rxcpu
+    while read -r qid peer; do
+        [ -n "$qid" ] || continue
+        nicq=$((qid - 1)); sport="${peer##*:}"
+        case "$sport" in ''|*[!0-9]*) echo "   q$nicq: no peer port ($peer); skipped"; continue ;; esac
+        irq="$(TUNE_NS="${TUNE_NS_INI:-}" nic_queue_irqs "$TUNE_NIC_INI" "$nicq" | head -1)"
+        [ -n "$irq" ] || { echo "   q$nicq: no $TUNE_NIC_INI IRQ found; skipped"; continue; }
+        hcpus="$(ls "$mqdir/hctx$nicq" 2>/dev/null | sed -n 's/^cpu//p' | sort -n)"
+        rxcpu="$(echo "$hcpus" | sed -n 2p)"
+        [ -n "$rxcpu" ] || rxcpu="$(echo "$hcpus" | sed -n 1p)"
+        [ -n "$rxcpu" ] || { echo "   q$nicq: empty hctx$nicq CPU set; skipped"; continue; }
+        echo "$rxcpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+        if ini_exec ethtool -N "$TUNE_NIC_INI" flow-type tcp4 \
+                src-port "$IOUTGT_PORT" dst-port "$sport" action "$nicq" >/dev/null 2>&1; then
+            echo "   q$nicq: dst-port $sport -> rx queue $nicq, irq$irq -> cpu $rxcpu (hctx $(echo $hcpus | tr ' ' ','))"
+        else
+            echo "   q$nicq: ntuple rule (dst-port $sport) rejected"
+        fi
+    done <<EOF
+$rows
+EOF
+}
+
 # Show, per IO queue, the io-thread's LIVE affinity (from `ioutgt list`) beside
 # its $TUNE_NIC RX IRQ effective CPU, with the separation verdict (OK = io-thread
 # on a different logical CPU than its RX IRQ; SAME-CPU = the capping

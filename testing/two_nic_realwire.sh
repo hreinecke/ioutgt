@@ -205,6 +205,13 @@ TUNE_NIC="${NIC_T:-}"
 [ "$NIC_TUNE" = 1 ] || TUNE_NIC=""
 # shellcheck disable=SC2034  # consumed by common.sh's nic_* / tune_* helpers
 TUNE_NS="$NS_T"
+# Initiator-side twin (tune_initiator_tcp): NIC_I and the netns it lives in.
+# shellcheck disable=SC2034  # consumed by common.sh's tune_initiator_tcp
+TUNE_NIC_INI="${NIC_I:-}"
+# shellcheck disable=SC2034  # blanked so tune_initiator_tcp no-ops
+[ "$NIC_TUNE" = 1 ] || TUNE_NIC_INI=""
+# shellcheck disable=SC2034  # consumed by common.sh's tune_initiator_tcp
+TUNE_NS_INI="$NS_I"
 
 # =====================================================================
 cmd_up() {
@@ -357,7 +364,8 @@ case "${1:-}" in
     connect)             run_for_targets connect_one    "${2:-}"
                          # IRQ affinity sync needs the IO queues connected
                          # (their pthread tids appear in `ioutgt list`).
-                         case "${2:-}" in ioutgt|"") tune_target_nic ;; esac ;;
+                         case "${2:-}" in ioutgt|"") tune_target_nic
+                                                     tune_initiator_tcp ;; esac ;;
     disconnect)          run_for_targets disconnect_one "${2:-}" ;;
     fio)                 run_for_targets fio_one        "${2:-}" ;;
     fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
