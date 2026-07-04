@@ -151,7 +151,9 @@ mod tests {
     #[test]
     fn rxe_reactor_event_send_recv() -> io::Result<()> {
         let Some(rdma) = Rdma::open_first()? else {
-            eprintln!("skip rxe_reactor: no RDMA device (configure rdma_rxe to run)");
+            eprintln!(
+                "skip rxe_reactor: no RDMA device with an active port (configure rdma_rxe to run)"
+            );
             return Ok(());
         };
         let rt = QueueRuntime::new(RingConfig::default())?;

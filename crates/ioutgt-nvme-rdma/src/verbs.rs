@@ -12,7 +12,7 @@ use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::address::{AddressHandleAttribute, GidEntry, GidType};
 use sideway::ibverbs::completion::{CompletionChannel, GenericCompletionQueue};
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
-use sideway::ibverbs::device_context::DeviceContext;
+use sideway::ibverbs::device_context::{DeviceContext, PortState};
 use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::protection_domain::ProtectionDomain;
 use sideway::ibverbs::queue_pair::{
@@ -58,16 +58,24 @@ pub struct Rdma {
 }
 
 impl Rdma {
-    /// Open the first RDMA device and allocate a protection domain, or `None`
-    /// when no RDMA device is present (RDMA unavailable — not an error).
+    /// Open the first RDMA device whose port is ACTIVE and allocate a
+    /// protection domain, or `None` when no usable device is present (RDMA
+    /// unavailable — not an error). Devices with a down port are skipped,
+    /// not errors: an HCA whose netdev is down/unaddressed (e.g. test-rig
+    /// ports between runs) only exposes a link-local GID, and routing
+    /// through it fails the RTR transition with "network unreachable" —
+    /// an environment condition, exactly like an empty device list.
     pub fn open_first() -> io::Result<Option<Rdma>> {
         let list = DeviceList::new().map_err(oerr)?;
-        let Some(dev) = list.iter().next() else {
-            return Ok(None);
-        };
-        let ctx = dev.open().map_err(oerr)?;
-        let pd = ctx.alloc_pd().map_err(oerr)?;
-        Ok(Some(Rdma { ctx, pd, port: 1 }))
+        for dev in list.iter() {
+            let ctx = dev.open().map_err(oerr)?;
+            if ctx.query_port(1).map_err(oerr)?.port_state() != PortState::Active {
+                continue;
+            }
+            let pd = ctx.alloc_pd().map_err(oerr)?;
+            return Ok(Some(Rdma { ctx, pd, port: 1 }));
+        }
+        Ok(None)
     }
 
     /// Register `[ptr, ptr+len)` as a memory region with the given access,
@@ -275,7 +283,9 @@ mod tests {
     #[test]
     fn rxe_loopback_send_write_read() -> io::Result<()> {
         let Some(rdma) = Rdma::open_first()? else {
-            eprintln!("skip rxe_loopback: no RDMA device (configure rdma_rxe to run)");
+            eprintln!(
+                "skip rxe_loopback: no RDMA device with an active port (configure rdma_rxe to run)"
+            );
             return Ok(());
         };
 
