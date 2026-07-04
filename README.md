@@ -18,7 +18,7 @@ iopoll, io-uring slots in future, dmabuf read/write in future, ...)
 
 Memory safe modern programming language
 
-Async/.await
+Async/.await with Tokio & io_uring reactor
 
 ## userspace (compared with kernel nvme target)
 
@@ -43,7 +43,8 @@ Crash in isolation
 
 ## Performance
 
-One process, one queue thread per NVMe queue, no locks in the data path:
+One process, one queue thread per NVMe queue, no locks in the data path,
+single fio JOB with queue depth 128.
 
 ```text
    host (nvme-cli / fio)                    ioutgt target
