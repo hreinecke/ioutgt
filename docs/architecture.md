@@ -162,16 +162,18 @@ management via `rdma-mummy-sys`; see `docs/nvme-rdma.md`).
 | `ioutgt-uring` | reactor + op futures + `sendbatch` | — |
 | `ioutgt-cpus` | locality-aware even CPU grouping | — |
 
-### 4.1 Assembly: what `spawn_target()` wires up
+### 4.1 Assembly: what the harness `spawn()` wires up
 
-`main()` parses the config and hands everything to `spawn_target()`
-(`crates/ioutgt/src/lib.rs`), which is the only place all eight crates
-meet:
+`main()` parses the config and calls the binary's thin entry point —
+`spawn_target()` (`crates/ioutgt/src/lib.rs`) is a kernel-feature
+probe plus `ioutgt_harness::spawn::<TcpTransport>()`; the RDMA binary
+passes `RdmaTransport` through the same seam. The harness `spawn()` is
+where every layer meets, parameterized over the `Transport` trait:
 
-**`spawn_target()` — what gets spawned and wired**
+**harness `spawn::<T>()` — what gets spawned and wired**
 
 ```text
-spawn_target(config)                                   [ioutgt]
+spawn::<T>(config)                                  [ioutgt-harness]
   └─ control thread (plain Tokio): control_loop()
        ├─ Registry::new()                              [ioutgt-core]
        ├─ build_port(): per namespace
@@ -182,14 +184,15 @@ spawn_target(config)                                   [ioutgt]
        │    └─ stats/nudge read `senders`: Some → admin/io mailbox,
        │       None → zeroed stats / no-op nudge        (pool down)
        └─ select! loop:
-            ├─ accept → ensure_pool_up(senders) → setup_connection()
+            ├─ T::accept → ensure_pool_up(senders) → setup_connection()
             │    ensure_pool_up (if down): build_pool() →
             │      make_admin/make_io: mailbox() + pending spawn closure,
             │        each → QueueRuntime::new()          [ioutgt-uring]
             │          block_on: loop { msg = mailbox.recv()
-            │            Conn → spawn run_queue(conn)     [ioutgt-nvme-tcp]
-            │            Shutdown → return (thread exits, ring drops) }
-            │    accept_handshake/read_connect → MailboxSender::send(QueueConn)
+            │            Conn → spawn T::run_queue(conn)  [ioutgt-nvme-tcp /
+            │            Shutdown → return (ring drops)     ioutgt-nvme-rdma]
+            │    T::handshake (TCP: accept_handshake/read_connect)
+            │      → MailboxSender::send(QueueConn)
             │      qid 0 → admin thread, qid n → io thread[(n-1) % N]
             └─ idle tick → active==0 for grace? → teardown_pool(senders)
                  (Shutdown to every thread; senders → None)

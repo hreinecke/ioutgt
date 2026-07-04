@@ -64,8 +64,9 @@ push a `SendWork::Response`):
        │                        │                          │ sendmsg
 ```
 
-Tag exhaustion parks the recv loop in `await_tag` instead of
-terminating — a conforming host at full depth may legitimately deliver
+The Connect SQE stashed by the control-thread handshake is the queue's
+first `claim_tag()`/`submit()`. Thereafter, tag exhaustion parks the
+recv loop in `await_tag` instead of terminating — a conforming host at full depth may legitimately deliver
 command N+1 before our own send completion frees the tag (mirrors
 nvmet; exceeding the negotiated depth is never fatal here).
 
@@ -225,7 +226,11 @@ Backends add their own copies: file adds **none** (O_DIRECT is the
 default, buffered only as a fallback when the store refuses it — same
 default-direct policy as nvmet; the `buffered_io` mapping is in
 `nvmet-comparison.md` §5); memory adds one per direction; null adds
-none. The data-pool arena is also registered as an io_uring fixed
+none (reads memset the slot — visible when measuring protocol overhead
+with it). The default backend is `memory`; O_DIRECT only matters under
+`--backend file`. Everything else on the path is bounded per PDU:
+header assembly in the decoder, the 64-byte SQE stash, and
+header/digest encoding into the send arena. The data-pool arena is also registered as an io_uring fixed
 buffer, so disk IO from pooled slots uses `READV_FIXED`/`WRITEV_FIXED`
 (best-effort; released at teardown).
 
@@ -267,7 +272,10 @@ mode vs classic mode); the two never mix on one connection.
 - **Per-connection, not shared** — a recv CQE reports `(bid, len)` but
   not the consume offset; one consumer per ring keeps the tracked
   offset authoritative. Each connection gets its own `bgid` and fixed
-  buffers.
+  buffers. (Sharing pressure is keyed on *controller* count, not queue
+  count — the target offers `io_threads` IO queues per controller, a
+  bijection onto the io-threads, so a shared ring was only ever at
+  risk with ≥ 2 controllers; per-connection ownership makes it moot.)
 - **Retain + borrow**: a payload that fits the current sub-buffer is
   retained in place (`SlotData::ring()` lease — implemented for both
   in-capsule data and whole-transfer H2CData) and the write borrows the
@@ -281,9 +289,10 @@ mode vs classic mode); the two never mix on one connection.
   exhaust/re-provide cycle would park forever) and wakes when a
   completing write releases its borrow. A write's completion never
   waits on recv.
-- **Ceilings, graceful**: the per-thread fixed-buffer table and
-  `RLIMIT_MEMLOCK` both fall back to classic recv (confirm the
-  `recv ring engaged` log line). Admin queues always skip it; kernels
+- **Ceilings, graceful**: the per-thread fixed-buffer table (64 slots,
+  ~3 per connection counting the pool arena) and `RLIMIT_MEMLOCK` both
+  fall back to classic recv (confirm the `recv ring engaged` log
+  line). Admin queues always skip it; kernels
   without `IOU_PBUF_RING_INC` (< ~6.12) fall back with a `debug!`.
 - **Off by default**: memory is pre-pinned per connection
   (connections × recv_buf_mb), and the win is copy-elision + freed
@@ -308,6 +317,7 @@ mode vs classic mode); the two never mix on one connection.
 
 | Flag | Default | Effect |
 |------|---------|--------|
+| `--backend` | `memory` | `memory` / `null` / `file` (regular file or bdev, O_DIRECT) |
 | `--no-hdgst` / `--no-ddgst` | digests on | disable header/data digest negotiation |
 | `--send-zc` | off | `SENDMSG_ZC` batches (see size gate above) |
 | `IOUTGT_ZC_MIN_BYTES` (env) | 12288 | min average payload for a ZC batch |

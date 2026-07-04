@@ -13,8 +13,10 @@ acceptance, the recv/reap machinery.
 
 Mirrors kernel `drivers/nvme/target/rdma.c`. The host SENDs a command
 capsule (SQE + keyed SGL `{addr, rkey, len}` naming its registered
-buffer); the target moves data one-sided and SENDs the CQE back.
-No R2T, no C2HData PDUs, no digests.
+buffer — the 16-byte keyed descriptor in the SQE `dptr` at offset 24:
+`addr@0`, 24-bit `len@8`, `rkey@11`; `parse_keyed_sgl`); the target
+moves data one-sided and SENDs the CQE back. No R2T, no C2HData PDUs,
+no digests.
 
 ```text
  WRITE (host → target)               READ (target → host)
@@ -56,8 +58,11 @@ sideway's **CM** API can't do what an NVMe target needs — read
 CONNECT_REQUEST private data (`nvme_rdma_cm_req` carrying the qid),
 reply with private data, `reject` — so `cm.rs` drives librdmacm
 directly over `rdma-mummy-sys` (sideway's own FFI backend; types
-unify), mirroring sideway's naming for a mechanical future swap back.
-Three seams, all earmarked for upstream PRs:
+unify), mirroring sideway's naming for a mechanical future swap back
+once upstream grows `Event::private_data()`,
+`ConnectionParameter::setup_private_data`, `Identifier::reject`,
+`setup_send_with_inv`, and pre-established `DeviceContext` access.
+Three seams:
 
 - `Identifier::get_device_context()` — layout-asserted transmute to a
   sideway `DeviceContext` (why the `=0.4.3` pin).
@@ -115,6 +120,10 @@ back to 0).
 | resp bufs | per-slot CQE staging | SEND |
 | cdata buf | admin Connect-data landing zone | RDMA READ (keyed-SGL ConnectData) |
 
+(Connect carries a 1024-byte `ConnectData`: IO queues send it
+in-capsule; the admin host sends it host-resident via keyed SGL, RDMA
+READ into the cdata buffer before controller bootstrap.)
+
 Work-request ids encode the WR class + owner, the same trick as TCP's
 TTAG = slot index (no lookup maps):
 
@@ -130,6 +139,8 @@ recv/response buffers; slot tasks only hold `Rc<QueueCore>` + the
 `SendList` and post nothing. Commands execute on preallocated per-tag
 tasks (as on TCP) — required, not a perf choice: a parked Async Event
 Request would stall inline dispatch, but only idles its own slot task.
+A per-tag `JoinSet` aborts every slot task when it drops at `run()`
+exit.
 
 ```text
  run() — select! over five arms:
@@ -186,7 +197,9 @@ host disconnect produces no flushed completions. Teardown signals:
   (`executing() > 0`, bounded) before freeing — a backend op can't
   target the pool arena as it's freed. The stop is a bare `Notify`
   (not the mailbox doorbell), so a fully idle queue may only observe
-  it at the ~1 s park backstop.
+  it at the ~1 s park backstop; routing it through the mailbox would
+  make teardown prompt (the harness mailbox-only invariant covers the
+  data path, and this is a second cross-thread wake channel).
 - **Abrupt (host vanishes, no DREQ)**: nothing on the QP or CM
   notices, so the backstop's keep-alive watchdog (every 2nd tick,
   ≈ 2 s) covers it: an admin queue silent past KATO×2 + 5 s tears down
@@ -244,6 +257,10 @@ subcommands are shared through `ioutgt_harness::client`.
 | bring-up | `testing/run_rdma_connect.sh` | rxe + kernel host: discover → connect → write/read-back `cmp` → fio verify → disconnect |
 | A/B correctness | `testing/run_rdma_compare.sh` | same driver against ioutgt **and** nvmet-rdma (loop bdev backends; guest tmpfs can't host either file backend) |
 | box perf | `testing/two_nic_realwire_rdma.sh` | two real mlx5 NICs, forced wire, fio/fio_perf vs nvmet-rdma |
+
+VM gotcha: the guests re-add the netdev IP after `rdma link add` to
+force the rxe RoCEv2 GID to populate, which otherwise races bind on
+some boots.
 
 `testing/common.sh` selects the fabric via `TRANSPORT=tcp|rdma`
 (binary, kernel modules, `addr_trtype`, `nvme -t`; forces digests +
