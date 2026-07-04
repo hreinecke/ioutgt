@@ -58,38 +58,37 @@ One process, one queue thread per NVMe queue, no locks in the data path:
 
 Measured with `fio_perf` (single job, qd 128, 15 s/phase, real NVMe SSD
 backends, same host kernel driver for both targets; collected via
-`taskset -c 45 rdma2.sh fio_perf` / `taskset -c 45 nic2.sh fio_perf`):
+`taskset -c 45 rdma2.sh fio_perf` / `taskset -c 45 nic2.sh fio_perf` —
+the harness pins the RX/CQ IRQ placement on both the target and the
+initiator side post-connect, so single-job numbers are reproducible
+across reconnects instead of an RSS/vector placement lottery):
 
 **NVMe/RDMA** (100 GbE mlx5, RoCEv2)
 
 | phase | ioutgt IOPS | ioutgt BW | nvmet IOPS | nvmet BW | ioutgt vs nvmet |
 |-------|------------|-----------|------------|----------|-----------------|
-| 4k randread | 165.2k | 645 MiB/s | 160.9k | 629 MiB/s | +2.7% |
-| 4k randwrite | 176.8k | 691 MiB/s | 179.1k | 700 MiB/s | −1.3% |
-| 64k randread | 95.2k | 5948 MiB/s | 68.7k | 4297 MiB/s | **+38.6%** |
-| 64k randwrite | 92.9k | 5803 MiB/s | 64.7k | 4044 MiB/s | **+43.6%** |
+| 4k randread | 254.2k | 993 MiB/s | 228.7k | 894 MiB/s | **+11.1%** |
+| 4k randwrite | 259.6k | 1014 MiB/s | 261.0k | 1020 MiB/s | −0.5% |
+| 64k randread | 128.7k | 8044 MiB/s | 63.3k | 3957 MiB/s | **+103.3%** |
+| 64k randwrite | 127.1k | 7943 MiB/s | 61.4k | 3836 MiB/s | **+107.0%** |
 
 **NVMe/TCP** (same wire)
 
 | phase | ioutgt IOPS | ioutgt BW | nvmet IOPS | nvmet BW | ioutgt vs nvmet |
 |-------|------------|-----------|------------|----------|-----------------|
-| 4k randread | 242.9k | 949 MiB/s | 115.0k | 449 MiB/s | **+111.2%** |
-| 4k randwrite | 242.4k | 947 MiB/s | 116.8k | 456 MiB/s | **+107.5%** |
-| 64k randread | 52.6k | 3289 MiB/s | 28.7k | 1792 MiB/s | **+83.3%** |
-| 64k randwrite | 34.0k | 2124 MiB/s | 17.2k | 1072 MiB/s | **+97.7%** |
+| 4k randread | 239.5k | 936 MiB/s | 111.0k | 434 MiB/s | **+115.8%** |
+| 4k randwrite | 249.3k | 974 MiB/s | 116.0k | 453 MiB/s | **+114.9%** |
+| 64k randread | 52.9k | 3308 MiB/s | 28.1k | 1754 MiB/s | **+88.3%** |
+| 64k randwrite | 34.8k | 2176 MiB/s | 17.0k | 1062 MiB/s | **+104.7%** |
 
 For scale: the backing SSD does 122k IOPS (7.6 GiB/s) at 64k random
 locally, and the raw wire carries 98 Gb/s (`ibperf`) — the single-job
-64k numbers are one queue thread driving ~80% of the drive's 64k
+64k RDMA numbers are one queue thread saturating the drive's 64k
 ceiling through one QP.
 
 ## Roadmap
 
 - Receive zero-copy for NVMe/TCP (io_uring `RECV_ZC`).
-- Trace and close the remaining single-flow 4k gap between our RDMA and
-  TCP transports — the evidence points at the host-side driver (kernel
-  `nvme-rdma` submits per-command with no `queue_rqs`/`commit_rqs`
-  batching, unlike `nvme-tcp`/`nvme-pci`).
 - In-band authentication.
 - Cleanup and code simplification passes.
 - Performance optimization.
