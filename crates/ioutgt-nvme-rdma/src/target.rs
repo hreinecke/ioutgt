@@ -171,10 +171,11 @@ fn staged_len(sqe: &Sqe) -> usize {
 }
 
 /// Fill `sges` with the slot data's pool-lease segments covering its first
-/// `len` bytes, tagged with `lkey`; returns the sge count. A pool lease spans
-/// at most [`MAX_SEGS`] runs, so the fixed array always suffices, and the
-/// extended post guard copies the list into the WQE at `setup_sge_list`, so
-/// one stack array can be reused across a batch.
+/// `len` bytes, tagged with `lkey`; returns the run count. A pool lease spans
+/// at most [`MAX_SEGS`] runs, so the fixed array always suffices. The callers
+/// emit one single-SGE work request per run (see `post_reads_batch` for why —
+/// rdma-core's rxe provider corrupts multi-SGE WR lengths), so the array is
+/// only a scratch enumeration of the lease's contiguous runs.
 // A run never exceeds the lease length <= MDTS (128 KiB) < u32::MAX.
 #[allow(clippy::cast_possible_truncation)]
 fn fill_sges(
@@ -321,9 +322,10 @@ impl BatchHist {
 /// tells the loop they exist. Single-threaded (`Rc` + `RefCell`).
 #[derive(Default)]
 struct ProbeShared {
-    /// `(wr_id, success)` pairs the probe pulled off the CQ; consumed by
-    /// `drain_into` ahead of the live CQ on the next `process_cqes`.
-    staged: RefCell<Vec<(u64, bool)>>,
+    /// `(wr_id, status)` pairs the probe pulled off the CQ (raw
+    /// `ibv_wc_status`, 0 = success); consumed by `drain_into` ahead of the
+    /// live CQ on the next `process_cqes`.
+    staged: RefCell<Vec<(u64, u32)>>,
     /// Reap-loop waker, registered by `staged_ready` when `staged` is empty.
     waker: RefCell<Option<std::task::Waker>>,
 }
@@ -715,10 +717,20 @@ impl RdmaQueue {
     }
 
     /// Post every write-command host-data READ collected in `read_batch` on ONE
-    /// doorbell: for each, an RDMA READ scattering the host's keyed-SGL region
-    /// into the slot's leased pool segments, all constructed on a single guard
-    /// and flushed with one `ibv_post_send`. Each READ completes independently
-    /// (`WR_READ` → submit_pending). Empties `read_batch` on success.
+    /// doorbell: for each command, one single-SGE RDMA READ **per contiguous
+    /// pool run** of its lease (remote address advanced run by run), all
+    /// constructed on a single guard and flushed with one `ibv_post_send`.
+    /// Only the LAST run's READ is signaled, so the completion protocol is
+    /// unchanged: one `WR_READ` per command → submit_pending (RC completes
+    /// same-QP READs in order). Empties `read_batch` on success.
+    ///
+    /// Single-SGE on purpose, not just simplicity: rdma-core's rxe provider
+    /// (≤ v61) computes a multi-SGE WR's total length as
+    /// `num_sge × sge[0].length` (`wr_set_sge_list` never advances the list
+    /// pointer), which inflates the wire RETH length of a fragmented lease's
+    /// READ — the host responder then NAKs Remote Access and kills the QP
+    /// (found by xfstests generic/113). Single-SGE WRs are immune on every
+    /// provider, and the common unfragmented lease still posts exactly one WR.
     fn post_reads_batch(&mut self) -> io::Result<()> {
         if self.read_batch.is_empty() {
             return Ok(());
@@ -748,14 +760,24 @@ impl RdmaQueue {
                 pool_lkey,
                 &mut sges,
             );
-            let h = g
-                .construct_wr(wr(WR_READ, u32::from(pr.tag)), WorkRequestFlags::Signaled)
-                .setup_read(pr.rkey, pr.addr);
-            // SAFETY: the sges reference the registered pool arena (pool_lkey,
-            // is_pool-checked in handle_recv); the slot stays leased until its
-            // response SEND completes (tag not released until then).
-            unsafe { h.setup_sge_list(&sges[..n]) };
-            reads += 1;
+            let mut remote = pr.addr;
+            for (i, sge) in sges[..n].iter().enumerate() {
+                let flags = if i + 1 == n {
+                    WorkRequestFlags::Signaled
+                } else {
+                    WorkRequestFlags::none()
+                };
+                let h = g
+                    .construct_wr(wr(WR_READ, u32::from(pr.tag)), flags)
+                    .setup_read(pr.rkey, remote);
+                // SAFETY: the sge references the registered pool arena
+                // (pool_lkey, is_pool-checked in handle_recv); the slot stays
+                // leased until its response SEND completes (tag not released
+                // until then).
+                unsafe { h.setup_sge(pool_lkey, sge.addr, sge.length) };
+                remote += u64::from(sge.length);
+                reads += 1;
+            }
         }
         // One atomic ibv_post_send for the batch (extended guard's
         // ibv_wr_complete); a post error is fatal and tears the queue down, so
@@ -770,19 +792,17 @@ impl RdmaQueue {
         Ok(())
     }
 
-    /// Drain all currently-available completions as `(wr_id, success)` into the
-    /// reused `out` buffer (cleared first), so the steady IO path allocates none.
-    fn drain_into(&self, out: &mut Vec<(u64, bool)>) {
+    /// Drain all currently-available completions as `(wr_id, status)` (raw
+    /// `ibv_wc_status`, 0 = success) into the reused `out` buffer (cleared
+    /// first), so the steady IO path allocates none.
+    fn drain_into(&self, out: &mut Vec<(u64, u32)>) {
         out.clear();
         // Completions the park-probe already pulled off the CQ come first
         // (they are older than anything still queued).
         out.append(&mut self.probe.staged.borrow_mut());
         if let Ok(poller) = self.cq.start_poll() {
             for wc in poller {
-                out.push((
-                    wc.wr_id(),
-                    wc.status() == WorkCompletionStatus::Success as u32,
-                ));
+                out.push((wc.wr_id(), wc.status()));
             }
         }
     }
@@ -794,7 +814,7 @@ impl RdmaQueue {
     fn process_cqes(
         &mut self,
         ctx: &Rc<ConnCtx<AnyBackend>>,
-        comps: &mut Vec<(u64, bool)>,
+        comps: &mut Vec<(u64, u32)>,
     ) -> io::Result<bool> {
         self.drain_into(comps);
         if !comps.is_empty() {
@@ -803,9 +823,40 @@ impl RdmaQueue {
         }
         // `comps` is a local buffer (disjoint from `self`), so iterating it while
         // calling `&mut self` handlers is sound.
-        for &(id, ok) in comps.iter() {
-            if !ok {
-                // Flushed completion: the peer is gone.
+        for &(id, status) in comps.iter() {
+            if status != WorkCompletionStatus::Success as u32 {
+                // Not just a teardown flush? Decode the WR before stopping: a
+                // non-flush error names the exact op the peer rejected (e.g.
+                // REM_ACCESS = our READ/WRITE hit a bad rkey/bounds at the
+                // host) — evidence that would otherwise vanish with the queue.
+                if status != WorkCompletionStatus::WorkRequestFlushedError as u32 {
+                    let tag = wr_low(id) as usize;
+                    let kind = match wr_kind(id) {
+                        WR_RECV => "RECV",
+                        WR_READ => "READ",
+                        WR_WRITE => "WRITE",
+                        WR_SEND => "SEND",
+                        _ => "?",
+                    };
+                    let sgl = self
+                        .pending_read
+                        .get(tag)
+                        .map(parse_keyed_sgl)
+                        .map(|s| (s.rkey, s.addr, s.len))
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        qid = self.nvme.qid,
+                        qpn = self.qp.qp_number(),
+                        kind,
+                        tag,
+                        status,
+                        stashed_rkey = sgl.0,
+                        stashed_addr = format_args!("{:#x}", sgl.1),
+                        stashed_len = sgl.2,
+                        "rdma completion error; tearing queue down"
+                    );
+                }
+                // Peer gone (flush) or QP now in error: stop the reap loop.
                 return Ok(true);
             }
             match wr_kind(id) {
@@ -930,13 +981,15 @@ impl RdmaQueue {
     /// steady reap loop takes over once [`Self::bootstrap`] returns.
     async fn await_bootstrap(&mut self, kind: u64) -> io::Result<u32> {
         // One Connect per queue, so this one-time buffer is fine.
-        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(8);
+        let mut comps: Vec<(u64, u32)> = Vec::with_capacity(8);
         loop {
             crate::cq::wait(&self.channel, &self.cq).await?;
             self.drain_into(&mut comps);
-            for &(id, ok) in &comps {
-                if !ok {
-                    return Err(io::Error::other("RDMA completion error (peer gone?)"));
+            for &(id, status) in &comps {
+                if status != WorkCompletionStatus::Success as u32 {
+                    return Err(io::Error::other(format!(
+                        "RDMA completion error at bootstrap (status {status})"
+                    )));
                 }
                 match wr_kind(id) {
                     k if k == kind => {
@@ -1192,14 +1245,27 @@ impl RdmaQueue {
                     &mut sges,
                 );
                 let dst = parse_keyed_sgl(&resp.cmd);
-                let hw = g
-                    .construct_wr(wr(WR_WRITE, u32::from(tag)), WorkRequestFlags::Signaled)
-                    .setup_write(dst.rkey, dst.addr);
-                // SAFETY: the sges reference the registered pool arena (pool_lkey);
-                // the slot stays leased until both WRs complete (tag not released).
-                unsafe { hw.setup_sge_list(&sges[..n]) };
+                // One single-SGE WRITE per contiguous pool run, only the last
+                // signaled — same rxe-provider multi-SGE-length workaround
+                // (and completion protocol) as `post_reads_batch`.
+                let mut remote = dst.addr;
+                for (i, sge) in sges[..n].iter().enumerate() {
+                    let flags = if i + 1 == n {
+                        WorkRequestFlags::Signaled
+                    } else {
+                        WorkRequestFlags::none()
+                    };
+                    let hw = g
+                        .construct_wr(wr(WR_WRITE, u32::from(tag)), flags)
+                        .setup_write(dst.rkey, remote);
+                    // SAFETY: the sge references the registered pool arena
+                    // (pool_lkey); the slot stays leased until both WRs
+                    // complete (tag not released).
+                    unsafe { hw.setup_sge(pool_lkey, sge.addr, sge.length) };
+                    remote += u64::from(sge.length);
+                    writes += 1;
+                }
                 pending = 2;
-                writes += 1;
             }
             let off = tag as usize * CQE_LEN;
             resp_buf[off..off + CQE_LEN].copy_from_slice(resp.outcome.cqe.as_bytes());
@@ -1380,7 +1446,7 @@ impl RdmaQueue {
 
         let responses = Rc::clone(&self.responses);
         // Reused across iterations: the steady IO path allocates nothing.
-        let mut comps: Vec<(u64, bool)> = Vec::with_capacity(64);
+        let mut comps: Vec<(u64, u32)> = Vec::with_capacity(64);
         // Drained-response batch, posted on one doorbell; reused, so no steady alloc.
         let mut resp_batch: Vec<RdmaResp> = Vec::with_capacity(self.nslots as usize);
         // Persistent multishot poll on the comp-channel fd: one SQE, a CQE per
@@ -1431,13 +1497,10 @@ impl RdmaQueue {
             ioutgt_uring::add_park_probe(
                 Box::new(move || {
                     let mut staged = shared.staged.borrow_mut();
-                    let drain = |staged: &mut Vec<(u64, bool)>| {
+                    let drain = |staged: &mut Vec<(u64, u32)>| {
                         if let Ok(poller) = cq.start_poll() {
                             for wc in poller {
-                                staged.push((
-                                    wc.wr_id(),
-                                    wc.status() == WorkCompletionStatus::Success as u32,
-                                ));
+                                staged.push((wc.wr_id(), wc.status()));
                             }
                         }
                     };
@@ -1628,6 +1691,7 @@ fn build_conn_resources(
     ctx: &Arc<DeviceContext>,
     sqsize: u16,
     qid: u16,
+    pool_bytes: usize,
 ) -> io::Result<(
     Arc<ProtectionDomain>,
     Arc<CompletionChannel>,
@@ -1636,7 +1700,18 @@ fn build_conn_resources(
 )> {
     let channel = ctx.create_comp_channel().map_err(oerr)?;
     channel.set_nonblocking(true)?;
-    let depth = u32::from(sqsize) * 3 + 16;
+    // Data WRs are single-SGE, one per contiguous pool run (see
+    // `post_reads_batch`), so the in-flight WR bound follows from the POOL,
+    // not the queue depth: every run holds ≥1 pool grain, so live runs across
+    // all leases ≤ pool grains — reads and response-writes each bounded by
+    // that, plus one response SEND per slot. Clamped for absurd pool sizes.
+    let pool_grains = u32::try_from(pool_bytes / ioutgt_core::pool::PAGE).unwrap_or(u32::MAX);
+    let sq_wrs = (2 * pool_grains.max(1))
+        .saturating_add(u32::from(sqsize) + 16)
+        .clamp(u32::from(sqsize) * 2 + 8, 16384);
+    // Flushed WRs report completions even when unsignaled, so the CQ must
+    // cover the whole SQ + RQ or a teardown flush overruns it.
+    let depth = sq_wrs + u32::from(sqsize) + 24;
     // Spread queues across completion vectors (admin on 0, IO queues on 1, 2,
     // …) like nvmet-rdma (`comp_vector = idx % num_comp_vectors`). Sharing one
     // vector funnels every queue's CQ interrupts through a single MSI-X
@@ -1657,7 +1732,7 @@ fn build_conn_resources(
 
     let pd = ctx.alloc_pd().map_err(oerr)?;
     let mut b = pd.create_qp_builder();
-    b.setup_max_send_wr(u32::from(sqsize) * 2 + 8)
+    b.setup_max_send_wr(sq_wrs)
         .setup_max_recv_wr(u32::from(sqsize) + 8)
         // Up to MAX_DATA_SGE pool segments per RDMA WRITE of a read response.
         .setup_max_send_sge(MAX_DATA_SGE)
@@ -1736,7 +1811,8 @@ pub async fn run_conn(
         u32::from(conn.port.io_queue_size).max(1)
     };
     let sqsize = u16::try_from((u32::from(conn.hsqsize) + 1).clamp(1, cap)).unwrap_or(1);
-    let (pd, channel, cq, qp) = build_conn_resources(&dev, sqsize, conn.qid)?;
+    let (pd, channel, cq, qp) =
+        build_conn_resources(&dev, sqsize, conn.qid, conn.port.queue_buf_bytes)?;
     conn.id.get_qp_attr(QueuePairState::Init)?.apply(&qp)?;
     conn.id
         .get_qp_attr(QueuePairState::ReadyToReceive)?
@@ -1796,6 +1872,14 @@ pub async fn run_conn(
     // error → connection reset (reconnect storm). responder_resources is 0: an
     // nvme-rdma host never issues RDMA reads against the target.
     conn.id.accept(qp_num, &rep, 0, initiator_depth)?;
+    // qid ↔ QPN map: lets a kernel-side `rxe0: qp#N ...` error line be
+    // attributed to (or ruled out as) one of our queues.
+    tracing::info!(
+        qid = conn.qid,
+        qpn = qp_num,
+        initiator_depth,
+        "rdma queue accepted"
+    );
 
     let peer = format!("rdma:qid{}", conn.qid);
     queue
