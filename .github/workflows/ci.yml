@@ -19,10 +19,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # rdma-mummy-sys generates its bindings against the system rdma-core
-      # headers at build time; it needs clang libs <= 19 (the 24.04 image
-      # ships libclang 18 — see README Requirements).
-      - name: install rdma-core headers
-        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
+      # headers at build time, and its bindgen (0.66) mis-generates the
+      # pthread-embedding ibv_* structs against libclang >= 22 (opaque
+      # `_address`-only fields, E0609 "no field" — see README Requirements
+      # and RDMA-Rust/rdma-mummy-sys#24). Pin libclang 19 explicitly; the
+      # runner image's default libclang is newer.
+      - name: install rdma-core headers + libclang 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libibverbs-dev librdmacm-dev
+          sudo apt-get install -y libclang-19-dev || {
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            sudo bash /tmp/llvm.sh 19
+          }
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,8 +45,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: install rdma-core headers
-        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
+      - name: install rdma-core headers + libclang 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libibverbs-dev librdmacm-dev
+          sudo apt-get install -y libclang-19-dev || {
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            sudo bash /tmp/llvm.sh 19
+          }
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
@@ -54,8 +71,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: uname -r
-      - name: install rdma-core
-        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev rdma-core
+      - name: install rdma-core + libclang 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libibverbs-dev librdmacm-dev rdma-core
+          sudo apt-get install -y libclang-19-dev || {
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            sudo bash /tmp/llvm.sh 19
+          }
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
       # Best effort: a soft-RoCE device makes the rxe gates run for real;
       # without it (module absent on most cloud kernels) they skip cleanly —
       # the suite treats "no RDMA device with an active port" as an
