@@ -1,22 +1,40 @@
 [package]
 name = "ioutgt-nvme-tcp"
-description = "NVMe/TCP transport: ICReq handshake, PDU recv/send state machines, digests, R2T"
+description = "NVMe/TCP target binary + transport: ICReq handshake, PDU recv/send state machines, digests, R2T"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "ioutgt-nvme-tcp"
+path = "src/main.rs"
 
 [dependencies]
+ioutgt-backend = { workspace = true }
+# Shared backend builder + JSON config (memory/null/file), the transport-neutral
+# queue-thread pool / control-loop / control API: the TCP Transport impl plugs
+# into the harness; the CLI mirrors the ioutgt-nvme-rdma binary.
+ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
+ioutgt-harness = { workspace = true }
 ioutgt-nvme = { workspace = true }
 ioutgt-stream = { workspace = true }
 ioutgt-uring = { workspace = true }
+clap = { workspace = true }
 libc = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The control-socket integration test parses JSON responses.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

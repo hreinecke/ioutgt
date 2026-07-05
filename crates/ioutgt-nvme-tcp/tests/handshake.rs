@@ -11,10 +11,10 @@ use ioutgt_nvme::{digest, spec};
 use zerocopy::{FromBytes, IntoBytes};
 
 fn start_target() -> std::net::SocketAddr {
-    let mut config = ioutgt::TargetConfig::single_memory("nqn.2026-06.io.ioutgt:test", 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory("nqn.2026-06.io.ioutgt:test", 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
-    ioutgt::spawn_target(config).expect("target start")
+    ioutgt_nvme_tcp::spawn_target(config).expect("target start")
 }
 
 /// Build the 64-byte Connect SQE + 1024-byte data for qid 0.

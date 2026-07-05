@@ -77,8 +77,8 @@ if [ "${1:-}" != "--guest" ]; then
 	RDMA_BIN=-
 	if [ "$MODE" = ioutgt ]; then
 		echo "[host] building targets ($PROFILE)"
-		cargo build $PROFILE_FLAG -p ioutgt --bin ioutgt-nvme-tcp
-		cargo build $PROFILE_FLAG -p ioutgt-nvme-rdma --bin ioutgt-nvme-rdma
+		cargo build $PROFILE_FLAG -p ioutgt-nvme-tcp
+		cargo build $PROFILE_FLAG -p ioutgt-nvme-rdma
 		TCP_BIN="$TOP/target/$PROFILE/ioutgt-nvme-tcp"
 		RDMA_BIN="$TOP/target/$PROFILE/ioutgt-nvme-rdma"
 		for b in "$TCP_BIN" "$RDMA_BIN"; do

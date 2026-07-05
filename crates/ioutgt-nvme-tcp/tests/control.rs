@@ -34,11 +34,11 @@ fn runtime_namespace_add_remove_with_aer() {
     let socket = std::env::temp_dir().join(format!("ioutgt-ctl-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
 
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.control_socket = Some(socket.clone());
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // Admin connection with a parked AER.
     let mut admin = Client::handshake(addr, false, false);
@@ -153,11 +153,11 @@ fn list_controller_reports_queues_and_namespaces() {
     let socket = std::env::temp_dir().join(format!("ioutgt-lsctrl-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
 
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.control_socket = Some(socket.clone());
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // Empty registry: ok, pid present, no controllers.
     let resp = ctl(&socket, r#"{"op":"LIST_CONTROLLER"}"#);
@@ -250,11 +250,11 @@ fn get_stats_counts_ios_and_folds_retired() {
     let socket = std::env::temp_dir().join(format!("ioutgt-stat-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
 
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.control_socket = Some(socket.clone());
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     let mut admin = Client::handshake(addr, false, false);
     let cntlid = admin.connect(0, 32, 0xFFFF, 1);

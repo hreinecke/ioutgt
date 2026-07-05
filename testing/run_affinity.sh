@@ -10,7 +10,7 @@ TOP="$(cd "$(dirname "$0")/.." && pwd)"
 VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
 VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
 
-cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt
+cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt-nvme-tcp
 
 # Tell the guest which checkout (and thus which binary) to use; env
 # does not cross into the VM, the 9p marker directory does. Honour a

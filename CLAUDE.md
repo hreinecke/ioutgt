@@ -18,10 +18,10 @@ refactoring and public-API changes are fine when they improve the design
 ## Commands
 
 ```sh
-cargo build --release -p ioutgt   # the target binary
+cargo build --release -p ioutgt-nvme-tcp   # the target binary
 cargo test --workspace            # unit + in-process integration suites
 cargo test -p ioutgt-uring --test echo        # one integration test file
-cargo test -p ioutgt io_verify                # filter by test name
+cargo test -p ioutgt-nvme-tcp io_verify       # filter by test name
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -60,7 +60,7 @@ cargo run --release --example loadgen -- \
 
 ## Architecture
 
-Nine crates in a strict dependency DAG (full diagrams: architecture.md
+Ten crates in a strict dependency DAG (full diagrams: architecture.md
 §4). The two main leaves are deliberately opposite: `ioutgt-nvme` is
 **sans-IO** (bytes ↔ structs only, no sockets/async — shared by target,
 test client, and the decoder fuzz test) and `ioutgt-uring` is **pure
@@ -73,12 +73,14 @@ future NBD). `ioutgt-stream` is the transport-shared, ZC-aware
 gather-send harness `StreamSender`, layered above core + uring (walked
 end to end in `docs/stream-sender.md`). The frontends compose these:
 `ioutgt-nvme-tcp` (NVMe/TCP transport — joins `QueueCore<Sqe>` with a
-`SendList<SendWork>` as `NvmeTcpQueue` and drives `StreamSender`),
-`ioutgt-backend`, and `ioutgt-control`. The `ioutgt` binary assembles
-everything in `spawn_target()` (`crates/ioutgt/src/lib.rs`). The last
-leaf, `ioutgt-cpus`, provides locality-aware even CPU grouping
-(`spread_cpus`) for topology-aware IO-thread pinning (used only by the
-binary).
+`SendList<SendWork>` as `NvmeTcpQueue` and drives `StreamSender`) and
+`ioutgt-nvme-rdma` (NVMe/RDMA transport), plus `ioutgt-backend` and
+`ioutgt-control`. Each transport crate is self-contained: it ships its
+own binary and assembles the target in `spawn_target()` / `main()`
+(`crates/ioutgt-nvme-tcp/src/lib.rs`, mirrored by `ioutgt-nvme-rdma`),
+running on the shared `ioutgt-harness` queue-thread pool. The last leaf,
+`ioutgt-cpus`, provides locality-aware even CPU grouping (`spread_cpus`)
+for topology-aware IO-thread pinning (used only by the binaries).
 
 Threading: a control thread on plain Tokio does accept + ICReq handshake
 + first-Connect parse, then routes the socket by qid to a pinned queue

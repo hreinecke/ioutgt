@@ -18,11 +18,11 @@ const BLOCK: u64 = 512;
 const BIG: u32 = 131_072;
 
 fn spawn_zc_target() -> std::net::SocketAddr {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 64);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 64);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.send_zc = true;
-    ioutgt::spawn_target(config).expect("target start")
+    ioutgt_nvme_tcp::spawn_target(config).expect("target start")
 }
 
 fn fill_pattern(buf: &mut [u8], seed: u8) {

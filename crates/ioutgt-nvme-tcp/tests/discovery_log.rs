@@ -66,10 +66,10 @@ fn get_disc_log(client: &mut Client, cid: u16, offset: u64, len: u32) -> Vec<u8>
 
 #[test]
 fn discovery_log_is_intact_with_sqflow_disabled() {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     let mut client = Client::handshake(addr, false, false);
     connect_discovery(&mut client);

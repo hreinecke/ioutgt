@@ -31,10 +31,10 @@ fn pool_thread_names() -> Vec<String> {
 
 #[test]
 fn pool_spawns_lazily_on_first_connection() {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 2;
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // The target is bound and the control thread is running, but no
     // client has connected: no admin or IO queue threads exist yet.

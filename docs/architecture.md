@@ -72,7 +72,7 @@ queues reach the same admin/IO threads through the shared harness.
 
 ## 3. Crate map and cross-crate call flow
 
-The workspace is eleven crates forming a strict dependency DAG — every
+The workspace is ten crates forming a strict dependency DAG — every
 crate depends only on layers below it. The two main leaves are
 deliberately opposite in character:
 
@@ -96,7 +96,7 @@ machinery.
 
 ```text
   binaries  ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt                  │  │ ioutgt-nvme-rdma        │
+            │ ioutgt-nvme-tcp         │  │ ioutgt-nvme-rdma        │
             │ (bin: ioutgt-nvme-tcp)  │  │ (bin: ioutgt-nvme-rdma) │
             └─────────────────────────┘  └─────────────────────────┘
   harness   ┌──────────────────────────────────────────────────────┐
@@ -132,11 +132,10 @@ machinery.
 
 | Crate | Role | Depends on (workspace) |
 |-------|------|------------------------|
-| [`ioutgt`](../crates/ioutgt) | the `ioutgt-nvme-tcp` binary + assembly | all others |
+| [`ioutgt-nvme-tcp`](../crates/ioutgt-nvme-tcp) | NVMe/TCP transport + binary | harness, core, backend, control, stream, nvme, uring |
 | [`ioutgt-nvme-rdma`](../crates/ioutgt-nvme-rdma) | NVMe/RDMA transport + binary | harness, core, backend, control, nvme, uring |
 | [`ioutgt-harness`](../crates/ioutgt-harness) | shared binary harness (spawn, queue-thread pool, control server, stat client) | core, backend, control, cpus, uring |
 | [`ioutgt-control`](../crates/ioutgt-control) | config + UDS control plane | core, backend |
-| [`ioutgt-nvme-tcp`](../crates/ioutgt-nvme-tcp) | NVMe/TCP transport | core, stream, nvme, uring |
 | [`ioutgt-backend`](../crates/ioutgt-backend) | storage backends | core, uring |
 | [`ioutgt-stream`](../crates/ioutgt-stream) | protocol-neutral stream mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
 | [`ioutgt-core`](../crates/ioutgt-core) | NVMe model + dispatch + `slotq` engine | nvme |
@@ -147,7 +146,7 @@ machinery.
 ### 3.1 Assembly: what the harness `spawn()` wires up
 
 `main()` parses the config and calls the binary's thin entry point —
-`spawn_target()` ([`crates/ioutgt/src/lib.rs`](../crates/ioutgt/src/lib.rs))
+`spawn_target()` ([`crates/ioutgt-nvme-tcp/src/lib.rs`](../crates/ioutgt-nvme-tcp/src/lib.rs))
 is a kernel-feature probe plus `ioutgt_harness::spawn::<TcpTransport>()`;
 the RDMA binary passes `RdmaTransport` through the same seam.
 

@@ -107,7 +107,11 @@ fn run_verify(hdgst: bool, ddgst: bool) {
     run_verify_cfg(hdgst, ddgst, |_| {});
 }
 
-fn run_verify_cfg(hdgst: bool, ddgst: bool, tweak: impl FnOnce(&mut ioutgt::TargetConfig)) {
+fn run_verify_cfg(
+    hdgst: bool,
+    ddgst: bool,
+    tweak: impl FnOnce(&mut ioutgt_nvme_tcp::TargetConfig),
+) {
     run_verify_full(hdgst, ddgst, false, tweak);
 }
 
@@ -115,13 +119,13 @@ fn run_verify_full(
     hdgst: bool,
     ddgst: bool,
     single_h2c: bool,
-    tweak: impl FnOnce(&mut ioutgt::TargetConfig),
+    tweak: impl FnOnce(&mut ioutgt_nvme_tcp::TargetConfig),
 ) {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 64);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 64);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 2;
     tweak(&mut config);
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     let mut admin = Client::handshake(addr, hdgst, ddgst);
     let cntlid = admin.connect(0, 32, 0xFFFF, 1);

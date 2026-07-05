@@ -10,10 +10,10 @@ use ioutgt_nvme::pdu::PduKind;
 use ioutgt_nvme::{spec, status};
 
 fn run_io_flow(hdgst: bool, ddgst: bool) {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // Admin queue: stays open so the controller stays registered.
     let mut admin = Client::handshake(addr, hdgst, ddgst);

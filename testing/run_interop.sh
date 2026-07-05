@@ -17,7 +17,7 @@ TEST_NAME="${1:-ioutgt_nvme_tcp}"
 PORT="${IOUTGT_PORT:-14420}"
 LOG="$TOP/target/ioutgt-interop.log"
 
-cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt
+cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt-nvme-tcp
 
 # IOUTGT_BACKEND=memory (default) | null | file
 BACKEND_ARGS=()

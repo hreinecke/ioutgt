@@ -40,11 +40,11 @@ fn cap_memlock() {
 
 #[test]
 fn zc_mixed_batch_real_and_fallback_notifs() {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 64);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 64);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.send_zc = true;
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // The queue-thread pool (and its io_uring rings) spawns lazily on the
     // first connection, so open both queues first to force the rings into

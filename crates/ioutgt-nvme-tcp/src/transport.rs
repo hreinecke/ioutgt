@@ -8,12 +8,12 @@ use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+use crate::connection::{ConnPermit, QueueConn, run_queue as tcp_run_queue};
+use crate::handshake::{accept_handshake, read_connect};
 use ioutgt_backend::AnyBackend;
 use ioutgt_core::controller::Registry;
 use ioutgt_core::subsystem::{PortConfig, TransportType};
 use ioutgt_harness::{OnCtx, TargetConfig, Transport};
-use ioutgt_nvme_tcp::connection::{ConnPermit, QueueConn, run_queue as tcp_run_queue};
-use ioutgt_nvme_tcp::handshake::{accept_handshake, read_connect};
 
 use crate::{CONNECT_DISABLE_SQFLOW, sqsize_cap};
 
@@ -57,7 +57,7 @@ impl Transport for TcpTransport {
             &mut stream,
             cfg.allow_hdgst,
             cfg.allow_ddgst,
-            ioutgt_nvme_tcp::MAX_H2C_DATA,
+            crate::MAX_H2C_DATA,
         )
         .await?;
         let first = read_connect(&mut stream, negotiated).await?;

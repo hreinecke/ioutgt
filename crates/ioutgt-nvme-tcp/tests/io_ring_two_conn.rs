@@ -1,23 +1,27 @@
 #![allow(clippy::cast_possible_truncation)] // test indices bounded by constants
 
-//! Zero-copy recv-ring torture against a *slow* backend.
+//! Two connections sharing ONE reactor thread, each with its OWN recv ring.
 //!
-//! The instant memory backend completes a write before the next recv chunk
-//! even arrives, so a retained recv-ring sub-buffer is borrowed for almost no
-//! time. A real SSD makes the write take long enough that many in-flight
-//! writes pin both sub-buffers at once, driving the recv loop into the
-//! 2-buffer back-pressure (ENOBUFS park) and deferred-re-provide paths — the
-//! load- and timing-dependent corner the box reproduces and the in-process
-//! suites miss.
+//! Connections routed to the same io thread (qid `n` → io thread `(n-1) % N`)
+//! share its single io_uring. With `io_threads = 1`, every IO queue lands on
+//! thread 0. Two independent controllers (each its own admin + one qid-1 IO
+//! connection) therefore run two multishot recvs on the same reactor, each
+//! drawing from its own per-connection 2-sub-buffer ring (distinct `bgid`s
+//! from the thread-local pool).
 //!
-//! This test reconstructs that pressure locally with a deliberately tiny ring
-//! (two sub-buffers), an artificial per-write delay (`mem_write_delay_us`), and
-//! a *sliding-window* pipeline that keeps many whole-transfer (single-PDU) R2T
-//! writes outstanding at once — so the ring stays saturated, sub-buffers stay
-//! borrowed across slow writes, and recv repeatedly parks on ENOBUFS and
-//! resumes on deferred re-provide. Then it reads everything back and verifies
-//! byte-for-byte. A corruption, assertion, or hang here is the recv-ring
-//! lifecycle bug.
+//! REGRESSION GUARD for the shared-ring offset-desync corruption. Recv rings
+//! used to be created once per reactor thread and SHARED by every connection on
+//! it. A recv CQE carries only `(bid, len)`, not the buffer offset, and
+//! `StreamReader`'s ring mode reads and advances `BufRing::recv_off(bid)` inside
+//! each connection's own task; two connections' tasks do not run in
+//! CQE-completion order, so the shared per-buffer offset desynced and one
+//! connection read bytes the kernel delivered to the other — framing/data
+//! corruption (observed as "response for unknown cid", a verify mismatch, or a
+//! broken pipe). The fix gives each connection its OWN ring (one consumer per
+//! ring ⇒ the offset cannot desync). This test pins two connections to one
+//! io-thread with the ring on and verifies both complete with byte-correct
+//! data, even under a slow backend that keeps both rings saturated and parked
+//! on ENOBUFS together.
 
 mod common;
 
@@ -31,7 +35,13 @@ use ioutgt_nvme::{spec, status};
 const BLOCK: u64 = 512;
 /// Whole-transfer sizes; the larger ones (> 16 KiB inline limit) take the R2T
 /// path and, when they fit a sub-buffer, are retained zero-copy as one PDU.
-const SIZES: &[u32] = &[65_536, 131_072, 65_536, 32_768, 131_072, 98_304];
+const SIZES: &[u32] = &[65_536, 131_072, 98_304, 32_768, 131_072, 65_536];
+
+/// Whole-transfer writes per connection.
+const TOTAL: usize = 400;
+/// Outstanding writes per connection, so the shared ring stays saturated and
+/// both connections park on ENOBUFS together.
+const WINDOW: usize = 32;
 
 fn fill_pattern(buf: &mut [u8], slba: u64, generation: u8) {
     for (block_index, chunk) in buf.chunks_mut(BLOCK as usize).enumerate() {
@@ -53,12 +63,6 @@ struct Region {
     generation: u8,
 }
 
-/// Total whole-transfer writes pushed through the pipeline.
-const TOTAL: usize = 800;
-/// Target number of writes outstanding at once (near the 64-deep queue) so the
-/// two-sub-buffer ring stays saturated and recv keeps parking on ENOBUFS.
-const WINDOW: usize = 48;
-
 fn submit_write(io: &mut Client, cid: u16, region: &Region) {
     let nblocks = u64::from(region.len) / BLOCK;
     let nlb0 = u16::try_from(nblocks - 1).unwrap();
@@ -75,24 +79,14 @@ fn submit_write(io: &mut Client, cid: u16, region: &Region) {
 }
 
 /// Sliding-window write pipeline over one connection, then read-back verify.
-fn drive_connection(
-    addr: std::net::SocketAddr,
-    qid: u16,
-    cntlid: u16,
-    band_base: u64,
-    hdgst: bool,
-    ddgst: bool,
-) {
-    let mut io = Client::handshake(addr, hdgst, ddgst);
-    io.connect(qid, 64, cntlid, 1);
-    // A hang (buffer-leak deadlock) must fail the test, not block forever.
+fn drive_connection(addr: std::net::SocketAddr, cntlid: u16, generation: u8, band_base: u64) {
+    let mut io = Client::handshake(addr, false, false);
+    io.connect(1, 64, cntlid, 1);
+    // A hang (lost-wakeup deadlock) must fail the test, not block forever.
     io.stream()
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
 
-    let generation = (qid as u8).wrapping_add(1);
-
-    // Precompute disjoint regions.
     let mut regions: Vec<Region> = Vec::with_capacity(TOTAL);
     let mut slba = band_base;
     for i in 0..TOTAL {
@@ -105,7 +99,6 @@ fn drive_connection(
         slba += u64::from(len) / BLOCK;
     }
 
-    // cid → region index, for in-flight writes (awaiting R2T then response).
     let mut inflight: HashMap<u16, usize> = HashMap::new();
     let mut next_idx = 0usize;
     let mut completed = 0usize;
@@ -119,7 +112,6 @@ fn drive_connection(
         c
     };
 
-    // Prime the window.
     for _ in 0..WINDOW.min(TOTAL) {
         let cid = alloc_cid();
         let idx = next_idx;
@@ -128,8 +120,6 @@ fn drive_connection(
         submit_write(&mut io, cid, &regions[idx]);
     }
 
-    // Drain R2Ts (send the H2C payload) and responses (free a window slot and
-    // submit the next write) until every write has completed.
     while completed < TOTAL {
         let (decoded, _) = io.recv_pdu();
         match decoded.kind {
@@ -187,53 +177,44 @@ fn drive_connection(
         fill_pattern(&mut expect, region.slba, region.generation);
         assert_eq!(
             payload, expect,
-            "qid={qid} verify failed at slba={} len={}",
+            "gen={generation} verify failed at slba={} len={}",
             region.slba, region.len
         );
         cid = cid.wrapping_add(1).max(1);
     }
 }
 
-fn run(recv_buf_bytes: usize, write_delay_us: u64, hdgst: bool, ddgst: bool) {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 1024);
+/// Two IO connections on a single io thread, each with its own per-connection
+/// recv ring, under a slow backend. Both should finish and read back
+/// byte-for-byte. Regression guard for the shared-ring offset-desync
+/// corruption documented at the top of this file.
+#[test]
+fn two_connections_per_connection_ring_no_corruption() {
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 2048);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
-    config.recv_buf_bytes = recv_buf_bytes;
-    config.mem_write_delay_us = write_delay_us;
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    config.recv_buf_bytes = 256 * 1024; // two 128 KiB sub-buffers
+    config.mem_write_delay_us = 300;
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
-    let mut admin = Client::handshake(addr, hdgst, ddgst);
-    let cntlid = admin.connect(0, 32, 0xFFFF, 1);
+    // Two independent controllers, each its own admin connection (kept alive
+    // for controller liveness) plus one qid-1 IO connection. With io_threads=1
+    // both IO connections route to io thread 0 ((1-1) % 1 == 0), sharing the
+    // reactor but each with its OWN recv ring. Drive them concurrently so both
+    // park on ENOBUFS.
+    let mut admin_a = Client::handshake(addr, false, false);
+    let cntlid_a = admin_a.connect(0, 32, 0xFFFF, 1);
+    let mut admin_b = Client::handshake(addr, false, false);
+    let cntlid_b = admin_b.connect(0, 32, 0xFFFF, 1);
 
-    drive_connection(addr, 1, cntlid, 0, hdgst, ddgst);
-}
-
-/// Saturated retain pipeline, 256 KiB ring (two 128 KiB sub-buffers), slow
-/// writes — the headline reproducer.
-#[test]
-fn slow_backend_recv_ring_retain() {
-    run(256 * 1024, 300, false, false);
-}
-
-/// Same with header+data digests: the DDGST is folded over retained ring
-/// memory window by window, never over bytes the kernel has not delivered.
-#[test]
-fn slow_backend_recv_ring_retain_digests() {
-    run(256 * 1024, 300, true, true);
-}
-
-/// Smaller ring (two 32 KiB sub-buffers): most transfers exceed a sub-buffer,
-/// so retains fail the fit check and fall to the copy path while the few that
-/// fit stay borrowed — exercises the retain/copy boundary under back-pressure.
-#[test]
-fn slow_backend_recv_ring_small_buffers() {
-    run(64 * 1024, 200, false, false);
-}
-
-/// Larger 2 MiB-sub-buffer ring matching the box's `--recv-buf-mb 4`: a 64 KiB
-/// or 128 KiB payload is retained far inside one sub-buffer and spans several
-/// recv chunks before completing.
-#[test]
-fn slow_backend_recv_ring_box_geometry() {
-    run(4 * 1024 * 1024, 250, false, false);
+    // Disjoint bands within the shared 2 GiB namespace (both controllers see
+    // the same backing store): A near 0, B at 1 M blocks.
+    let h1 = std::thread::spawn(move || drive_connection(addr, cntlid_a, 1, 0));
+    let h2 = std::thread::spawn(move || drive_connection(addr, cntlid_b, 2, 1_000_000));
+    let r1 = h1.join();
+    let r2 = h2.join();
+    drop(admin_a);
+    drop(admin_b);
+    r1.expect("controller A connection");
+    r2.expect("controller B connection");
 }

@@ -236,7 +236,7 @@ atomic load. Everything else on the data path is `Cell`/`RefCell`.
 **Multiple subsystems share one pool — there is no pool-per-subsystem.**
 A port may serve several subsystems, but they are all served by a single
 fixed per-port pool: 1 admin thread + N IO threads (`build_pool` in
-`crates/ioutgt/src/lib.rs`), lazily spawned on the first connection and
+`crates/ioutgt-harness/src/lib.rs`), lazily spawned on the first connection and
 reclaimed after an idle grace period. Connections hash onto it by qid
 (`(qid−1) % N`); the subsystem is resolved **per connection** from the
 Connect capsule's `subsysnqn` (`fabrics_exec.rs` → `PortConfig::subsystem`)

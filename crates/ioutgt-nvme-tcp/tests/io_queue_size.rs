@@ -10,11 +10,11 @@ use ioutgt_nvme::spec;
 use zerocopy::FromBytes;
 
 fn start_target(io_queue_size: u16) -> std::net::SocketAddr {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.io_queue_size = io_queue_size;
-    ioutgt::spawn_target(config).expect("target start")
+    ioutgt_nvme_tcp::spawn_target(config).expect("target start")
 }
 
 /// MAXCMD must equal the configured io_queue_size — distinct from the

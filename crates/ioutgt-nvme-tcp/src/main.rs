@@ -1,4 +1,9 @@
-//! ioutgt — high-performance io_uring-based NVMe/TCP target.
+//! ioutgt-nvme-tcp — high-performance io_uring-based NVMe/TCP target binary.
+//!
+//! Runs on the shared `ioutgt-harness` queue-thread pool (admin thread + N IO
+//! threads, CPU-pinned), with the runtime control socket (`ctl`/`list`/`stat`
+//! served by the harness). The sibling `ioutgt-nvme-rdma` binary mirrors this
+//! CLI for the RDMA transport.
 
 use ioutgt_harness::client::{ctl, list_target, stat_target};
 
@@ -160,10 +165,10 @@ fn main() -> std::io::Result<()> {
     }
 
     let config = match &args.config {
-        Some(path) => ioutgt::TargetConfig::from_file(path)?,
+        Some(path) => ioutgt_nvme_tcp::TargetConfig::from_file(path)?,
         None => {
             let mut config =
-                ioutgt::TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
+                ioutgt_nvme_tcp::TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
             config.listen = args.listen;
             config.io_threads = args.io_threads;
             config.allow_hdgst = !args.no_hdgst;
@@ -189,7 +194,7 @@ fn main() -> std::io::Result<()> {
             config
         }
     };
-    let addr = ioutgt::spawn_target(config)?;
+    let addr = ioutgt_nvme_tcp::spawn_target(config)?;
     eprintln!("ioutgt listening on {addr}");
     // The target runs on its own threads; park the main thread.
     loop {

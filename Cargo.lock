@@ -366,26 +366,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ioutgt"
-version = "0.1.0"
-dependencies = [
- "clap",
- "ioutgt-backend",
- "ioutgt-control",
- "ioutgt-core",
- "ioutgt-harness",
- "ioutgt-nvme",
- "ioutgt-nvme-tcp",
- "ioutgt-uring",
- "libc",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zerocopy",
-]
-
-[[package]]
 name = "ioutgt-backend"
 version = "0.1.0"
 dependencies = [
@@ -472,13 +452,19 @@ dependencies = [
 name = "ioutgt-nvme-tcp"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "ioutgt-backend",
+ "ioutgt-control",
  "ioutgt-core",
+ "ioutgt-harness",
  "ioutgt-nvme",
  "ioutgt-stream",
  "ioutgt-uring",
  "libc",
+ "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zerocopy",
 ]
 

@@ -53,12 +53,12 @@ fn connect_admin(addr: std::net::SocketAddr) -> Client {
 
 #[test]
 fn pool_reclaimed_after_idle_then_respawned() {
-    let mut config = ioutgt::TargetConfig::single_memory(NQN, 16);
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 2;
     // Short grace so the test is fast (production default is 30s).
     config.idle_teardown = Some(Duration::from_millis(500));
-    let addr = ioutgt::spawn_target(config).expect("target start");
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     assert!(
         pool_thread_names().is_empty(),
