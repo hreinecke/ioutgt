@@ -262,6 +262,57 @@ fn fill_sges(
     n
 }
 
+/// The one-sided op a batched data-transfer WR issues over a pool run.
+#[derive(Clone, Copy)]
+enum SgeOp {
+    /// RDMA READ — pull host write-data into the slot.
+    Read,
+    /// RDMA WRITE — push slot read-data to the host.
+    Write,
+}
+
+/// Post one single-SGE work request per contiguous pool run in `sges`, all on
+/// the open guard `g`, advancing the remote address run by run; only the last
+/// run is signaled (so one completion per command, RC-ordered). Returns the WR
+/// count. Shared by [`RdmaQueue::post_reads_batch`] (READ) and
+/// [`RdmaQueue::post_responses_batch`]'s read-data WRITE.
+///
+/// Single-SGE per run on purpose, not just simplicity: rdma-core's rxe provider
+/// (≤ v61) computes a multi-SGE WR's total length as `num_sge × sge[0].length`
+/// (`wr_set_sge_list` never advances the list pointer), inflating the wire RETH
+/// length of a fragmented lease — the host responder then NAKs Remote Access and
+/// kills the QP (found by xfstests generic/113). Single-SGE WRs are immune on
+/// every provider, and the common unfragmented lease still posts exactly one WR.
+fn post_sge_runs<G: PostSendGuard>(
+    g: &mut G,
+    wr_id: u64,
+    op: SgeOp,
+    rkey: u32,
+    base: u64,
+    lkey: u32,
+    sges: &[ibv_sge],
+) -> u64 {
+    let mut remote = base;
+    for (i, sge) in sges.iter().enumerate() {
+        let flags = if i + 1 == sges.len() {
+            WorkRequestFlags::Signaled
+        } else {
+            WorkRequestFlags::none()
+        };
+        let wr = g.construct_wr(wr_id, flags);
+        let h = match op {
+            SgeOp::Read => wr.setup_read(rkey, remote),
+            SgeOp::Write => wr.setup_write(rkey, remote),
+        };
+        // SAFETY: the sge references the registered pool arena (`lkey`); the
+        // slot stays leased until its response WRs complete (its tag is not
+        // released until then), so the memory outlives the transfer.
+        unsafe { h.setup_sge(lkey, sge.addr, sge.length) };
+        remote += u64::from(sge.length);
+    }
+    sges.len() as u64
+}
+
 /// The extended-verbs handle of `qp`, for work-request calls sideway does not
 /// wrap. All target QPs are built with `build_ex` (asserted), so the handle is
 /// valid whenever a post-send guard session is open on `qp`.
@@ -841,24 +892,15 @@ impl RdmaQueue {
                 pool_lkey,
                 &mut sges,
             );
-            let mut remote = pr.addr;
-            for (i, sge) in sges[..n].iter().enumerate() {
-                let flags = if i + 1 == n {
-                    WorkRequestFlags::Signaled
-                } else {
-                    WorkRequestFlags::none()
-                };
-                let h = g
-                    .construct_wr(WrId::new(WrKind::Read, u32::from(pr.tag)).encode(), flags)
-                    .setup_read(pr.rkey, remote);
-                // SAFETY: the sge references the registered pool arena
-                // (pool_lkey, is_pool-checked in handle_recv); the slot stays
-                // leased until its response SEND completes (tag not released
-                // until then).
-                unsafe { h.setup_sge(pool_lkey, sge.addr, sge.length) };
-                remote += u64::from(sge.length);
-                reads += 1;
-            }
+            reads += post_sge_runs(
+                &mut g,
+                WrId::new(WrKind::Read, u32::from(pr.tag)).encode(),
+                SgeOp::Read,
+                pr.rkey,
+                pr.addr,
+                pool_lkey,
+                &sges[..n],
+            );
         }
         // One atomic ibv_post_send for the batch (extended guard's
         // ibv_wr_complete); a post error is fatal and tears the queue down, so
@@ -1350,26 +1392,17 @@ impl RdmaQueue {
                     &mut sges,
                 );
                 let dst = parse_keyed_sgl(&resp.cmd);
-                // One single-SGE WRITE per contiguous pool run, only the last
-                // signaled — same rxe-provider multi-SGE-length workaround
-                // (and completion protocol) as `post_reads_batch`.
-                let mut remote = dst.addr;
-                for (i, sge) in sges[..n].iter().enumerate() {
-                    let flags = if i + 1 == n {
-                        WorkRequestFlags::Signaled
-                    } else {
-                        WorkRequestFlags::none()
-                    };
-                    let hw = g
-                        .construct_wr(WrId::new(WrKind::Write, u32::from(tag)).encode(), flags)
-                        .setup_write(dst.rkey, remote);
-                    // SAFETY: the sge references the registered pool arena
-                    // (pool_lkey); the slot stays leased until both WRs
-                    // complete (tag not released).
-                    unsafe { hw.setup_sge(pool_lkey, sge.addr, sge.length) };
-                    remote += u64::from(sge.length);
-                    writes += 1;
-                }
+                // One single-SGE WRITE per contiguous pool run (the rxe
+                // multi-SGE-length workaround; see `post_sge_runs`).
+                writes += post_sge_runs(
+                    &mut g,
+                    WrId::new(WrKind::Write, u32::from(tag)).encode(),
+                    SgeOp::Write,
+                    dst.rkey,
+                    dst.addr,
+                    pool_lkey,
+                    &sges[..n],
+                );
                 pending = 2;
             }
             let off = tag as usize * CQE_LEN;
