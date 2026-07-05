@@ -2,12 +2,27 @@
 
 Status: **built** (M15 transport + M16 perf + M17 adaptive `--poll`).
 A standalone binary on the shared `ioutgt-harness` pool; kernel-host
-interop green on soft-RoCE (VM gates) and mlx5 (two-NIC box); matches
-or beats nvmet-rdma on every single-job fio_perf phase on the test box
-(64k +38-44%, 4k within ±3%). Reuses the NVMe model / slot engine /
-dispatch / backends (`ioutgt-core`, `ioutgt-nvme`) unchanged; new here:
-memory registration, CQ draining through the reactor, RDMA-CM
-acceptance, the recv/reap machinery.
+interop green on soft-RoCE (VM gates) and mlx5 (two-NIC box), matching
+or beating nvmet-rdma on every single-job fio_perf phase on the test box
+(64k +38-44%, 4k within ±3%).
+
+This doc covers only the RDMA-specific layer — memory registration, CQ
+draining through the reactor, RDMA-CM acceptance, and the recv/reap
+machinery. The machinery it sits on is documented elsewhere:
+
+- thread model, reactor, slot engine, transport contract —
+  [`architecture.md`](architecture.md) (§2, §4, §5.1)
+- NVMe model / dispatch / backends, reused unchanged from TCP —
+  [`architecture.md`](architecture.md) (§6, §7)
+- where this transport plugs into the shared base —
+  [`architecture.md`](architecture.md) (§5.1.2)
+- flow control vs nvmet / SPDK —
+  [`rdma-flow-control-nvmet-vs-spdk.md`](rdma-flow-control-nvmet-vs-spdk.md)
+
+Wire behavior mirrors kernel nvmet-rdma (`drivers/nvme/target/rdma.c`).
+Errors produce typed NVMe status CQEs or CM rejects, not panics or silent
+closes — except the paths the "Known v1 divergences" below call out, which
+surface as a torn-down queue.
 
 ## Wire protocol
 
@@ -30,20 +45,23 @@ no digests.
                                              after the WRITE)
 ```
 
-Write data ≤ 4 KiB rides **in the capsule**: IOCCSZ advertises
-`RDMA_INLINE_DATA_SIZE` (4 KiB) and SGLS sets the address-as-offset bit
-(SAOS — what actually gates the host's `use_inline_data`). One ~100 ns
-copy capsule → pool lease, no RDMA READ round-trip; the capsule's RECV
-re-post is deferred until the copy (ring-safe: no response yet, so the
-host can't reuse that SQ slot). This closed the last single-flow
-4k-randwrite deficit vs nvmet.
+Write-data placement forks on size:
 
-Larger writes post an RDMA READ into the slot's pool-registered
-segments **without submitting the slot**; submission is deferred to the
-READ completion (`submit_pending`), which wakes the slot task against
-the now-filled slot. Malformed SGLs (bad descriptor, out-of-bounds
-offset, zero length) fail without dispatch via a queued error CQE
-(`SGL_INVALID_TYPE` / `DATA_SGL_LEN_INVALID`).
+- **≤ 4 KiB — inline in the capsule.** IOCCSZ advertises
+  `RDMA_INLINE_DATA_SIZE` (4 KiB) and SGLS sets the address-as-offset bit
+  (SAOS — what actually gates the host's `use_inline_data`). One ~100 ns
+  copy capsule → pool lease, no RDMA READ round-trip; the capsule's RECV
+  re-post is deferred until the copy (ring-safe: no response yet, so the
+  host can't reuse that SQ slot). This closed the last single-flow
+  4k-randwrite deficit vs nvmet.
+- **Larger — one-sided RDMA READ.** The target posts an RDMA READ into
+  the slot's pool-registered segments *without submitting the slot*;
+  submission defers to the READ completion (`submit_pending`), which wakes
+  the slot task against the now-filled slot.
+
+Malformed SGLs (bad descriptor, out-of-bounds offset, zero length) fail
+without dispatch via a queued error CQE (`SGL_INVALID_TYPE` /
+`DATA_SGL_LEN_INVALID`).
 
 ## Bindings: sideway (verbs) + rdma-mummy-sys (CM)
 
