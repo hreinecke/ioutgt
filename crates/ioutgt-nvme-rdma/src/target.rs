@@ -1892,8 +1892,15 @@ fn build_conn_resources(
     let mut b = pd.create_qp_builder();
     b.setup_max_send_wr(sq_wrs)
         .setup_max_recv_wr(u32::from(sqsize) + 8)
-        // Up to MAX_DATA_SGE pool segments per RDMA WRITE of a read response.
-        .setup_max_send_sge(MAX_DATA_SGE)
+        // One SGE per send WR: every data transfer is a single-SGE WR — one
+        // RDMA READ/WRITE per contiguous pool run (see `post_sge_runs`) — and
+        // the CQE SEND carries one sge. A larger cap (this was `MAX_SEGS` = 32
+        // for the old multi-SGE WRs) inflates each mlx5 send WQE to ~9 WQEBBs,
+        // so `sq_wrs` (2×pool_grains, ~4240 at 8 MiB) × that overruns the HCA's
+        // `max_qp_wr` (8192) and `ibv_create_qp` returns EINVAL — killing the
+        // admin queue and hanging the host connect. rxe ignores the WQEBB
+        // budget, so only real HCAs hit it.
+        .setup_max_send_sge(1)
         .setup_max_recv_sge(1)
         .setup_send_cq(cq.clone())
         .setup_recv_cq(cq.clone())
@@ -1906,12 +1913,6 @@ fn build_conn_resources(
     let qp: GenericQueuePair = b.build_ex().map_err(oerr)?.into();
     Ok((pd, channel, cq, qp))
 }
-
-/// QP send-SGE cap. Must equal the pool's max segments per lease so a fragmented
-/// read response's RDMA WRITE (one sge per run) never exceeds `max_send_sge` —
-/// otherwise `ibv_post_send` returns EINVAL and kills the connection.
-#[allow(clippy::cast_possible_truncation)] // MAX_SEGS (32) trivially fits u32
-const MAX_DATA_SGE: u32 = MAX_SEGS as u32;
 
 /// Admin (qid 0) queue-depth cap (entries). The fabrics admin queue is small;
 /// clamp a host's request to this regardless of what it asks for.
