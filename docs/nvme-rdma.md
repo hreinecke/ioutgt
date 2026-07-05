@@ -123,7 +123,7 @@ control loop is plain Tokio with no reactor. So `bind` spawns a dedicated
   │                     rdma_reject; else adopt the child cm_id
   │   ESTABLISHED     → ack
   │   DISCONNECTED    → DREP, fire the conn's stop, prune conns
-  ▼   RdmaRaw { cm_id, qid, hsqsize, stop } ── bounded mpsc (≤256) ──►
+  ▼   RdmaRaw { id (cm_id), qid, hsqsize, stop } ─ bounded mpsc (≤256) ─►
 
   control thread — harness plain-Tokio loop (shared with TCP)
   │ accept()     drain the mpsc → one RdmaRaw
