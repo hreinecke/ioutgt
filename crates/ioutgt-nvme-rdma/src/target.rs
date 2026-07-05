@@ -960,13 +960,9 @@ impl RdmaQueue {
                     self.wr.read.complete();
                     self.submit_pending(low as u16);
                 }
-                WrKind::Send => {
-                    self.wr.send.complete();
-                    self.on_response_done(low);
-                }
-                WrKind::Write => {
-                    self.wr.write.complete();
-                    self.on_response_done(low);
+                // Response WRs: the CQE SEND, and the read-data WRITE before it.
+                WrKind::Send | WrKind::Write => {
+                    self.service_response(kind, low);
                 }
             }
         }
@@ -1072,6 +1068,21 @@ impl RdmaQueue {
         }
     }
 
+    /// Service a response-WR completion — the CQE SEND, or the read-data RDMA
+    /// WRITE that precedes it — counting it and dropping the tag's in-flight
+    /// response count (releasing the slot at 0). Returns `true` if `kind` was a
+    /// response WR; `false` (a no-op) for RECV/READ. Shared by the steady reap
+    /// loop and [`Self::await_bootstrap`], which service responses identically.
+    fn service_response(&mut self, kind: WrKind, low: u32) -> bool {
+        match kind {
+            WrKind::Send => self.wr.send.complete(),
+            WrKind::Write => self.wr.write.complete(),
+            WrKind::Recv | WrKind::Read => return false,
+        }
+        self.on_response_done(low);
+        true
+    }
+
     /// Bootstrap-only: park on the completion channel until a completion of
     /// `kind` (`WrKind::Recv` for the Connect capsule, `WrKind::Read` for its keyed-SGL
     /// connect data) arrives, returning its low bits (the recv buffer index /
@@ -1100,19 +1111,10 @@ impl RdmaQueue {
                     .complete();
                     return Ok(low);
                 }
-                match k {
-                    WrKind::Send => {
-                        self.wr.send.complete();
-                        self.on_response_done(low);
-                    }
-                    WrKind::Write => {
-                        self.wr.write.complete();
-                        self.on_response_done(low);
-                    }
-                    // A RECV/READ that isn't the awaited kind: ignore
-                    // (bootstrap awaits exactly one of them).
-                    WrKind::Recv | WrKind::Read => {}
-                }
+                // Not the awaited kind: service any response WR (SEND/WRITE) so
+                // slots still release during bootstrap; a non-awaited RECV/READ
+                // is ignored (`service_response` returns false).
+                self.service_response(k, low);
             }
         }
     }
