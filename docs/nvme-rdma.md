@@ -76,31 +76,57 @@ Three seams:
 
 The binary runs on the shared harness pool via
 `ioutgt_harness::spawn::<RdmaTransport>` — multi-core queues, control
-socket, `ConnPermit`, idle-teardown, same as TCP. One mismatch: the CM
-event channel parks on its fd via io_uring `POLL_ADD`, which the
-plain-Tokio control thread can't provide — so `bind` spawns a dedicated
-CM reactor thread.
+socket, `ConnPermit`, idle-teardown, same as TCP. Where TCP hands a socket
+straight from the control thread to a queue thread, RDMA inserts a third
+thread first. The reason: the RDMA-CM event channel is awaited by parking
+its fd on an io_uring `POLL_ADD` (`CmChannel::next_event`), but the harness
+control loop is plain Tokio with no reactor. So `bind` spawns a dedicated
+**CM reactor thread**, and a connection crosses all three — one job each:
+
+- **CM thread** (`cm_thread_main`, own reactor) — owns the one CM event
+  channel (it multiplexes every cm_id) and runs `RdmaListener::accept`:
+  validate + adopt (or typed-`rdma_reject`) each `CONNECT_REQUEST`, ack
+  `ESTABLISHED`, and on `DISCONNECTED` send the DREP + fire the queue's
+  `stop` + prune. Emits one `RdmaRaw` per good connect; never touches a QP.
+- **Control thread** (harness plain-Tokio loop, shared with TCP) — bridges
+  CM → queue: `accept` drains the CM→control mpsc, `handshake` wraps the
+  `RdmaRaw` as an `RdmaConn` (no wire I/O — the fabrics Connect arrives later
+  over the QP), and the harness routes by qid, exactly as TCP: **qid 0 →
+  admin thread, qid n → io thread `(n-1) % N`**.
+- **Queue thread** (pinned; owns this queue's io_uring) — `run_conn` does
+  everything verbs-bound: build the QP on the cm_id's device, drive
+  `INIT → RTR → RTS`, prime RECVs + arm the CQ *before* `rdma_accept`, then
+  run the reap loop + slot tasks (the "Queue pipeline" section below).
 
 ```text
- CM thread (cm_thread_main,          queue thread (routed by qid)
- own QueueRuntime)                   ┌─────────────────────────────────┐
-   rdma_cm events:                   │ run_conn:                       │
-   ├─ CONNECT_REQUEST                │   PD / comp-channel / CQ / QP   │
-   │    qid from private data;       │     on the cm_id's own device   │
-   │    malformed recfmt/len →       │     context                     │
-   │    typed rdma_reject.           │   INIT→RTR→RTS (CM attrs)       │
-   │    RdmaRaw ──mpsc──► control    │   prime RECVs + arm CQ          │
-   │    thread (harness routes       │     BEFORE rdma_accept — the    │
-   │    qid 0 → admin,               │     first capsule is never lost │
-   │    qid n → io[(n-1) % N])       │   run(): reap loop + slot tasks │
-   ├─ ESTABLISHED                    └─────────────────────────────────┘
-   └─ DISCONNECTED → DREP, prune
-        conns, fire the conn's stop
+  CM thread — cm_thread_main, own io_uring reactor
+  │ RdmaListener::accept   (one CM channel multiplexes all cm_ids)
+  │   CONNECT_REQUEST → parse CmReq; bad recfmt/len → typed
+  │                     rdma_reject; else adopt the child cm_id
+  │   ESTABLISHED     → ack
+  │   DISCONNECTED    → DREP, fire the conn's stop, prune conns
+  ▼   RdmaRaw { cm_id, qid, hsqsize, stop } ── bounded mpsc (≤256) ──►
+
+  control thread — harness plain-Tokio loop (shared with TCP)
+  │ accept()     drain the mpsc → one RdmaRaw
+  │ handshake()  wrap as RdmaConn   (no wire I/O; Connect comes later)
+  │ route by qid    qid 0 → admin thread,   qid n → io thread (n-1) % N
+  ▼   RdmaConn (Send) ──────────────────────────────────────────────►
+
+  queue thread — pinned; its io_uring reaps this queue's completions
+  │ run_conn:
+  │   build PD / comp-channel / CQ / QP on the cm_id's device
+  │   INIT → RTR → RTS         (CM-derived QP attributes)
+  │   prime RECVs + arm CQ     ── BEFORE rdma_accept, so the host's
+  │                               first capsule is never lost
+  │   rdma_accept              (reply CmRep{crqsize}; initiator_depth arg)
+  │   run(): reap loop + per-tag slot tasks
 ```
 
-A cm_id is created and has its lifecycle events pumped on the CM
-thread but builds its QP and `rdma_accept`s on a queue thread
-(`Identifier: Send + Sync`; librdmacm cm_id ops are thread-safe).
+The cm_id makes both hops: created and pumped for lifecycle events on the
+CM thread, but its QP is built and `rdma_accept`ed on the queue thread. It
+travels as the `Send` `RdmaRaw`/`RdmaConn` (`Identifier: Send + Sync`;
+librdmacm cm_id operations are thread-safe).
 
 Accept-time QP details: admin depth clamped to 32; the reply's
 `initiator_depth` = the QP's real `max_rd_atomic` (a hardcoded value
