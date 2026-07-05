@@ -104,10 +104,8 @@ thread but builds its QP and `rdma_accept`s on a queue thread
 
 Accept-time QP details: admin depth clamped to 32; the reply's
 `initiator_depth` = the QP's real `max_rd_atomic` (a hardcoded value
-here once caused reconnect storms); IO queues widen the RC ACK timeout
-to ~4.3 s (admin stays short to protect keep-alive detection); CQs are
-spread across completion vectors (admin on 0, IO by qid; rxe falls
-back to 0).
+here once caused reconnect storms);  CQs are spread across completion
+vectors (admin on 0, IO by qid; rxe falls back to 0).
 
 ## Queue pipeline (`target.rs`)
 
@@ -282,5 +280,3 @@ Box gotchas baked into the two-NIC driver:
   historical "64k congestion wedge" was NetworkManager's DHCP loop
   flushing the test IP/GID — see `rdma-64k-congestion-wedge.md`.
 
-Wire-protocol background:
-<https://ming1.github.io/storage/linux-nvme-target-explained#156-nvme-rdma-wire-protocol-for-read--write>
