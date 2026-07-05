@@ -26,22 +26,10 @@ Easy to develop and maintain
 
 Crash in isolation
 
-## Design highlights
-
-- **One thread per NVMe queue**, each with its own io_uring instance
-  (`SINGLE_ISSUER | DEFER_TASKRUN`) and its own Tokio current-thread
-  runtime — no work stealing, no cross-queue scheduling, no shared locks
-  on the data path.
-- **Bounded concurrency as a first-class primitive**: NVMe queue depth and
-  command IDs bound all in-flight state, so every command slot, buffer, and
-  async task is preallocated at queue creation. Steady state performs zero
-  allocations — SPDK's request-tracker model with async/await readability.
-- **Sans-io protocol core**: the NVMe/TCP PDU codec operates on byte slices
-  only, shared by the target, the test client, and the fuzzer.
-- **Backends** (null, memory, file, block device) implement one async trait
-  and have no protocol awareness, mirroring the Linux kernel nvmet split.
-
 ## Performance
+
+Pass xfstests(./check -g quick) on nvme-tcp & nvme-rdma backed by
+ioutgt target.
 
 One process, one queue thread per NVMe queue, no locks in the data path,
 single fio JOB with queue depth 128.
@@ -105,10 +93,11 @@ testing/two_nic_realwire_tcp.sh down
 
 ## Roadmap
 
+- Performance optimization.
 - Receive zero-copy for NVMe/TCP (io_uring `RECV_ZC`).
 - In-band authentication.
+- Metadata/PI formats.
 - Cleanup and code simplification passes.
-- Performance optimization.
 - More targets behind the same core: NBD, iSCSI.
 
 ## Workspace layout
