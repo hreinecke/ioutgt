@@ -57,7 +57,7 @@ bdev backend path.
 ## 3. New transports (the framework bet)
 
 2026-06-12: the prerequisite transport-abstraction refactor landed
-(transport contract in architecture.md §6.1; design spec
+(transport contract in architecture.md §5.1; design spec
 `docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`).
 NBD is next; NVMe/RDMA after.
 

@@ -5,25 +5,7 @@ end records what shipped; `docs/roadmap.md` holds what's next. This doc
 covers the transport-neutral engine; the per-transport detail lives in
 [`docs/nvme-tcp.md`](nvme-tcp.md) and [`docs/nvme-rdma.md`](nvme-rdma.md).
 
-## 1. Mission and goals
-
-ioutgt is a userspace storage target framework built on io_uring. The first
-production transport is NVMe/TCP. Goals, in priority order:
-
-1. **Correctness / protocol compliance** — interoperate with the Linux
-   kernel NVMe/TCP host driver and nvme-cli, validated continuously.
-2. **Throughput and latency** — saturate 100G-class networks and modern
-   NVMe SSDs at 4K and 128K block sizes with low p99 latency.
-3. **Minimal allocations and queue-local execution** — zero steady-state
-   allocation, no cross-queue locks, explicit CPU placement, NUMA awareness.
-4. **Readable async/await** — performance must not come at the cost of an
-   unmaintainable callback soup; the data path reads as straight-line
-   async Rust.
-
-Non-goals (for now): multipath/ANA beyond a single optimized group,
-metadata/PI formats, fused commands, NVMe reservations.
-
-## 2. The core idea: bounded concurrency
+## 1. The core idea: bounded concurrency
 
 Most async servers have unbounded concurrency and pay for it with dynamic
 allocation, task spawning, and buffer churn on every request. NVMe does not:
@@ -37,85 +19,85 @@ request tracker does, but expressed as async Rust:
   allocated, plus one **persistent async task per slot** ("task per tag").
 - Each task loops forever: await command arrival in my slot → dispatch →
   await backend completion → queue the response → return my tag.
-- The TCP transfer tag (TTAG) for R2T/H2CData *is* the slot index. The host
-  CID is opaque to us — it is stored in the slot and echoed in the CQE, so
-  no CID→slot hash map exists anywhere.
+- The transport's transfer identifier (TCP TTAG, the low bits of the RDMA
+  wr_id) *is* the slot index. The host CID is opaque — stored in the slot
+  and echoed in the CQE — so no CID→slot hash map exists anywhere.
 - Slot wakeups are same-thread `Cell<Option<Waker>>` doorbells: no atomics,
   no channels, no allocation.
 
 Steady state on the IO path: **zero allocations, zero atomic RMW, zero
 locks**.
 
-## 3. Process and thread model
+## 2. Process and thread model
 
-One process manages one NVMe controller set (one port, N subsystems).
-
-**Process layout — control thread, admin thread, N pinned IO threads**
+One process serves one port (N subsystems). Three kinds of thread:
 
 ```text
 Controller Process
 │
-├── Control Thread            tokio current-thread (enable_all)
-│     ├── TCP listener (port 4420 + discovery)
-│     ├── ICReq/ICResp handshake + first Connect capsule parse
+├── Control Thread            plain Tokio (current-thread, enable_all)
+│     ├── transport listener + accept
+│     ├── transport handshake → routing key (qid)
 │     ├── UDS control plane (JSON): namespace mgmt, stats
 │     └── routes accepted queues:  qid 0 → Admin thread
 │                                  qid n → IO thread[(n-1) % N]
 │
-├── Admin Queue Thread         pinned; own ring; admin queues of all ctrls
+├── Admin Queue Thread         own ring; admin queues of all controllers
 │
-└── IO Queue Threads 0..N-1    pinned, one CPU from spread_cpus
-                               group i (§11); own ring; own memory;
-                               own command slots; own send/recv machines
+└── IO Queue Threads 0..N-1    pinned to one CPU from spread_cpus group i
+                               (§10); own ring, own memory, own command
+                               slots, own send/recv machines
 ```
 
-Why the control thread does the handshake: the queue ID is only knowable
-from the fabrics Connect command (the first capsule), so blind round-robin
-of raw connections would put admin queues on IO threads. Handshake traffic
-is control-plane rate; doing it on plain Tokio sockets costs nothing where
-it matters and keeps queue threads free of accept/handshake states. After
-parsing Connect, the control thread packs the socket, the parsed Connect
-capsule, and the negotiated digest flags into a `QueueConn` and sends it
-to the target thread's mailbox.
-The queue thread then owns the socket exclusively for the connection's
-lifetime.
+Why the handshake runs on the control thread:
+
+- The routing key (qid) is only knowable after transport-specific setup
+  (§5.1 item 1) — blind round-robin of raw connections would land admin
+  queues on IO threads.
+- Handshake traffic is control-plane rate; plain Tokio sockets cost
+  nothing there and keep queue threads free of accept/handshake states.
+- After the handshake, the connection is packed into a transport `Conn`
+  value and mailed to its queue thread, which owns it exclusively for the
+  connection's lifetime.
 
 Cross-thread communication into a queue thread happens **only** through its
 mailbox (MPSC queue + eventfd doorbell, watched by a persistent multishot
 read on the ring). Queue-thread handles are deliberately not `Send`; the
 mailbox sender is the only exported handle.
 
-The NVMe/RDMA binary has the same shape with two differences: the
-listener is an `rdma_cm` event channel driven by a dedicated CM reactor
-thread (its fd parks on io_uring `POLL_ADD`, which the plain-Tokio
-control thread cannot provide), and accepted queues reach the same
-admin/IO threads through the shared `ioutgt-harness` pool.
+One transport-specific variance: NVMe/RDMA adds a dedicated CM reactor
+thread for the `rdma_cm` event channel (its fd parks on io_uring
+`POLL_ADD`, which the plain-Tokio control thread cannot provide); accepted
+queues reach the same admin/IO threads through the shared harness.
 
-## 4. Crate map and cross-crate call flow
+## 3. Crate map and cross-crate call flow
 
 The workspace is eleven crates forming a strict dependency DAG — every
 crate depends only on layers below it. The two main leaves are
-deliberately opposite in character: `ioutgt-nvme` is **sans-IO** (pure
-bytes ↔ structs, no sockets, no async, fuzzable in isolation) and
-`ioutgt-uring` is **pure IO** (op futures and the reactor, zero protocol
-knowledge). A third small leaf, `ioutgt-cpus`, groups CPUs evenly per
-NUMA / cluster / SMT locality (`spread_cpus`): the grouping
-algorithm is pure (driven by a `CpuTopology` value, synthetic in tests),
-with sysfs reading confined to `CpuTopology::from_sysfs()`.
+deliberately opposite in character:
 
-Two crates sit above the frontends: `ioutgt-harness` is the shared
-binary harness — config loading, `spawn()`, the queue-thread pool,
-control server and the `ctl`/`list`/`stat` clients — parameterized over
-a `Transport` trait so the NVMe/TCP and NVMe/RDMA binaries are thin
-wrappers around the same machinery. `ioutgt-nvme-rdma` is both the
-RDMA transport library and its binary (verbs via `sideway`, connection
-management via `rdma-mummy-sys`; see `docs/nvme-rdma.md`).
+- `ioutgt-nvme` is **sans-IO**: pure bytes ↔ structs, no sockets, no
+  async, fuzzable in isolation.
+- `ioutgt-uring` is **pure IO**: op futures and the reactor, zero
+  protocol knowledge.
+
+A third small leaf, `ioutgt-cpus`, groups CPUs evenly per NUMA / cluster /
+SMT locality (`spread_cpus`); the algorithm is pure (driven by a
+`CpuTopology` value, synthetic in tests), with sysfs reading confined to
+`CpuTopology::from_sysfs()`.
+
+Above the frontends, `ioutgt-harness` is the shared binary harness —
+config loading, `spawn()`, the queue-thread pool, control server and the
+`ctl`/`list`/`stat` clients — parameterized over a `Transport` trait so
+the NVMe/TCP and NVMe/RDMA binaries are thin wrappers around the same
+machinery.
 
 **Crate map — the dependency DAG**
 
 ```text
   binaries  ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt (NVMe/TCP)       │  │ ioutgt-nvme-rdma        │
+            │ ioutgt                  │  │ ioutgt-nvme-rdma        │
+            │ (bin: ioutgt-nvme-tcp)  │  │ (bin: ioutgt-nvme-rdma) │
             └─────────────────────────┘  └─────────────────────────┘
   harness   ┌──────────────────────────────────────────────────────┐
             │ ioutgt-harness — config, spawn(), queue-thread pool, │
@@ -150,83 +132,82 @@ management via `rdma-mummy-sys`; see `docs/nvme-rdma.md`).
 
 | Crate | Role | Depends on (workspace) |
 |-------|------|------------------------|
-| `ioutgt` | NVMe/TCP binary + assembly | all others |
-| `ioutgt-nvme-rdma` | NVMe/RDMA transport + binary | harness, core, backend, control, nvme, uring |
-| `ioutgt-harness` | shared binary harness (spawn, queue-thread pool, control server, stat client) | core, backend, control, cpus, uring |
-| `ioutgt-control` | config + UDS control plane | core, backend |
-| `ioutgt-nvme-tcp` | NVMe/TCP transport | core, stream, nvme, uring |
-| `ioutgt-backend` | storage backends | core, uring |
-| `ioutgt-stream` | protocol-neutral stream-transport mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
-| `ioutgt-core` | NVMe model + dispatch + `slotq` engine | nvme |
-| `ioutgt-nvme` | sans-IO codec | — |
-| `ioutgt-uring` | reactor + op futures + `sendbatch` | — |
-| `ioutgt-cpus` | locality-aware even CPU grouping | — |
+| [`ioutgt`](../crates/ioutgt) | the `ioutgt-nvme-tcp` binary + assembly | all others |
+| [`ioutgt-nvme-rdma`](../crates/ioutgt-nvme-rdma) | NVMe/RDMA transport + binary | harness, core, backend, control, nvme, uring |
+| [`ioutgt-harness`](../crates/ioutgt-harness) | shared binary harness (spawn, queue-thread pool, control server, stat client) | core, backend, control, cpus, uring |
+| [`ioutgt-control`](../crates/ioutgt-control) | config + UDS control plane | core, backend |
+| [`ioutgt-nvme-tcp`](../crates/ioutgt-nvme-tcp) | NVMe/TCP transport | core, stream, nvme, uring |
+| [`ioutgt-backend`](../crates/ioutgt-backend) | storage backends | core, uring |
+| [`ioutgt-stream`](../crates/ioutgt-stream) | protocol-neutral stream mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
+| [`ioutgt-core`](../crates/ioutgt-core) | NVMe model + dispatch + `slotq` engine | nvme |
+| [`ioutgt-nvme`](../crates/ioutgt-nvme) | sans-IO codec | — |
+| [`ioutgt-uring`](../crates/ioutgt-uring) | reactor + op futures + `sendbatch` | — |
+| [`ioutgt-cpus`](../crates/ioutgt-cpus) | locality-aware even CPU grouping | — |
 
-### 4.1 Assembly: what the harness `spawn()` wires up
+### 3.1 Assembly: what the harness `spawn()` wires up
 
 `main()` parses the config and calls the binary's thin entry point —
-`spawn_target()` (`crates/ioutgt/src/lib.rs`) is a kernel-feature
-probe plus `ioutgt_harness::spawn::<TcpTransport>()`; the RDMA binary
-passes `RdmaTransport` through the same seam. The harness `spawn()` is
-where every layer meets, parameterized over the `Transport` trait:
+`spawn_target()` ([`crates/ioutgt/src/lib.rs`](../crates/ioutgt/src/lib.rs))
+is a kernel-feature probe plus `ioutgt_harness::spawn::<TcpTransport>()`;
+the RDMA binary passes `RdmaTransport` through the same seam.
 
-**harness `spawn::<T>()` — what gets spawned and wired**
+**`spawn::<T>()` — the control thread**
 
 ```text
-spawn::<T>(config)                                  [ioutgt-harness]
-  └─ control thread (plain Tokio): control_loop()
-       ├─ Registry::new()                              [ioutgt-core]
-       ├─ build_port(): per namespace
-       │    build_backend() → AnyBackend               [ioutgt-control → -backend]
-       │    Namespace / Subsystem::new() / PortConfig  [ioutgt-core]
-       ├─ senders: Mutex<Option<PoolSenders>> = None   (pool down)
-       ├─ server::serve(UnixListener, CtlState)        [ioutgt-control]
-       │    └─ stats/nudge read `senders`: Some → admin/io mailbox,
-       │       None → zeroed stats / no-op nudge        (pool down)
-       └─ select! loop:
-            ├─ T::accept → ensure_pool_up(senders) → setup_connection()
-            │    ensure_pool_up (if down): build_pool() →
-            │      make_admin/make_io: mailbox() + pending spawn closure,
-            │        each → QueueRuntime::new()          [ioutgt-uring]
-            │          block_on: loop { msg = mailbox.recv()
-            │            Conn → spawn T::run_queue(conn)  [ioutgt-nvme-tcp /
-            │            Shutdown → return (ring drops)     ioutgt-nvme-rdma]
-            │    T::handshake (TCP: accept_handshake/read_connect)
-            │      → MailboxSender::send(QueueConn)
-            │      qid 0 → admin thread, qid n → io thread[(n-1) % N]
-            └─ idle tick → active==0 for grace? → teardown_pool(senders)
-                 (Shutdown to every thread; senders → None)
+spawn::<T>(config)                                     [ioutgt-harness]
+  └─ "ioutgt-control" thread (plain Tokio) → control_loop::<T>():
+       Registry::new()                                 [ioutgt-core]
+       T::bind() → listener + bound address
+       build_port(): Subsystem / Namespace → AnyBackend [core, backend]
+       spawn_control_api(): UDS server                 [ioutgt-control]
+       loop select!
+         ├─ T::accept() ──► handle_accept()
+         └─ idle tick   ──► teardown pool after the grace window
 ```
 
-The mailbox (`ioutgt-uring::mailbox`) is the only cross-thread channel: an
-MPSC queue plus eventfd doorbell that the queue thread watches with a
-persistent ring read, so handing off a connection never touches the queue
+**`handle_accept()` — pool bring-up, handshake, routing**
+
+```text
+handle_accept(raw)
+  ensure_pool_up(): pool down? build admin + N IO threads, each:
+      mailbox (MPSC + eventfd) ⇄ pinned OS thread + QueueRuntime (own ring)
+      loop mailbox.recv():
+        Conn(conn) → spawn T::run_queue(conn)          [transport crate]
+        Stats      → snapshot own counters, reply
+        Shutdown   → return (ring drops)
+  ConnPermit: count connection, reject past the limit
+  spawn T::handshake(raw) → (qid, conn)
+    qid 0 → admin mailbox          qid n → io[(n-1) % N] mailbox
+```
+
+The mailbox ([`ioutgt-uring`](../crates/ioutgt-uring)`::mailbox`) is the
+only cross-thread channel; handing off a connection never touches a queue
 thread's hot path.
 
-**Lazy pool spawn + idle teardown.** The queue-thread pool (admin + N IO
-threads) is spawned on the first accepted connection and reclaimed after an
-idle grace period — `control_loop` owns its whole lifecycle through one
-`Arc<Mutex<Option<PoolSenders>>>` (`None` = pool down). On the first accept
-(or the first after a teardown), `ensure_pool_up` runs `build_pool` →
-`make_admin_thread`/`make_io_thread`, which create each thread's mailbox +
-eventfd and a *pending* closure that builds the OS-thread/io_uring/runtime;
-the closures run before the connection's `QueueConn` is routed, so a
-freshly-started or idle-reclaimed target holds only the control thread. An
-`idle_teardown` grace window (default 30s, `--idle-teardown-secs`, `0`
-disables) is polled on a coarse tick: once `active` (the connection count,
-decremented by `ConnPermit` on `run_queue` end) has been zero for the whole
-window, `teardown_pool` sends each thread a `Shutdown` message — they
-return from `block_on`, dropping their rings (the op-slab is empty at idle,
-so no drain) — and clears the senders to `None`. The grace window keeps the
-pool alive across nvme-tcp reconnect / kill-recovery (which re-establishes
-queues within ~10s); only a genuinely idle target reclaims the threads. The
-control socket's stats/nudge closures read the shared cell, so they track
-the live senders across teardown/respawn; while the pool is down a stats
-query is answered with a zeroed snapshot (it neither blocks nor mis-reports
-threads as unresponsive) and a namespace-change nudge no-ops (no live
-controllers — the edit still lands in the port model for the next connect).
+**Lazy pool spawn + idle teardown.** The pool exists only while
+connections do; `senders: Mutex<Option<PoolSenders>>` is the single
+source of truth (`None` = down):
 
-### 4.2 Queue thread: the per-connection task set
+```text
+        first accept (or first after teardown): ensure_pool_up()
+  None ────────────────────────────────────────────────────────► Some(pool)
+   ▲                                                                │
+   └──── active == 0 for the whole grace window: teardown_pool() ◄──┘
+         (Shutdown to every thread → rings drop; senders → None)
+```
+
+- Grace window: 30 s default (`--idle-teardown-secs`, `0` disables) —
+  long enough to survive nvme reconnect / kill-recovery (~10 s), so only
+  a genuinely idle target reclaims its threads.
+- `active` is the connection count; `ConnPermit` decrements it when
+  `run_queue` ends.
+- A fresh or idle-reclaimed target holds only the control thread; the
+  pool threads are up before the triggering connection is routed to them.
+- While the pool is down: a stats query answers with a zeroed snapshot
+  (never blocks, never mis-reports), and a namespace-change nudge no-ops —
+  the edit still lands in the port model for the next connect.
+
+### 3.2 Queue thread: the per-connection task set
 
 Every transport's `run_queue()` builds the same shape on the queue
 thread: the generic slot engine (`QueueCore<C>`, core) joined with a
@@ -255,21 +236,19 @@ movement, copy budget — live in their own docs:
 - **NVMe/RDMA**: [`docs/nvme-rdma.md`](nvme-rdma.md) — CM acceptance,
   keyed-SGL data movement, the reap loop.
 
-Crate seams, with NVMe/TCP as the example: **bin→tcp** is the two
-handshake calls plus `run_queue()` itself — the queue threads' entry
-point, with the `on_ctx` hook that registers each connection's stats;
-**bin/tcp→uring** is op futures + mailbox; **tcp→core** is the
-`QueueCore<Sqe>`/`SlotArray` slot API plus `dispatch::execute` (the
-send list and `SendWork` type are transport-owned in `NvmeTcpQueue`);
-**tcp→stream** is the `StreamSender`/`StreamReader` harness, driven by
-transport closures; **core→backend** is the `Backend` trait behind
-`Arc<Namespace>`; **control→core** is `Registry` + `Subsystem`
-add/remove + the NS-changed nudge, while GET_STATS reaches the queue
-threads through binary-injected `StatsSource` closures over the same
-mailboxes; **core/tcp→nvme** is types and encode/decode only — the
-codec never does IO, and the reactor never sees a PDU.
+Crate seams, with NVMe/TCP as the example:
 
-## 5. Reactor: io_uring under Tokio current-thread
+| Seam | What crosses it |
+|------|-----------------|
+| bin → transport | the handshake calls + `run_queue()` (queue-thread entry point, with the `on_ctx` hook registering per-connection stats) |
+| bin/transport → uring | op futures + mailbox |
+| transport → core | `QueueCore<Sqe>`/`SlotArray` slot API + `dispatch::execute`; the send list and work type (`SendWork`) are transport-owned |
+| tcp → stream | `StreamSender`/`StreamReader`, driven by transport closures |
+| core → backend | the `Backend` trait behind `Arc<Namespace>` |
+| control → core | `Registry` + `Subsystem` add/remove + the NS-changed nudge; GET_STATS reaches queue threads via binary-injected `StatsSource` closures over the same mailboxes |
+| core/transport → nvme | types + encode/decode only — the codec never does IO, the reactor never sees a PDU |
+
+## 4. Reactor: io_uring under Tokio current-thread
 
 Each queue thread runs `tokio::runtime::Builder::new_current_thread()` with
 a `LocalSet`, with **no** Tokio IO driver or timer enabled. A thread-local
@@ -305,10 +284,10 @@ preallocated slots; maintenance mode) and a **fully custom executor**
 `select!`/`JoinHandle`/ecosystem for free — only the wait primitive needs
 replacing).
 
-## 6. Transports
+## 5. Transports
 
 Two production transports share the engine; each has an as-built doc.
-The obligations any transport must meet are the contract in §6.1.
+The obligations any transport must meet are the contract in §5.1.
 
 - **NVMe/TCP** ([`docs/nvme-tcp.md`](nvme-tcp.md)) — PDU phase machine
   mirroring nvmet's, in-capsule ≤ 16 KiB + single-R2T writes, CRC32C
@@ -319,9 +298,9 @@ The obligations any transport must meet are the contract in §6.1.
   acceptance on a dedicated CM reactor thread, batched WR doorbells,
   adaptive `--poll`.
 
-## 6.1 Transport contract
+## 5.1 Transport contract
 
-The engine split (§4.2) makes the obligations of any transport explicit.
+The engine split (§3.2) makes the obligations of any transport explicit.
 A transport supplies six pieces; the design spec
 (`docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`)
 records the decision rationale; this section is the authoritative
@@ -371,12 +350,12 @@ as-built statement.
    → free. If a backend never returns, the design leaks rather than
    use-after-frees.
 
-The standing invariants from §2/§3 apply unchanged across all transports:
+The standing invariants from §1/§2 apply unchanged across all transports:
 zero steady-state allocation, no locks, no atomic RMW on the IO path;
 mailbox-only entry into queue threads; codecs sans-IO; reactor cancellation
 safety (the slab entry, not the op future, owns kernel-visible resources).
 
-### 6.1.1 NBD on the refactored base
+### 5.1.1 NBD on the refactored base
 
 NBD (`ioutgt-nbd`, follow-up plan) maps cleanly onto the contract with no
 NVMe machinery at all: `C = NbdCmd` (flags, type, cookie, offset, length —
@@ -389,7 +368,7 @@ Read responses use `GatherBatch` (`ioutgt-uring::sendbatch`) — the same
 arena/iovec/short-send logic — with a 16-byte simple-reply header. Setup is
 fixed-newstyle option haggling on the control thread, routed round-robin.
 
-### 6.1.2 NVMe/RDMA on the refactored base
+### 5.1.2 NVMe/RDMA on the refactored base
 
 NVMe/RDMA (`ioutgt-nvme-rdma`, built — see `docs/nvme-rdma.md` for the
 as-built detail) reuses `C = Sqe` with its own response work type (no R2T
@@ -404,7 +383,7 @@ RDMA SEND carrying the CQE; QP ordering makes WRITE-before-SEND free.
 `release_tag` fires when both signaled response completions are reaped — when
 the NIC is provably done with slot pages, matching obligation 5. Slot/pool
 buffers are registered as MRs at queue install (the registered-buffers theme
-from §9, mandatory here). Setup uses an rdma_cm event channel on a dedicated
+from §8, mandatory here). Setup uses an rdma_cm event channel on a dedicated
 CM reactor thread (its fd parks on io_uring `POLL_ADD`, which the plain-tokio
 control thread cannot provide); qid is read from CONNECT_REQUEST private data
 and routed `(qid-1) % N` as today. The verbs completion-channel fd is a
@@ -414,7 +393,7 @@ dispatch, controller model, and discovery are all reused unchanged;
 `PortConfig.trtype = TransportType::Rdma` makes discovery advertise the
 correct TRTYPE.
 
-## 7. Core model
+## 6. Core model
 
 **Object model — Port / Subsystem / Namespace, and the per-Connect Controller**
 
@@ -431,18 +410,23 @@ Controller (cntlid) ── created by fabrics Connect on the admin queue
       via Set Features NUM_QUEUES)
 ```
 
-Queue teardown is the userspace analogue of nvmet's `percpu_ref`: an
-executing-slot counter drained before slot memory is freed (backend ops
-may still be DMAing into it), preceded by failing parked AERs
-(`ConnCtx::close`, the analog of `nvmet_async_events_failall` — its
-omission was a measurable per-disconnect leak), with a deliberate
-leak-on-wedge instead of a use-after-free if a backend never returns.
+Queue teardown — the userspace analogue of nvmet's `percpu_ref`:
 
-The namespace table is versioned for runtime add/remove: an `Arc`
-snapshot behind a generation counter; IO queues revalidate with one
-atomic load per command and refresh only when the control plane changed
-something. Changes fire the NS_ATTR async event (note: Identify must
-advertise OAES.NS_ATTR or Linux hosts never enable the notice).
+- Fail parked AERs first (`ConnCtx::close`, the analog of
+  `nvmet_async_events_failall`; its omission was a measurable
+  per-disconnect leak).
+- Drain the executing-slot counter to zero before freeing slot memory
+  (backend ops may still be DMAing into it).
+- If a backend never returns: leak, deliberately, rather than
+  use-after-free.
+
+Namespace table — versioned for runtime add/remove:
+
+- An `Arc` snapshot behind a generation counter; IO queues revalidate
+  with one atomic load per command and refresh only when the control
+  plane changed something.
+- Changes fire the NS_ATTR async event (note: Identify must advertise
+  OAES.NS_ATTR or Linux hosts never enable the notice).
 
 Admin command surface (interop-minimal, values per nvmet): Identify CNS
 0x00/0x01/0x02/0x03, Get/Set Features (NUM_QUEUES, KATO, async event
@@ -451,7 +435,7 @@ Property Get/Set (CAP/VS/CC/CSTS), fabrics Connect. IO commands: Read,
 Write, Flush, then Write Zeroes and DSM-deallocate advertised via ONCS once
 backend support lands.
 
-## 8. Backend trait
+## 7. Backend trait
 
 ```rust
 trait Backend {
@@ -483,33 +467,36 @@ punch-hole/zero-range as before. IOPOLL is not used: a polled ring cannot
 carry socket ops, and a second per-thread IOPOLL ring is a measured-later
 roadmap item.
 
-## 9. Buffer strategy: staged, measured
+## 8. Buffer strategy: staged, measured
 
 | Concern | As built |
 |---------|----------|
-| Slot data buffers | Leased on demand from a per-queue `BufPool` (`ioutgt-core/src/pool.rs`): a contiguous arena (default 8 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. The arena is registered as an io_uring fixed buffer (and, on RDMA, as an MR). |
+| Slot data buffers | Leased on demand from a per-queue `BufPool` ([`ioutgt-core/src/pool.rs`](../crates/ioutgt-core/src/pool.rs)): a contiguous arena (default 8 MiB, `--queue-buf-mb`, 4 KiB grain) with a coalescing free-run allocator handing out a contiguous run when one fits, else a scatter list of ≤ `MAX_SEGS`. Each command leases exactly its transfer size (reads/admin via `lease_await` with pool-exhaustion backpressure; write/admin via `lease_or_owned`, a private-buffer fallback that never blocks the serial recv loop), freed at `release_tag`. The pool is deliberately smaller than depth × MDTS. The arena is registered as an io_uring fixed buffer (and, on RDMA, as an MR). |
 | Recv (TCP) | Classic single-shot RECV → 64 KiB scratch → copy into the slot; H2C write tails ≥ 16 KiB land **straight into the slot's pooled segments** (one scatter `recvmsg`/`MSG_WAITALL`). Opt-in `--recv-buf-mb`: per-connection provided-buffer ring. Details: `docs/nvme-tcp.md`. |
 | Send (TCP) | Batch-drain into one gather `SENDMSG`; opt-in `--send-zc` (`SENDMSG_ZC`, slot reuse gated on the notification CQE, size-gated, copy fallback). Details: `docs/nvme-tcp.md`. |
 | Data movement (RDMA) | Target-posted RDMA READ/WRITE against the registered pool arena; in-capsule write data ≤ 4 KiB. Details: `docs/nvme-rdma.md`. |
-| Disk | Vectored `READV`/`WRITEV` (`_FIXED` when the lease is pooled) over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §8). |
+| Disk | Vectored `READV`/`WRITEV` (`_FIXED` when the lease is pooled) over the slot's segments; single fd, `O_DIRECT` with a buffered fallback when the store refuses it (see §7). |
 | Deferred | RECV_ZC (zcrx) — needs real-NIC header-data split; bundles; second IOPOLL ring. |
 
 MDTS is 128 KiB on IO queues; the admin queue sizes its pool so its
 synchronous data leases never block.
 
-## 10. Control plane and configuration
+## 9. Control plane and configuration
 
 - Unix domain socket, newline-delimited JSON: `ADD_NAMESPACE`,
   `REMOVE_NAMESPACE`, `LIST_NAMESPACE`, `LIST_CONTROLLER`, `GET_STATS`.
-  Stats are aggregated by querying each queue thread's mailbox — no
-  shared counters: per-queue IO counters (`QueueStats`) and per-thread
-  ring counters (`ReactorStats`, `io_uring_enter`/parks/SQEs/CQEs) are
-  plain `Cell`s written only by the owning thread; GET_STATS sends a
-  oneshot-reply message through the mailbox and each thread snapshots
-  its own cells (500 ms timeout per thread, so a wedged backend can't
-  hang the control API), and on `clear` zeros them after the snapshot.
-  `ioutgt stat` renders them under a controller-identity header, `-i N`
-  for iostat-style rates computed client-side, `--clear` to reset.
+- Stats are aggregated by querying each queue thread's mailbox — no
+  shared counters:
+  - Per-queue IO counters (`QueueStats`) and per-thread ring counters
+    (`ReactorStats`: `io_uring_enter`/parks/SQEs/CQEs) are plain `Cell`s
+    written only by the owning thread.
+  - GET_STATS sends a oneshot-reply message through the mailbox; each
+    thread snapshots its own cells (500 ms timeout per thread, so a
+    wedged backend can't hang the control API), and on `clear` zeros
+    them after the snapshot.
+  - `ioutgt stat` renders them under a controller-identity header,
+    `-i N` for iostat-style rates computed client-side, `--clear` to
+    reset.
 - The target is fully constructible from a JSON config file: subsystems,
   namespaces (backend type + path + nsid), listen address, thread/affinity
   map, digest policy, inline data size. Validation produces line-precise
@@ -517,26 +504,29 @@ synchronous data leases never block.
 - Runtime namespace changes propagate via mailboxes and fire AER
   NS_CHANGED so connected hosts rescan without reconnect.
 
-## 11. CPU affinity and NUMA
+## 10. CPU affinity and NUMA
 
-By default (`pin_threads` on; opt out with `--no-pin` or
-`"pin_threads": false`), IO queue thread placement uses `ioutgt-cpus`
-(`spread_cpus`, an ioutgt-original algorithm): all possible CPUs are
-grouped evenly per NUMA / cluster / SMT locality (group seats
-apportioned to nodes largest-remainder by present-CPU weight, nodes
-packed in cluster-major SMT-atom order with present CPUs spread first —
-the same locality properties managed IRQs and therefore host-side nvme
-queues get, though not bit-identical to the kernel's grouping), one
-group per IO thread, and each thread is pinned to its group's first
-online CPU. A group with no online CPU (or sysfs failure) leaves that thread
-unpinned with a warning; the admin thread is never pinned. Combined with
-the deterministic qid→thread routing `(n-1) % N`, this lines the host's
-per-CPU queues up with topology-aware target cores. Slot arrays and
-buffers are allocated on the owning thread (first-touch locality); the
-allocation hooks take a NUMA node hint so multi-node placement needs no
-API change (development machine is single-node).
+Default on (`pin_threads`; opt out with `--no-pin` or
+`"pin_threads": false`):
 
-## 12. Testing strategy
+- [`ioutgt-cpus`](../crates/ioutgt-cpus)' `spread_cpus` (an
+  ioutgt-original algorithm) groups all possible CPUs evenly per NUMA /
+  cluster / SMT locality: group seats apportioned to nodes
+  largest-remainder by present-CPU weight, nodes packed in cluster-major
+  SMT-atom order with present CPUs spread first — the same locality
+  properties managed IRQs (and therefore host-side nvme queues) get,
+  though not bit-identical to the kernel's grouping.
+- One group per IO thread; each thread pins to its group's first online
+  CPU. A group with no online CPU (or sysfs failure) leaves that thread
+  unpinned with a warning. The admin thread is never pinned.
+- Combined with the deterministic qid→thread routing `(n-1) % N`, this
+  lines the host's per-CPU queues up with topology-aware target cores.
+- Slot arrays and buffers are allocated on the owning thread
+  (first-touch locality); the allocation hooks take a NUMA node hint so
+  multi-node placement needs no API change (development machine is
+  single-node).
+
+## 11. Testing strategy
 
 1. **Unit**: per crate; PDU codec tested against byte fixtures captured
    from a real kernel-host ↔ kernel-nvmet loopback session (tcpdump), and
@@ -556,7 +546,7 @@ API change (development machine is single-node).
    against ioutgt and an identically-configured kernel nvmet, with perf
    flamegraphs both sides. See `docs/benchmark-plan.md`.
 
-## 13. Milestones
+## 12. Milestones
 
 | # | Deliverable | Status |
 |---|-------------|--------|
@@ -571,7 +561,7 @@ API change (development machine is single-node).
 | M8 | hardening + fuzz | done — abuse suite, kill-recovery, RSS-gated soak, workspace ASAN |
 | M9 | performance pass | part 1 done — batched send 4.2×; post-M10: gather send (+22% 128K read BW), direct-to-slot recv (−44% c/IOP 128K write); rest in roadmap |
 | M10 | docs | comparison/usage/roadmap done; **nvmet benchmark deferred** (`benchmark-plan.md`) |
-| M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§6.1) |
+| M11 | transport-abstraction refactor | done — engine split (`slotq`), generic `QueueCore<C>`, transport-owned send work (`NvmeTcpQueue`), contract documented (§5.1) |
 | M12 | shared send harness | done — ZC gather-send machinery extracted to `ioutgt-stream::StreamSender` behind a per-transport staging closure; NVMe/TCP keeps only PDU encoding |
 | M13 | shared recv byte-source | done — buffered scratch + `ops::recv` (`fill`/`consume`) and the direct-into-slot `MSG_WAITALL` tail (`read_direct`) extracted to `ioutgt-stream::StreamReader`; NVMe/TCP keeps the PDU phase machine |
 | M14 | multi-transport harness | done — spawn, queue-thread pool, control server and clients extracted to `ioutgt-harness` behind a `Transport` trait; both binaries share them |
@@ -579,7 +569,7 @@ API change (development machine is single-node).
 | M16 | NVMe/RDMA performance | done — pool arena as io_uring fixed buffer, reactor park-probe (CQ polled at the sleep point), in-capsule write data (IOCCSZ + SGLS SAOS, nvmet parity); matches or beats nvmet-rdma on every single-job fio_perf phase on the test box (64k +38-44%, 4k within ±3%) |
 | M17 | adaptive `--poll` (RDMA binary only) | done — busy-poll while commands are in flight (+200 µs grace), event-driven when idle; qd1 latency −20-30%, admin queue exempt |
 
-## 14. Risks
+## 13. Risks
 
 | Risk | Mitigation |
 |------|-----------|

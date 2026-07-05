@@ -4,7 +4,7 @@ The first production transport. This doc covers only the TCP-specific
 layer; the machinery it sits on is documented elsewhere:
 
 - thread model, reactor, slot engine, transport contract —
-  [`architecture.md`](architecture.md) (§3, §5, §6.1)
+  [`architecture.md`](architecture.md) (§2, §4, §5.1)
 - the shared gather-send harness (`StreamSender`) —
   [`stream-sender.md`](stream-sender.md)
 - the shared recv byte-source (`StreamReader`) —
