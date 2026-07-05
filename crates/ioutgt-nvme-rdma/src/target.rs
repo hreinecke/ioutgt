@@ -65,12 +65,82 @@ const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
 /// Bytes of an NVMe CQE (the response capsule).
 const CQE_LEN: usize = 16;
 
-// Work-request id encoding: high byte = kind, low 32 bits = slot tag / recv idx.
-const WR_RECV: u64 = 1 << 40;
-const WR_SEND: u64 = 2 << 40;
-const WR_WRITE: u64 = 3 << 40;
-const WR_READ: u64 = 4 << 40;
-const WR_KIND_MASK: u64 = 0xff << 40;
+/// The class of an RDMA work request, encoded in a wr_id's high byte (bits
+/// 40..48); the low 32 bits carry the slot tag or recv-buffer index. Every
+/// wr_id is built with [`WrId::encode`] and every completion decoded with
+/// [`WrId::decode`], so the completion dispatch match stays exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrKind {
+    /// Command-capsule RECV (low bits = recv-buffer index).
+    Recv,
+    /// Response-capsule SEND (low bits = slot tag).
+    Send,
+    /// Read-data RDMA WRITE, target → host (low bits = slot tag).
+    Write,
+    /// Write-data RDMA READ, host → target (low bits = slot tag).
+    Read,
+}
+
+impl WrKind {
+    /// High-byte code — kept identical to the original `WR_*` constants (1..=4)
+    /// so no posted/completed wr_id value changes.
+    const fn code(self) -> u64 {
+        match self {
+            WrKind::Recv => 1,
+            WrKind::Send => 2,
+            WrKind::Write => 3,
+            WrKind::Read => 4,
+        }
+    }
+
+    /// The class named by a raw wr_id's high byte, or `None` if it is unknown
+    /// (impossible for an id we posted — a defensive guard, not a wire case).
+    fn from_id(id: u64) -> Option<WrKind> {
+        match (id >> 40) & 0xff {
+            1 => Some(WrKind::Recv),
+            2 => Some(WrKind::Send),
+            3 => Some(WrKind::Write),
+            4 => Some(WrKind::Read),
+            _ => None,
+        }
+    }
+
+    /// Short label for completion-error diagnostics.
+    fn name(self) -> &'static str {
+        match self {
+            WrKind::Recv => "RECV",
+            WrKind::Send => "SEND",
+            WrKind::Write => "WRITE",
+            WrKind::Read => "READ",
+        }
+    }
+}
+
+/// A decoded work-request id: its [`WrKind`] class and the low-32-bit tag/index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WrId {
+    kind: WrKind,
+    low: u32,
+}
+
+impl WrId {
+    fn new(kind: WrKind, low: u32) -> WrId {
+        WrId { kind, low }
+    }
+
+    /// Pack into the raw `wr_id` posted on a work request.
+    fn encode(self) -> u64 {
+        (self.kind.code() << 40) | u64::from(self.low)
+    }
+
+    /// Unpack a completion's raw `wr_id`, or `None` if its class byte is unknown.
+    fn decode(id: u64) -> Option<WrId> {
+        WrKind::from_id(id).map(|kind| WrId {
+            kind,
+            low: (id & 0xffff_ffff) as u32,
+        })
+    }
+}
 
 /// Reap-loop backstop interval: how long the queue may sit on the comp-channel
 /// event before it defensively re-arms + re-drains the CQ (recovering a rarely
@@ -126,16 +196,6 @@ fn invalidate_rkey_for(cmd: &Sqe) -> Option<u32> {
     } else {
         None
     }
-}
-
-fn wr(kind: u64, low: u32) -> u64 {
-    kind | u64::from(low)
-}
-fn wr_kind(id: u64) -> u64 {
-    id & WR_KIND_MASK
-}
-fn wr_low(id: u64) -> u32 {
-    (id & 0xffff_ffff) as u32
 }
 
 /// A host RDMA target region from a command SQE's keyed SGL data block
@@ -432,11 +492,31 @@ impl RdmaWrStats {
             (["recv_posted", "recv_done", "recv_inflight"], &self.recv),
         ]
     }
+
+    /// The scalar counters with their GET_STATS keys (wire-format stable).
+    fn scalars(&self) -> [(&'static str, &Cell<u64>); 2] {
+        [
+            ("poll_batches", &self.poll_batches),
+            ("sq_doorbells", &self.sq_doorbells),
+        ]
+    }
+
+    /// The batch histograms paired with their GET_STATS key rows. Pairing keys
+    /// to histograms here — rather than zipping `HIST_KEYS` positionally in both
+    /// `snapshot` and `reset` — is what keeps the two from drifting out of sync.
+    fn hists(&self) -> [(&'static [&'static str; 6], &BatchHist); 4] {
+        [
+            (&HIST_KEYS[0], &self.read_db),
+            (&HIST_KEYS[1], &self.resp_db),
+            (&HIST_KEYS[2], &self.recv_db),
+            (&HIST_KEYS[3], &self.poll),
+        ]
+    }
 }
 
 impl TransportStats for RdmaWrStats {
     fn snapshot(&self) -> Vec<(&'static str, u64)> {
-        let mut out = Vec::with_capacity(14);
+        let mut out = Vec::with_capacity(38);
         for (names, class) in self.classes() {
             let gauge = u64::try_from(class.inflight.get().max(0)).unwrap_or(0);
             out.extend([
@@ -445,13 +525,10 @@ impl TransportStats for RdmaWrStats {
                 (names[2], gauge),
             ]);
         }
-        out.push(("poll_batches", self.poll_batches.get()));
-        out.push(("sq_doorbells", self.sq_doorbells.get()));
-        for (keys, hist) in
-            HIST_KEYS
-                .iter()
-                .zip([&self.read_db, &self.resp_db, &self.recv_db, &self.poll])
-        {
+        for (key, cell) in self.scalars() {
+            out.push((key, cell.get()));
+        }
+        for (keys, hist) in self.hists() {
             for (key, cell) in keys.iter().zip(&hist.0) {
                 out.push((key, cell.get()));
             }
@@ -464,9 +541,10 @@ impl TransportStats for RdmaWrStats {
             class.posted.set(0);
             class.done.set(0);
         }
-        self.poll_batches.set(0);
-        self.sq_doorbells.set(0);
-        for hist in [&self.read_db, &self.resp_db, &self.recv_db, &self.poll] {
+        for (_, cell) in self.scalars() {
+            cell.set(0);
+        }
+        for (_, hist) in self.hists() {
             for cell in &hist.0 {
                 cell.set(0);
             }
@@ -509,7 +587,7 @@ pub struct RdmaQueue {
     /// validation-failure path) and drained + posted by the reap loop.
     responses: Rc<SendList<RdmaResp>>,
     /// For a deferred write command: the SQE stashed at RECV, submitted to its
-    /// slot only once its host write-data RDMA READ (`WR_READ`) completes.
+    /// slot only once its host write-data RDMA READ (`WrKind::Read`) completes.
     pending_read: Vec<Sqe>,
     /// Per-class RDMA WR counters (READ/WRITE/SEND/RECV posted/done/inflight),
     /// shared with `nvme.stats` so GET_STATS can snapshot them on this thread.
@@ -669,7 +747,7 @@ impl RdmaQueue {
             lkey: self.recv_mr.lkey(),
         };
         let mut rwr = ibv_recv_wr {
-            wr_id: wr(WR_RECV, idx),
+            wr_id: WrId::new(WrKind::Recv, idx).encode(),
             next: std::ptr::null_mut(),
             sg_list: &mut sge,
             num_sge: 1,
@@ -694,19 +772,22 @@ impl RdmaQueue {
 
     /// RDMA READ `len` bytes from the host's keyed-SGL region into `cdata_buf`
     /// (the fabrics Connect data, which on the admin queue is host-resident, not
-    /// in-capsule). Completes with a `WR_READ` work completion.
+    /// in-capsule). Completes with a `WrKind::Read` work completion.
     ///
-    /// This shares the `wr(WR_READ, _)` encoding with the write-data path's
+    /// This shares the `WrId::new(WrKind::Read, _)` encoding with the write-data path's
     /// per-tag READs, with `0` in the low bits — but it is bootstrap-only and is
     /// awaited to completion in [`Self::await_read`] *before* the steady reap loop
-    /// (and thus the `WR_READ => submit_pending` arm) exists, so the two never
+    /// (and thus the `WrKind::Read => submit_pending` arm) exists, so the two never
     /// coexist and the shared low value is unambiguous.
     fn post_read_cdata(&mut self, src: &KeyedSgl, len: usize) -> io::Result<()> {
         let lkey = self.cdata_mr.lkey();
         let addr = self.cdata_buf.as_ptr() as u64;
         let mut g = self.qp.start_post_send();
         let h = g
-            .construct_wr(wr(WR_READ, 0), WorkRequestFlags::Signaled)
+            .construct_wr(
+                WrId::new(WrKind::Read, 0).encode(),
+                WorkRequestFlags::Signaled,
+            )
             .setup_read(src.rkey, src.addr);
         // SAFETY: cdata_buf is registered (cdata_mr, LocalWrite) and lives in
         // this struct; len is clamped to its size by the caller.
@@ -721,7 +802,7 @@ impl RdmaQueue {
     /// pool run** of its lease (remote address advanced run by run), all
     /// constructed on a single guard and flushed with one `ibv_post_send`.
     /// Only the LAST run's READ is signaled, so the completion protocol is
-    /// unchanged: one `WR_READ` per command → submit_pending (RC completes
+    /// unchanged: one `WrKind::Read` per command → submit_pending (RC completes
     /// same-QP READs in order). Empties `read_batch` on success.
     ///
     /// Single-SGE on purpose, not just simplicity: rdma-core's rxe provider
@@ -768,7 +849,7 @@ impl RdmaQueue {
                     WorkRequestFlags::none()
                 };
                 let h = g
-                    .construct_wr(wr(WR_READ, u32::from(pr.tag)), flags)
+                    .construct_wr(WrId::new(WrKind::Read, u32::from(pr.tag)).encode(), flags)
                     .setup_read(pr.rkey, remote);
                 // SAFETY: the sge references the registered pool arena
                 // (pool_lkey, is_pool-checked in handle_recv); the slot stays
@@ -812,14 +893,10 @@ impl RdmaQueue {
     /// op the peer rejected (e.g. REM_ACCESS on a bad rkey/bounds), evidence that
     /// would otherwise vanish with the queue.
     fn log_completion_error(&self, id: u64, status: u32) {
-        let tag = wr_low(id) as usize;
-        let kind = match wr_kind(id) {
-            WR_RECV => "RECV",
-            WR_READ => "READ",
-            WR_WRITE => "WRITE",
-            WR_SEND => "SEND",
-            _ => "?",
-        };
+        // Low bits regardless of class, for diagnostics on an (impossible)
+        // undecodable id; `name()` gives "?" for an unknown class byte.
+        let tag = (id & 0xffff_ffff) as usize;
+        let kind = WrKind::from_id(id).map_or("?", WrKind::name);
         let sgl = self
             .pending_read
             .get(tag)
@@ -867,26 +944,30 @@ impl RdmaQueue {
                 // Peer gone (flush) or QP now in error: stop the reap loop.
                 return Ok(true);
             }
-            match wr_kind(id) {
-                WR_RECV => {
+            let Some(WrId { kind, low }) = WrId::decode(id) else {
+                // Every wr_id is one we posted; an undecodable class is a bug,
+                // not a wire event, so skip it rather than mis-dispatching.
+                continue;
+            };
+            match kind {
+                WrKind::Recv => {
                     self.wr.recv.complete();
-                    self.handle_recv(ctx, wr_low(id))?;
+                    self.handle_recv(ctx, low)?;
                 }
                 // A write-data RDMA READ finished: the slot is filled, so submit
                 // it to wake its slot task.
-                WR_READ => {
+                WrKind::Read => {
                     self.wr.read.complete();
-                    self.submit_pending(wr_low(id) as u16);
+                    self.submit_pending(low as u16);
                 }
-                WR_SEND => {
+                WrKind::Send => {
                     self.wr.send.complete();
-                    self.on_response_done(wr_low(id));
+                    self.on_response_done(low);
                 }
-                WR_WRITE => {
+                WrKind::Write => {
                     self.wr.write.complete();
-                    self.on_response_done(wr_low(id));
+                    self.on_response_done(low);
                 }
-                _ => {}
             }
         }
         self.drain_deferred(ctx)?;
@@ -992,11 +1073,11 @@ impl RdmaQueue {
     }
 
     /// Bootstrap-only: park on the completion channel until a completion of
-    /// `kind` (`WR_RECV` for the Connect capsule, `WR_READ` for its keyed-SGL
+    /// `kind` (`WrKind::Recv` for the Connect capsule, `WrKind::Read` for its keyed-SGL
     /// connect data) arrives, returning its low bits (the recv buffer index /
     /// tag). Response completions are serviced (slots released) meanwhile; the
     /// steady reap loop takes over once [`Self::bootstrap`] returns.
-    async fn await_bootstrap(&mut self, kind: u64) -> io::Result<u32> {
+    async fn await_bootstrap(&mut self, kind: WrKind) -> io::Result<u32> {
         // One Connect per queue, so this one-time buffer is fine.
         let mut comps: Vec<(u64, u32)> = Vec::with_capacity(8);
         loop {
@@ -1008,24 +1089,29 @@ impl RdmaQueue {
                         "RDMA completion error at bootstrap (status {status})"
                     )));
                 }
-                match wr_kind(id) {
-                    k if k == kind => {
-                        match kind {
-                            WR_RECV => &self.wr.recv,
-                            _ => &self.wr.read,
-                        }
-                        .complete();
-                        return Ok(wr_low(id));
+                let Some(WrId { kind: k, low }) = WrId::decode(id) else {
+                    continue;
+                };
+                if k == kind {
+                    match kind {
+                        WrKind::Recv => &self.wr.recv,
+                        _ => &self.wr.read,
                     }
-                    WR_SEND => {
+                    .complete();
+                    return Ok(low);
+                }
+                match k {
+                    WrKind::Send => {
                         self.wr.send.complete();
-                        self.on_response_done(wr_low(id));
+                        self.on_response_done(low);
                     }
-                    WR_WRITE => {
+                    WrKind::Write => {
                         self.wr.write.complete();
-                        self.on_response_done(wr_low(id));
+                        self.on_response_done(low);
                     }
-                    _ => {}
+                    // A RECV/READ that isn't the awaited kind: ignore
+                    // (bootstrap awaits exactly one of them).
+                    WrKind::Recv | WrKind::Read => {}
                 }
             }
         }
@@ -1035,7 +1121,7 @@ impl RdmaQueue {
     /// route it. A host-to-controller-data command (IO write / DSM) leases a pool
     /// buffer and RDMA-READs the host's keyed-SGL data into it; the slot is
     /// submitted — waking its slot task to dispatch — only when that READ
-    /// completes (`WR_READ` → [`Self::submit_pending`]). Everything else submits
+    /// completes (`WrKind::Read` → [`Self::submit_pending`]). Everything else submits
     /// at once. Commands the transport cannot satisfy are failed without dispatch.
     fn handle_recv(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>, idx: u32) -> io::Result<()> {
         let sqe = Sqe::read_from_bytes(&self.recv_slice(idx)[..SQE_LEN])
@@ -1186,7 +1272,7 @@ impl RdmaQueue {
         self.nvme.slots.slot(tag).set_data_len(len as u32);
         // Stash the SQE and defer the host-data RDMA READ into read_batch, so all
         // of this CQ poll's write-command reads flush on one doorbell; the slot
-        // is submitted when the READ completes (`WR_READ` → submit_pending).
+        // is submitted when the READ completes (`WrKind::Read` → submit_pending).
         let sgl = parse_keyed_sgl(&sqe);
         self.pending_read[tag as usize] = sqe;
         self.read_batch.push(PendingRead {
@@ -1273,7 +1359,7 @@ impl RdmaQueue {
                         WorkRequestFlags::none()
                     };
                     let hw = g
-                        .construct_wr(wr(WR_WRITE, u32::from(tag)), flags)
+                        .construct_wr(WrId::new(WrKind::Write, u32::from(tag)).encode(), flags)
                         .setup_write(dst.rkey, remote);
                     // SAFETY: the sge references the registered pool arena
                     // (pool_lkey); the slot stays leased until both WRs
@@ -1293,7 +1379,7 @@ impl RdmaQueue {
             // unreaped and the IO hangs (mirrors nvmet-rdma, which marks its
             // responses solicited).
             let ws = g.construct_wr(
-                wr(WR_SEND, u32::from(tag)),
+                WrId::new(WrKind::Send, u32::from(tag)).encode(),
                 WorkRequestFlags::Signaled | WorkRequestFlags::Solicited,
             );
             match invalidate_rkey_for(&resp.cmd) {
@@ -1341,7 +1427,7 @@ impl RdmaQueue {
         registry: &Arc<Registry>,
         peer: &str,
     ) -> io::Result<Rc<ConnCtx<AnyBackend>>> {
-        let idx = self.await_bootstrap(WR_RECV).await?;
+        let idx = self.await_bootstrap(WrKind::Recv).await?;
         // `inline_cd` is Some for an in-capsule (IO-queue) connect, None for a
         // keyed-SGL (admin-queue) connect that we must RDMA READ below.
         let (sqe, inline_cd) = {
@@ -1369,7 +1455,7 @@ impl RdmaQueue {
             let sgl = parse_keyed_sgl(&sqe);
             let len = (sgl.len as usize).min(ICD_LEN);
             self.post_read_cdata(&sgl, len)?;
-            self.await_bootstrap(WR_READ).await?;
+            self.await_bootstrap(WrKind::Read).await?;
             Box::new(
                 ConnectData::read_from_bytes(&self.cdata_buf[..size_of::<ConnectData>()])
                     .map_err(|_| io::Error::other("short connect data"))?,
@@ -2069,5 +2155,84 @@ impl RdmaListener {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `WrId` must round-trip and keep the exact legacy bit layout (high byte
+    /// 1..=4 << 40, low 32 = tag/idx), because posted and completed wr_ids are
+    /// matched by these bits — an off-by-one would misroute completions.
+    #[test]
+    fn wr_id_round_trips_with_legacy_layout() {
+        for kind in [WrKind::Recv, WrKind::Send, WrKind::Write, WrKind::Read] {
+            for low in [0u32, 1, 7, 0xffff_ffff] {
+                let decoded = WrId::decode(WrId::new(kind, low).encode()).expect("known kind");
+                assert_eq!(decoded, WrId { kind, low });
+            }
+        }
+        // Exact values the old `WR_* | low` encoding produced.
+        assert_eq!(WrId::new(WrKind::Recv, 7).encode(), (1 << 40) | 7);
+        assert_eq!(WrId::new(WrKind::Send, 7).encode(), (2 << 40) | 7);
+        assert_eq!(WrId::new(WrKind::Write, 7).encode(), (3 << 40) | 7);
+        assert_eq!(WrId::new(WrKind::Read, 7).encode(), (4 << 40) | 7);
+        // An unknown class byte decodes to None (the defensive guard).
+        assert_eq!(WrId::decode(9 << 40), None);
+    }
+
+    /// The GET_STATS key list + order is a stable wire format the `stat` tooling
+    /// reads; lock it so the table-driven `snapshot` can't silently reorder it.
+    #[test]
+    fn stats_snapshot_key_order_is_stable() {
+        let keys: Vec<&str> = RdmaWrStats::default()
+            .snapshot()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "read_posted",
+                "read_done",
+                "read_inflight",
+                "write_posted",
+                "write_done",
+                "write_inflight",
+                "send_posted",
+                "send_done",
+                "send_inflight",
+                "recv_posted",
+                "recv_done",
+                "recv_inflight",
+                "poll_batches",
+                "sq_doorbells",
+                "read_db_b1",
+                "read_db_b2",
+                "read_db_b4",
+                "read_db_b8",
+                "read_db_b16",
+                "read_db_b32",
+                "resp_db_b1",
+                "resp_db_b2",
+                "resp_db_b4",
+                "resp_db_b8",
+                "resp_db_b16",
+                "resp_db_b32",
+                "recv_db_b1",
+                "recv_db_b2",
+                "recv_db_b4",
+                "recv_db_b8",
+                "recv_db_b16",
+                "recv_db_b32",
+                "poll_b1",
+                "poll_b2",
+                "poll_b4",
+                "poll_b8",
+                "poll_b16",
+                "poll_b32",
+            ]
+        );
     }
 }
