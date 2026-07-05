@@ -807,6 +807,38 @@ impl RdmaQueue {
         }
     }
 
+    /// Decode and log a failed RDMA completion (non-flush): name the WR class
+    /// and its tag, and surface any keyed-SGL target the tag stashed — the exact
+    /// op the peer rejected (e.g. REM_ACCESS on a bad rkey/bounds), evidence that
+    /// would otherwise vanish with the queue.
+    fn log_completion_error(&self, id: u64, status: u32) {
+        let tag = wr_low(id) as usize;
+        let kind = match wr_kind(id) {
+            WR_RECV => "RECV",
+            WR_READ => "READ",
+            WR_WRITE => "WRITE",
+            WR_SEND => "SEND",
+            _ => "?",
+        };
+        let sgl = self
+            .pending_read
+            .get(tag)
+            .map(parse_keyed_sgl)
+            .map(|s| (s.rkey, s.addr, s.len))
+            .unwrap_or_default();
+        tracing::warn!(
+            qid = self.nvme.qid,
+            qpn = self.qp.qp_number(),
+            kind,
+            tag,
+            status,
+            stashed_rkey = sgl.0,
+            stashed_addr = format_args!("{:#x}", sgl.1),
+            stashed_len = sgl.2,
+            "rdma completion error; tearing queue down"
+        );
+    }
+
     /// Drain the CQ and dispatch each completion. Returns `Ok(true)` when a
     /// flushed completion is seen (peer gone → stop the reap loop), `Ok(false)`
     /// to keep going, `Err` on a fatal handler error. Reused by both the
@@ -830,31 +862,7 @@ impl RdmaQueue {
                 // REM_ACCESS = our READ/WRITE hit a bad rkey/bounds at the
                 // host) — evidence that would otherwise vanish with the queue.
                 if status != WorkCompletionStatus::WorkRequestFlushedError as u32 {
-                    let tag = wr_low(id) as usize;
-                    let kind = match wr_kind(id) {
-                        WR_RECV => "RECV",
-                        WR_READ => "READ",
-                        WR_WRITE => "WRITE",
-                        WR_SEND => "SEND",
-                        _ => "?",
-                    };
-                    let sgl = self
-                        .pending_read
-                        .get(tag)
-                        .map(parse_keyed_sgl)
-                        .map(|s| (s.rkey, s.addr, s.len))
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        qid = self.nvme.qid,
-                        qpn = self.qp.qp_number(),
-                        kind,
-                        tag,
-                        status,
-                        stashed_rkey = sgl.0,
-                        stashed_addr = format_args!("{:#x}", sgl.1),
-                        stashed_len = sgl.2,
-                        "rdma completion error; tearing queue down"
-                    );
+                    self.log_completion_error(id, status);
                 }
                 // Peer gone (flush) or QP now in error: stop the reap loop.
                 return Ok(true);
@@ -881,6 +889,15 @@ impl RdmaQueue {
                 _ => {}
             }
         }
+        self.drain_deferred(ctx)?;
+        Ok(false)
+    }
+
+    /// After a CQ poll, run the deferred-work drains its completions may have
+    /// unblocked: retry pool-deferred write stages (leases freed), un-park
+    /// commands (tags freed), then flush this poll's collected host-data READs
+    /// on one doorbell.
+    fn drain_deferred(&mut self, ctx: &Rc<ConnCtx<AnyBackend>>) -> io::Result<()> {
         // Pool leases freed by this poll's response completions un-block
         // deferred write stages, oldest first (head-of-line, like SPDK's
         // pending queues — a big front request is not starved by smaller
@@ -913,7 +930,7 @@ impl RdmaQueue {
         // Flush the write-command host-data READs `handle_recv` collected from
         // this poll's RECV batch — all on one doorbell.
         self.post_reads_batch()?;
-        Ok(false)
+        Ok(())
     }
 
     /// Keep-alive / controller-liveness watchdog, run on the backstop cadence
@@ -1407,6 +1424,157 @@ impl RdmaQueue {
         crate::cq::arm(&self.cq)
     }
 
+    /// One persistent task per slot (preallocated at queue install — zero
+    /// per-command allocation): each loops await_command → dispatch →
+    /// begin_respond → push the response for the reap loop to post. Dispatch
+    /// off the reap loop means a parked Async Event Request (held until an
+    /// async event) cannot stall the queue. The JoinSet aborts every task when
+    /// it drops at `run` exit, so a parked AER task is torn down cleanly.
+    fn spawn_slot_tasks(&self, ctx: &Rc<ConnCtx<AnyBackend>>) -> JoinSet<()> {
+        let mut slot_tasks: JoinSet<()> = JoinSet::new();
+        for tag in 0..u16::try_from(self.nslots).unwrap_or(u16::MAX) {
+            let nvme = Rc::clone(&self.nvme);
+            let ctx = Rc::clone(ctx);
+            let responses = Rc::clone(&self.responses);
+            slot_tasks.spawn_local(async move {
+                loop {
+                    let cmd = nvme.await_command(tag).await;
+                    let outcome = dispatch::execute(&ctx, tag, &cmd).await;
+                    nvme.begin_respond(tag);
+                    responses.push(RdmaResp { tag, cmd, outcome });
+                }
+            });
+        }
+        slot_tasks
+    }
+
+    /// Reactor park-probe: drain this queue's CQ at the reactor's sleep
+    /// point — under load completions are reaped with no comp-channel
+    /// event, no read(2) and no poll round-trip per batch (measured ~16%
+    /// of a saturated io-thread). Going to sleep, the probe arms the CQ
+    /// and race-drains once (arm-before-drain), so the sleep always has a
+    /// wake source; while awake it never arms, so no events are generated.
+    /// The probe only stages + wakes; processing stays in this loop.
+    ///
+    /// `poll` selects poll mode (see the caller): with it set, the probe spins
+    /// while IO is in flight instead of sleeping. Returns the probe handle for
+    /// [`ioutgt_uring::remove_park_probe`].
+    fn install_park_probe(&self, poll: bool) -> io::Result<u64> {
+        let shared = Rc::clone(&self.probe);
+        let cq = Rc::clone(&self.cq);
+        let last_active = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+        let spin_nvme = Rc::clone(&self.nvme);
+        let spin_last = Rc::clone(&last_active);
+        let spin = poll.then(|| {
+            Box::new(move || !spin_nvme.slots.idle() || spin_last.get().elapsed() < SPIN_GRACE)
+                as Box<dyn Fn() -> bool>
+        });
+        let probe_nvme = Rc::clone(&self.nvme);
+        ioutgt_uring::add_park_probe(
+            Box::new(move || {
+                let mut staged = shared.staged.borrow_mut();
+                let drain = |staged: &mut Vec<(u64, u32)>| {
+                    if let Ok(poller) = cq.start_poll() {
+                        for wc in poller {
+                            staged.push((wc.wr_id(), wc.status()));
+                        }
+                    }
+                };
+                drain(&mut staged);
+                if poll && !staged.is_empty() {
+                    last_active.set(std::time::Instant::now());
+                }
+                // Arm whenever this pass may end in a sleep: event mode
+                // always; poll mode whenever the queue is idle — deliberately
+                // IGNORING the spin grace here. The spin predicate is
+                // re-evaluated after this probe with a later timestamp, so
+                // gating the arm on the same grace check could disagree
+                // across the 200 us boundary and let the pass sleep with the
+                // CQ unarmed (a ~1 s backstop stall on the next capsule —
+                // review finding). Arming strictly more often than the
+                // predicate sleeps closes the race; the cost is at most one
+                // spurious comp event per idle transition while grace-
+                // spinning, which the fd poll simply drains.
+                if staged.is_empty() && (!poll || probe_nvme.slots.idle()) {
+                    // Nothing pending: arm so a completion during the coming
+                    // sleep raises an event for the multishot poll, then
+                    // re-check the race window.
+                    if crate::cq::arm(&cq).is_err() {
+                        return true; // never sleep on a broken CQ
+                    }
+                    drain(&mut staged);
+                }
+                if !staged.is_empty() {
+                    if let Some(w) = shared.waker.borrow_mut().take() {
+                        w.wake();
+                    }
+                    true
+                } else {
+                    false
+                }
+            }),
+            spin,
+        )
+    }
+
+    /// Teardown: resolve parked AERs, then drain in-flight dispatches before
+    /// returning (returning drops `self` → the QP and the pool arena). A slot
+    /// task mid-dispatch may have a backend op in flight into the arena; the
+    /// in-flight RDMA WRs are handled by the QP destroy + Drop's CQ drain.
+    /// `ctx.close()` lets executing() reach 0. Bounded; the memory backend
+    /// dispatches synchronously, so this is ~instant there.
+    async fn teardown(
+        self,
+        ctx: Rc<ConnCtx<AnyBackend>>,
+        slot_tasks: JoinSet<()>,
+        result: io::Result<()>,
+    ) -> io::Result<()> {
+        tracing::debug!(qid = self.nvme.qid, "nvme-rdma: queue teardown");
+        ctx.close();
+        // Tear down the controller when its admin queue dies (TCP parity).
+        // Removed before the drain so the IO queues' watchdogs see it gone and
+        // follow promptly — an abruptly-vanished host sends no per-queue DREQs.
+        if let Role::Admin(admin) = &ctx.role {
+            let cntlid = admin.cntlid.get();
+            if cntlid != 0 && ctx.registry.remove(cntlid).is_some() {
+                tracing::info!(cntlid, "nvme-rdma: controller removed");
+            }
+        }
+        let mut waited = 0u32;
+        while self.nvme.slots.executing() > 0 && waited < 10_000 {
+            match ioutgt_uring::ops::sleep(std::time::Duration::from_millis(2)) {
+                Ok(s) => {
+                    let _ = s.await;
+                }
+                Err(_) => break,
+            }
+            waited += 2;
+        }
+        if self.nvme.slots.executing() > 0 {
+            // A wedged backend op (file backend) still references the pool arena.
+            // Returning would drop `self` (dereg the MRs, free the arena) and the
+            // slot tasks while the kernel may still write into the arena — a UAF.
+            // Leak both instead, keeping the arena + the op's buffer alive for the
+            // process's remaining lifetime (mirrors the TCP teardown). v1's memory
+            // backend dispatches synchronously, so this is never reached.
+            tracing::warn!(
+                qid = self.nvme.qid,
+                executing = self.nvme.slots.executing(),
+                "nvme-rdma: teardown drain timed out; leaking queue + tasks"
+            );
+            std::mem::forget(slot_tasks);
+            std::mem::forget(self);
+            return result;
+        }
+        // All ops have drained: release the pool's fixed-buffer slot so the
+        // index is reusable before the queue (and its arena) is freed on
+        // return. The leak branch above intentionally keeps it pinned.
+        if let Some(idx) = self.nvme.slots.pool().take_buf_index() {
+            ioutgt_uring::unregister_pool_buffer(idx);
+        }
+        result
+    }
+
     /// Drive this connection: bootstrap the controller from the Connect capsule,
     /// then process commands until the QP errors (peer disconnect) or a fatal
     /// error. Requires [`prime`](Self::prime) to have been called first. `on_ctx`
@@ -1423,26 +1591,7 @@ impl RdmaQueue {
         let ctx = self.bootstrap(&port, &registry, &peer).await?;
         on_ctx(&ctx);
 
-        // One persistent task per slot (preallocated at queue install — zero
-        // per-command allocation): each loops await_command → dispatch →
-        // begin_respond → push the response for the reap loop to post. Dispatch
-        // off the reap loop means a parked Async Event Request (held until an
-        // async event) cannot stall the queue. The JoinSet aborts every task when
-        // it drops at `run` exit, so a parked AER task is torn down cleanly.
-        let mut slot_tasks: JoinSet<()> = JoinSet::new();
-        for tag in 0..u16::try_from(self.nslots).unwrap_or(u16::MAX) {
-            let nvme = Rc::clone(&self.nvme);
-            let ctx = Rc::clone(&ctx);
-            let responses = Rc::clone(&self.responses);
-            slot_tasks.spawn_local(async move {
-                loop {
-                    let cmd = nvme.await_command(tag).await;
-                    let outcome = dispatch::execute(&ctx, tag, &cmd).await;
-                    nvme.begin_respond(tag);
-                    responses.push(RdmaResp { tag, cmd, outcome });
-                }
-            });
-        }
+        let slot_tasks = self.spawn_slot_tasks(&ctx);
 
         let responses = Rc::clone(&self.responses);
         // Reused across iterations: the steady IO path allocates nothing.
@@ -1464,82 +1613,19 @@ impl RdmaQueue {
         // `sleep` rebuilt its timer op every wake and never survived to elapse
         // under load, which is exactly how a stranded completion wedged the queue.
         let mut backstop = std::pin::pin!(ioutgt_uring::ops::sleep(BACKSTOP)?);
-        // Reactor park-probe: drain this queue's CQ at the reactor's sleep
-        // point — under load completions are reaped with no comp-channel
-        // event, no read(2) and no poll round-trip per batch (measured ~16%
-        // of a saturated io-thread). Going to sleep, the probe arms the CQ
-        // and race-drains once (arm-before-drain), so the sleep always has a
-        // wake source; while awake it never arms, so no events are generated.
-        // The probe only stages + wakes; processing stays in this loop.
-        let probe_id = {
-            let shared = Rc::clone(&self.probe);
-            let cq = Rc::clone(&self.cq);
-            // Poll mode (`--poll`): while commands are in flight (any tag
-            // claimed), the spin predicate keeps the reactor from sleeping —
-            // the CQ is busy-polled at park cadence and completions never
-            // wait for an event. The moment the queue drains idle (all tags
-            // free — the admin queue between keep-alives, an idle
-            // connection), the probe arms the CQ and the thread sleeps
-            // event-driven; the next capsule's comp event resumes the spin.
-            // One core per IO thread only while it is doing IO. The admin
-            // queue (qid 0) never spins: its parked Async Event Request holds
-            // a slot for the controller lifetime (so `idle()` is never true
-            // there), and keep-alive latency does not merit a core.
-            let poll = port.poll && self.nvme.qid != 0;
-            let last_active = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
-            let spin_nvme = Rc::clone(&self.nvme);
-            let spin_last = Rc::clone(&last_active);
-            let spin = poll.then(|| {
-                Box::new(move || !spin_nvme.slots.idle() || spin_last.get().elapsed() < SPIN_GRACE)
-                    as Box<dyn Fn() -> bool>
-            });
-            let probe_nvme = Rc::clone(&self.nvme);
-            ioutgt_uring::add_park_probe(
-                Box::new(move || {
-                    let mut staged = shared.staged.borrow_mut();
-                    let drain = |staged: &mut Vec<(u64, u32)>| {
-                        if let Ok(poller) = cq.start_poll() {
-                            for wc in poller {
-                                staged.push((wc.wr_id(), wc.status()));
-                            }
-                        }
-                    };
-                    drain(&mut staged);
-                    if poll && !staged.is_empty() {
-                        last_active.set(std::time::Instant::now());
-                    }
-                    // Arm whenever this pass may end in a sleep: event mode
-                    // always; poll mode whenever the queue is idle — deliberately
-                    // IGNORING the spin grace here. The spin predicate is
-                    // re-evaluated after this probe with a later timestamp, so
-                    // gating the arm on the same grace check could disagree
-                    // across the 200 us boundary and let the pass sleep with the
-                    // CQ unarmed (a ~1 s backstop stall on the next capsule —
-                    // review finding). Arming strictly more often than the
-                    // predicate sleeps closes the race; the cost is at most one
-                    // spurious comp event per idle transition while grace-
-                    // spinning, which the fd poll simply drains.
-                    if staged.is_empty() && (!poll || probe_nvme.slots.idle()) {
-                        // Nothing pending: arm so a completion during the coming
-                        // sleep raises an event for the multishot poll, then
-                        // re-check the race window.
-                        if crate::cq::arm(&cq).is_err() {
-                            return true; // never sleep on a broken CQ
-                        }
-                        drain(&mut staged);
-                    }
-                    if !staged.is_empty() {
-                        if let Some(w) = shared.waker.borrow_mut().take() {
-                            w.wake();
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }),
-                spin,
-            )?
-        };
+        // Poll mode (`--poll`): while commands are in flight (any tag
+        // claimed), the spin predicate keeps the reactor from sleeping —
+        // the CQ is busy-polled at park cadence and completions never
+        // wait for an event. The moment the queue drains idle (all tags
+        // free — the admin queue between keep-alives, an idle
+        // connection), the probe arms the CQ and the thread sleeps
+        // event-driven; the next capsule's comp event resumes the spin.
+        // One core per IO thread only while it is doing IO. The admin
+        // queue (qid 0) never spins: its parked Async Event Request holds
+        // a slot for the controller lifetime (so `idle()` is never true
+        // there), and keep-alive latency does not merit a core.
+        let poll = port.poll && self.nvme.qid != 0;
+        let probe_id = self.install_park_probe(poll)?;
         // Reap until peer-gone (a flushed completion), a CM Disconnected (`stop`),
         // or a fatal error; then drain and tear down. Each select arm yields
         // Ok(false) to keep going, Ok(true) to stop, or Err for a fatal error.
@@ -1628,56 +1714,7 @@ impl RdmaQueue {
         // wedged-backend leak path below).
         ioutgt_uring::remove_park_probe(probe_id);
 
-        // Teardown: resolve parked AERs, then drain in-flight dispatches before
-        // returning (returning drops `self` → the QP and the pool arena). A slot
-        // task mid-dispatch may have a backend op in flight into the arena; the
-        // in-flight RDMA WRs are handled by the QP destroy + Drop's CQ drain.
-        // `ctx.close()` lets executing() reach 0. Bounded; the memory backend
-        // dispatches synchronously, so this is ~instant there.
-        tracing::debug!(qid = self.nvme.qid, "nvme-rdma: queue teardown");
-        ctx.close();
-        // Tear down the controller when its admin queue dies (TCP parity).
-        // Removed before the drain so the IO queues' watchdogs see it gone and
-        // follow promptly — an abruptly-vanished host sends no per-queue DREQs.
-        if let Role::Admin(admin) = &ctx.role {
-            let cntlid = admin.cntlid.get();
-            if cntlid != 0 && ctx.registry.remove(cntlid).is_some() {
-                tracing::info!(cntlid, "nvme-rdma: controller removed");
-            }
-        }
-        let mut waited = 0u32;
-        while self.nvme.slots.executing() > 0 && waited < 10_000 {
-            match ioutgt_uring::ops::sleep(std::time::Duration::from_millis(2)) {
-                Ok(s) => {
-                    let _ = s.await;
-                }
-                Err(_) => break,
-            }
-            waited += 2;
-        }
-        if self.nvme.slots.executing() > 0 {
-            // A wedged backend op (file backend) still references the pool arena.
-            // Returning would drop `self` (dereg the MRs, free the arena) and the
-            // slot tasks while the kernel may still write into the arena — a UAF.
-            // Leak both instead, keeping the arena + the op's buffer alive for the
-            // process's remaining lifetime (mirrors the TCP teardown). v1's memory
-            // backend dispatches synchronously, so this is never reached.
-            tracing::warn!(
-                qid = self.nvme.qid,
-                executing = self.nvme.slots.executing(),
-                "nvme-rdma: teardown drain timed out; leaking queue + tasks"
-            );
-            std::mem::forget(slot_tasks);
-            std::mem::forget(self);
-            return result;
-        }
-        // All ops have drained: release the pool's fixed-buffer slot so the
-        // index is reusable before the queue (and its arena) is freed on
-        // return. The leak branch above intentionally keeps it pinned.
-        if let Some(idx) = self.nvme.slots.pool().take_buf_index() {
-            ioutgt_uring::unregister_pool_buffer(idx);
-        }
-        result
+        self.teardown(ctx, slot_tasks, result).await
     }
 }
 
