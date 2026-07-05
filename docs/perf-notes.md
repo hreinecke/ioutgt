@@ -59,7 +59,6 @@ anything else touches the wire.
 
 ## Gather send: staging buffer removed (2026-06-11)
 
-Design: `docs/superpowers/specs/2026-06-11-gather-send-design.md`.
 send_loop's slot → staging payload memcpy replaced by one SENDMSG
 gather per batch (headers/digests in a small arena, payload iovecs
 pointing into slot buffers). Wire bytes identical (golden tests +
@@ -112,7 +111,6 @@ plain SEND (`ITER_UBUF`).
 
 ## Direct-to-slot payload recv (2026-06-11)
 
-Design: `docs/superpowers/specs/2026-06-11-direct-slot-recv-design.md`.
 Large H2C payload tails (`remaining >= H2C_DIRECT_MIN` = 16 KiB at
 buffer-drain time) recv straight into the slot at the reassembly
 offset via one `MSG_WAITALL` raw op; in-capsule payloads and buffered
@@ -181,13 +179,11 @@ Per-queue/per-thread counters (GET_STATS `threads`, `ioutgt stat`) are
 null backend, 4 IO threads, loadgen 4K randread conns=4 qd=32, 3
 interleaved reps. Baseline median 409.4K IOPS (393.3–415.6K), with
 counters 408.1K (407.6–409.7K), p50 ~172 µs both sides — well inside
-the run-to-run spread. Design:
-`docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+the run-to-run spread.
 
 ## SENDMSG_ZC loopback A/B (2026-06-12)
 
-`--send-zc` (design: `docs/superpowers/specs/2026-06-12-send-zc-design.md`)
-landed opt-in. An earlier table in this section recorded −4%/−61% —
+`--send-zc` landed opt-in. An earlier table in this section recorded −4%/−61% —
 those runs were **invalid**: queues were silently wedging on ENOMEM
 from ZC pinned-page accounting (see the RLIMIT_MEMLOCK note below;
 fixed the same day, with the field symptom being ~27 s IO hangs under

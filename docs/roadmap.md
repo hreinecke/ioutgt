@@ -15,8 +15,7 @@ two IO threads. This file orders what comes next.
 - ~~Direct-to-slot payload recv~~ — **done** (2026-06-11): large H2C
   tails land in the slot via one `MSG_WAITALL` raw recv; −44% target
   cycles/IOP on 128 KiB writes, 4K flat; kept at threshold 16 KiB.
-  Design in `docs/superpowers/specs/2026-06-11-direct-slot-recv-design.md`,
-  numbers in `docs/perf-notes.md`. Reminder for the multishot item
+  Numbers in `docs/perf-notes.md`. Reminder for the multishot item
   above: the bypass is irreconcilable with provided buffers on one
   connection (kernel picks the buffer) — landing multishot means a
   per-connection strategy choice.
@@ -26,8 +25,7 @@ two IO threads. This file orders what comes next.
 - ~~`SEND_ZC` with notification-gated buffer reuse~~ — **landed
   opt-in** (2026-06-12, `--send-zc`): `SENDMSG_ZC` over the gather
   iovecs, double-buffered batches, payload tags release on the
-  notification CQE, recv path parks on tag exhaustion. Design in
-  `docs/superpowers/specs/2026-06-12-send-zc-design.md`. **Still
+  notification CQE, recv path parks on tag exhaustion. **Still
   open: real-NIC evaluation** — loopback falls back to copying
   (REPORT_USAGE confirms: `zc_copied == zc_batches`) and the default
   8 MiB `RLIMIT_MEMLOCK` forces copy fallbacks under load, so the flag
@@ -37,8 +35,7 @@ two IO threads. This file orders what comes next.
 - ~~Per-queue stats counters surfaced through `GET_STATS`~~ — **done**
   (2026-06-12): `Cell` counters snapshotted on the owning thread via a
   mailbox round trip, rendered by `ioutgt stat` (`-i` for rates);
-  A/B-verified free. Design in
-  `docs/superpowers/specs/2026-06-12-queue-stats-design.md`.
+  A/B-verified free.
 - Recv/send **budget tuning** (configurable, swept), optional second
   **IOPOLL ring** per thread for disk ops, `OpEntry` slab/waker
   micro-costs.
@@ -57,8 +54,7 @@ bdev backend path.
 ## 3. New transports (the framework bet)
 
 2026-06-12: the prerequisite transport-abstraction refactor landed
-(transport contract in architecture.md §5.1; design spec
-`docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`).
+(transport contract in architecture.md §5.1).
 NBD is next; NVMe/RDMA after.
 
 The split that makes this tractable: `ioutgt-nvme` is sans-io,

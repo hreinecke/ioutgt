@@ -300,9 +300,7 @@ The obligations any transport must meet are the contract in §5.1.
 ## 5.1 Transport contract
 
 The engine split (§3.2) makes the obligations of any transport explicit.
-A transport supplies six pieces; the design spec
-(`docs/superpowers/specs/2026-06-12-transport-abstraction-design.md`)
-records the decision rationale; this section is the authoritative
+A transport supplies six pieces; this section is the authoritative
 as-built statement.
 
 1. **Setup** (control thread, plain Tokio): authenticate or handshake
