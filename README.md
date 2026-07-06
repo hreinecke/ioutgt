@@ -109,13 +109,12 @@ testing/two_nic_realwire_tcp.sh down
 | `ioutgt-nvme` | sans-io NVMe spec types, NVMe/TCP PDU codec, CRC32C digests |
 | `ioutgt-core` | subsystems, controllers, namespaces, queues, dispatch, the slot engine |
 | `ioutgt-stream` | protocol-neutral stream send/recv harness (`StreamSender`/`StreamReader`) |
-| `ioutgt-nvme-tcp` | NVMe/TCP transport state machines |
+| `ioutgt-nvme-tcp` | NVMe/TCP transport + binary |
 | `ioutgt-nvme-rdma` | NVMe/RDMA transport + binary (verbs, CM, adaptive `--poll`) |
 | `ioutgt-backend` | null / memory / file / block backends |
 | `ioutgt-control` | UDS JSON control plane + config schema |
 | `ioutgt-harness` | shared binary harness: spawn, queue-thread pool, control server, `stat` client |
 | `ioutgt-cpus` | locality-aware even CPU grouping for topology-aware pinning |
-| `ioutgt` | the NVMe/TCP target binary |
 
 ## Documentation
 
