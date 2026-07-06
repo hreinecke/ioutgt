@@ -94,6 +94,7 @@ testing/two_nic_realwire_tcp.sh down
 ## Roadmap
 
 - Performance optimization.
+- Analysis & Comparison with SPDK.
 - Receive zero-copy for NVMe/TCP (io_uring `RECV_ZC`).
 - In-band authentication.
 - Metadata/PI formats.
@@ -137,7 +138,7 @@ testing/two_nic_realwire_tcp.sh down
 
 ## Requirements
 
-- Linux ≥ 6.11 (`DEFER_TASKRUN` + multishot era; developed on 6.19)
+- Linux ≥ 6.11 (`DEFER_TASKRUN` + multishot era; developed on 7.1)
 - Rust ≥ 1.88 stable
 - clang libs ≤ 19 for building `ioutgt-nvme-rdma`: its `rdma-mummy-sys`
   dependency runs bindgen at build time, which fails against
