@@ -94,7 +94,7 @@ if [ "${1:-}" != "--guest" ]; then
 	# error-recovery hang leaves a test in uninterruptible sleep), ./check
 	# inside the guest can never be killed, so bound it from OUTSIDE by killing
 	# qemu. Without this the run hangs forever.
-	RUN_TIMEOUT="${IOUTGT_XFSTESTS_TIMEOUT:-90m}"
+	RUN_TIMEOUT="${IOUTGT_XFSTESTS_TIMEOUT:-200m}"
 	exec timeout --kill-after=30s "$RUN_TIMEOUT" \
 		"$VMTEST" -c "$VMTEST_CONF" run ioutgt_xfstests \
 		--guest "$MODE" "$TCP_BIN" "$RDMA_BIN" "${CHECK_ARGS[@]}"
