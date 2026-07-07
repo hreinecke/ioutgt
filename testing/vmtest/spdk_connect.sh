@@ -47,25 +47,10 @@ modprobe "nvme-$TRANSPORT" 2>/dev/null || true
 TARGET_IP=127.0.0.1
 if [ "$TRANSPORT" = rdma ]; then
     log "loading rdma_rxe + adding an rxe device (matching the ioutgt rdma gate)"
-    modprobe rdma_rxe 2>/dev/null || true
-    # Pick the netdev that HAS a global IPv4 (not necessarily the default route).
-    DEV=$(ip -o -4 addr show up scope global 2>/dev/null | awk '{print $2; exit}')
-    [ -n "${DEV:-}" ] || fail "no usable netdev for rxe"
-    CIDR=$(ip -o -4 addr show dev "$DEV" scope global 2>/dev/null | awk '{print $4; exit}')
-    TARGET_IP=${CIDR%%/*}
-    [ -n "$TARGET_IP" ] || fail "no IP on $DEV"
-    ip link set "$DEV" up 2>/dev/null || true
-    rdma link add rxe0 type rxe netdev "$DEV" 2>/dev/null || true
-    for _ in $(seq 1 20); do ibv_devinfo 2>/dev/null | grep -q PORT_ACTIVE && break; sleep 0.5; done
-    # rxe's RoCEv2 GID enumerates netdev IPs via async work; re-add the IP after
-    # the link exists to re-trigger the GID notifier (else rdma_bind_addr fails).
-    gid_ready() { show_gids 2>/dev/null | grep -qw "$TARGET_IP"; }
-    if ! gid_ready; then
-        ip addr del "$CIDR" dev "$DEV" 2>/dev/null || true
-        ip addr add "$CIDR" dev "$DEV" 2>/dev/null || true
-        for _ in $(seq 1 20); do gid_ready && break; sleep 0.5; done
-    fi
-    log "rxe dev=$DEV ip=$TARGET_IP (GID $(gid_ready && echo ready || echo MISSING))"
+    # shellcheck source=../common/rxe.sh
+    . "$(dirname "$0")/../common/rxe.sh"
+    rxe_setup || fail "rxe bring-up (no netdev/IP)"
+    TARGET_IP="$RXE_IP"
 fi
 export TARGET_IP
 
