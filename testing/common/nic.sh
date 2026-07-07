@@ -248,6 +248,9 @@ EOF
 
 tune_target_nic() {
     [ -n "${TUNE_NIC:-}" ] || { echo "   (TUNE_NIC unset; skipping IRQ affinity sync)"; return 0; }
+    # This tuner reads ioutgt's control socket for per-queue placement, so it only
+    # applies to an ioutgt target — skip it for nvmet/SPDK (no control socket).
+    { [ -n "${IOUTGT_SOCK:-}" ] && [ -n "${IOUTGT_BIN:-}" ]; } || { echo "   (no ioutgt control socket; NIC IRQ tuning is ioutgt-only, skipping)"; return 0; }
     command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
     local json rows
     json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"
@@ -365,6 +368,10 @@ mq_debug_dir() {
 tune_initiator_tcp() {
     [ -n "${TUNE_NIC_INI:-}" ] ||
         { echo "   (TUNE_NIC_INI unset; skipping initiator RX steering)"; return 0; }
+    # Steers RX by ioutgt's per-queue peer ports (needs its control socket + NQN),
+    # so it only applies to an ioutgt target — skip for nvmet/SPDK.
+    { [ -n "${IOUTGT_SOCK:-}" ] && [ -n "${IOUTGT_BIN:-}" ] && [ -n "${IOUTGT_NQN:-}" ]; } ||
+        { echo "   (no ioutgt control socket; initiator RX steering is ioutgt-only, skipping)"; return 0; }
     command -v jq >/dev/null 2>&1 ||
         { echo "   (jq not found; skipping initiator RX steering)"; return 0; }
     local rows dev mqdir
@@ -464,6 +471,9 @@ tune_initiator_rdma() {
 # netdev channel (= qid-1).
 tune_status() {
     [ -n "${TUNE_NIC:-}" ] || return 0
+    # Live IRQ-vs-io-thread affinity readout reads ioutgt's control socket; it
+    # only applies to an ioutgt target — skip for nvmet/SPDK.
+    { [ -n "${IOUTGT_SOCK:-}" ] && [ -n "${IOUTGT_BIN:-}" ]; } || return 0
     local what="queue"
     [ "${TUNE_COMP_VECTOR:-0}" = 1 ] && what="comp-vector"
     echo "== $TUNE_NIC $what IRQ vs ioutgt io-thread (live) affinity =="
