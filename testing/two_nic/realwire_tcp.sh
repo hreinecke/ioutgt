@@ -93,6 +93,11 @@ ini_exec() { ip netns exec "$NS_I" "$@"; }
 # :-4 default, so 'up' may auto-size it from the NIC only when the user did not.
 NRQ_USER_SET="${NR_QUEUES+1}"
 
+# TCP fabric: pin it before common.sh (which otherwise honors an inherited
+# TRANSPORT via ${TRANSPORT:-tcp}), mirroring realwire_rdma.sh's export=rdma, so
+# a stale TRANSPORT=rdma in the environment can't silently turn a tcp run into
+# rdma — whether invoked directly or via run_fio_perf.sh.
+export TRANSPORT=tcp
 . "$(dirname "$0")/../common/common.sh"
 
 # Persisted auto-sized NR_QUEUES (so the separate up/start/connect/status
