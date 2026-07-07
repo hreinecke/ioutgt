@@ -151,69 +151,7 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }
 
-require_nics() {
-    : "${NIC_T:?set NIC_T to the target-side NIC, e.g. NIC_T=mlx5p1}"
-    : "${NIC_I:?set NIC_I to the initiator-side NIC, e.g. NIC_I=mlx5p2}"
-}
 fail() { echo "FAIL: $*" >&2; exit 1; }
-
-# ---- RDMA-specific wire helpers (used only when TRANSPORT=rdma) -------
-# The rdma (ibverbs) device name backing a netdev, from sysfs.
-nic_ibdev() {
-    local nic="$1" d
-    for d in /sys/class/net/"$nic"/device/infiniband/*; do
-        [ -e "$d" ] || continue
-        basename "$d"; return 0
-    done
-    return 1
-}
-# Put the box in rdma netns-exclusive mode (global; idempotent).
-rdma_netns_exclusive() {
-    local mode; mode="$(rdma system show 2>/dev/null | grep -o 'netns [a-z]*' | awk '{print $2}')"
-    [ "$mode" = exclusive ] && { echo "   rdma netns mode already exclusive"; return 0; }
-    echo ">> setting rdma system netns mode = exclusive (global; was ${mode:-shared})"
-    rdma system set netns exclusive 2>&1 || {
-        echo "   could not set rdma netns exclusive — free any rdma device in a" >&2
-        echo "   non-default netns / in use (no live nvme-rdma sessions), or set at boot." >&2
-        return 1
-    }
-}
-rdma_move_dev() { rdma dev set "$1" netns "$2" 2>/dev/null || true; }
-rdma_gid_ready() {
-    local nic="$1" ip="$2" ns="$3"; local -a x=(); [ -n "$ns" ] && x=(ip netns exec "$ns")
-    local ib hex; ib="$("${x[@]}" sh -c "ls /sys/class/net/$nic/device/infiniband/ 2>/dev/null" | head -1)"
-    [ -n "$ib" ] || return 1
-    # shellcheck disable=SC2086  # deliberate split of the dotted quad into 4 args
-    hex="$(printf '%02x%02x:%02x%02x' ${ip//./ })"
-    "${x[@]}" sh -c "grep -qi 'ffff:$hex' /sys/class/infiniband/$ib/ports/*/gids/* 2>/dev/null"
-}
-# Address a RoCE NIC + seat its RoCEv2 GID in the rdma_cm cache (carrier flap).
-rdma_address_nic() {
-    local nic="$1" ip="$2" ns="$3"; local -a x=(); [ -n "$ns" ] && x=(ip netns exec "$ns")
-    "${x[@]}" ip addr flush dev "$nic" 2>/dev/null || true
-    "${x[@]}" ip link set "$nic" down
-    "${x[@]}" ip link set "$nic" up
-    "${x[@]}" ip link set "$nic" mtu "$MTU"
-    local i
-    for i in $(seq 1 40); do
-        [ "$("${x[@]}" cat "/sys/class/net/$nic/carrier" 2>/dev/null)" = 1 ] && break
-        sleep 0.5
-    done
-    "${x[@]}" ip addr add "$ip/$PREFIX" dev "$nic"
-    "${x[@]}" ip link set lo up 2>/dev/null || true
-    for i in $(seq 1 60); do rdma_gid_ready "$nic" "$ip" "$ns" && return 0; sleep 0.5; done
-    echo "   warning: RoCEv2 GID for $ip on $nic ($ns netns) not visible after 30s" >&2
-    return 0
-}
-rdma_verify_dev() {
-    local ns="$1" dev="$2" i; local -a pfx=(); [ -n "$ns" ] && pfx=(ip netns exec "$ns")
-    for i in $(seq 1 20); do
-        "${pfx[@]}" rdma link show 2>/dev/null | grep "$dev/" | grep -qi "state ACTIVE" && return 0
-        sleep 0.5
-    done
-    echo "   ${ns:-root} rdma link:" >&2; "${pfx[@]}" rdma link show 2>/dev/null | sed 's/^/     /' >&2 || true
-    return 1
-}
 
 # ---- up/down: branch on transport ------------------------------------
 cmd_up_rdma() {

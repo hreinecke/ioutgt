@@ -183,10 +183,6 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 
 # NIC_T/NIC_I are only needed to move the cards into/out of the namespaces
 # (up/down); status/connect/etc. just use the namespaces themselves.
-require_nics() {
-    : "${NIC_T:?set NIC_T to the target-side NIC, e.g. NIC_T=enp1s0f0}"
-    : "${NIC_I:?set NIC_I to the initiator-side NIC, e.g. NIC_I=enp1s0f1}"
-}
 
 # in_net / NSDIR (nsenter --net into a namespace, keeping the mount ns so
 # configfs stays visible) live in common.sh, shared with two_nic/realwire_rdma.
