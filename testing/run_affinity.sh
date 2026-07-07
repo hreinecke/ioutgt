@@ -7,8 +7,7 @@
 set -eu
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"
-VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
-VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
+. "$TOP/testing/common/vmtest.sh"     # VMTEST + VMTEST_CONF (env-overridable)
 
 cargo build --release --manifest-path "$TOP/Cargo.toml" -p ioutgt-nvme-tcp
 

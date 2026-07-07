@@ -5,7 +5,7 @@
 # Ad-hoc vmtest driver: runs the whole local_tgt.sh flow (start -> connect ->
 # fio_perf -> stop) against the ioutgt target inside the guest over loopback,
 # then checks the fio_perf sweep produced real numbers. Run with:
-#   ~/git/utils/vmtest/vmtest -c ~/git/linux-knext/vmtest.conf run \
+#   ~/git/utils/vmtest/vmtest -c ~/git/linux-ioutgt/vmtest.conf run \
 #       /path/to/ioutgt/testing/vmtest/local_fio_perf.sh
 # The ioutgt release binary must be built on the host first (the guest sees
 # the repo read-only, so it cannot build).

@@ -67,8 +67,7 @@ if [ "${1:-}" != "--guest" ]; then
 	[ ${#CHECK_ARGS[@]} -eq 0 ] && CHECK_ARGS=(-g quick)
 	TOP="$(cd "$(dirname "$0")/../.." && pwd)"
 	cd "$TOP"
-	VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
-	VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-ioutgt/vmtest.conf}"
+	. "$TOP/testing/common/vmtest.sh"     # VMTEST + VMTEST_CONF (env-overridable)
 	PROFILE="${IOUTGT_PROFILE:-release}"
 	PROFILE_FLAG=""
 	[ "$PROFILE" = release ] && PROFILE_FLAG="--release"

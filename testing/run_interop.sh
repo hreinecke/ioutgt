@@ -5,8 +5,7 @@
 set -eu
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"
-VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
-VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
+. "$TOP/testing/common/vmtest.sh"     # VMTEST + VMTEST_CONF (env-overridable)
 # t/io_uring throughput probe for the ioutgt_bench guest test; published to
 # the guest via the 9p marker dir below (env does not cross into the VM).
 # Other tests ignore it; override for a different fio build.

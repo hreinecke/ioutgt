@@ -9,8 +9,7 @@ set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$TOP"
-VMTEST="${VMTEST:-$HOME/git/utils/vmtest/vmtest}"
-VMTEST_CONF="${VMTEST_CONF:-$HOME/git/linux-knext/vmtest.conf}"
+. "$TOP/testing/common/vmtest.sh"     # VMTEST + VMTEST_CONF (env-overridable)
 
 cargo build -p ioutgt-nvme-rdma --bin ioutgt-nvme-rdma
 BIN="$TOP/target/debug/ioutgt-nvme-rdma"
