@@ -69,24 +69,31 @@ fi
 
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }; }
 
-# Map a target kind ('nvmet'|'ioutgt') to its "PORT NQN" pair.
+# The target kinds a driver compares, in order. Defaults to the ioutgt-vs-nvmet
+# pair; the spdk driver overrides it (e.g. TARGET_KINDS="spdk nvmet") before
+# sourcing. Drives run_for_targets' "act on all" case and the selector check.
+TARGET_KINDS="${TARGET_KINDS:-ioutgt nvmet}"
+
+# Map a target kind ('nvmet'|'ioutgt'|'spdk') to its "PORT NQN" pair. Only the
+# kinds a given driver defines the PORT/NQN vars for are usable.
 target_params() {
     case "${1:-}" in
         ioutgt) echo "$IOUTGT_PORT $IOUTGT_NQN" ;;
         nvmet)  echo "$NVMET_PORT $NVMET_NQN" ;;
-        *) echo "specify target: nvmet | ioutgt" >&2; return 1 ;;
+        spdk)   echo "$SPDK_PORT $SPDK_NQN" ;;
+        *) echo "specify target: one of [$TARGET_KINDS]" >&2; return 1 ;;
     esac
 }
 
-# Run a per-target function $1 for the selected target $2, or for BOTH
-# targets (ioutgt then nvmet) when no selector is given.
+# Run a per-target function $1 for the selected target $2, or for every kind in
+# $TARGET_KINDS (in order) when no selector is given.
 run_for_targets() {
-    local fn="$1"
-    case "${2:-}" in
-        ioutgt|nvmet) "$fn" "$2" ;;
-        "")           "$fn" ioutgt; "$fn" nvmet ;;
-        *) echo "specify target: nvmet | ioutgt (or omit for both)" >&2; exit 1 ;;
-    esac
+    local fn="$1" sel="${2:-}" k
+    if [ -n "$sel" ]; then
+        for k in $TARGET_KINDS; do [ "$k" = "$sel" ] && { "$fn" "$sel"; return; }; done
+        echo "specify target: one of [$TARGET_KINDS] (or omit for all)" >&2; exit 1
+    fi
+    for k in $TARGET_KINDS; do "$fn" "$k"; done
 }
 
 # Ensure $BACKEND (a caller local) exists. A missing non-/dev path is
@@ -260,5 +267,6 @@ realwire_netns_delete() {
 _common_dir="$(dirname "${BASH_SOURCE[0]}")"
 . "$_common_dir/nvmet.sh"
 . "$_common_dir/ioutgt.sh"
+. "$_common_dir/spdk.sh"
 . "$_common_dir/fio.sh"
 . "$_common_dir/nic.sh"

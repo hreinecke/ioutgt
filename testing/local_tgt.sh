@@ -37,8 +37,16 @@ IOUTGT_PORT=14420
 IOUTGT_NQN="nqn.2026-06.io.localtgt:ioutgt"
 NVMET_PORT=24420
 NVMET_NQN="nqn.2026-06.io.localtgt:nvmet"
+SPDK_PORT=34420
+SPDK_NQN="nqn.2026-06.io.localtgt:spdk"
 # shellcheck disable=SC2034  # consumed by common.sh's connect/discover verbs
 HOSTNQN="nqn.2026-06.io.localtgt:host"
+
+# Which targets this run drives (override, e.g. TARGET_KINDS=spdk for a pure
+# SPDK loopback smoke; default keeps the ioutgt-vs-nvmet pair).
+TARGET_KINDS="${TARGET_KINDS:-ioutgt nvmet}"
+# SPDK loopback backend (malloc = pure RAM, no file). See common.sh SPDK_* knobs.
+SPDK_BACKEND="${SPDK_BACKEND:-/tmp/local_tgt-spdk.img}"
 
 # Per-target backing: a regular file or block device only (file-backend
 # only, matching two_nic/realwire_tcp.sh). A missing non-/dev path is
@@ -111,12 +119,14 @@ start_one() {
     case "$1" in
         nvmet)  nvmet_setup  "$NVMET_NQN"  "$NVMET_PORT"  "$TARGET_IP" "$NVMET_BACKEND" ;;
         ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$TARGET_IP" "$IOUTGT_BACKEND" ;;
+        spdk)   spdk_start   "$SPDK_NQN"   "$SPDK_PORT"   "$TARGET_IP" "$SPDK_BACKEND" ;;
     esac
 }
 stop_one() {
     case "$1" in
         nvmet)  nvmet_teardown "$NVMET_NQN" ;;
         ioutgt) ioutgt_stop ;;
+        spdk)   spdk_stop ;;
     esac
 }
 
