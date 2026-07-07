@@ -20,4 +20,4 @@ BIN=$(cargo test -p ioutgt-nvme-rdma --no-run --message-format=json \
 # Publish the guest entrypoint into the vmtest tests dir (vmtest runs tests/NAME.sh).
 cp "$TOP/testing/vmtest/ioutgt_rdma_loopback.sh" "$(dirname "$VMTEST")/tests/ioutgt_rdma_loopback.sh"
 
-exec "$VMTEST" -c "$VMTEST_CONF" run ioutgt_rdma_loopback "$BIN"
+exec "$VMTEST" -c "$VMTEST_CONF" run ioutgt_rdma_loopback "$BIN" "$TOP"

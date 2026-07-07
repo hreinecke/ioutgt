@@ -18,4 +18,4 @@ BIN="$TOP/target/debug/ioutgt-nvme-rdma"
 # Publish the guest entrypoint into the vmtest tests dir (vmtest runs tests/NAME.sh).
 cp "$TOP/testing/vmtest/ioutgt_rdma_connect.sh" "$(dirname "$VMTEST")/tests/ioutgt_rdma_connect.sh"
 
-exec "$VMTEST" -c "$VMTEST_CONF" run ioutgt_rdma_connect "$BIN"
+exec "$VMTEST" -c "$VMTEST_CONF" run ioutgt_rdma_connect "$BIN" "$TOP"
