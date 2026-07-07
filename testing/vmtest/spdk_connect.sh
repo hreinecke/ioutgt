@@ -7,7 +7,7 @@
 #   RDMA : soft-RoCE (rdma_rxe on the guest NIC)
 #
 # Runs: start spdk -> connect spdk -> short fio -> disconnect -> stop, on a
-# malloc (RAM) bdev so no backing file/device is needed. Marks PASS/FAIL.
+# small aio bdev over an auto-created /tmp backing file. Marks PASS/FAIL.
 #
 # Arg 1: transport (tcp|rdma, default tcp). Run by path from the repo worktree
 # (guest cwd), so it finds ./testing/local_tgt.sh over the 9p mount.
@@ -69,13 +69,10 @@ if [ "$TRANSPORT" = rdma ]; then
 fi
 export TARGET_IP
 
-# Drive the SPDK target over loopback via local_tgt.sh. Small malloc (RAM) bdev
-# so it fits the hugepage pool alongside DPDK's own reservation.
-# Small hugepage footprint (512 MiB of 2M pages) + a 128 MiB malloc bdev. The VM
-# has IOMMU on but no VFIO device bound, so DPDK can't derive physical DMA
-# addresses — force IOVA=VA and pre-reserve memory (-s) so spdk_zmalloc succeeds.
-# aio bdev (per-IO DMA buffers over a small file) rather than malloc (which
-# spdk_zmalloc's the whole disk contiguously — hard in this constrained VM).
+# Drive the SPDK target over loopback via local_tgt.sh, on an aio bdev over a
+# small /tmp file (per-IO DMA buffers; a malloc bdev would spdk_zmalloc the
+# whole disk contiguously — hard in this constrained VM), with a small
+# hugepage footprint (512 MiB of 2M pages).
 export TARGET_KINDS=spdk SPDK_BDEV=aio SPDK_BACKEND=/tmp/spdk-test.img BACKEND_GB=1 SPDK_HUGEMEM=512 FIO_SECS=5 FIO_JOBS=1 FIO_QD=16
 # NOTE: this VM boots with intel_iommu=on and no VFIO-bound device, so DPDK
 # cannot obtain DMA-mappable memory for a malloc/aio bdev (spdk_zmalloc ENOMEM)
@@ -98,7 +95,7 @@ diag "DMAR: $(dmesg 2>/dev/null | grep -iE 'DMAR:|Intel-IOMMU|IOMMU.*disabled|IO
 diag "iommu-enabled-count: $(dmesg 2>/dev/null | grep -c 'IOMMU enabled') ; vfio: $(lsmod 2>/dev/null | grep -c vfio)"
 [ "${HP_TOTAL:-0}" -ge 64 ] || fail "VM reserved only ${HP_TOTAL:-0} hugepages — the SPDK harness is otherwise ready"
 
-log "=== start SPDK nvmf target ($TRANSPORT, malloc bdev) ==="
+log "=== start SPDK nvmf target ($TRANSPORT, aio bdev) ==="
 $LT start spdk || fail "spdk start"
 log "=== connect ==="
 $LT connect spdk || { cat "${SPDK_LOG:-/tmp/spdk-realwire.log}" 2>/dev/null | tail -20; fail "connect"; }

@@ -198,6 +198,9 @@ iothread_cpu() {
 # io-thread on the IRQ CPU's HT sibling (same policy/helpers as the TCP tuner).
 tune_target_rdma() {
     [ -n "${TUNE_NIC:-}" ] || { echo "   (TUNE_NIC unset; skipping IRQ affinity sync)"; return 0; }
+    # This tuner reads ioutgt's control socket for per-queue placement, so it only
+    # applies to an ioutgt target — skip it for nvmet/SPDK (no control socket).
+    { [ -n "${IOUTGT_SOCK:-}" ] && [ -n "${IOUTGT_BIN:-}" ]; } || { echo "   (no ioutgt control socket; RDMA IRQ tuning is ioutgt-only, skipping)"; return 0; }
     command -v jq >/dev/null 2>&1 || { echo "   (jq not found; skipping IRQ affinity sync)"; return 0; }
     local json rows
     json="$("$IOUTGT_BIN" ctl --socket "$IOUTGT_SOCK" '{"op":"LIST_CONTROLLER"}' 2>/dev/null || true)"

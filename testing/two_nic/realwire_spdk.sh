@@ -265,7 +265,14 @@ cmd_down_tcp() {
 cmd_up() {
     if [ "$TRANSPORT" = rdma ]; then cmd_up_rdma; else cmd_up_tcp; fi
 }
-cmd_down() { [ "$TRANSPORT" = rdma ] && cmd_down_rdma || cmd_down_tcp; }
+cmd_down() {
+    # If SPDK ran on its userspace NVMe driver (SPDK_BDEV=nvme), rebind the
+    # backend PCI device to the kernel so it is a normal /dev/nvme again. A
+    # failed rebind is loud and keeps its state for a retry — still tear the
+    # wire down rather than aborting mid-cleanup (set -e).
+    spdk_vfio_reset || true
+    if [ "$TRANSPORT" = rdma ]; then cmd_down_rdma; else cmd_down_tcp; fi
+}
 
 # ---- targets: start/stop route to one (or both) ----------------------
 start_one() {
