@@ -30,27 +30,13 @@ fail() { log "[compare] RESULT: FAIL ($*)"; exit 1; }
 
 # --- soft-RoCE bring-up (rxe on the guest NIC) ------------------------------
 log "[compare] loading rdma_rxe + nvme/nvmet-rdma"
-modprobe rdma_rxe 2>/dev/null || true
 modprobe nvme-rdma 2>/dev/null || true
 modprobe nvmet-rdma 2>/dev/null || true
 
-# RoCEv2 needs an IP'd Ethernet netdev for a usable GID.
-DEV=$(ip -o -4 addr show up scope global 2>/dev/null | awk '{print $2; exit}')
-[ -n "${DEV:-}" ] || fail "no usable netdev"
-CIDR=$(ip -o -4 addr show dev "$DEV" scope global 2>/dev/null | awk '{print $4; exit}')
-IP=${CIDR%%/*}
-[ -n "${IP:-}" ] || fail "no IP on $DEV"
-rdma link add rxe0 type rxe netdev "$DEV" 2>&1 || echo "[compare] rdma link add note: $?"
-for _ in $(seq 1 20); do ibv_devinfo 2>/dev/null | grep -q "PORT_ACTIVE" && break; sleep 0.5; done
-# rxe's RoCEv2 GID table enumerates netdev IPs asynchronously; re-adding the IP
-# after the link exists re-triggers the GID notifier (see ioutgt_rdma_connect.sh).
-gid_ready() { show_gids 2>/dev/null | grep -qw "$IP"; }
-if ! gid_ready; then
-	log "[compare] GID for $IP missing; re-adding $CIDR on $DEV"
-	ip addr del "$CIDR" dev "$DEV" 2>/dev/null || true
-	ip addr add "$CIDR" dev "$DEV" 2>/dev/null || true
-	for _ in $(seq 1 20); do gid_ready && break; sleep 0.5; done
-fi
+# shellcheck source=../common/rxe.sh
+. "$(dirname "$0")/../common/rxe.sh"
+rxe_setup || fail "rxe bring-up (no netdev/IP)"
+DEV="$RXE_DEV" IP="$RXE_IP"
 log "[compare] rxe up on $DEV ip=$IP"
 
 # --- loop-backed block-device backends --------------------------------------
