@@ -1,7 +1,7 @@
 # The "RDMA 64k congestion wedge" — actual root cause: host network management
 
 Status: **RESOLVED** (July 2026). The recurring controller wedge on the mlx5
-dev box (`testing/two_nic_realwire_rdma.sh`) that was
+dev box (`testing/two_nic/realwire_rdma.sh`) that was
 investigated for weeks as a RoCE congestion problem was **not a congestion,
 flow-control, or ioutgt/nvmet bug at all**. It was the host's network
 management stack destroying the test fabric out from under the RDMA session.
@@ -109,7 +109,7 @@ don't read it as wire/fabric behavior.
 
 - Idle connect soak: keep-alives healthy past 3 min (previously fatal at
   +45–90 s).
-- Full `two_nic_realwire_rdma.sh fio_perf` sweep (both targets, 4k/64k × randread/randwrite,
+- Full `two_nic/realwire_rdma.sh fio_perf` sweep (both targets, 4k/64k × randread/randwrite,
   qd=128): all 8 phases complete. ioutgt ≈ 157k/167k 4k IOPS, 6.3 GiB/s 64k
   randread; nvmet ≈ 156k/171k, 7.0/5.8 GiB/s.
 - The one mid-sweep error recovery observed (qid 5/8/9 tag exhaustion, §3.1)

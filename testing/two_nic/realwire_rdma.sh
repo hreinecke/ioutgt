@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# two_nic_realwire_rdma.sh — the NVMe/RDMA (RoCEv2) sibling of
-# two_nic_realwire_tcp.sh: run an NVMe/RDMA target and initiator on ONE host but
+# two_nic/realwire_rdma.sh — the NVMe/RDMA (RoCEv2) sibling of
+# two_nic/realwire_tcp.sh: run an NVMe/RDMA target and initiator on ONE host but
 # force the traffic across two real RoCE NICs (real hardware offload), for both
 # the in-kernel nvmet-rdma target and ioutgt-nvme-rdma, so the two can be
 # compared back to back on the same wire.
@@ -48,14 +48,14 @@
 # USAGE (one env block, then subcommands; selector verbs take nvmet|ioutgt)
 #   export NIC_T=mlx5p1 NIC_I=mlx5p2
 #   export IOUTGT_BACKEND=/dev/nvme0n1 NVMET_BACKEND=/dev/nvme1n1
-#   sudo -E ./two_nic_realwire_rdma.sh up
-#   sudo -E ./two_nic_realwire_rdma.sh start                # both targets
-#   sudo -E ./two_nic_realwire_rdma.sh connect ioutgt       # or just one
-#   sudo -E ./two_nic_realwire_rdma.sh fio                  # both, back to back
-#   sudo -E ./two_nic_realwire_rdma.sh fio_perf             # perf sweep, both
-#   sudo -E ./two_nic_realwire_rdma.sh disconnect
-#   sudo -E ./two_nic_realwire_rdma.sh stop
-#   sudo -E ./two_nic_realwire_rdma.sh down
+#   sudo -E ./two_nic/realwire_rdma.sh up
+#   sudo -E ./two_nic/realwire_rdma.sh start                # both targets
+#   sudo -E ./two_nic/realwire_rdma.sh connect ioutgt       # or just one
+#   sudo -E ./two_nic/realwire_rdma.sh fio                  # both, back to back
+#   sudo -E ./two_nic/realwire_rdma.sh fio_perf             # perf sweep, both
+#   sudo -E ./two_nic/realwire_rdma.sh disconnect
+#   sudo -E ./two_nic/realwire_rdma.sh stop
+#   sudo -E ./two_nic/realwire_rdma.sh down
 #
 # KNOBS (env vars; see also common.sh)
 #   IOUTGT_BACKEND / NVMET_BACKEND   each target's file or block device
@@ -93,7 +93,7 @@ HOSTNQN="nqn.2026-06.io.realwire:host"
 TARGET_IP="$IP_T"
 ini_exec() { ip netns exec "$NS_I" "$@"; }
 
-. "$(dirname "$0")/common.sh"
+. "$(dirname "$0")/../common/common.sh"
 
 # Per-target backend (file or block device); each target has its OWN, so one env
 # block drives both. Validated only when its target is started.
@@ -119,7 +119,7 @@ IOUTGT_LOG="${IOUTGT_LOG:-/tmp/ioutgt-realwire-rdma.log}"
 
 usage() {
     cat <<EOF
-two_nic_realwire_rdma.sh — NVMe/RDMA target + initiator across two real RoCE
+two_nic/realwire_rdma.sh — NVMe/RDMA target + initiator across two real RoCE
 NICs on one host. The target (NIC_T + its rdma device) stays in the ROOT netns
 (nvmet-rdma can only listen there); only the initiator (NIC_I) is isolated in
 its own netns, which still forces hardware-offloaded RoCE over the wire.

@@ -69,7 +69,7 @@ locally, and the raw wire carries 98 Gb/s (`ibperf`) — the single-job
 ceiling through one QP.
 
 Both tables come from the in-repo realwire drivers,
-`testing/two_nic_realwire_tcp.sh` and `testing/two_nic_realwire_rdma.sh`:
+`testing/two_nic/realwire_tcp.sh` and `testing/two_nic/realwire_rdma.sh`:
 target and initiator run on one host but each NIC is isolated in its own
 network namespace, so the only path between them is the physical cable —
 real hardware traffic, kernel host driver on the initiator side, and the
@@ -84,11 +84,11 @@ lottery. To reproduce:
 export NIC_T=<port0> NIC_I=<port1>       # two cabled ports, NOT your mgmt NIC
 export IOUTGT_BACKEND=/dev/nvmeXn1 NVMET_BACKEND=/dev/nvmeYn1
 export NR_QUEUES=16 QUEUE_SIZE=128 FIO_JOBS=1 FIO_QD=128 FIO_SECS=15
-testing/two_nic_realwire_tcp.sh up       # or two_nic_realwire_rdma.sh
-testing/two_nic_realwire_tcp.sh start && testing/two_nic_realwire_tcp.sh connect
-taskset -c <cpu> testing/two_nic_realwire_tcp.sh fio_perf
-testing/two_nic_realwire_tcp.sh disconnect && testing/two_nic_realwire_tcp.sh stop
-testing/two_nic_realwire_tcp.sh down
+testing/two_nic/realwire_tcp.sh up       # or two_nic/realwire_rdma.sh
+testing/two_nic/realwire_tcp.sh start && testing/two_nic/realwire_tcp.sh connect
+taskset -c <cpu> testing/two_nic/realwire_tcp.sh fio_perf
+testing/two_nic/realwire_tcp.sh disconnect && testing/two_nic/realwire_tcp.sh stop
+testing/two_nic/realwire_tcp.sh down
 ```
 
 ## Roadmap

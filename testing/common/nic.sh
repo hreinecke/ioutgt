@@ -1,4 +1,4 @@
-# common_nic.sh — NIC/IRQ perf tuning and affinity helpers.
+# nic.sh — NIC/IRQ perf tuning and affinity helpers.
 # Sourced by common.sh (not a standalone script).
 
 # ===== NIC perf tuning (target NIC = $TUNE_NIC, in net namespace $TUNE_NS) =====

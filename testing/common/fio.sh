@@ -1,4 +1,4 @@
-# common_fio.sh — the fio workload verbs shared by the drivers:
+# fio.sh — the fio workload verbs shared by the drivers:
 # fio_one (smoke), fio_verify_one (crc32c data-integrity gate),
 # fio_perf_one (perf sweep) and their knobs. Sourced by common.sh
 # (not a standalone script).

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# two_nic_realwire_tcp.sh — run an NVMe/TCP target and initiator on ONE host
+# two_nic/realwire_tcp.sh — run an NVMe/TCP target and initiator on ONE host
 # but force the traffic across two real NICs (real network hardware),
 # for either the Linux kernel nvmet-tcp target or ioutgt.
 #
@@ -37,13 +37,13 @@
 # USAGE (one env block, then subcommands; selector verbs take nvmet|ioutgt)
 #   export NIC_T=enp1s0f0 NIC_I=enp1s0f1
 #   export IOUTGT_BACKEND=/dev/sdb NVMET_BACKEND=/dev/sdc
-#   sudo -E ./two_nic_realwire_tcp.sh up
-#   sudo -E ./two_nic_realwire_tcp.sh start                # both (omit selector)
-#   sudo -E ./two_nic_realwire_tcp.sh connect ioutgt       # or just one
-#   sudo -E ./two_nic_realwire_tcp.sh fio                  # both, back to back
-#   sudo -E ./two_nic_realwire_tcp.sh disconnect
-#   sudo -E ./two_nic_realwire_tcp.sh stop                 # stop targets, then
-#   sudo -E ./two_nic_realwire_tcp.sh down                 # remove netns
+#   sudo -E ./two_nic/realwire_tcp.sh up
+#   sudo -E ./two_nic/realwire_tcp.sh start                # both (omit selector)
+#   sudo -E ./two_nic/realwire_tcp.sh connect ioutgt       # or just one
+#   sudo -E ./two_nic/realwire_tcp.sh fio                  # both, back to back
+#   sudo -E ./two_nic/realwire_tcp.sh disconnect
+#   sudo -E ./two_nic/realwire_tcp.sh stop                 # stop targets, then
+#   sudo -E ./two_nic/realwire_tcp.sh down                 # remove netns
 #
 # KNOBS (env vars)
 #   IOUTGT_BACKEND / NVMET_BACKEND   each target's file or block device
@@ -93,7 +93,7 @@ ini_exec() { ip netns exec "$NS_I" "$@"; }
 # :-4 default, so 'up' may auto-size it from the NIC only when the user did not.
 NRQ_USER_SET="${NR_QUEUES+1}"
 
-. "$(dirname "$0")/common.sh"
+. "$(dirname "$0")/../common/common.sh"
 
 # Persisted auto-sized NR_QUEUES (so the separate up/start/connect/status
 # invocations agree) and the control socket the ioutgt target binds (queried
@@ -130,7 +130,7 @@ IOUTGT_LOG="${IOUTGT_LOG:-/tmp/ioutgt-realwire.log}"
 
 usage() {
     cat <<EOF
-two_nic_realwire_tcp.sh — drive an NVMe/TCP target + initiator across two real
+two_nic/realwire_tcp.sh — drive an NVMe/TCP target + initiator across two real
 NICs on one host, isolating each NIC in its own netns to force the wire.
 
 Targets (same target IP $IP_T, distinct port/NQN/backend):
@@ -184,7 +184,7 @@ require_nics() {
 }
 
 # in_net / NSDIR (nsenter --net into a namespace, keeping the mount ns so
-# configfs stays visible) live in common.sh, shared with two_nic_realwire_rdma.
+# configfs stays visible) live in common.sh, shared with two_nic/realwire_rdma.
 
 # Target context for common.sh's nvmet_setup/ioutgt_start. nvmet's configfs
 # script runs via in_net (nsenter --net, keeping the mount ns so configfs stays

@@ -8,7 +8,7 @@
 # verbs (start -> connect -> fio --verify -> disconnect -> stop) against both
 # the ioutgt-nvme-rdma target and the in-kernel nvmet-rdma target, asserting a
 # clean crc32c verify on each. This is the loopback sibling of the box perf
-# comparison (two_nic_realwire_tcp.sh, TRANSPORT=rdma); here we gate correctness +
+# comparison (two_nic/realwire_tcp.sh, TRANSPORT=rdma); here we gate correctness +
 # the harness wiring, not throughput.
 #
 # Backends are LOOP BLOCK DEVICES, not files: the guest root is tmpfs, which

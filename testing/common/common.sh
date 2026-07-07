@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # common.sh — shared helpers for the NVMe target drivers
-# (two_nic_realwire_tcp.sh, local_tgt.sh). Sourced, never executed. The fabric is
+# (two_nic/realwire_tcp.sh, local_tgt.sh). Sourced, never executed. The fabric is
 # selected by TRANSPORT=tcp|rdma (default tcp); see the knobs section.
 #
 # The sourcing script supplies the transport context; these helpers stay
@@ -196,7 +196,7 @@ disconnect_one() {
 # so a successful cross-namespace ping is itself proof the bytes crossed the
 # wire. Transport-neutral — these helpers read the caller's NS_T/NS_I,
 # NIC_T/NIC_I, IP_T/IP_I, PREFIX, MTU globals. (The RDMA driver additionally
-# moves each NIC's rdma device into the netns; see two_nic_realwire_rdma.sh.)
+# moves each NIC's rdma device into the netns; see two_nic/realwire_rdma.sh.)
 NSDIR="${NSDIR:-/run/netns}"
 
 # nsenter --net enters ONLY the net namespace, leaving the mount namespace
@@ -258,7 +258,7 @@ realwire_netns_delete() {
 # files; source them last so their knob defaults can see the shared knobs
 # above.
 _common_dir="$(dirname "${BASH_SOURCE[0]}")"
-. "$_common_dir/common_nvmet.sh"
-. "$_common_dir/common_ioutgt.sh"
-. "$_common_dir/common_fio.sh"
-. "$_common_dir/common_nic.sh"
+. "$_common_dir/nvmet.sh"
+. "$_common_dir/ioutgt.sh"
+. "$_common_dir/fio.sh"
+. "$_common_dir/nic.sh"

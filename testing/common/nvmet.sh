@@ -1,4 +1,4 @@
-# common_nvmet.sh — the Linux in-kernel nvmet target (configfs):
+# nvmet.sh — the Linux in-kernel nvmet target (configfs):
 # setup/teardown. Sourced by common.sh (not a standalone script);
 # shares its knobs and helpers.
 

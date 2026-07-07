@@ -1,4 +1,4 @@
-# common_ioutgt.sh — the ioutgt userspace target: knobs, start/stop,
+# ioutgt.sh — the ioutgt userspace target: knobs, start/stop,
 # io-thread CPU sampling. Sourced by common.sh (not a standalone
 # script); shares its knobs and helpers.
 

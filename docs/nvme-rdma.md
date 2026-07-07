@@ -298,13 +298,13 @@ subcommands are shared through `ioutgt_harness::client`.
 | verbs loopback | `testing/run_rdma_loopback.sh` | the verbs layer alone, rxe loopback in the VM |
 | bring-up | `testing/run_rdma_connect.sh` | rxe + kernel host: discover → connect → write/read-back `cmp` → fio verify → disconnect |
 | A/B correctness | `testing/run_rdma_compare.sh` | same driver against ioutgt **and** nvmet-rdma (loop bdev backends; guest tmpfs can't host either file backend) |
-| box perf | `testing/two_nic_realwire_rdma.sh` | two real mlx5 NICs, forced wire, fio/fio_perf vs nvmet-rdma |
+| box perf | `testing/two_nic/realwire_rdma.sh` | two real mlx5 NICs, forced wire, fio/fio_perf vs nvmet-rdma |
 
 VM gotcha: the guests re-add the netdev IP after `rdma link add` to
 force the rxe RoCEv2 GID to populate, which otherwise races bind on
 some boots.
 
-`testing/common.sh` selects the fabric via `TRANSPORT=tcp|rdma`
+`testing/common/common.sh` selects the fabric via `TRANSPORT=tcp|rdma`
 (binary, kernel modules, `addr_trtype`, `nvme -t`; forces digests +
 zero-copy send off for rdma). The `fio_verify` verb is the
 data-integrity gate (mixed 4k–128k writes at pool-exhausting pressure
