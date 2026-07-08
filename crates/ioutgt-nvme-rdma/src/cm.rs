@@ -115,9 +115,7 @@ impl CmChannel {
                 rdma_port_space::RDMA_PS_TCP,
             )
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check_rc(rc)?;
         let id = NonNull::new(raw).ok_or_else(|| io::Error::other("rdma_create_id: null id"))?;
         Ok(Identifier {
             inner: Arc::new(IdentifierInner {
@@ -231,6 +229,17 @@ fn conn_param(
 static DEVICE_CONTEXTS: LazyLock<Mutex<HashMap<usize, Arc<DeviceContext>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// librdmacm calls return 0 on success and -1 (errno set) on failure; map
+/// that C convention to `io::Result`. The per-call `// SAFETY:` note stays on
+/// each `unsafe` FFI block; only the uniform post-call check is shared here.
+fn check_rc(rc: i32) -> io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 impl Identifier {
     /// Whether `raw` (an event's id pointer) is this id. Pointer comparison
     /// only — see the module identity rule.
@@ -247,20 +256,14 @@ impl Identifier {
                 OsSocketAddr::from(addr).as_mut_ptr(),
             )
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Start listening (after [`bind_addr`](Self::bind_addr)).
     pub fn listen(&self, backlog: i32) -> io::Result<()> {
         // SAFETY: valid bound id.
         let rc = unsafe { rdma_listen(self.inner.id.as_ptr(), backlog) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Resolve `dst` to an RDMA device (client side); completes with an
@@ -285,10 +288,7 @@ impl Identifier {
                 timeout_ms,
             )
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Resolve the route to the resolved address; completes with a
@@ -298,10 +298,7 @@ impl Identifier {
             .map_err(|_| io::Error::other("timeout too large"))?;
         // SAFETY: valid id whose address is resolved.
         let rc = unsafe { rdma_resolve_route(self.inner.id.as_ptr(), timeout_ms) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Complete an active-side connection whose QP is externally managed
@@ -309,20 +306,14 @@ impl Identifier {
     pub fn establish(&self) -> io::Result<()> {
         // SAFETY: valid id in the connect-response state.
         let rc = unsafe { rdma_establish(self.inner.id.as_ptr()) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Disconnect (sends the DREQ, or the DREP when answering one).
     pub fn disconnect(&self) -> io::Result<()> {
         // SAFETY: valid connected id.
         let rc = unsafe { rdma_disconnect(self.inner.id.as_ptr()) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Accept a connect request, binding the (already RTS) queue pair `qp_num`
@@ -338,10 +329,7 @@ impl Identifier {
         // SAFETY: valid id with a pending connect request; rdma_accept copies
         // the private data synchronously, so `reply` need only outlive this call.
         let rc = unsafe { rdma_accept(self.inner.id.as_ptr(), &mut cp) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Initiate a connect (client side), binding the INIT queue pair `qp_num`
@@ -357,10 +345,7 @@ impl Identifier {
         // SAFETY: valid route-resolved id; rdma_connect copies the private data
         // synchronously.
         let rc = unsafe { rdma_connect(self.inner.id.as_ptr(), &mut cp) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// Reject a connect request, returning `reason` (an encoded
@@ -378,10 +363,7 @@ impl Identifier {
         // SAFETY: valid id with a pending connect request; rdma_reject copies
         // the private data synchronously.
         let rc = unsafe { rdma_reject(self.inner.id.as_ptr(), ptr, len) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check_rc(rc)
     }
 
     /// The CM-derived queue-pair attributes for transitioning to `state`
@@ -394,9 +376,7 @@ impl Identifier {
         let mut mask = 0i32;
         // SAFETY: valid id in a CM state that defines attributes for `state`.
         let rc = unsafe { rdma_init_qp_attr(self.inner.id.as_ptr(), &mut attr, &mut mask) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check_rc(rc)?;
         Ok(QueuePairAttribute { attr, mask })
     }
 
