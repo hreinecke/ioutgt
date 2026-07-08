@@ -1222,6 +1222,35 @@ impl RdmaQueue {
         result
     }
 
+    /// One backstop-timer tick: re-arm the CQ, drain any completion whose
+    /// comp-channel event was lost, re-arm the timer, and — on a healthy poll —
+    /// run the keep-alive watchdog. Returns the reap-loop step (`Ok(true)` =
+    /// tear down). Split out of the `run` select arm so the fallible steps can
+    /// use `?` here: the arm itself must stay `?`-free (a `?` there returns from
+    /// `run`, skipping `remove_park_probe`), so it forwards to this helper and
+    /// lets the result flow through `step`. See the backstop arm for the
+    /// missed-events rationale. On the `?` error paths the timer is left unreset,
+    /// which is harmless — an error breaks the reap loop and teardown drops it.
+    fn backstop_tick(
+        &mut self,
+        ctx: &Rc<ConnCtx<AnyBackend>>,
+        comps: &mut Vec<(u64, u32)>,
+        mut backstop: std::pin::Pin<&mut ioutgt_uring::ops::Sleep>,
+    ) -> io::Result<bool> {
+        crate::cq::arm(&self.cq)?;
+        let stop = self.process_cqes(ctx, comps)?;
+        // Reset the persistent timer only after firing (a busy select! cannot
+        // starve it, since it is not rebuilt every wake).
+        backstop.set(ioutgt_uring::ops::sleep(BACKSTOP)?);
+        // Piggyback the keep-alive / controller-liveness watchdog on the backstop
+        // cadence (see [`Self::watchdog`]); skip it on a peer-gone poll.
+        if stop {
+            Ok(true)
+        } else {
+            Ok(self.watchdog(ctx))
+        }
+    }
+
     /// Drive this connection: bootstrap the controller from the Connect capsule,
     /// then process commands until the QP errors (peer disconnect) or a fatal
     /// error. Requires [`prime`](Self::prime) to have been called first. `on_ctx`
@@ -1327,26 +1356,8 @@ impl RdmaQueue {
                 // dead CQ on this (shared, long-lived) queue thread. Errors
                 // must flow through `step` so every exit passes the removal.
                 res = backstop.as_mut() => match res {
+                    Ok(()) => self.backstop_tick(&ctx, &mut comps, backstop.as_mut()),
                     Err(e) => Err(e),
-                    Ok(()) => {
-                        let r = match crate::cq::arm(&self.cq) {
-                            Err(e) => Err(e),
-                            Ok(()) => self.process_cqes(&ctx, &mut comps),
-                        };
-                        match ioutgt_uring::ops::sleep(BACKSTOP) {
-                            Err(e) => Err(e),
-                            Ok(t) => {
-                                backstop.set(t);
-                                // Piggyback the keep-alive / controller-liveness
-                                // watchdog on the backstop cadence (see
-                                // [`Self::watchdog`]).
-                                match r {
-                                    Ok(false) => Ok(self.watchdog(&ctx)),
-                                    other => other,
-                                }
-                            }
-                        }
-                    }
                 }
             };
             match step {
