@@ -17,6 +17,7 @@ pub(crate) fn oerr<E: std::error::Error>(e: E) -> std::io::Error {
 pub mod cm;
 pub mod cmproto;
 pub mod cq;
+pub mod listener;
 pub mod target;
 pub mod transport;
 // Test-only scaffolding: RC-loopback resource helpers for the rxe gates. The

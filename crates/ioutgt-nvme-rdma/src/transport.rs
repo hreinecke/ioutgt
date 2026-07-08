@@ -25,7 +25,8 @@ use ioutgt_harness::{OnCtx, TargetConfig, Transport};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::target::{RdmaConn, RdmaListener, RdmaRaw, run_conn};
+use crate::listener::{RdmaListener, RdmaRaw};
+use crate::target::{RdmaConn, run_conn};
 
 /// Accepted-but-not-yet-handshaked connections buffered between the CM thread
 /// and the control thread (bounded so a stalled control thread applies
