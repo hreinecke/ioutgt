@@ -87,7 +87,7 @@ Three seams:
 - `get_qp_attr` wraps `rdma_init_qp_attr`; attrs applied via raw
   `ibv_modify_qp` through sideway's `qp()` accessor.
 - `SEND_WITH_INV` — one raw extended-verbs pair
-  (`target.rs::wr_send_with_inv`); used when the host's SGL requests
+  (`wr.rs::wr_send_with_inv`); used when the host's SGL requests
   remote invalidation (`SGL_FMT_INVALIDATE`).
 
 ## Threading: CM thread → control thread → queue thread

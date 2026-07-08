@@ -274,7 +274,7 @@ connection's `OwnedFd` stays the sole owner, so the teardown contract
 
 ## 7. How NVMe/TCP wires it up
 
-`drive_recv` (`crates/ioutgt-nvme-tcp/src/connection.rs`) constructs one
+`drive_recv` (`crates/ioutgt-nvme-tcp/src/recv.rs`) constructs one
 reader per connection and drives the `RecvPhase` machine out of its
 window:
 

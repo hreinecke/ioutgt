@@ -57,14 +57,14 @@ use crate::stats::RdmaWrStats;
 use crate::wr::{SgeOp, WrId, WrKind, fill_sges, post_sge_runs, qp_ex_of, wr_send_with_inv};
 
 /// Bytes of an NVMe SQE.
-pub(crate) const SQE_LEN: usize = 64;
+const SQE_LEN: usize = 64;
 /// Max in-capsule data we accept — one page, matching what IOCCSZ advertises
 /// (`ioutgt_core::RDMA_INLINE_DATA_SIZE`, nvmet-rdma's default): write
 /// payloads up to this arrive inside the command capsule (no RDMA READ). The
 /// fabrics Connect data (1024 B) rides the same allowance.
-pub(crate) const ICD_LEN: usize = ioutgt_core::RDMA_INLINE_DATA_SIZE as usize;
+const ICD_LEN: usize = ioutgt_core::RDMA_INLINE_DATA_SIZE as usize;
 /// RECV capsule buffer: SQE + max in-capsule data.
-pub(crate) const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
+const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
 /// Bytes of an NVMe CQE (the response capsule).
 const CQE_LEN: usize = 16;
 

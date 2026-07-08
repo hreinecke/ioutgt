@@ -66,7 +66,7 @@ impl BatchHist {
 /// GET_STATS key names for the three batch histograms (wire-format stable):
 /// WRs per read-batch doorbell, WRs per response-batch doorbell, and CQEs per
 /// non-empty poll.
-pub(crate) const HIST_KEYS: [[&str; 6]; 4] = [
+const HIST_KEYS: [[&str; 6]; 4] = [
     [
         "read_db_b1",
         "read_db_b2",

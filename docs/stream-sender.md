@@ -703,7 +703,7 @@ mean a path shipped ZC ops without draining, i.e. a use-after-free risk.
 ## 10. How NVMe/TCP wires it up
 
 The transport supplies just two things: a staging closure and the
-worst-case sizings. From `crates/ioutgt-nvme-tcp/src/connection.rs`:
+worst-case sizings. From `crates/ioutgt-nvme-tcp/src/send.rs`:
 
 ```rust
 const ARENA_PER_ITEM: usize = 64;  // C2HData hdr 24+4 + DDGST 4 + capsule 24+4

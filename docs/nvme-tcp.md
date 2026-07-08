@@ -137,7 +137,7 @@ work item, greedily drain the rest of the `SendList`, ship the whole
 batch as a single gather `sendmsg` — headers/digests packed into a
 per-batch arena, read payloads referenced in place from slot buffers,
 contiguous chunks merged. The transport supplies only a staging closure
-(`stage_send_work` + `release_class`, `connection.rs`): encode one
+(`stage_send_work` + `release_class`, `send.rs`): encode one
 `SendWork` into the arena and return its tag-release class
 (`Staged::{NoRelease, AtCqe, AtNotif}`).
 
