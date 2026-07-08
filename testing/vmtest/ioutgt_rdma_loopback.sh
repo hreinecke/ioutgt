@@ -2,7 +2,7 @@
 # vmtest-desc: ioutgt NVMe/RDMA verbs rxe-loopback functional test
 # vmtest-requires: root
 set -u
-BIN="${1:?usage: ioutgt_rdma_loopback <test-binary-path>}"
+BIN="${1:?usage: ioutgt_rdma_loopback <test-binary-path> <repo-top>}"
 REPO_TOP="${2:?usage: ioutgt_rdma_loopback <test-binary-path> <repo-top>}"
 echo "[rdma] loading rdma_rxe"
 # shellcheck source=../common/rxe.sh

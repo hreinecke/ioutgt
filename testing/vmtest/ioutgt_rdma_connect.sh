@@ -7,7 +7,7 @@
 # discover -> connect -> identify -> a namespace read -> disconnect. The
 # write-data path is not implemented yet (RD4), so IO here is read-only.
 set -u
-BIN="${1:?usage: ioutgt_rdma_connect <target-binary-path>}"
+BIN="${1:?usage: ioutgt_rdma_connect <target-binary> <repo-top>}"
 REPO_TOP="${2:?usage: ioutgt_rdma_connect <target-binary> <repo-top>}"
 NQN="nqn.2025-01.io.ioutgt:rdma"
 PORT=4420
@@ -20,7 +20,7 @@ modprobe nvme_rdma 2>&1 || true
 # shellcheck source=../common/rxe.sh
 . "$REPO_TOP/testing/common/rxe.sh"
 rxe_setup || fail "rxe bring-up (no netdev/IP)"
-DEV="$RXE_DEV" CIDR="$RXE_CIDR" IP="$RXE_IP"
+DEV="$RXE_DEV" IP="$RXE_IP"
 ibv_devinfo 2>&1 | grep -E "hca_id|state:|link_layer" | head -6
 
 # Start the target on the rxe IP. Stream its log live (so a hang/panic is
