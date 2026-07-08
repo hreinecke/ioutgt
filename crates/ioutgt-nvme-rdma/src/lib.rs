@@ -18,6 +18,7 @@ pub mod cm;
 pub mod cmproto;
 pub mod cq;
 pub mod listener;
+pub mod stats;
 pub mod target;
 pub mod transport;
 // Test-only scaffolding: RC-loopback resource helpers for the rxe gates. The
