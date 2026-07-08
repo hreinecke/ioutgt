@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 pub mod connection;
 pub mod handshake;
 pub mod queue;
+pub mod send;
 pub mod transport;
 
 use transport::TcpTransport;
