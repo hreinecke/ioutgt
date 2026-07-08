@@ -22,6 +22,7 @@ pub mod sgl;
 pub mod stats;
 pub mod target;
 pub mod transport;
+pub mod wr;
 // Test-only scaffolding: RC-loopback resource helpers for the rxe gates. The
 // production path builds its resources in `target`/`cm` directly on sideway.
 #[cfg(test)]
