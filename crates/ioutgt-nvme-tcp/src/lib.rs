@@ -27,13 +27,14 @@ use std::net::SocketAddr;
 pub mod connection;
 pub mod handshake;
 pub mod queue;
+pub mod recv;
 pub mod send;
 pub mod transport;
 
 use transport::TcpTransport;
 
-pub use connection::H2C_DIRECT_MIN;
 pub use ioutgt_harness::TargetConfig;
+pub use recv::H2C_DIRECT_MIN;
 
 /// Connect CATTR bit 2: host requests SQ flow control disabled.
 pub(crate) const CONNECT_DISABLE_SQFLOW: u8 = 1 << 2;
