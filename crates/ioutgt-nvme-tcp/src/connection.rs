@@ -203,13 +203,7 @@ fn spawn_keepalive_watchdog<B: Backend>(ctx: Rc<ConnCtx<B>>, fd: i32) -> JoinHan
             let Role::Admin(admin) = &ctx.role else {
                 return;
             };
-            let kato = u64::from(admin.kato_ms.get());
-            if kato == 0 {
-                continue;
-            }
-            let silent =
-                u64::try_from(admin.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
-            if silent > kato * 2 + 5_000 {
+            if let Some(silent) = admin.keepalive_expired() {
                 info!(
                     cntlid = admin.cntlid.get(),
                     silent_ms = silent,

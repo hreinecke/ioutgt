@@ -68,6 +68,21 @@ pub struct AdminState<B> {
     pub closing: Cell<bool>,
 }
 
+impl<B> AdminState<B> {
+    /// Keep-alive verdict: `Some(silent_ms)` when the host has been quiet
+    /// past KATO×2 + a 5 s grace (mirrors nvmet's timer). `None` when KATO is
+    /// disabled (0, e.g. a persistent discovery controller) or still alive.
+    /// `last_heard` is bumped by every dispatched command.
+    pub fn keepalive_expired(&self) -> Option<u64> {
+        let kato = u64::from(self.kato_ms.get());
+        if kato == 0 {
+            return None;
+        }
+        let silent = u64::try_from(self.last_heard.get().elapsed().as_millis()).unwrap_or(u64::MAX);
+        (silent > kato * 2 + 5_000).then_some(silent)
+    }
+}
+
 /// IO-queue state.
 #[allow(missing_docs)]
 pub struct IoState<B> {
