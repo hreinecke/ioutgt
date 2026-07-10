@@ -2,8 +2,8 @@
 
 A high-performance userspace storage target framework built on io_uring,
 written in Rust. It speaks **NVMe/TCP** and **NVMe/RDMA** today; the
-architecture is transport-independent and designed to grow NBD and iSCSI
-behind the same core.
+architecture is transport-independent and designed to grow NBD & iSCSI,
+..., behind the same core.
 
 ## io_uring keeps going
 
