@@ -159,7 +159,7 @@ impl QueueStatsSnapshot {
 
 /// Transport-neutral per-queue context: the slot array plus SQ-head
 /// flow control and stats, generic over the per-slot command type `C`
-/// (`Sqe` for NVMe, the request header for NBD). The send list is
+/// (the SQE for NVMe, the request header for NBD). The send list is
 /// deliberately absent — its work type belongs to the transport
 /// ([`crate::slotq::SendList`] instantiated next to this in the
 /// transport's composite). `sqhd`/`sqhd_disabled` are NVMe SQ-head
