@@ -57,13 +57,14 @@ bdev backend path.
 (transport contract in architecture.md §5.1).
 NBD is next; NVMe/RDMA after.
 
-The split that makes this tractable: `ioutgt-nvme` is sans-io,
-`ioutgt-core` owns the slot engine (`slotq`), NVMe model, and
-dispatch/controllers, and a transport supplies the six obligations of
-the transport contract (setup → install → recv path → slot task body →
-send path → teardown) using its own `SlotArray<C>` + `SendList<W>`
-instantiation. NVMe/TCP's `connection.rs` (now `ioutgt-nvme-tcp`) is
-the template.
+The split that makes this tractable: `ioutgt-core` is the
+protocol-neutral queue engine (a dependency-free leaf); `ioutgt-nvme`
+is the NVMe crate — sans-IO codec modules plus the transport-independent
+model (dispatch/controllers) — layered on it. A transport supplies the
+six obligations of the transport contract (setup → install → recv path
+→ slot task body → send path → teardown) using its own `SlotArray<C>` +
+`SendList<W>` instantiation. NVMe/TCP's `connection.rs` (now
+`ioutgt-nvme-tcp`) is the template.
 
 - **NVMe/RDMA** (`ioutgt-rdma`): same fabrics/core unchanged; the
   transport maps `SendWork::Response`/data to RDMA SEND/WRITE and

@@ -15,7 +15,7 @@ is identified by a CID drawn from that bounded space.
 ioutgt treats this bound as the central scheduling primitive, the way SPDK's
 request tracker does, but expressed as async Rust:
 
-- At queue install, a `Box<[CmdSlot]>` of exactly `sqsize` slots is
+- At queue install, a `Box<[Slot<Sqe>]>` of exactly `sqsize` slots is
   allocated, plus one **persistent async task per slot** ("task per tag").
 - Each task loops forever: await command arrival in my slot → dispatch →
   await backend completion → queue the response → return my tag.
@@ -73,13 +73,19 @@ queues reach the same admin/IO threads through the shared harness.
 ## 3. Crate map and cross-crate call flow
 
 The workspace is ten crates forming a strict dependency DAG — every
-crate depends only on layers below it. The two main leaves are
+crate depends only on layers below it. The two foundation leaves are
 deliberately opposite in character:
 
-- `ioutgt-nvme` is **sans-IO**: pure bytes ↔ structs, no sockets, no
-  async, fuzzable in isolation.
+- `ioutgt-core` is the **protocol-neutral queue engine**: slot array,
+  buffer pool, permits, the `Backend` trait, zero dependencies.
 - `ioutgt-uring` is **pure IO**: op futures and the reactor, zero
   protocol knowledge.
+
+`ioutgt-nvme` layers the NVMe world on `ioutgt-core`: its codec modules
+(`spec`/`pdu`/`identify`/`fabrics`/`status`/`digest`) stay **sans-IO**
+— pure bytes ↔ structs, no sockets, no async, fuzzable in isolation —
+while the rest of the crate carries the transport-independent model
+(subsystems, controllers, dispatch).
 
 A third small leaf, `ioutgt-cpus`, groups CPUs evenly per NUMA / cluster /
 SMT locality (`spread_cpus`); the algorithm is pure (driven by a
@@ -117,15 +123,15 @@ machinery.
             │                         │  │ (StreamSender/Reader)   │
             └─────────────────────────┘  └─────────────────────────┘
   model     ┌──────────────────────────────────────────────────────┐
-            │ ioutgt-core — Port/Subsystem/Namespace, Registry,    │
-            │ NVMe model + dispatch + the protocol-neutral slot   │
-            │ engine (`slotq`), Backend trait definition          │
+            │ ioutgt-nvme — Port/Subsystem/Namespace, Registry,    │
+            │ NVMe model + dispatch, plus the sans-IO NVMe(-oF)    │
+            │ codec: Sqe/Cqe, PDUs, CRC32C                         │
             └──────────────────────────────────────────────────────┘
   leaves    ┌─────────────────────────┐  ┌─────────────────────────┐
-            │ ioutgt-nvme             │  │ ioutgt-uring            │
-            │ sans-IO NVMe(-oF) codec │  │ io_uring reactor, op    │
-            │ Sqe/Cqe, PDUs, CRC32C   │  │ futures, mailbox,       │
-            │                         │  │ QueueRuntime,           │
+            │ ioutgt-core             │  │ ioutgt-uring            │
+            │ protocol-neutral slot   │  │ io_uring reactor, op    │
+            │ engine (`slotq`),       │  │ futures, mailbox,       │
+            │ Backend trait           │  │ QueueRuntime,           │
             │                         │  │ sendbatch (GatherBatch) │
             └─────────────────────────┘  └─────────────────────────┘
 ```
@@ -138,8 +144,8 @@ machinery.
 | [`ioutgt-control`](../crates/ioutgt-control) | config + UDS control plane | core, backend |
 | [`ioutgt-backend`](../crates/ioutgt-backend) | storage backends | core, uring |
 | [`ioutgt-stream`](../crates/ioutgt-stream) | protocol-neutral stream mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
-| [`ioutgt-core`](../crates/ioutgt-core) | NVMe model + dispatch + `slotq` engine | nvme |
-| [`ioutgt-nvme`](../crates/ioutgt-nvme) | sans-IO codec | — |
+| [`ioutgt-core`](../crates/ioutgt-core) | protocol-neutral `slotq` engine, `Backend` trait | — |
+| [`ioutgt-nvme`](../crates/ioutgt-nvme) | sans-IO codec + NVMe model + dispatch | core |
 | [`ioutgt-uring`](../crates/ioutgt-uring) | reactor + op futures + `sendbatch` | — |
 | [`ioutgt-cpus`](../crates/ioutgt-cpus) | locality-aware even CPU grouping | — |
 
@@ -155,9 +161,9 @@ the RDMA binary passes `RdmaTransport` through the same seam.
 ```text
 spawn::<T>(config)                                     [ioutgt-harness]
   └─ "ioutgt-control" thread (plain Tokio) → control_loop::<T>():
-       Registry::new()                                 [ioutgt-core]
+       Registry::new()                                 [ioutgt-nvme]
        T::bind() → listener + bound address
-       build_port(): Subsystem / Namespace → AnyBackend [core, backend]
+       build_port(): Subsystem / Namespace → AnyBackend [nvme, backend]
        spawn_control_api(): UDS server                 [ioutgt-control]
        loop select!
          ├─ T::accept() ──► handle_accept()
@@ -241,11 +247,11 @@ Crate seams, with NVMe/TCP as the example:
 |------|-----------------|
 | bin → transport | the handshake calls + `run_queue()` (queue-thread entry point, with the `on_ctx` hook registering per-connection stats) |
 | bin/transport → uring | op futures + mailbox |
-| transport → core | `QueueCore<Sqe>`/`SlotArray` slot API + `dispatch::execute`; the send list and work type (`SendWork`) are transport-owned |
+| transport → core | `QueueCore<Sqe>`/`SlotArray` slot API; the send list and work type (`SendWork`) are transport-owned |
 | tcp → stream | `StreamSender`/`StreamReader`, driven by transport closures |
-| core → backend | the `Backend` trait behind `Arc<Namespace>` |
-| control → core | `Registry` + `Subsystem` add/remove + the NS-changed nudge; GET_STATS reaches queue threads via binary-injected `StatsSource` closures over the same mailboxes |
-| core/transport → nvme | types + encode/decode only — the codec never does IO, the reactor never sees a PDU |
+| nvme → backend | the `Backend` trait behind `Arc<Namespace>` |
+| control → nvme | `Registry` + `Subsystem` add/remove + the NS-changed nudge; GET_STATS reaches queue threads via binary-injected `StatsSource` closures over the same mailboxes |
+| transport → nvme | `dispatch::execute` plus codec types for encode/decode — the codec never does IO, the reactor never sees a PDU |
 
 ## 4. Reactor: io_uring under Tokio current-thread
 
@@ -349,7 +355,7 @@ as-built statement.
 
 The standing invariants from §1/§2 apply unchanged across all transports:
 zero steady-state allocation, no locks, no atomic RMW on the IO path;
-mailbox-only entry into queue threads; codecs sans-IO; reactor cancellation
+mailbox-only entry into queue threads; codec modules sans-IO; reactor cancellation
 safety (the slab entry, not the op future, owns kernel-visible resources).
 
 ### 5.1.1 NBD on the refactored base
@@ -390,7 +396,7 @@ dispatch, controller model, and discovery are all reused unchanged;
 `PortConfig.trtype = TransportType::Rdma` makes discovery advertise the
 correct TRTYPE.
 
-## 6. Core model
+## 6. NVMe model (`ioutgt-nvme`)
 
 **Object model — Port / Subsystem / Namespace, and the per-Connect Controller**
 
@@ -538,7 +544,8 @@ Default on (`pin_threads`; opt out with `--no-pin` or
    against `10.0.2.2:14420` (the harness avoids 4420, which is often
    owned by other targets on a dev box; the port is published to the
    guest via the 9p marker), across the digest × queue-count matrix.
-4. **Fuzzing**: cargo-fuzz on the PDU decoder.
+4. **Fuzzing**: in-crate deterministic decoder torture test
+   (`crates/ioutgt-nvme/tests/decoder_fuzz.rs`) on the PDU decoder.
 5. **Benchmarks**: fio (4K rand R/W, 128K seq R/W, 70/30 mix; QD 1/32/128)
    against ioutgt and an identically-configured kernel nvmet, with perf
    flamegraphs both sides. See `docs/benchmark-plan.md`.

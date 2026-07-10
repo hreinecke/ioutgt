@@ -143,7 +143,7 @@ and **zero fabric-congestion awareness** — both delegate losslessness to PFC/D
 
 - **Has (partial):** the `BufPool` is the analog of SPDK's iobuf gate — `lease_await` parks a read
   command when the pool is exhausted (def `slotq.rs:166`, called from the shared read path
-  `ioutgt-core/src/io.rs:132`). But only the **read** path awaits; the **write-data-pull** path uses
+  `ioutgt-nvme/src/io.rs:132`). But only the **read** path awaits; the **write-data-pull** path uses
   `lease_or_owned` (never-block, private-buffer fallback; def `slotq.rs:176`, called from
   `ioutgt-nvme-rdma/src/target.rs:678`), so it does *not* backpressure.
 - **Lacks:** a **send-WR credit** (nvmet's `sq_wr_avail`) and a **read-depth counter** (SPDK's

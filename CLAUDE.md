@@ -60,17 +60,19 @@ cargo run --release --example loadgen -- \
 ## Architecture
 
 Ten crates in a strict dependency DAG (full diagrams: architecture.md
-§4). The two main leaves are deliberately opposite: `ioutgt-nvme` is
-**sans-IO** (bytes ↔ structs only, no sockets/async — shared by target,
-test client, and the decoder fuzz test) and `ioutgt-uring` is **pure
-IO** (reactor + op futures + the protocol-free gather-send mechanics
-`sendbatch::GatherBatch`, zero protocol knowledge). `ioutgt-core` sits
-above them: the NVMe model, dispatch, and the protocol-neutral slot
-engine (`slotq`); its per-connection context is the generic
-`QueueCore<C>` (`QueueCore<Sqe>` for NVMe, `QueueCore<NbdReq>` for a
-future NBD). `ioutgt-stream` is the transport-shared, ZC-aware
-gather-send harness `StreamSender`, layered above core + uring (walked
-end to end in `docs/stream-sender.md`). The frontends compose these:
+§3). The two foundation leaves are `ioutgt-core` (the protocol-neutral
+queue engine — slot array, buffer pool, permits, `Backend` trait, and
+the generic per-connection context `QueueCore<C>` (`QueueCore<Sqe>`
+for NVMe, `QueueCore<NbdReq>` for a future NBD); zero dependencies)
+and `ioutgt-uring` (pure IO: reactor + op futures + gather-send
+mechanics, zero protocol knowledge). `ioutgt-nvme` layers the NVMe
+world on the engine: sans-IO codec modules (bytes ↔ structs — shared
+by target, test client, and the decoder fuzz test) plus the
+transport-independent model (subsystems, controllers, dispatch),
+mirroring kernel nvmet's `core.c`. `ioutgt-stream` is the
+transport-shared, ZC-aware gather-send harness `StreamSender`, layered
+above core + uring (walked end to end in `docs/stream-sender.md`). The
+frontends compose these:
 `ioutgt-nvme-tcp` (NVMe/TCP transport — joins `QueueCore<Sqe>` with a
 `SendList<SendWork>` as `NvmeTcpQueue` and drives `StreamSender`) and
 `ioutgt-nvme-rdma` (NVMe/RDMA transport), plus `ioutgt-backend` and
@@ -103,10 +105,13 @@ never call each other — their only rendezvous is `NvmeTcpQueue`
 - **Cross-thread communication into a queue thread goes only through its
   mailbox** (ioutgt-uring). Queue-thread handles are deliberately not
   `Send`; the type system enforces this rule.
-- **The codec stays sans-IO**: no sockets, no async, no allocation-driven
-  APIs in ioutgt-nvme. `ioutgt-core` must not depend on `ioutgt-uring`.
+- **The codec modules of `ioutgt-nvme` stay sans-IO**: no sockets, no
+  async, no allocation-driven APIs in `spec`/`pdu`/`identify`/
+  `fabrics`/`status`/`digest` — the decoder fuzz test and the
+  control-thread handshake depend on it. `ioutgt-core` stays
+  dependency-free and in particular must not depend on `ioutgt-uring`.
   (The transport-shared send harness that needs both — `StreamSender` —
-  lives in its own crate `ioutgt-stream`, layered above the two leaves.)
+  lives in its own crate `ioutgt-stream`.)
 - **Reactor cancellation safety**: the slab entry, not the op future,
   owns kernel-visible resources. A future dropped mid-flight orphans its
   entry; the entry is freed only on the terminal CQE. Anything touching

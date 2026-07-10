@@ -23,7 +23,7 @@ head-to-head against nvmet is deferred (`docs/benchmark-plan.md`).
 accounting, and a lock-free `llist` carrying completions from
 executor context to the send side.
 
-**ioutgt.** Preallocated `CmdSlot` array sized by the negotiated
+**ioutgt.** Preallocated `Slot<Sqe>` array sized by the negotiated
 sqsize, plus **one persistent async task per tag** that loops
 await-command → dispatch → complete. The TCP transfer tag *is* the
 slot index; the host CID is stored and echoed, so no CID lookup

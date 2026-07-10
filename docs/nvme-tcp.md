@@ -128,7 +128,7 @@ Three rules keep this simple and safe:
   exceeds MDTS terms with `DATA_LIMIT_EXCEEDED`.
 - **The decoder never sees payload.** Only header bytes pass through
   `PduDecoder`; payload goes scratch → slot (or kernel → slot), keeping
-  the codec sans-IO and the copy budget visible in one place (below).
+  the codec modules sans-IO and the copy budget visible in one place (below).
 
 ## Send: drain everything, ship one op
 
@@ -244,7 +244,7 @@ buffer, so disk IO from pooled slots uses `READV_FIXED`/`WRITEV_FIXED`
   control (Connect CATTR bit 2 → `sqhd_disabled`), not on a config
   flag, and only for clean reads.
 - **Status mapping**: `BackendError` → NVMe SC via `io::nvme_status`
-  (`ioutgt-core`), a free function mirroring nvmet's
+  (`ioutgt-nvme`), a free function mirroring nvmet's
   `blk_to_nvme_status`.
 
 ## Zero-copy receive (`--recv-buf-mb`, default off)
