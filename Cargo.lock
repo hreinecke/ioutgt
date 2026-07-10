@@ -381,6 +381,7 @@ version = "0.1.0"
 dependencies = [
  "ioutgt-backend",
  "ioutgt-core",
+ "ioutgt-nvme",
  "serde",
  "serde_json",
  "tokio",
@@ -390,12 +391,6 @@ dependencies = [
 [[package]]
 name = "ioutgt-core"
 version = "0.1.0"
-dependencies = [
- "ioutgt-nvme",
- "libc",
- "tracing",
- "zerocopy",
-]
 
 [[package]]
 name = "ioutgt-cpus"
@@ -413,6 +408,7 @@ dependencies = [
  "ioutgt-control",
  "ioutgt-core",
  "ioutgt-cpus",
+ "ioutgt-nvme",
  "ioutgt-uring",
  "serde_json",
  "tokio",
@@ -424,6 +420,9 @@ name = "ioutgt-nvme"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "ioutgt-core",
+ "libc",
+ "tracing",
  "zerocopy",
 ]
 

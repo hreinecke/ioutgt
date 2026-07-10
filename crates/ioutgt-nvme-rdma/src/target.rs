@@ -1,5 +1,5 @@
 //! Focused-v1 NVMe/RDMA target queue: drive the transport-neutral NVMe model
-//! ([`ioutgt_core::dispatch`]) over RDMA capsules on one CM-established RC QP.
+//! ([`ioutgt_nvme::dispatch`]) over RDMA capsules on one CM-established RC QP.
 //!
 //! Per command: RECV the command capsule → parse the [`Sqe`] (and, for Connect,
 //! the in-capsule [`ConnectData`]) → run it through the slot pipeline and
@@ -19,15 +19,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ioutgt_backend::AnyBackend;
-use ioutgt_core::controller::Registry;
-use ioutgt_core::dispatch::{self, ConnCtx, Outcome, Role};
 use ioutgt_core::pool::MAX_SEGS;
 use ioutgt_core::queue::QueueCore;
 use ioutgt_core::slotq::SendList;
-use ioutgt_core::subsystem::PortConfig;
+use ioutgt_nvme::controller::Registry;
+use ioutgt_nvme::dispatch::{self, ConnCtx, Outcome, Role};
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::spec::Sqe;
 use ioutgt_nvme::status;
+use ioutgt_nvme::subsystem::PortConfig;
 use rdma_mummy_sys::ibv_sge;
 use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::completion::{
@@ -59,10 +59,10 @@ use crate::wr::{SgeOp, WrId, WrKind, fill_sges, post_sge_runs, qp_ex_of, wr_send
 /// Bytes of an NVMe SQE.
 const SQE_LEN: usize = 64;
 /// Max in-capsule data we accept — one page, matching what IOCCSZ advertises
-/// (`ioutgt_core::RDMA_INLINE_DATA_SIZE`, nvmet-rdma's default): write
+/// (`ioutgt_nvme::RDMA_INLINE_DATA_SIZE`, nvmet-rdma's default): write
 /// payloads up to this arrive inside the command capsule (no RDMA READ). The
 /// fabrics Connect data (1024 B) rides the same allowance.
-const ICD_LEN: usize = ioutgt_core::RDMA_INLINE_DATA_SIZE as usize;
+const ICD_LEN: usize = ioutgt_nvme::RDMA_INLINE_DATA_SIZE as usize;
 /// RECV capsule buffer: SQE + max in-capsule data.
 const CAPSULE_LEN: usize = SQE_LEN + ICD_LEN;
 /// Bytes of an NVMe CQE (the response capsule).
@@ -229,7 +229,7 @@ impl RdmaQueue {
         queue_buf_bytes: usize,
     ) -> io::Result<RdmaQueue> {
         let pool_bytes = if qid == 0 {
-            usize::from(sqsize).max(1) * ioutgt_core::ADMIN_DATA_MAX
+            usize::from(sqsize).max(1) * ioutgt_nvme::ADMIN_DATA_MAX
         } else {
             queue_buf_bytes
         };

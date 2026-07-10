@@ -1,6 +1,6 @@
 [package]
 name = "ioutgt-nvme"
-description = "Sans-io NVMe and NVMe/TCP protocol types, PDU codec, and digests"
+description = "NVMe protocol: sans-IO codec (spec types, PDU codec, digests) plus the transport-independent target model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+ioutgt-core = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
 zerocopy = { workspace = true }
 crc32c = { workspace = true }
 

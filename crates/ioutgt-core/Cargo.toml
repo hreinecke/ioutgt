@@ -1,6 +1,6 @@
 [package]
 name = "ioutgt-core"
-description = "Transport-independent NVMe target core: subsystems, controllers, namespaces, queues, command dispatch"
+description = "Protocol-neutral queue engine: command slots, buffer pool, permits, backend trait"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-ioutgt-nvme = { workspace = true }
-libc = { workspace = true }
-zerocopy = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

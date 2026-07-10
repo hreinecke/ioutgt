@@ -142,17 +142,17 @@ impl FileConfig {
         // within [2, CAP.MQES]. Without this the JSON path would bypass
         // the connect-time memory-amplification guard (a huge value lets a
         // host preallocate oversized IO queues; < 2 rejects every connect).
-        if !(2..=ioutgt_core::MAX_QUEUE_ENTRIES).contains(&self.io_queue_size) {
+        if !(2..=ioutgt_nvme::MAX_QUEUE_ENTRIES).contains(&self.io_queue_size) {
             return Err(format!(
                 "io_queue_size {} out of range (2..={})",
                 self.io_queue_size,
-                ioutgt_core::MAX_QUEUE_ENTRIES
+                ioutgt_nvme::MAX_QUEUE_ENTRIES
             ));
         }
         // The pool must hold at least one max-size transfer (MDTS); cap it
         // so a typo can't reserve absurd amounts of RAM per IO queue.
         const MAX_POOL_MB: usize = 1024; // 1 GiB
-        let min_pool_mb = (ioutgt_core::MDTS_BYTES as usize)
+        let min_pool_mb = (ioutgt_nvme::MDTS_BYTES as usize)
             .div_ceil(1024 * 1024)
             .max(1);
         if !(min_pool_mb..=MAX_POOL_MB).contains(&self.queue_buf_mb) {

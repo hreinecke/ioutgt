@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::backend::Backend;
+use ioutgt_core::backend::Backend;
 
 /// Fabric transport serving a port; selects the TRTYPE byte in
 /// discovery log entries (NVMe-oF: RDMA = 1, TCP = 3).
@@ -29,8 +29,8 @@ impl TransportType {
     /// Discovery-log TRTYPE encoding.
     pub fn trtype(self) -> u8 {
         match self {
-            TransportType::Tcp => ioutgt_nvme::fabrics::trtype::TCP,
-            TransportType::Rdma => ioutgt_nvme::fabrics::trtype::RDMA,
+            TransportType::Tcp => crate::fabrics::trtype::TCP,
+            TransportType::Rdma => crate::fabrics::trtype::RDMA,
         }
     }
 }

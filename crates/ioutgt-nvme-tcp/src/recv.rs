@@ -655,7 +655,7 @@ async fn handle_capsule_cmd(
     let slot = queue.slot(tag);
     if data_len > 0 {
         // In-capsule payload follows the capsule on the wire.
-        if data_len > ioutgt_core::MDTS_BYTES {
+        if data_len > ioutgt_nvme::MDTS_BYTES {
             return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
         }
         // In ring mode, try to retain the in-capsule payload in place
@@ -682,7 +682,7 @@ async fn handle_capsule_cmd(
         })))
     } else if needs_r2t(&sqe) {
         let length = sqe.dptr.length.get();
-        if length > ioutgt_core::MDTS_BYTES {
+        if length > ioutgt_nvme::MDTS_BYTES {
             return Err(RecvEnd::term(pdu::fes::DATA_LIMIT_EXCEEDED));
         }
         queue.lease_or_owned(tag, length as usize);

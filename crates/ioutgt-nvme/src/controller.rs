@@ -55,7 +55,7 @@ impl RegisterState {
 
     /// Apply a Property Set of CC.
     pub fn write_cc(&mut self, value: u32) -> CcEffect {
-        use ioutgt_nvme::fabrics::{cc, csts};
+        use crate::fabrics::{cc, csts};
         let was_enabled = self.cc & cc::EN != 0;
         let now_enabled = value & cc::EN != 0;
         let shutdown = value & cc::SHN_MASK != 0;
@@ -77,7 +77,7 @@ impl RegisterState {
 
     /// CSTS.RDY is set.
     pub fn ready(&self) -> bool {
-        self.csts & ioutgt_nvme::fabrics::csts::RDY != 0
+        self.csts & crate::fabrics::csts::RDY != 0
     }
 }
 
@@ -219,7 +219,7 @@ pub struct ControllerEntry {
 impl ControllerEntry {
     /// The controller is bound to the well-known discovery subsystem.
     pub fn is_discovery(&self) -> bool {
-        self.subsys_nqn == ioutgt_nvme::fabrics::DISCOVERY_NQN
+        self.subsys_nqn == crate::fabrics::DISCOVERY_NQN
     }
 }
 
@@ -370,7 +370,7 @@ pub enum IoConnectError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ioutgt_nvme::fabrics::cc;
+    use crate::fabrics::cc;
 
     #[test]
     fn enable_sequence() {
@@ -392,7 +392,7 @@ mod tests {
         let mut regs = RegisterState::new(128);
         regs.write_cc(cc::EN);
         assert_eq!(regs.write_cc(cc::EN | cc::SHN_NORMAL), CcEffect::Shutdown);
-        assert!(regs.csts() & ioutgt_nvme::fabrics::csts::SHST_COMPLETE != 0);
+        assert!(regs.csts() & crate::fabrics::csts::SHST_COMPLETE != 0);
     }
 
     fn qi(qid: u16) -> QueueInfo {
@@ -409,13 +409,7 @@ mod tests {
     fn discovery_entries_flagged() {
         let registry = Registry::new();
         registry
-            .allocate(
-                ioutgt_nvme::fabrics::DISCOVERY_NQN,
-                "nqn.host",
-                0,
-                120_000,
-                qi(0),
-            )
+            .allocate(crate::fabrics::DISCOVERY_NQN, "nqn.host", 0, 120_000, qi(0))
             .unwrap();
         let snap = registry.snapshot();
         assert!(snap[0].is_discovery());

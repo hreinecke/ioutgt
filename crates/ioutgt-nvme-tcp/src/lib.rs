@@ -61,7 +61,7 @@ pub fn spawn_target(config: TargetConfig) -> io::Result<SocketAddr> {
 /// guard so it is never rejected when `io_queue_size` is set small.
 pub(crate) fn sqsize_cap(qid: u16, io_queue_size: u16) -> u16 {
     if qid == 0 {
-        ioutgt_core::MAX_QUEUE_ENTRIES
+        ioutgt_nvme::MAX_QUEUE_ENTRIES
     } else {
         io_queue_size
     }
@@ -69,10 +69,6 @@ pub(crate) fn sqsize_cap(qid: u16, io_queue_size: u16) -> u16 {
 
 /// MAXH2CDATA we advertise in ICResp (16 MiB, as kernel nvmet).
 pub const MAX_H2C_DATA: u32 = 0x40_0000 * 4;
-
-/// In-capsule data limit we advertise via IOCCSZ (16 KiB, as nvmet's
-/// default inline_data_size).
-pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -86,7 +82,7 @@ mod tests {
         // …while the admin queue keeps the hard CAP.MQES guard, so it is
         // never rejected even when io_queue_size is set below the admin
         // depth (NVME_AQ_DEPTH = 32).
-        assert_eq!(sqsize_cap(0, 8), ioutgt_core::MAX_QUEUE_ENTRIES);
-        assert_eq!(sqsize_cap(0, 256), ioutgt_core::MAX_QUEUE_ENTRIES);
+        assert_eq!(sqsize_cap(0, 8), ioutgt_nvme::MAX_QUEUE_ENTRIES);
+        assert_eq!(sqsize_cap(0, 256), ioutgt_nvme::MAX_QUEUE_ENTRIES);
     }
 }

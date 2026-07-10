@@ -15,6 +15,7 @@ ioutgt-backend = { workspace = true }
 ioutgt-control = { workspace = true }
 ioutgt-core = { workspace = true }
 ioutgt-cpus = { workspace = true }
+ioutgt-nvme = { workspace = true }
 ioutgt-uring = { workspace = true }
 core_affinity = { workspace = true }
 serde_json = { workspace = true }

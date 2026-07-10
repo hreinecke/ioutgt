@@ -7,14 +7,14 @@
 
 use std::rc::Rc;
 
-use ioutgt_nvme::spec::{DsmRange, RwCommand, Sqe, io_opcode};
-use ioutgt_nvme::status;
+use crate::spec::{DsmRange, RwCommand, Sqe, io_opcode};
+use crate::status;
 use zerocopy::FromBytes;
 
-use crate::backend::{Backend, BackendError, LbaRange};
 use crate::dispatch::{ConnCtx, IoState, Outcome};
-use crate::queue::stat_add;
 use crate::subsystem::Namespace;
+use ioutgt_core::backend::{Backend, BackendError, LbaRange};
+use ioutgt_core::queue::stat_add;
 
 /// NVMe status code for a backend failure, per nvmet's
 /// blk_to_nvme_status mapping. Lives here — not on the `Backend`

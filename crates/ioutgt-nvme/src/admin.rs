@@ -5,19 +5,19 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ioutgt_nvme::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
-use ioutgt_nvme::identify::{
+use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
+use crate::identify::{
     IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, cmic, nmic,
     oncs,
 };
-use ioutgt_nvme::spec::{Sqe, admin_opcode, cns, feat, log_page};
-use ioutgt_nvme::status;
+use crate::spec::{Sqe, admin_opcode, cns, feat, log_page};
+use crate::status;
 use tracing::debug;
 use zerocopy::IntoBytes;
 
-use crate::backend::Backend;
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
 use crate::subsystem::Subsystem;
+use ioutgt_core::backend::Backend;
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;

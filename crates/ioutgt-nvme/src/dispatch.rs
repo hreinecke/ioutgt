@@ -9,14 +9,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ioutgt_nvme::fabrics::ConnectData;
-use ioutgt_nvme::spec::{Cqe, Sqe, admin_opcode};
-use ioutgt_nvme::status;
+use crate::fabrics::ConnectData;
+use crate::spec::{Cqe, Sqe, admin_opcode};
+use crate::status;
 
-use crate::backend::Backend;
 use crate::controller::{RegisterState, Registry};
-use crate::queue::QueueCore;
 use crate::subsystem::{NsCache, PortConfig, Subsystem};
+use ioutgt_core::backend::Backend;
+use ioutgt_core::queue::QueueCore;
 
 /// Per-connection dispatch context (single-threaded, shared by the
 /// connection's tasks via `Rc`).
@@ -236,13 +236,13 @@ pub async fn execute<B: Backend>(ctx: &Rc<ConnCtx<B>>, tag: u16, sqe: &Sqe) -> O
 
     // Fabrics commands are legal on both queue types.
     if sqe.opcode == admin_opcode::FABRICS {
-        crate::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
+        ioutgt_core::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
         return crate::fabrics_exec::execute(ctx, tag, sqe);
     }
 
     match &ctx.role {
         Role::Admin(admin) => {
-            crate::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
+            ioutgt_core::queue::stat_add(&ctx.queue.stats.other_cmds, 1);
             // Everything but Connect/Property requires an enabled
             // controller.
             if !admin.regs.borrow().ready() {

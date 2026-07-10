@@ -3,15 +3,15 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ioutgt_nvme::fabrics::{self, ConnectCommand, PropertyCommand, fctype, prop};
-use ioutgt_nvme::spec::Sqe;
-use ioutgt_nvme::status;
+use crate::fabrics::{self, ConnectCommand, PropertyCommand, fctype, prop};
+use crate::spec::Sqe;
+use crate::status;
 use tracing::{debug, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::backend::Backend;
 use crate::controller::{CcEffect, QueueInfo, current_cpus, current_tid};
 use crate::dispatch::{ConnCtx, Outcome, Role};
+use ioutgt_core::backend::Backend;
 
 /// NUL/space-trimmed string from a fixed NQN field.
 pub fn nqn_str(raw: &[u8]) -> &str {

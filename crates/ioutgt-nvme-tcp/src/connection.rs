@@ -16,11 +16,11 @@ use crate::queue::NvmeTcpQueue;
 use crate::recv::recv_loop;
 use crate::send::{self, ARENA_PER_ITEM};
 use ioutgt_core::backend::Backend;
-use ioutgt_core::controller::Registry;
-use ioutgt_core::dispatch::{self, ConnCtx, Role};
-use ioutgt_core::subsystem::PortConfig;
+use ioutgt_nvme::controller::Registry;
+use ioutgt_nvme::dispatch::{self, ConnCtx, Role};
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::spec::Sqe;
+use ioutgt_nvme::subsystem::PortConfig;
 use ioutgt_uring::ops;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -63,7 +63,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     // IO: a shared pool deliberately smaller than depth × MDTS — slots
     // lease on demand and park / fall back under pressure.
     let pool_bytes = if conn.qid == 0 {
-        usize::from(conn.sqsize).max(1) * ioutgt_core::ADMIN_DATA_MAX
+        usize::from(conn.sqsize).max(1) * ioutgt_nvme::ADMIN_DATA_MAX
     } else {
         conn.port.queue_buf_bytes
     };
@@ -104,7 +104,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         }
     }
     let fd = conn.fd.as_raw_fd();
-    let peer = ioutgt_core::controller::peer_of(fd);
+    let peer = ioutgt_nvme::controller::peer_of(fd);
     let ctx = if conn.qid == 0 {
         ConnCtx::new_admin(
             Rc::clone(&queue.nvme),

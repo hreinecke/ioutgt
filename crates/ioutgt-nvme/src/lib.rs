@@ -1,21 +1,63 @@
-//! Sans-io NVMe protocol layer.
+//! The NVMe crate: sans-IO protocol codec plus the target-side model.
 //!
-//! NVMe spec structures (SQE/CQE/Identify/log pages/fabrics capsules) as
-//! `repr(C)` zerocopy types with compile-time size assertions, NVMe/TCP PDU
-//! definitions, an incremental PDU decoder/encoder that operates purely on
-//! byte slices, and CRC32C digest helpers.
+//! The codec modules — [`spec`], [`pdu`], [`identify`], [`fabrics`],
+//! [`status`], [`digest`] — are NVMe wire structures as `repr(C)`
+//! zerocopy types, an incremental PDU decoder/encoder operating purely
+//! on byte slices, and CRC32C digest helpers. **They perform no IO and
+//! own no sockets**: the target data path, the control-thread handshake,
+//! the integration-test client, and the decoder fuzz test all share this
+//! one codec. All wire integers are little-endian per the NVMe base
+//! specification.
 //!
-//! This crate performs no IO and owns no sockets: the target data path, the
-//! control-thread handshake, the integration-test client, and the fuzzer all
-//! share this one codec.
-//!
-//! All wire integers are little-endian per the NVMe base specification;
-//! the zerocopy types use explicit `U16`/`U32`/`U64` little-endian wrappers
-//! so reinterpreting received bytes is endian-correct on any host.
+//! The model modules — [`subsystem`], [`controller`], [`dispatch`],
+//! [`fabrics_exec`], [`admin`], [`io`] — are the transport-independent
+//! NVMe target: subsystems, controllers, namespaces, and admin/IO
+//! command dispatch, layered on the protocol-neutral engine in
+//! `ioutgt-core`. They mirror the role of `core.c`/`nvmet.h` in the
+//! Linux kernel nvmet target.
 
+pub mod admin;
+pub mod controller;
 pub mod digest;
+pub mod dispatch;
 pub mod fabrics;
+pub mod fabrics_exec;
 pub mod identify;
+pub mod io;
 pub mod pdu;
 pub mod spec;
 pub mod status;
+pub mod subsystem;
+
+/// Largest queue we accept (CAP.MQES advertises this minus one).
+///
+/// Slots no longer pin a per-slot data buffer (they lease on demand from
+/// a shared per-queue `BufPool`), so per-queue memory is bounded
+/// by the pool size, not by `entries × MDTS`. The host sizes its queues
+/// to `min(desired, MQES + 1)`; Connect requests beyond this are rejected
+/// (a hostile host ignores the advertised MQES, so the limit is enforced,
+/// not just advertised).
+pub const MAX_QUEUE_ENTRIES: u16 = 256;
+
+/// Maximum single-command transfer (MDTS): 2^5 × 4 KiB pages = 128 KiB,
+/// matching the `mdts = 5` we advertise. Read/write transfers are
+/// validated against this; a slot leases exactly the transfer size.
+pub const MDTS_BYTES: u32 = 128 * 1024;
+
+/// Cap on admin-command response data staged in a slot (identify/log
+/// pages). The admin pool is sized `depth × ADMIN_DATA_MAX` so admin
+/// leases never block.
+pub const ADMIN_DATA_MAX: usize = 8 * 1024;
+
+/// In-capsule data the RDMA transport advertises via IOCCSZ (one page,
+/// matching nvmet-rdma's default `inline_data_size`): the host then embeds
+/// write payloads up to this size in the command capsule itself, sparing the
+/// target a per-write RDMA READ round trip. Must match the RDMA transport's
+/// RECV capsule sizing.
+pub const RDMA_INLINE_DATA_SIZE: u32 = 4096;
+
+/// In-capsule data we advertise via IOCCSZ (16 KiB, nvmet's default).
+pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
+
+/// AEC bit: namespace-attribute-changed notices.
+pub const AEN_CFG_NS_ATTR: u32 = 1 << 8;

@@ -18,10 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ioutgt_backend::AnyBackend;
-use ioutgt_core::controller::Registry;
 use ioutgt_core::permit::ConnPermit;
-use ioutgt_core::subsystem::{PortConfig, TransportType};
 use ioutgt_harness::{OnCtx, TargetConfig, Transport};
+use ioutgt_nvme::controller::Registry;
+use ioutgt_nvme::subsystem::{PortConfig, TransportType};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 

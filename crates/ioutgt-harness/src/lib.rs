@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 use ioutgt_backend::AnyBackend;
 use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, SubsystemConfig};
 use ioutgt_control::server::{CtlState, build_backend};
-use ioutgt_core::controller::Registry;
-use ioutgt_core::dispatch::ConnCtx;
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
-use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
+use ioutgt_nvme::controller::Registry;
+use ioutgt_nvme::dispatch::ConnCtx;
+use ioutgt_nvme::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{error, info, warn};
@@ -294,7 +294,7 @@ fn thread_stats_json(
         .collect();
     serde_json::json!({
         "name": name,
-        "tid": ioutgt_core::controller::current_tid(),
+        "tid": ioutgt_nvme::controller::current_tid(),
         "ring": { "parks": ring.parks, "sqes": ring.sqes,
                   "send_sqes": ring.send_sqes, "recv_sqes": ring.recv_sqes,
                   "read_sqes": ring.read_sqes, "write_sqes": ring.write_sqes,
@@ -528,7 +528,7 @@ fn build_port(
                 Arc::new(Namespace {
                     nsid: ns.nsid,
                     backend: Arc::new(backend),
-                    uuid: ioutgt_core::subsystem::namespace_uuid(&spec.nqn, ns.nsid),
+                    uuid: ioutgt_nvme::subsystem::namespace_uuid(&spec.nqn, ns.nsid),
                 }),
             );
         }
