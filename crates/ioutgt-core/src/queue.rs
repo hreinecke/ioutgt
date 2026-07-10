@@ -1,6 +1,6 @@
 //! Per-queue context: the slot array plus SQ-head flow control and
 //! per-queue lifetime stats. Generic over the per-slot command type
-//! `C` ([`Sqe`] for NVMe, the request header for NBD) so the same
+//! `C` (the SQE for NVMe, the request header for NBD) so the same
 //! [`QueueCore`] serves every protocol; the send list is deliberately
 //! absent — its work type belongs to the transport
 //! ([`crate::slotq::SendList`] instantiated next to this in the
@@ -13,8 +13,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-
-use ioutgt_nvme::spec::Sqe;
 
 use crate::slotq::SlotArray;
 pub use crate::slotq::{Slot, SlotState};
@@ -159,22 +157,6 @@ impl QueueStatsSnapshot {
     }
 }
 
-/// NVMe command slot: the generic slot stashing an [`Sqe`].
-pub type CmdSlot = Slot<Sqe>;
-
-impl Slot<Sqe> {
-    /// Park the SQE while its in-capsule payload is still arriving
-    /// (state stays `Receiving`; [`SlotArray::submit`] delivers it).
-    pub fn stash_sqe(&self, sqe: Sqe) {
-        self.stash_cmd(sqe);
-    }
-
-    /// The SQE parked by [`Slot::stash_sqe`].
-    pub fn stashed_sqe(&self) -> Sqe {
-        self.cmd()
-    }
-}
-
 /// Transport-neutral per-queue context: the slot array plus SQ-head
 /// flow control and stats, generic over the per-slot command type `C`
 /// (`Sqe` for NVMe, the request header for NBD). The send list is
@@ -246,7 +228,7 @@ mod tests {
 
     #[test]
     fn tag_lifecycle_and_sqhd_wrap() {
-        let q = QueueCore::new(1, 4, 4096, false, Sqe::zeroed());
+        let q = QueueCore::new(1, 4, 4096, false, 0u64);
         // sqhd wraps modulo sqsize.
         assert_eq!(q.advance_sqhd(), 1);
         assert_eq!(q.advance_sqhd(), 2);
@@ -262,7 +244,7 @@ mod tests {
         // Walk one slot through the full lifecycle via the deref'd
         // engine, including the await_command transition (Ready).
         let tag = tags[0];
-        q.submit(tag, Sqe::zeroed());
+        q.submit(tag, 0u64);
         assert_eq!(q.slot(tag).state(), SlotState::Ready);
         {
             let fut = q.await_command(tag);
@@ -284,7 +266,7 @@ mod tests {
 
     #[test]
     fn sqhd_disabled_reports_zero() {
-        let q = QueueCore::new(1, 8, 64, true, Sqe::zeroed());
+        let q = QueueCore::new(1, 8, 64, true, 0u64);
         assert_eq!(q.advance_sqhd(), 0);
         assert_eq!(q.advance_sqhd(), 0);
     }
@@ -326,7 +308,7 @@ mod tests {
 
     #[test]
     fn queue_core_owns_zeroed_stats() {
-        let queue = QueueCore::new(1, 4, 4096, false, Sqe::zeroed());
+        let queue = QueueCore::new(1, 4, 4096, false, 0u64);
         assert_eq!(
             queue.stats.snapshot(),
             QueueStatsSnapshot {

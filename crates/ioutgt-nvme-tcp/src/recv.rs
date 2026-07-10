@@ -214,7 +214,7 @@ impl DdgstPhase {
             // NVME_SC_DATA_XFER_ERROR and keeps the connection.
             // Executing the write is skipped so corrupt data never
             // reaches the backend.
-            let cid = queue.slot(self.tag).stashed_sqe().cid.get();
+            let cid = queue.slot(self.tag).cmd().cid.get();
             warn!(qid = queue.qid, cid, "DDGST mismatch; failing command");
             let cqe = Cqe::new(
                 0,
@@ -279,14 +279,14 @@ fn finish_payload(queue: &Rc<NvmeTcpQueue>, tag: u16, kind: PayloadKind) -> Resu
     let slot = queue.slot(tag);
     match kind {
         PayloadKind::InCapsule => {
-            queue.submit(tag, slot.stashed_sqe());
+            queue.submit(tag, slot.cmd());
             Ok(())
         }
         PayloadKind::H2c { last, length } => {
             let done = slot.recv_offset() + length;
             slot.set_recv_offset(done);
             if done == slot.data_len() {
-                queue.submit(tag, slot.stashed_sqe());
+                queue.submit(tag, slot.cmd());
                 Ok(())
             } else if last {
                 // Host claims the transfer is over but bytes are missing.
@@ -670,7 +670,7 @@ async fn handle_capsule_cmd(
             queue.lease_or_owned(tag, data_len as usize);
         }
         slot.set_data_len(data_len);
-        slot.stash_sqe(sqe);
+        slot.stash_cmd(sqe);
         Ok(Some(RecvPhase::Data(DataPhase {
             tag,
             base: 0,
@@ -688,7 +688,7 @@ async fn handle_capsule_cmd(
         queue.lease_or_owned(tag, length as usize);
         slot.set_data_len(length);
         slot.set_recv_offset(0);
-        slot.stash_sqe(sqe);
+        slot.stash_cmd(sqe);
         // Solicit the whole transfer with one R2T; the host may
         // split it into several H2CData PDUs.
         queue.solicit(tag, sqe.cid.get(), 0, length);
@@ -717,7 +717,7 @@ fn validate_h2c(
     }
     let slot = queue.slot(ttag);
     let valid = slot.state() == ioutgt_core::queue::SlotState::Receiving
-        && slot.stashed_sqe().cid.get() == cid
+        && slot.cmd().cid.get() == cid
         && offset == slot.recv_offset()
         && offset
             .checked_add(length)
