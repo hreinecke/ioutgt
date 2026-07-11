@@ -13,9 +13,10 @@ use crate::fabrics::ConnectData;
 use crate::spec::{Cqe, Sqe, admin_opcode};
 use crate::status;
 
-use crate::controller::{RegisterState, Registry};
+use crate::controller::RegisterState;
 use ioutgt_core::backend::Backend;
 use ioutgt_core::queue::QueueCore;
+use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{NsCache, PortConfig, Subsystem};
 
 /// Per-connection dispatch context (single-threaded, shared by the

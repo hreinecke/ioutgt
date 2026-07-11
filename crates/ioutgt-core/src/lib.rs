@@ -16,6 +16,7 @@ pub mod buf;
 pub mod permit;
 pub mod pool;
 pub mod queue;
+pub mod registry;
 pub mod slotq;
 pub mod subsystem;
 

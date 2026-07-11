@@ -9,9 +9,10 @@ use crate::status;
 use tracing::{debug, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::controller::{CcEffect, QueueInfo};
+use crate::controller::CcEffect;
 use crate::dispatch::{ConnCtx, Outcome, Role};
 use ioutgt_core::backend::Backend;
+use ioutgt_core::registry::QueueInfo;
 use ioutgt_cpus::thread::{current_cpus, current_tid};
 
 /// NUL/space-trimmed string from a fixed NQN field.
@@ -119,10 +120,14 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             } else {
                 cmd.kato.get()
             };
-            let Some(cntlid) =
-                ctx.registry
-                    .allocate(subsysnqn, hostnqn, max_qid, kato, queue_info(ctx))
-            else {
+            let Some(cntlid) = ctx.registry.allocate(
+                subsysnqn,
+                hostnqn,
+                max_qid,
+                kato,
+                queue_info(ctx),
+                discovery,
+            ) else {
                 return Outcome::status(ctx.cqe(0, cid, status::CONNECT_CTRL_BUSY | status::DNR));
             };
             admin.cntlid.set(cntlid);
@@ -148,7 +153,7 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                 Ok(entry) => {
                     io.cntlid.set(cntlid);
                     ctx.queue.stats.cntlid.set(cntlid);
-                    if !entry.is_discovery()
+                    if !entry.discovery
                         && let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn)
                     {
                         let _ = io.subsys.set(Arc::clone(subsys));

@@ -25,9 +25,9 @@ use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, Subsyst
 use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
+use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
-use ioutgt_nvme::controller::Registry;
 use ioutgt_nvme::dispatch::ConnCtx;
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};

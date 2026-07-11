@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend};
 use ioutgt_core::Backend;
+use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig};
-use ioutgt_nvme::controller::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -265,7 +265,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                         "cntlid": entry.cntlid,
                         "subsysnqn": entry.subsys_nqn,
                         "hostnqn": entry.hostnqn,
-                        "discovery": entry.is_discovery(),
+                        "discovery": entry.discovery,
                     })
                 })
                 .collect();
@@ -325,7 +325,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                         "cntlid": entry.cntlid,
                         "subsysnqn": entry.subsys_nqn,
                         "hostnqn": entry.hostnqn,
-                        "discovery": entry.is_discovery(),
+                        "discovery": entry.discovery,
                         "kato_ms": entry.kato_ms,
                         "queues": queues,
                         "namespaces": namespaces,
