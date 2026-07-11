@@ -129,7 +129,22 @@ impl Transport for RdmaTransport {
     }
 
     async fn run_queue(conn: RdmaConn, on_ctx: OnCtx) {
-        if let Err(e) = run_conn(conn, on_ctx).await {
+        // Adapt the harness callback: hand it the queue's stats and a
+        // weak namespace-change nudge instead of the dispatch context.
+        let adapted =
+            |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<ioutgt_backend::AnyBackend>>| {
+                let weak = std::rc::Rc::downgrade(ctx);
+                on_ctx(ioutgt_harness::ConnHandles {
+                    stats: std::rc::Rc::clone(&ctx.queue.stats),
+                    ns_changed: Box::new(move || {
+                        weak.upgrade().is_some_and(|ctx| {
+                            ctx.fire_ns_changed();
+                            true
+                        })
+                    }),
+                });
+            };
+        if let Err(e) = run_conn(conn, adapted).await {
             tracing::warn!("nvme-rdma queue ended: {e}");
         }
     }

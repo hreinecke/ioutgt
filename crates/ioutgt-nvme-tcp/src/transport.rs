@@ -95,8 +95,19 @@ impl Transport for TcpTransport {
     }
 
     fn run_queue(conn: Self::Conn, on_ctx: OnCtx) -> impl Future<Output = ()> {
-        // `Box<dyn FnOnce(&Rc<ConnCtx<AnyBackend>>)>` satisfies the
-        // `impl FnOnce(&Rc<ConnCtx<B>>)` bound with `B = AnyBackend`.
-        tcp_run_queue(conn, on_ctx)
+        // Adapt the harness callback: hand it the queue's stats and a
+        // weak namespace-change nudge instead of the dispatch context.
+        tcp_run_queue(conn, |ctx| {
+            let weak = std::rc::Rc::downgrade(ctx);
+            on_ctx(ioutgt_harness::ConnHandles {
+                stats: std::rc::Rc::clone(&ctx.queue.stats),
+                ns_changed: Box::new(move || {
+                    weak.upgrade().is_some_and(|ctx| {
+                        ctx.fire_ns_changed();
+                        true
+                    })
+                }),
+            });
+        })
     }
 }

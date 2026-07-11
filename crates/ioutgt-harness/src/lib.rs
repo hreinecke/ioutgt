@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -28,16 +28,31 @@ use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
-use ioutgt_nvme::dispatch::ConnCtx;
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tracing::{error, info, warn};
+
+/// What a connection reports to its queue thread once its dispatch state
+/// exists. Built by the transport's `run_queue` from its per-connection
+/// context; the harness never sees that context itself.
+pub struct ConnHandles {
+    /// The queue's lifetime stats, recorded for GET_STATS aggregation.
+    pub stats: Rc<QueueStats>,
+    /// Fire the namespace-changed async event if the connection is still
+    /// alive; returns `false` once it is gone (the thread prunes it).
+    /// Firing is a protocol no-op on connections without AERs (IO
+    /// queues), which never reach the admin thread's nudge list anyway.
+    pub ns_changed: NsNudge,
+}
+
+/// A connection's namespace-change nudge (see [`ConnHandles::ns_changed`]).
+pub type NsNudge = Box<dyn Fn() -> bool>;
 
 /// Install callback, run once a connection's dispatch context exists: the admin
 /// thread registers the live controller for AER nudges, and every thread
 /// records the queue's stats handle. Boxed so the generic pool can hand it to a
 /// transport's `run_queue` without the pool being generic over the closure.
-pub type OnCtx = Box<dyn FnOnce(&Rc<ConnCtx<AnyBackend>>)>;
+pub type OnCtx = Box<dyn FnOnce(ConnHandles)>;
 
 /// A fabric transport. All methods are associated (the implementing type is a
 /// ZST marker); the harness threads `Self::Conn` through the queue-thread pool
@@ -359,8 +374,8 @@ fn make_io_thread<T: Transport>(
                         Ok(IoMsg::Conn(conn)) => {
                             prune_dead_queues(&queues, &mut retired);
                             let queues = Rc::clone(&queues);
-                            let on_ctx: OnCtx = Box::new(move |ctx| {
-                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
+                            let on_ctx: OnCtx = Box::new(move |handles| {
+                                queues.borrow_mut().push(Rc::clone(&handles.stats));
                             });
                             tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
@@ -393,30 +408,25 @@ fn make_admin_thread<T: Transport>(
                 return;
             };
             rt.block_on(async move {
-                let live: Rc<RefCell<Vec<Weak<ConnCtx<AnyBackend>>>>> =
-                    Rc::new(RefCell::new(Vec::new()));
+                // Namespace-change nudges for the live admin connections;
+                // firing one that has died returns false and prunes it.
+                let live: Rc<RefCell<Vec<NsNudge>>> = Rc::new(RefCell::new(Vec::new()));
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
                 let mut retired = QueueStatsSnapshot::default();
                 loop {
                     match rx.recv().await {
                         Ok(AdminMsg::Conn(conn)) => {
-                            live.borrow_mut().retain(|weak| weak.strong_count() > 0);
                             prune_dead_queues(&queues, &mut retired);
                             let live = Rc::clone(&live);
                             let queues = Rc::clone(&queues);
-                            let on_ctx: OnCtx = Box::new(move |ctx| {
-                                live.borrow_mut().push(Rc::downgrade(ctx));
-                                queues.borrow_mut().push(Rc::clone(&ctx.queue.stats));
+                            let on_ctx: OnCtx = Box::new(move |handles| {
+                                queues.borrow_mut().push(Rc::clone(&handles.stats));
+                                live.borrow_mut().push(handles.ns_changed);
                             });
                             tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
                         Ok(AdminMsg::NsChanged) => {
-                            live.borrow_mut().retain(|weak| {
-                                weak.upgrade().is_some_and(|ctx| {
-                                    ctx.fire_ns_changed();
-                                    true
-                                })
-                            });
+                            live.borrow_mut().retain(|fire| fire());
                         }
                         Ok(AdminMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);
