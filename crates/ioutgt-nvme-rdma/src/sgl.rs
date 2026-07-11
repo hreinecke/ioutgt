@@ -74,5 +74,5 @@ pub(crate) fn parse_keyed_sgl(sqe: &Sqe) -> KeyedSgl {
 /// The staged transfer length of a validated host-data-in SQE: its keyed-SGL
 /// length clamped to MDTS. Recomputed when a pool-deferred command retries.
 pub(crate) fn staged_len(sqe: &Sqe) -> usize {
-    (parse_keyed_sgl(sqe).len as usize).min(ioutgt_nvme::MDTS_BYTES as usize)
+    (parse_keyed_sgl(sqe).len as usize).min(ioutgt_core::MDTS_BYTES as usize)
 }

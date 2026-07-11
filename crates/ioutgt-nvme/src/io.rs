@@ -101,7 +101,7 @@ fn checked_len<B: Backend>(backend: &B, sqe: &Sqe) -> Result<(RwCommand, u32), u
     let rw = RwCommand::parse(sqe);
     let nlb = u64::from(rw.nlb) + 1;
     let len = nlb << backend.block_shift();
-    if len > u64::from(crate::MDTS_BYTES) {
+    if len > u64::from(ioutgt_core::MDTS_BYTES) {
         return Err(status::INVALID_FIELD | status::DNR);
     }
     // The SGL data-length field is 32-bit for an in-capsule data-block

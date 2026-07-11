@@ -29,21 +29,6 @@ pub mod spec;
 pub mod status;
 pub mod subsystem;
 
-/// Largest queue we accept (CAP.MQES advertises this minus one).
-///
-/// Slots no longer pin a per-slot data buffer (they lease on demand from
-/// a shared per-queue `BufPool`), so per-queue memory is bounded
-/// by the pool size, not by `entries × MDTS`. The host sizes its queues
-/// to `min(desired, MQES + 1)`; Connect requests beyond this are rejected
-/// (a hostile host ignores the advertised MQES, so the limit is enforced,
-/// not just advertised).
-pub const MAX_QUEUE_ENTRIES: u16 = 256;
-
-/// Maximum single-command transfer (MDTS): 2^5 × 4 KiB pages = 128 KiB,
-/// matching the `mdts = 5` we advertise. Read/write transfers are
-/// validated against this; a slot leases exactly the transfer size.
-pub const MDTS_BYTES: u32 = 128 * 1024;
-
 /// Cap on admin-command response data staged in a slot (identify/log
 /// pages). The admin pool is sized `depth × ADMIN_DATA_MAX` so admin
 /// leases never block.

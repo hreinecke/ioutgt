@@ -111,7 +111,7 @@ impl<B: Backend> ConnCtx<B> {
             connect_data,
             peer,
             role: Role::Admin(AdminState {
-                regs: RefCell::new(RegisterState::new(crate::MAX_QUEUE_ENTRIES)),
+                regs: RefCell::new(RegisterState::new(ioutgt_core::MAX_QUEUE_ENTRIES)),
                 cntlid: Cell::new(0),
                 subsys: RefCell::new(None),
                 discovery: Cell::new(false),
