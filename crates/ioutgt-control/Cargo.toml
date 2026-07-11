@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 ioutgt-backend = { workspace = true }
 ioutgt-core = { workspace = true }
+ioutgt-cpus = { workspace = true }
 ioutgt-nvme = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

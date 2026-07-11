@@ -104,7 +104,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         }
     }
     let fd = conn.fd.as_raw_fd();
-    let peer = ioutgt_nvme::controller::peer_of(fd);
+    let peer = peer_of(fd);
     let ctx = if conn.qid == 0 {
         ConnCtx::new_admin(
             Rc::clone(&queue.nvme),
@@ -325,5 +325,37 @@ async fn teardown<B: Backend>(
             ctx.registry.remove(cntlid);
             info!(cntlid, "controller removed");
         }
+    }
+}
+
+/// Peer (remote) address of socket `fd` as `"ip:port"`, `"?"` on failure.
+/// Used by `LIST_CONTROLLER` so the harness can map a connection's source
+/// port to its qid for hardware NIC flow steering.
+fn peer_of(fd: std::os::fd::RawFd) -> String {
+    // SAFETY: a zeroed sockaddr_storage is a valid buffer for getpeername to
+    // overwrite; `len` matches its size.
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+        .expect("sockaddr_storage fits socklen_t");
+    // SAFETY: `fd` is a socket; ss/len describe a valid writable buffer of the
+    // stated size.
+    let rc = unsafe { libc::getpeername(fd, std::ptr::addr_of_mut!(ss).cast(), &mut len) };
+    if rc != 0 {
+        return "?".to_owned();
+    }
+    match i32::from(ss.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: family is AF_INET, so `ss` is a sockaddr_in.
+            let a = unsafe { &*std::ptr::addr_of!(ss).cast::<libc::sockaddr_in>() };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr));
+            format!("{ip}:{}", u16::from_be(a.sin_port))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: family is AF_INET6, so `ss` is a sockaddr_in6.
+            let a = unsafe { &*std::ptr::addr_of!(ss).cast::<libc::sockaddr_in6>() };
+            let ip = std::net::Ipv6Addr::from(a.sin6_addr.s6_addr);
+            format!("[{ip}]:{}", u16::from_be(a.sin6_port))
+        }
+        _ => "?".to_owned(),
     }
 }

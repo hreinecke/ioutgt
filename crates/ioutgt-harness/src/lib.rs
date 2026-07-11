@@ -294,7 +294,7 @@ fn thread_stats_json(
         .collect();
     serde_json::json!({
         "name": name,
-        "tid": ioutgt_nvme::controller::current_tid(),
+        "tid": ioutgt_cpus::thread::current_tid(),
         "ring": { "parks": ring.parks, "sqes": ring.sqes,
                   "send_sqes": ring.send_sqes, "recv_sqes": ring.recv_sqes,
                   "read_sqes": ring.read_sqes, "write_sqes": ring.write_sqes,

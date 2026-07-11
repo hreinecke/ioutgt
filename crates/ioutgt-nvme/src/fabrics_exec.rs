@@ -9,9 +9,10 @@ use crate::status;
 use tracing::{debug, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::controller::{CcEffect, QueueInfo, current_cpus, current_tid};
+use crate::controller::{CcEffect, QueueInfo};
 use crate::dispatch::{ConnCtx, Outcome, Role};
 use ioutgt_core::backend::Backend;
+use ioutgt_cpus::thread::{current_cpus, current_tid};
 
 /// NUL/space-trimmed string from a fixed NQN field.
 pub fn nqn_str(raw: &[u8]) -> &str {

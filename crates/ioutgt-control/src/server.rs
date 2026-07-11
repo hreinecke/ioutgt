@@ -316,7 +316,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                             // Live affinity (re-read by tid), so it reflects
                             // any post-connect re-pinning -- not the snapshot
                             // taken at Connect (q.cpus).
-                            let cpus = ioutgt_nvme::controller::cpus_of(q.tid);
+                            let cpus = ioutgt_cpus::thread::cpus_of(q.tid);
                             json!({ "qid": q.qid, "depth": q.sqsize, "tid": q.tid,
                                     "cpus": cpus, "group_cpus": group, "peer": q.peer })
                         })

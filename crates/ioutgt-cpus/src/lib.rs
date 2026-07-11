@@ -15,6 +15,7 @@
 
 mod cpuset;
 mod spread;
+pub mod thread;
 mod topology;
 
 pub use cpuset::CpuSet;

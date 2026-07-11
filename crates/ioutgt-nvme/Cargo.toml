@@ -10,7 +10,7 @@ authors.workspace = true
 
 [dependencies]
 ioutgt-core = { workspace = true }
-libc = { workspace = true }
+ioutgt-cpus = { workspace = true }
 tracing = { workspace = true }
 zerocopy = { workspace = true }
 crc32c = { workspace = true }
