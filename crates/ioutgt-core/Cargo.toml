@@ -1,6 +1,6 @@
 [package]
 name = "ioutgt-core"
-description = "Protocol-neutral queue engine: command slots, buffer pool, permits, backend trait"
+description = "Protocol-neutral queue engine (slots, buffers, permits, backend trait) and structural target model (subsystems, controller registry)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

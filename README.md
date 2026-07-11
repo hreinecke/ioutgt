@@ -106,8 +106,8 @@ testing/two_nic/realwire_tcp.sh down
 | Crate | Role |
 |-------|------|
 | `ioutgt-uring` | per-thread io_uring reactor + op futures, Tokio park integration |
-| `ioutgt-nvme` | sans-io NVMe spec types + PDU codec, plus the transport-independent model: subsystems, controllers, namespaces, dispatch |
-| `ioutgt-core` | protocol-neutral queue engine: slot array, buffer pool, permits, the `Backend` trait |
+| `ioutgt-nvme` | sans-io NVMe spec types + PDU codec, plus NVMe command execution: dispatch, admin/IO handlers, fabrics |
+| `ioutgt-core` | protocol-neutral queue engine (slots, buffer pool, permits, `Backend`) + the structural target model (subsystems, namespaces, controller registry) |
 | `ioutgt-stream` | protocol-neutral stream send/recv harness (`StreamSender`/`StreamReader`) |
 | `ioutgt-nvme-tcp` | NVMe/TCP transport + binary |
 | `ioutgt-nvme-rdma` | NVMe/RDMA transport + binary (verbs, CM, adaptive `--poll`) |

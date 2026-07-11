@@ -61,15 +61,17 @@ cargo run --release --example loadgen -- \
 
 Ten crates in a strict dependency DAG (full diagrams: architecture.md
 §3). The two foundation leaves are `ioutgt-core` (the protocol-neutral
-queue engine — slot array, buffer pool, permits, `Backend` trait, and
-the generic per-connection context `QueueCore<C>` (`QueueCore<Sqe>`
-for NVMe, `QueueCore<NbdReq>` for a future NBD); zero dependencies)
-and `ioutgt-uring` (pure IO: reactor + op futures + gather-send
-mechanics, zero protocol knowledge). `ioutgt-nvme` layers the NVMe
-world on the engine: sans-IO codec modules (bytes ↔ structs — shared
-by target, test client, and the decoder fuzz test) plus the
-transport-independent model (subsystems, controllers, dispatch),
-mirroring kernel nvmet's `core.c`. `ioutgt-stream` is the
+queue engine — slot array, buffer pool, permits, `Backend` trait, the
+generic per-connection context `QueueCore<C>` (`QueueCore<Sqe>` for
+NVMe, `QueueCore<NbdReq>` for a future NBD) — plus the structural
+target model: subsystem/namespace tables, the controller registry, and
+the engine sizing limits; zero dependencies) and `ioutgt-uring` (pure
+IO: reactor + op futures + gather-send mechanics, zero protocol
+knowledge). `ioutgt-nvme` layers the NVMe protocol on the engine:
+sans-IO codec modules (bytes ↔ structs — shared by target, test
+client, and the decoder fuzz test) plus command execution (dispatch,
+admin/IO handlers, fabrics, CC/CSTS register state), mirroring kernel
+nvmet's `core.c`. `ioutgt-stream` is the
 transport-shared, ZC-aware gather-send harness `StreamSender`, layered
 above core + uring (walked end to end in `docs/stream-sender.md`). The
 frontends compose these:

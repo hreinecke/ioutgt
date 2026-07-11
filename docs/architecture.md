@@ -76,16 +76,21 @@ The workspace is ten crates forming a strict dependency DAG — every
 crate depends only on layers below it. The two foundation leaves are
 deliberately opposite in character:
 
-- `ioutgt-core` is the **protocol-neutral queue engine**: slot array,
-  buffer pool, permits, the `Backend` trait, zero dependencies.
+- `ioutgt-core` is the **protocol-neutral queue engine** — slot array,
+  buffer pool, permits, the `Backend` trait — plus the structural
+  target model (subsystem/namespace tables, controller registry);
+  zero dependencies.
 - `ioutgt-uring` is **pure IO**: op futures and the reactor, zero
   protocol knowledge.
 
-`ioutgt-nvme` layers the NVMe world on `ioutgt-core`: its codec modules
-(`spec`/`pdu`/`identify`/`fabrics`/`status`/`digest`) stay **sans-IO**
-— pure bytes ↔ structs, no sockets, no async, fuzzable in isolation —
-while the rest of the crate carries the transport-independent model
-(subsystems, controllers, dispatch).
+`ioutgt-nvme` layers the NVMe protocol on `ioutgt-core`: its codec
+modules (`spec`/`pdu`/`identify`/`fabrics`/`status`/`digest`) stay
+**sans-IO** — pure bytes ↔ structs, no sockets, no async, fuzzable in
+isolation — while the rest of the crate executes commands (dispatch,
+admin/IO handlers, fabrics Connect, CC/CSTS register state). The
+structural target model — subsystem/namespace tables and the
+controller registry — lives in `ioutgt-core`, so the harness and
+control plane hold the served model without an NVMe dependency.
 
 A third small leaf, `ioutgt-cpus`, groups CPUs evenly per NUMA / cluster /
 SMT locality (`spread_cpus`); the algorithm is pure (driven by a
@@ -122,17 +127,17 @@ machinery.
             │ Null / Memory / File    │  │ + recv byte-source      │
             │                         │  │ (StreamSender/Reader)   │
             └─────────────────────────┘  └─────────────────────────┘
-  model     ┌──────────────────────────────────────────────────────┐
-            │ ioutgt-nvme — Port/Subsystem/Namespace, Registry,    │
-            │ NVMe model + dispatch, plus the sans-IO NVMe(-oF)    │
-            │ codec: Sqe/Cqe, PDUs, CRC32C                         │
+  protocol  ┌──────────────────────────────────────────────────────┐
+            │ ioutgt-nvme — NVMe command execution (dispatch,      │
+            │ admin/IO, fabrics, CC/CSTS), plus the sans-IO        │
+            │ NVMe(-oF) codec: Sqe/Cqe, PDUs, CRC32C               │
             └──────────────────────────────────────────────────────┘
   leaves    ┌─────────────────────────┐  ┌─────────────────────────┐
             │ ioutgt-core             │  │ ioutgt-uring            │
             │ protocol-neutral slot   │  │ io_uring reactor, op    │
             │ engine (`slotq`),       │  │ futures, mailbox,       │
-            │ Backend trait           │  │ QueueRuntime,           │
-            │                         │  │ sendbatch (GatherBatch) │
+            │ Backend trait, model:   │  │ QueueRuntime,           │
+            │ Subsystem/Ns, Registry  │  │ sendbatch (GatherBatch) │
             └─────────────────────────┘  └─────────────────────────┘
 ```
 
@@ -141,11 +146,11 @@ machinery.
 | [`ioutgt-nvme-tcp`](../crates/ioutgt-nvme-tcp) | NVMe/TCP transport + binary | harness, core, backend, control, stream, nvme, uring |
 | [`ioutgt-nvme-rdma`](../crates/ioutgt-nvme-rdma) | NVMe/RDMA transport + binary | harness, core, backend, control, nvme, uring |
 | [`ioutgt-harness`](../crates/ioutgt-harness) | shared binary harness (spawn, queue-thread pool, control server, stat client) | core, backend, control, cpus, uring |
-| [`ioutgt-control`](../crates/ioutgt-control) | config + UDS control plane | core, backend |
+| [`ioutgt-control`](../crates/ioutgt-control) | config + UDS control plane | core, backend, cpus |
 | [`ioutgt-backend`](../crates/ioutgt-backend) | storage backends | core, uring |
 | [`ioutgt-stream`](../crates/ioutgt-stream) | protocol-neutral stream mechanics: ZC gather-send (`StreamSender`) + buffered recv byte-source (`StreamReader`) | core, uring |
-| [`ioutgt-core`](../crates/ioutgt-core) | protocol-neutral `slotq` engine, `Backend` trait | — |
-| [`ioutgt-nvme`](../crates/ioutgt-nvme) | sans-IO codec + NVMe model + dispatch | core |
+| [`ioutgt-core`](../crates/ioutgt-core) | protocol-neutral `slotq` engine, `Backend` trait, subsystem/registry model | — |
+| [`ioutgt-nvme`](../crates/ioutgt-nvme) | sans-IO codec + NVMe command execution | core, cpus |
 | [`ioutgt-uring`](../crates/ioutgt-uring) | reactor + op futures + `sendbatch` | — |
 | [`ioutgt-cpus`](../crates/ioutgt-cpus) | locality-aware even CPU grouping | — |
 

@@ -4,7 +4,10 @@
 //! ([`buf`]), the [`Backend`] trait that storage backends implement, and
 //! the generic per-connection context [`queue::QueueCore`].
 //!
-//! Nothing here knows any protocol: the NVMe model lives in
+//! Alongside the engine sits the structural target model shared with
+//! the harness and control plane: subsystem/namespace tables
+//! ([`subsystem`]) and the controller registry ([`registry`]). Nothing
+//! here executes a protocol: NVMe command handling lives in
 //! `ioutgt-nvme`, which layers on top of this crate. A future NBD
 //! frontend would instantiate the same engine with its own command type
 //! (`QueueCore<NbdReq>`).

@@ -9,12 +9,12 @@
 //! one codec. All wire integers are little-endian per the NVMe base
 //! specification.
 //!
-//! The model modules — [`subsystem`], [`controller`], [`dispatch`],
-//! [`fabrics_exec`], [`admin`], [`io`] — are the transport-independent
-//! NVMe target: subsystems, controllers, namespaces, and admin/IO
-//! command dispatch, layered on the protocol-neutral engine in
-//! `ioutgt-core`. They mirror the role of `core.c`/`nvmet.h` in the
-//! Linux kernel nvmet target.
+//! The execution modules — [`dispatch`], [`fabrics_exec`], [`admin`],
+//! [`io`], [`controller`] — are the transport-independent NVMe target:
+//! admin/IO command handling and the CC/CSTS register machine, layered
+//! on the engine and structural model (subsystem tables, controller
+//! registry) in `ioutgt-core`. They mirror the role of
+//! `core.c`/`nvmet.h` in the Linux kernel nvmet target.
 
 pub mod admin;
 pub mod controller;
