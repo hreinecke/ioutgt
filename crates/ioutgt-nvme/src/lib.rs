@@ -27,7 +27,6 @@ pub mod io;
 pub mod pdu;
 pub mod spec;
 pub mod status;
-pub mod subsystem;
 
 /// Cap on admin-command response data staged in a slot (identify/log
 /// pages). The admin pool is sized `depth × ADMIN_DATA_MAX` so admin

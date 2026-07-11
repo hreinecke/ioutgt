@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use ioutgt_core::backend::Backend;
+use crate::backend::Backend;
 
 /// Fabric transport serving a port; selects the TRTYPE byte in
 /// discovery log entries (NVMe-oF: RDMA = 1, TCP = 3).
@@ -23,16 +23,6 @@ pub enum TransportType {
     /// NVMe/RDMA (no transport implementation yet; the discovery
     /// plumbing is transport-complete ahead of it).
     Rdma,
-}
-
-impl TransportType {
-    /// Discovery-log TRTYPE encoding.
-    pub fn trtype(self) -> u8 {
-        match self {
-            TransportType::Tcp => crate::fabrics::trtype::TCP,
-            TransportType::Rdma => crate::fabrics::trtype::RDMA,
-        }
-    }
 }
 
 /// One namespace: an NSID bound to a backend.

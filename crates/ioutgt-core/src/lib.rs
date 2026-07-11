@@ -17,6 +17,7 @@ pub mod permit;
 pub mod pool;
 pub mod queue;
 pub mod slotq;
+pub mod subsystem;
 
 pub use backend::{Backend, BackendError, LbaRange};
 

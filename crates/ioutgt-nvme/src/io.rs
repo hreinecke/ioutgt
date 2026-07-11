@@ -12,9 +12,9 @@ use crate::status;
 use zerocopy::FromBytes;
 
 use crate::dispatch::{ConnCtx, IoState, Outcome};
-use crate::subsystem::Namespace;
 use ioutgt_core::backend::{Backend, BackendError, LbaRange};
 use ioutgt_core::queue::stat_add;
+use ioutgt_core::subsystem::Namespace;
 
 /// NVMe status code for a backend failure, per nvmet's
 /// blk_to_nvme_status mapping. Lives here — not on the `Backend`

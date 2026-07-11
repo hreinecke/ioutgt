@@ -22,12 +22,12 @@ use ioutgt_backend::AnyBackend;
 use ioutgt_core::pool::MAX_SEGS;
 use ioutgt_core::queue::QueueCore;
 use ioutgt_core::slotq::SendList;
+use ioutgt_core::subsystem::PortConfig;
 use ioutgt_nvme::controller::Registry;
 use ioutgt_nvme::dispatch::{self, ConnCtx, Outcome, Role};
 use ioutgt_nvme::fabrics::ConnectData;
 use ioutgt_nvme::spec::Sqe;
 use ioutgt_nvme::status;
-use ioutgt_nvme::subsystem::PortConfig;
 use rdma_mummy_sys::ibv_sge;
 use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::completion::{

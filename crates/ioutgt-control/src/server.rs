@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend};
 use ioutgt_core::Backend;
+use ioutgt_core::subsystem::{Namespace, PortConfig};
 use ioutgt_nvme::controller::Registry;
-use ioutgt_nvme::subsystem::{Namespace, PortConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -141,7 +141,7 @@ pub async fn serve(listener: tokio::net::UnixListener, state: Arc<CtlState>) {
 fn resolve<'a>(
     state: &'a CtlState,
     subsysnqn: Option<&str>,
-) -> Result<&'a Arc<ioutgt_nvme::subsystem::Subsystem<AnyBackend>>, Response> {
+) -> Result<&'a Arc<ioutgt_core::subsystem::Subsystem<AnyBackend>>, Response> {
     match subsysnqn {
         Some(nqn) => state
             .port
@@ -212,7 +212,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 // Derived from the resolved subsystem NQN (not the request's
                 // optional selector) so runtime-added namespaces match the
                 // config path and stay unique per subsystem.
-                uuid: ioutgt_nvme::subsystem::namespace_uuid(&subsys.nqn, nsid),
+                uuid: ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid),
             };
             if let Err(err) = subsys.add_namespace(ns) {
                 return Response::err(err);

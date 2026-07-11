@@ -16,8 +16,8 @@ use tracing::debug;
 use zerocopy::IntoBytes;
 
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
-use crate::subsystem::Subsystem;
 use ioutgt_core::backend::Backend;
+use ioutgt_core::subsystem::{Subsystem, TransportType};
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;
@@ -202,7 +202,7 @@ fn build_id_ctrl<B: Backend>(
     // IOCCSZ and never sends in-capsule write data. TCP uses byte-aligned
     // in-capsule SGLs only.
     let mut sgls = SGLS_BYTE_ALIGNED;
-    if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
+    if matches!(ctx.port.trtype, ioutgt_core::subsystem::TransportType::Rdma) {
         sgls |= SGLS_KEYED | SGLS_SAOS;
     }
     id.sgls.set(sgls);
@@ -217,7 +217,7 @@ fn build_id_ctrl<B: Backend>(
         // advertises one page of in-capsule data (nvmet parity): small write
         // payloads then arrive inside the command capsule and skip the
         // per-write RDMA READ round trip; larger IO stays on keyed SGLs.
-        let inline = if matches!(ctx.port.trtype, crate::subsystem::TransportType::Rdma) {
+        let inline = if matches!(ctx.port.trtype, ioutgt_core::subsystem::TransportType::Rdma) {
             crate::RDMA_INLINE_DATA_SIZE
         } else {
             crate::INLINE_DATA_SIZE
@@ -370,7 +370,12 @@ fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
 
     for (index, (nqn, _subsys)) in subsystems.iter().enumerate() {
         let mut entry = DiscoveryLogEntry::zeroed();
-        entry.trtype = ctx.port.trtype.trtype();
+        // The model's transport enum is protocol-neutral; the NVMe-oF
+        // TRTYPE byte it maps to is this crate's concern.
+        entry.trtype = match ctx.port.trtype {
+            TransportType::Tcp => fabrics::trtype::TCP,
+            TransportType::Rdma => fabrics::trtype::RDMA,
+        };
         entry.adrfam = 1; // IPv4
         entry.subtype = fabrics::subtype::NVM;
         entry.treq = 0;
