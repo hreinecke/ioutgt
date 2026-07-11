@@ -1,4 +1,5 @@
-//! The NVMe crate: sans-IO protocol codec plus the target-side model.
+//! The NVMe crate: sans-IO protocol codec plus transport-independent
+//! command execution.
 //!
 //! The codec modules — [`spec`], [`pdu`], [`identify`], [`fabrics`],
 //! [`status`], [`digest`] — are NVMe wire structures as `repr(C)`

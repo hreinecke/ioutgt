@@ -55,7 +55,7 @@ pub struct NsNudge {
 }
 
 /// Install callback, run once a connection's dispatch context exists: the admin
-/// thread registers the live controller for AER nudges, and every thread
+/// thread keeps the connection's namespace-change nudge, and every thread
 /// records the queue's stats handle. Boxed so the generic pool can hand it to a
 /// transport's `run_queue` without the pool being generic over the closure.
 pub type OnCtx = Box<dyn FnOnce(ConnHandles)>;
@@ -402,8 +402,8 @@ fn make_io_thread<T: Transport>(
 }
 
 /// Create the admin queue thread's mailbox and return its sender plus a
-/// deferred spawn closure. The admin thread additionally tracks live
-/// controllers for AER nudges.
+/// deferred spawn closure. The admin thread additionally keeps the live
+/// connections' namespace-change nudges.
 fn make_admin_thread<T: Transport>(
     name: String,
 ) -> io::Result<(MailboxSender<AdminMsg<T::Conn>>, PendingThread)> {

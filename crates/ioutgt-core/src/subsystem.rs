@@ -14,8 +14,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
 
-/// Fabric transport serving a port; selects the TRTYPE byte in
-/// discovery log entries (NVMe-oF: RDMA = 1, TCP = 3).
+/// Fabric transport serving a port. Protocol wire encodings (e.g. the
+/// NVMe-oF discovery-log TRTYPE byte) are the protocol layer's concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
     /// NVMe/TCP.

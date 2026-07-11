@@ -166,9 +166,9 @@ the RDMA binary passes `RdmaTransport` through the same seam.
 ```text
 spawn::<T>(config)                                     [ioutgt-harness]
   └─ "ioutgt-control" thread (plain Tokio) → control_loop::<T>():
-       Registry::new()                                 [ioutgt-nvme]
+       Registry::new()                                 [ioutgt-core]
        T::bind() → listener + bound address
-       build_port(): Subsystem / Namespace → AnyBackend [nvme, backend]
+       build_port(): Subsystem / Namespace → AnyBackend [core, backend]
        spawn_control_api(): UDS server                 [ioutgt-control]
        loop select!
          ├─ T::accept() ──► handle_accept()
@@ -255,7 +255,7 @@ Crate seams, with NVMe/TCP as the example:
 | transport → core | `QueueCore<Sqe>`/`SlotArray` slot API; the send list and work type (`SendWork`) are transport-owned |
 | tcp → stream | `StreamSender`/`StreamReader`, driven by transport closures |
 | nvme → backend | the `Backend` trait behind `Arc<Namespace>` |
-| control → nvme | `Registry` + `Subsystem` add/remove + the NS-changed nudge; GET_STATS reaches queue threads via binary-injected `StatsSource` closures over the same mailboxes |
+| control → core | `Registry` + `Subsystem` add/remove + the NS-changed nudge; GET_STATS reaches queue threads via binary-injected `StatsSource` closures over the same mailboxes |
 | transport → nvme | `dispatch::execute` plus codec types for encode/decode — the codec never does IO, the reactor never sees a PDU |
 
 ## 4. Reactor: io_uring under Tokio current-thread
