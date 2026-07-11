@@ -183,6 +183,24 @@ impl<B: Backend> ConnCtx<B> {
         }
     }
 
+    /// Weak handles for the harness pool: a side-effect-free liveness
+    /// probe and a [`fire_ns_changed`](Self::fire_ns_changed) trigger,
+    /// both holding only a `Weak` on this context. Plain boxed closures
+    /// (not a named type) so the pool needs no NVMe types.
+    #[allow(clippy::type_complexity)]
+    pub fn ns_nudge(self: &Rc<Self>) -> (Box<dyn Fn() -> bool>, Box<dyn Fn()>) {
+        let alive = Rc::downgrade(self);
+        let fire = Rc::downgrade(self);
+        (
+            Box::new(move || alive.strong_count() > 0),
+            Box::new(move || {
+                if let Some(ctx) = fire.upgrade() {
+                    ctx.fire_ns_changed();
+                }
+            }),
+        )
+    }
+
     /// Namespace inventory changed: complete one parked AER with the
     /// NS_ATTR notice (if the host enabled it) so the host rescans.
     pub fn fire_ns_changed(&self) {

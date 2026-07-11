@@ -38,15 +38,21 @@ use tracing::{error, info, warn};
 pub struct ConnHandles {
     /// The queue's lifetime stats, recorded for GET_STATS aggregation.
     pub stats: Rc<QueueStats>,
-    /// Fire the namespace-changed async event if the connection is still
-    /// alive; returns `false` once it is gone (the thread prunes it).
-    /// Firing is a protocol no-op on connections without AERs (IO
-    /// queues), which never reach the admin thread's nudge list anyway.
+    /// Namespace-change nudge for this connection (a no-op on
+    /// connections without async events, e.g. IO queues — those never
+    /// reach the admin thread's nudge list anyway).
     pub ns_changed: NsNudge,
 }
 
-/// A connection's namespace-change nudge (see [`ConnHandles::ns_changed`]).
-pub type NsNudge = Box<dyn Fn() -> bool>;
+/// A connection's namespace-change nudge: a side-effect-free liveness
+/// probe (so the pool can prune dead entries without firing events)
+/// plus the fire itself.
+pub struct NsNudge {
+    /// `true` while the connection is alive; no side effects.
+    pub alive: Box<dyn Fn() -> bool>,
+    /// Fire the namespace-changed async event (a no-op once dead).
+    pub fire: Box<dyn Fn()>,
+}
 
 /// Install callback, run once a connection's dispatch context exists: the admin
 /// thread registers the live controller for AER nudges, and every thread
@@ -409,7 +415,9 @@ fn make_admin_thread<T: Transport>(
             };
             rt.block_on(async move {
                 // Namespace-change nudges for the live admin connections;
-                // firing one that has died returns false and prunes it.
+                // pruned alongside the stats list on every handoff so the
+                // list stays bounded under connect churn even if no
+                // namespace ever changes.
                 let live: Rc<RefCell<Vec<NsNudge>>> = Rc::new(RefCell::new(Vec::new()));
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
                 let mut retired = QueueStatsSnapshot::default();
@@ -417,6 +425,7 @@ fn make_admin_thread<T: Transport>(
                     match rx.recv().await {
                         Ok(AdminMsg::Conn(conn)) => {
                             prune_dead_queues(&queues, &mut retired);
+                            live.borrow_mut().retain(|n| (n.alive)());
                             let live = Rc::clone(&live);
                             let queues = Rc::clone(&queues);
                             let on_ctx: OnCtx = Box::new(move |handles| {
@@ -426,7 +435,13 @@ fn make_admin_thread<T: Transport>(
                             tokio::task::spawn_local(T::run_queue(conn, on_ctx));
                         }
                         Ok(AdminMsg::NsChanged) => {
-                            live.borrow_mut().retain(|fire| fire());
+                            live.borrow_mut().retain(|n| {
+                                let alive = (n.alive)();
+                                if alive {
+                                    (n.fire)();
+                                }
+                                alive
+                            });
                         }
                         Ok(AdminMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);

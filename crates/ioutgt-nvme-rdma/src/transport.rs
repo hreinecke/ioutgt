@@ -21,7 +21,7 @@ use ioutgt_backend::AnyBackend;
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{PortConfig, TransportType};
-use ioutgt_harness::{OnCtx, TargetConfig, Transport};
+use ioutgt_harness::{ConnHandles, NsNudge, OnCtx, TargetConfig, Transport};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -131,19 +131,13 @@ impl Transport for RdmaTransport {
     async fn run_queue(conn: RdmaConn, on_ctx: OnCtx) {
         // Adapt the harness callback: hand it the queue's stats and a
         // weak namespace-change nudge instead of the dispatch context.
-        let adapted =
-            |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<ioutgt_backend::AnyBackend>>| {
-                let weak = std::rc::Rc::downgrade(ctx);
-                on_ctx(ioutgt_harness::ConnHandles {
-                    stats: std::rc::Rc::clone(&ctx.queue.stats),
-                    ns_changed: Box::new(move || {
-                        weak.upgrade().is_some_and(|ctx| {
-                            ctx.fire_ns_changed();
-                            true
-                        })
-                    }),
-                });
-            };
+        let adapted = |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<AnyBackend>>| {
+            let (alive, fire) = ctx.ns_nudge();
+            on_ctx(ConnHandles {
+                stats: std::rc::Rc::clone(&ctx.queue.stats),
+                ns_changed: NsNudge { alive, fire },
+            });
+        };
         if let Err(e) = run_conn(conn, adapted).await {
             tracing::warn!("nvme-rdma queue ended: {e}");
         }

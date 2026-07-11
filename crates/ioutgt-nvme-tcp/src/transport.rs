@@ -13,7 +13,7 @@ use crate::handshake::{accept_handshake, read_connect};
 use ioutgt_backend::AnyBackend;
 use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{PortConfig, TransportType};
-use ioutgt_harness::{OnCtx, TargetConfig, Transport};
+use ioutgt_harness::{ConnHandles, NsNudge, OnCtx, TargetConfig, Transport};
 
 use crate::{CONNECT_DISABLE_SQFLOW, sqsize_cap};
 
@@ -98,15 +98,10 @@ impl Transport for TcpTransport {
         // Adapt the harness callback: hand it the queue's stats and a
         // weak namespace-change nudge instead of the dispatch context.
         tcp_run_queue(conn, |ctx| {
-            let weak = std::rc::Rc::downgrade(ctx);
-            on_ctx(ioutgt_harness::ConnHandles {
+            let (alive, fire) = ctx.ns_nudge();
+            on_ctx(ConnHandles {
                 stats: std::rc::Rc::clone(&ctx.queue.stats),
-                ns_changed: Box::new(move || {
-                    weak.upgrade().is_some_and(|ctx| {
-                        ctx.fire_ns_changed();
-                        true
-                    })
-                }),
+                ns_changed: NsNudge { alive, fire },
             });
         })
     }
