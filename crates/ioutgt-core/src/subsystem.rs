@@ -74,8 +74,10 @@ pub struct Subsystem<B> {
     pub model: String,
     /// Highest IO queue id offered to controllers (≤ IO threads).
     pub max_qid: u16,
-    /// Accept any hostnqn (host ACLs are future control-plane work).
+    /// Accept any hostnqn, ignoring `allowed_hosts`.
     pub allow_any_host: bool,
+    /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
+    pub allowed_hosts: Vec<String>,
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
 }
@@ -88,6 +90,7 @@ impl<B: Backend> Subsystem<B> {
         model: String,
         max_qid: u16,
         allow_any_host: bool,
+        allowed_hosts: Vec<String>,
         namespaces: BTreeMap<u32, Arc<Namespace<B>>>,
     ) -> Self {
         Subsystem {
@@ -96,9 +99,16 @@ impl<B: Backend> Subsystem<B> {
             model,
             max_qid,
             allow_any_host,
+            allowed_hosts,
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
         }
+    }
+
+    /// Host admission (nvmet semantics): any host, or membership in
+    /// `allowed_hosts`.
+    pub fn admits(&self, hostnqn: &str) -> bool {
+        self.allow_any_host || self.allowed_hosts.iter().any(|h| h == hostnqn)
     }
 
     /// Current table snapshot (control plane and admin/cold paths).

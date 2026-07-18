@@ -173,6 +173,7 @@ impl TargetConfig {
                 serial: "IOUTGT0001".into(),
                 model: "ioutgt".into(),
                 allow_any_host: true,
+                allowed_hosts: vec![],
                 namespaces: vec![NamespaceConfig {
                     nsid: 1,
                     backend: BackendConfig::Memory { size_mb },
@@ -563,6 +564,7 @@ fn build_port(
             spec.model.clone(),
             u16::try_from(config.io_threads.max(1)).unwrap_or(1),
             spec.allow_any_host,
+            spec.allowed_hosts.clone(),
             namespaces,
         ));
         subsystems.insert(spec.nqn.clone(), subsystem);

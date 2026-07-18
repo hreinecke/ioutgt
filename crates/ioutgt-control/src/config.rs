@@ -89,6 +89,9 @@ pub struct SubsystemConfig {
     pub model: String,
     #[serde(default = "default_true")]
     pub allow_any_host: bool,
+    /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     pub namespaces: Vec<NamespaceConfig>,
 }
 

@@ -92,8 +92,8 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                         status::CONNECT_INVALID_PARAM | status::DNR,
                     ));
                 };
-                if !subsys.allow_any_host {
-                    // Host ACLs arrive with the control plane.
+                if !subsys.admits(hostnqn) {
+                    info!(subsysnqn, hostnqn, "connect from disallowed host");
                     return Outcome::status(ctx.cqe(
                         0,
                         cid,
