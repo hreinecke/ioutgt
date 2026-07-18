@@ -89,13 +89,18 @@ pub(crate) fn to_file_config(
             "nvmet config has multiple {want} ports; ioutgt serves one port per process"
         ));
     }
-    // An IPv6 traddr needs brackets to parse as a SocketAddr.
-    let traddr = &port.addr.traddr;
-    let listen = if traddr.contains(':') {
-        format!("[{traddr}]:{}", port.addr.trsvcid)
-    } else {
-        format!("{traddr}:{}", port.addr.trsvcid)
-    };
+    // SocketAddr's Display owns the IPv6 bracketing.
+    let ip: std::net::IpAddr = port
+        .addr
+        .traddr
+        .parse()
+        .map_err(|_| format!("port traddr '{}' is not an IP address", port.addr.traddr))?;
+    let svc: u16 = port
+        .addr
+        .trsvcid
+        .parse()
+        .map_err(|_| format!("port trsvcid '{}' is not a port number", port.addr.trsvcid))?;
+    let listen = std::net::SocketAddr::new(ip, svc).to_string();
     // Only subsystems exported on the port are reachable (in configfs,
     // the port holds symlinks to them).
     let mut subsystems = Vec::new();
@@ -164,6 +169,16 @@ mod tests {
         FileConfig::parse(json, trtype)
     }
 
+    /// A one-tcp-port document exporting "nqn.a"; each test supplies
+    /// only its distinguishing subsystems array.
+    fn tcp_doc(subsystems: &str) -> String {
+        format!(
+            r#"{{ "ports": [ {{ "addr": {{ "traddr": "127.0.0.1", "trsvcid": "4420",
+                              "trtype": "tcp" }}, "subsystems": [ "nqn.a" ] }} ],
+                 "subsystems": {subsystems} }}"#
+        )
+    }
+
     /// A full `nvmetcli save`-shaped document — every field the kernel
     /// dumps for an rdma port (attr groups, portid, referrals, treq).
     const RDMA_EXAMPLE: &str = r#"{
@@ -217,12 +232,12 @@ mod tests {
     #[test]
     fn acl_and_serial_attrs_map() {
         let config = parse(
-            r#"{ "ports": [ { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420",
-                              "trtype": "tcp" }, "subsystems": [ "nqn.a" ] } ],
-                 "subsystems": [ { "nqn": "nqn.a",
+            &tcp_doc(
+                r#"[ { "nqn": "nqn.a",
                    "attr": { "allow_any_host": "0", "serial": "SN123", "model": "Linux" },
                    "allowed_hosts": [ "hostnqn" ],
-                   "namespaces": [ { "nsid": 1, "device": { "path": "/dev/sda" } } ] } ] }"#,
+                   "namespaces": [ { "nsid": 1, "device": { "path": "/dev/sda" } } ] } ]"#,
+            ),
             TransportType::Tcp,
         )
         .unwrap();
@@ -236,13 +251,13 @@ mod tests {
     #[test]
     fn device_uuid_mapped_nguid_ignored() {
         let config = parse(
-            r#"{ "ports": [ { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420",
-                              "trtype": "tcp" }, "subsystems": [ "nqn.a" ] } ],
-                 "subsystems": [ { "nqn": "nqn.a", "attr": { "allow_any_host": "1" },
+            &tcp_doc(
+                r#"[ { "nqn": "nqn.a", "attr": { "allow_any_host": "1" },
                    "namespaces": [ { "nsid": 1,
                      "device": { "path": "/dev/sda",
                                  "uuid": "00112233-4455-6677-8899-aabbccddeeff",
-                                 "nguid": "5b1e6a44-97f2-40e9-b3d1-0c88a1c0d201" } } ] } ] }"#,
+                                 "nguid": "5b1e6a44-97f2-40e9-b3d1-0c88a1c0d201" } } ] } ]"#,
+            ),
             TransportType::Tcp,
         )
         .unwrap();
@@ -255,12 +270,12 @@ mod tests {
     #[test]
     fn disabled_namespace_skipped() {
         let config = parse(
-            r#"{ "ports": [ { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420",
-                              "trtype": "tcp" }, "subsystems": [ "nqn.a" ] } ],
-                 "subsystems": [ { "nqn": "nqn.a", "attr": { "allow_any_host": "1" },
+            &tcp_doc(
+                r#"[ { "nqn": "nqn.a", "attr": { "allow_any_host": "1" },
                    "namespaces": [
                      { "nsid": 1, "device": { "path": "/dev/sda" }, "enable": 0 },
-                     { "nsid": 2, "device": { "path": "/dev/sdb" }, "enable": 1 } ] } ] }"#,
+                     { "nsid": 2, "device": { "path": "/dev/sdb" }, "enable": 1 } ] } ]"#,
+            ),
             TransportType::Tcp,
         )
         .unwrap();
@@ -316,10 +331,7 @@ mod tests {
         // Enabled namespace without a backing device path.
         assert!(
             parse(
-                r#"{ "ports": [ { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420",
-                              "trtype": "tcp" }, "subsystems": [ "nqn.a" ] } ],
-                 "subsystems": [ { "nqn": "nqn.a",
-                   "namespaces": [ { "nsid": 1 } ] } ] }"#,
+                &tcp_doc(r#"[ { "nqn": "nqn.a", "namespaces": [ { "nsid": 1 } ] } ]"#),
                 TransportType::Tcp,
             )
             .unwrap_err()

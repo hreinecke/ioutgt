@@ -509,8 +509,8 @@ synchronous data leases never block.
   namespaces (backend type + path + nsid + optional UUID), listen address,
   thread/affinity map, digest policy, inline data size. Validation produces
   line-precise errors before any thread spawns.
-- Two config schemas, auto-detected by the native schema's required
-  `listen` key: ioutgt's native engine-shaped one, and nvmetcli's
+- Two config schemas, auto-detected by nvmetcli's `ports` marker:
+  ioutgt's native engine-shaped one, and nvmetcli's
   configfs-shaped save format (`/etc/nvmet/config.json`), mapped onto
   the native structures by `ioutgt-control`'s `nvmet` module — port
   (selected by the binary's fabric), exported subsystems, host ACLs

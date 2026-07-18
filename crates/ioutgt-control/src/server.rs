@@ -210,8 +210,9 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 nsid,
                 backend: Arc::new(backend),
                 // Derived from the resolved subsystem NQN (not the request's
-                // optional selector) so runtime-added namespaces match the
-                // config path and stay unique per subsystem.
+                // optional selector), unique per subsystem. Deliberately no
+                // uuid in this payload: only the config file can pin one;
+                // runtime adds always take the derived identity.
                 uuid: ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid),
             };
             if let Err(err) = subsys.add_namespace(ns) {

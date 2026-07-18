@@ -162,40 +162,36 @@ impl FileConfig {
         Self::parse(&text, trtype).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Parse and validate either accepted schema: ioutgt's native
-    /// engine-shaped config (keyed by its required `listen` field) or
-    /// nvmetcli's configfs-shaped save format (see [`crate::nvmet`]).
+    /// Parse and validate either accepted schema. nvmetcli's
+    /// configfs-shaped save format is recognized by its own marker — a
+    /// top-level `ports` array, which every configfs save has and the
+    /// native schema (`deny_unknown_fields`) forbids — so a broken
+    /// native config still gets a native serde error (see
+    /// [`crate::nvmet`]).
     pub(crate) fn parse(
         text: &str,
         trtype: ioutgt_core::subsystem::TransportType,
     ) -> Result<FileConfig, String> {
         let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let config: FileConfig = if value.get("listen").is_some() {
-            serde_json::from_value(value).map_err(|e| e.to_string())?
-        } else {
+        let config: FileConfig = if value.get("ports").is_some() {
             crate::nvmet::to_file_config(value, trtype)?
+        } else {
+            serde_json::from_value(value).map_err(|e| e.to_string())?
         };
         config.validate()?;
         Ok(config)
     }
 
     /// Engine defaults around the given endpoint and subsystems — the
-    /// construction path for schemas that carry no engine tuning.
+    /// construction path for schemas that carry no engine tuning. Built
+    /// through serde so the `#[serde(default)]` attributes stay the
+    /// single defaults authority.
     pub(crate) fn engine_defaults(listen: String, subsystems: Vec<SubsystemConfig>) -> FileConfig {
-        FileConfig {
-            listen,
-            io_threads: default_io_threads(),
-            header_digest: true,
-            data_digest: true,
-            pin_threads: true,
-            send_zc: false,
-            io_queue_size: default_io_queue_size(),
-            queue_buf_mb: default_queue_buf_mb(),
-            recv_buf_mb: default_recv_buf_mb(),
-            control_socket: None,
-            idle_teardown_secs: default_idle_teardown_secs(),
-            subsystems,
-        }
+        let mut config: FileConfig =
+            serde_json::from_value(serde_json::json!({ "listen": listen, "subsystems": [] }))
+                .expect("static shape");
+        config.subsystems = subsystems;
+        config
     }
 
     /// Structural validation beyond what serde enforces.
