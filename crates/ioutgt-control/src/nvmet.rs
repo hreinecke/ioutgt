@@ -123,6 +123,8 @@ impl Subsystem {
             namespaces.push(NamespaceConfig {
                 nsid: ns.nsid,
                 backend: BackendConfig::File { path: path.into() },
+                // nguid has no ioutgt counterpart and is not conflated.
+                uuid: ns.device.get("uuid").cloned(),
             });
         }
         Ok(SubsystemConfig {
@@ -220,6 +222,25 @@ mod tests {
         assert_eq!(subsys.allowed_hosts, ["hostnqn"]);
         assert_eq!(subsys.serial, "SN123");
         assert_eq!(subsys.model, "Linux");
+    }
+
+    #[test]
+    fn device_uuid_mapped_nguid_ignored() {
+        let config = parse(
+            r#"{ "ports": [ { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420",
+                              "trtype": "tcp" }, "subsystems": [ "nqn.a" ] } ],
+                 "subsystems": [ { "nqn": "nqn.a", "attr": { "allow_any_host": "1" },
+                   "namespaces": [ { "nsid": 1,
+                     "device": { "path": "/dev/sda",
+                                 "uuid": "00112233-4455-6677-8899-aabbccddeeff",
+                                 "nguid": "5b1e6a44-97f2-40e9-b3d1-0c88a1c0d201" } } ] } ] }"#,
+            TransportType::Tcp,
+        )
+        .unwrap();
+        assert_eq!(
+            config.subsystems[0].namespaces[0].uuid.as_deref(),
+            Some("00112233-4455-6677-8899-aabbccddeeff")
+        );
     }
 
     #[test]

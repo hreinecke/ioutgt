@@ -27,6 +27,7 @@ fn mem(nsid: u32, size_mb: u64) -> NamespaceConfig {
     NamespaceConfig {
         nsid,
         backend: BackendConfig::Memory { size_mb },
+        uuid: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn static_multi_namespace_isolation_and_identify() {
         NamespaceConfig {
             nsid: 3,
             backend: BackendConfig::Null { size_mb: 8 },
+            uuid: None,
         },
     ]);
 

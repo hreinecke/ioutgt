@@ -109,6 +109,39 @@ pub(crate) fn default_model() -> String {
 pub struct NamespaceConfig {
     pub nsid: u32,
     pub backend: BackendConfig,
+    /// Namespace UUID, hyphenated ("xxxxxxxx-xxxx-…"). Defaults to an
+    /// identity derived from (subsystem NQN, nsid); set it to keep
+    /// host-visible identity (`/dev/disk/by-id`) across targets, e.g.
+    /// when restoring a kernel-nvmet save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+}
+
+/// Parse a hyphenated UUID string (8-4-4-4-12 hex) into its 16 bytes.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 36 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    let mut idx = 0;
+    let mut hi = None;
+    for (pos, ch) in text.bytes().enumerate() {
+        if matches!(pos, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let nibble = u8::try_from((ch as char).to_digit(16)?).ok()?;
+        match hi.take() {
+            None => hi = Some(nibble),
+            Some(h) => {
+                bytes[idx] = h << 4 | nibble;
+                idx += 1;
+            }
+        }
+    }
+    Some(bytes)
 }
 
 /// Backend selection (also the ADD_NAMESPACE payload).
@@ -231,6 +264,14 @@ impl FileConfig {
                 if !seen.insert(ns.nsid) {
                     return Err(format!("{}: duplicate nsid {}", subsys.nqn, ns.nsid));
                 }
+                if let Some(uuid) = &ns.uuid
+                    && parse_uuid(uuid).is_none()
+                {
+                    return Err(format!(
+                        "{}: nsid {}: uuid '{uuid}' is not a hyphenated UUID",
+                        subsys.nqn, ns.nsid
+                    ));
+                }
                 if let BackendConfig::Memory { size_mb } | BackendConfig::Null { size_mb } =
                     &ns.backend
                     && *size_mb == 0
@@ -323,6 +364,39 @@ mod tests {
             )
             .unwrap_err()
             .contains("recv_buf_mb")
+        );
+    }
+
+    #[test]
+    fn parse_uuid_accepts_hyphenated_and_rejects_malformed() {
+        assert_eq!(
+            parse_uuid("00112233-4455-6677-8899-aabbccddeeff"),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+        for bad in [
+            "",
+            "00112233-4455-6677-8899-aabbccddeef",   // short
+            "001122334455-6677-8899-aabbccddeeffaa", // hyphen misplaced
+            "0011223g-4455-6677-8899-aabbccddeeff",  // non-hex
+        ] {
+            assert_eq!(parse_uuid(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_namespace_uuid_rejected() {
+        assert!(
+            parse(
+                r#"{ "listen": "127.0.0.1:4420",
+                 "subsystems": [ { "nqn": "nqn.x", "namespaces": [
+                   { "nsid": 1, "backend": { "type": "memory", "size_mb": 1 },
+                     "uuid": "not-a-uuid" } ] } ] }"#
+            )
+            .unwrap_err()
+            .contains("uuid")
         );
     }
 
