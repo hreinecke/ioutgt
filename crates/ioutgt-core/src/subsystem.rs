@@ -60,6 +60,35 @@ pub fn namespace_uuid(nqn: &str, nsid: u32) -> [u8; 16] {
     uuid
 }
 
+/// Parse a hyphenated UUID string (8-4-4-4-12 hex) into its 16 bytes.
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let b = text.as_bytes();
+    if b.len() != 36 || [8, 13, 18, 23].iter().any(|&i| b[i] != b'-') {
+        return None;
+    }
+    let hex: String = text.split('-').collect();
+    // The ascii guard also rejects the leading `+` from_str_radix allows;
+    // 32 hex digits fit u128 exactly, so the parse cannot fail.
+    hex.bytes().all(|c| c.is_ascii_hexdigit()).then(|| {
+        u128::from_str_radix(&hex, 16)
+            .expect("checked hex")
+            .to_be_bytes()
+    })
+}
+
+/// Format 16 UUID bytes as the hyphenated string form.
+pub fn format_uuid(bytes: &[u8; 16]) -> String {
+    let v = u128::from_be_bytes(*bytes);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        v >> 96,
+        (v >> 80) & 0xffff,
+        (v >> 64) & 0xffff,
+        (v >> 48) & 0xffff,
+        v & 0xffff_ffff_ffff
+    )
+}
+
 /// Immutable namespace-table snapshot.
 pub type NsMap<B> = Arc<BTreeMap<u32, Arc<Namespace<B>>>>;
 
@@ -223,7 +252,27 @@ impl<B: Backend> PortConfig<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::namespace_uuid;
+    use super::{format_uuid, namespace_uuid, parse_uuid};
+
+    #[test]
+    fn parse_uuid_accepts_hyphenated_and_rejects_malformed() {
+        const TEXT: &str = "00112233-4455-6677-8899-aabbccddeeff";
+        const BYTES: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_eq!(parse_uuid(TEXT), Some(BYTES));
+        assert_eq!(format_uuid(&BYTES), TEXT);
+        for bad in [
+            "",
+            "00112233-4455-6677-8899-aabbccddeef",   // short
+            "001122334455-6677-8899-aabbccddeeffaa", // hyphen misplaced
+            "0011223g-4455-6677-8899-aabbccddeeff",  // non-hex
+            "+0112233-4455-6677-8899-aabbccddeeff",  // sign accepted by from_str_radix
+        ] {
+            assert_eq!(parse_uuid(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn namespace_uuid_is_deterministic() {

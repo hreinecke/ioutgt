@@ -120,11 +120,20 @@ impl Subsystem {
             let Some(path) = ns.device.get("path") else {
                 return Err(format!("{}: nsid {}: no device path", self.nqn, ns.nsid));
             };
+            // nguid has no ioutgt counterpart and is not conflated.
+            let uuid = match ns.device.get("uuid") {
+                Some(text) => Some(ioutgt_core::subsystem::parse_uuid(text).ok_or_else(|| {
+                    format!(
+                        "{}: nsid {}: device uuid '{text}' is not a hyphenated UUID",
+                        self.nqn, ns.nsid
+                    )
+                })?),
+                None => None,
+            };
             namespaces.push(NamespaceConfig {
                 nsid: ns.nsid,
                 backend: BackendConfig::File { path: path.into() },
-                // nguid has no ioutgt counterpart and is not conflated.
-                uuid: ns.device.get("uuid").cloned(),
+                uuid,
             });
         }
         Ok(SubsystemConfig {
@@ -238,8 +247,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.subsystems[0].namespaces[0].uuid.as_deref(),
-            Some("00112233-4455-6677-8899-aabbccddeeff")
+            config.subsystems[0].namespaces[0].uuid,
+            ioutgt_core::subsystem::parse_uuid("00112233-4455-6677-8899-aabbccddeeff"),
         );
     }
 
