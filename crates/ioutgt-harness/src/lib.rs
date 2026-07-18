@@ -26,7 +26,8 @@ use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
-use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, TransportType};
+pub use ioutgt_core::subsystem::TransportType;
+use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -182,9 +183,11 @@ impl TargetConfig {
         }
     }
 
-    /// Load and validate a JSON config file.
-    pub fn from_file(path: &std::path::Path) -> io::Result<TargetConfig> {
-        let file = FileConfig::load(path).map_err(io::Error::other)?;
+    /// Load and validate a JSON config file (native or nvmetcli
+    /// format). `trtype` is the fabric this binary serves; an
+    /// nvmetcli-format config uses it to pick the matching port.
+    pub fn from_file(path: &std::path::Path, trtype: TransportType) -> io::Result<TargetConfig> {
+        let file = FileConfig::load(path, trtype).map_err(io::Error::other)?;
         Ok(TargetConfig {
             listen: file.listen.parse().expect("validated"),
             io_threads: file.io_threads,

@@ -148,7 +148,7 @@ fn main() -> std::io::Result<()> {
         }
     }
     let mut config = match &args.config {
-        Some(path) => TargetConfig::from_file(path)?,
+        Some(path) => TargetConfig::from_file(path, ioutgt_harness::TransportType::Rdma)?,
         None => {
             let mut config = TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
             config.listen = args.listen;

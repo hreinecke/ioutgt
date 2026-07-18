@@ -165,7 +165,9 @@ fn main() -> std::io::Result<()> {
     }
 
     let config = match &args.config {
-        Some(path) => ioutgt_nvme_tcp::TargetConfig::from_file(path)?,
+        Some(path) => {
+            ioutgt_nvme_tcp::TargetConfig::from_file(path, ioutgt_harness::TransportType::Tcp)?
+        }
         None => {
             let mut config =
                 ioutgt_nvme_tcp::TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);

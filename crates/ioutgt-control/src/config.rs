@@ -95,11 +95,11 @@ pub struct SubsystemConfig {
     pub namespaces: Vec<NamespaceConfig>,
 }
 
-fn default_serial() -> String {
+pub(crate) fn default_serial() -> String {
     "IOUTGT0001".into()
 }
 
-fn default_model() -> String {
+pub(crate) fn default_model() -> String {
     "ioutgt".into()
 }
 
@@ -124,13 +124,51 @@ pub enum BackendConfig {
 }
 
 impl FileConfig {
-    /// Parse and validate a config file.
-    pub fn load(path: &std::path::Path) -> Result<FileConfig, String> {
+    /// Parse and validate a config file. `trtype` is the fabric the
+    /// loading binary serves; an nvmetcli-format config uses it to pick
+    /// the matching port.
+    pub fn load(
+        path: &std::path::Path,
+        trtype: ioutgt_core::subsystem::TransportType,
+    ) -> Result<FileConfig, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let config: FileConfig =
-            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text, trtype).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Parse and validate either accepted schema: ioutgt's native
+    /// engine-shaped config (keyed by its required `listen` field) or
+    /// nvmetcli's configfs-shaped save format (see [`crate::nvmet`]).
+    pub(crate) fn parse(
+        text: &str,
+        trtype: ioutgt_core::subsystem::TransportType,
+    ) -> Result<FileConfig, String> {
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let config: FileConfig = if value.get("listen").is_some() {
+            serde_json::from_value(value).map_err(|e| e.to_string())?
+        } else {
+            crate::nvmet::to_file_config(value, trtype)?
+        };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Engine defaults around the given endpoint and subsystems — the
+    /// construction path for schemas that carry no engine tuning.
+    pub(crate) fn engine_defaults(listen: String, subsystems: Vec<SubsystemConfig>) -> FileConfig {
+        FileConfig {
+            listen,
+            io_threads: default_io_threads(),
+            header_digest: true,
+            data_digest: true,
+            pin_threads: true,
+            send_zc: false,
+            io_queue_size: default_io_queue_size(),
+            queue_buf_mb: default_queue_buf_mb(),
+            recv_buf_mb: default_recv_buf_mb(),
+            control_socket: None,
+            idle_teardown_secs: default_idle_teardown_secs(),
+            subsystems,
+        }
     }
 
     /// Structural validation beyond what serde enforces.
