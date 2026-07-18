@@ -1,17 +1,29 @@
 {
-  "listen": "0.0.0.0:4420",
-  "io_threads": 2,
-  "header_digest": true,
-  "data_digest": true,
-  "control_socket": "/tmp/ioutgt.sock",
+  "hosts": [],
+  "ports": [
+    {
+      "addr": {
+        "adrfam": "ipv4",
+        "traddr": "0.0.0.0",
+        "trsvcid": "4420",
+        "trtype": "tcp"
+      },
+      "portid": 1,
+      "subsystems": [ "nqn.2026-06.io.ioutgt:test" ]
+    }
+  ],
   "subsystems": [
     {
-      "nqn": "nqn.2026-06.io.ioutgt:test",
-      "serial": "IOUTGT0001",
+      "attr": { "allow_any_host": "1", "serial": "IOUTGT0001" },
+      "allowed_hosts": [],
       "namespaces": [
-        { "nsid": 1, "backend": { "type": "memory", "size_mb": 64 } },
-        { "nsid": 2, "backend": { "type": "null", "size_mb": 1024 } }
-      ]
+        {
+          "nsid": 1,
+          "enable": 1,
+          "device": { "path": "/var/lib/ioutgt/ns1.img" }
+        }
+      ],
+      "nqn": "nqn.2026-06.io.ioutgt:test"
     }
   ]
 }

@@ -12,7 +12,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(version, about = "io_uring-based NVMe/TCP target")]
 struct Args {
-    /// JSON config file (overrides the individual flags below).
+    /// nvmetcli-format JSON config (kernel nvmet's save/restore
+    /// schema). Its tcp port supplies the listen address and
+    /// subsystems, replacing --listen/--subsys-nqn/--backend; the
+    /// engine flags below still apply.
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
@@ -164,38 +167,34 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let config = match &args.config {
-        Some(path) => {
-            ioutgt_nvme_tcp::TargetConfig::from_file(path, ioutgt_harness::TransportType::Tcp)?
-        }
-        None => {
-            let mut config =
-                ioutgt_nvme_tcp::TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
-            config.listen = args.listen;
-            config.io_threads = args.io_threads;
-            config.allow_hdgst = !args.no_hdgst;
-            config.allow_ddgst = !args.no_ddgst;
-            config.pin_threads = !args.no_pin;
-            config.send_zc = args.send_zc;
-            config.io_queue_size = args.io_queue_size;
-            config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
-            config.recv_buf_bytes = args.recv_buf_mb.saturating_mul(1024 * 1024);
-            config.idle_teardown = (args.idle_teardown_secs != 0)
-                .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
-            config.control_socket =
-                Some(args.control_socket.unwrap_or_else(default_control_socket));
-            config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
-                "memory" => ioutgt_control::config::BackendConfig::Memory {
-                    size_mb: args.mem_size_mb,
-                },
-                "null" => ioutgt_control::config::BackendConfig::Null {
-                    size_mb: args.mem_size_mb,
-                },
-                path => ioutgt_control::config::BackendConfig::File { path: path.into() },
-            };
-            config
-        }
+    let mut config =
+        ioutgt_nvme_tcp::TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
+    config.listen = args.listen;
+    config.io_threads = args.io_threads;
+    config.allow_hdgst = !args.no_hdgst;
+    config.allow_ddgst = !args.no_ddgst;
+    config.pin_threads = !args.no_pin;
+    config.send_zc = args.send_zc;
+    config.io_queue_size = args.io_queue_size;
+    config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
+    config.recv_buf_bytes = args.recv_buf_mb.saturating_mul(1024 * 1024);
+    config.idle_teardown = (args.idle_teardown_secs != 0)
+        .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
+    config.control_socket = Some(args.control_socket.unwrap_or_else(default_control_socket));
+    config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
+        "memory" => ioutgt_control::config::BackendConfig::Memory {
+            size_mb: args.mem_size_mb,
+        },
+        "null" => ioutgt_control::config::BackendConfig::Null {
+            size_mb: args.mem_size_mb,
+        },
+        path => ioutgt_control::config::BackendConfig::File { path: path.into() },
     };
+    // The config file owns the target model (listen + subsystems,
+    // replacing the flag-built ones); engine flags above still apply.
+    if let Some(path) = &args.config {
+        config.apply_file(path, ioutgt_harness::TransportType::Tcp)?;
+    }
     let addr = ioutgt_nvme_tcp::spawn_target(config)?;
     eprintln!("ioutgt listening on {addr}");
     // The target runs on its own threads; park the main thread.

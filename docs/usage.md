@@ -6,13 +6,14 @@
 # Flag-driven: one subsystem, one namespace.
 ioutgt --listen 0.0.0.0:4420 --io-threads 4 --backend memory --mem-size-mb 1024
 
-# Config-driven: everything from JSON (see "Config file" below).
-ioutgt --config target.json
+# Config-driven: target model from a kernel-nvmet JSON save
+# (see "Config file" below); engine flags still apply.
+ioutgt --config /etc/nvmet/config.json --io-threads 4
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config <path>` | — | JSON config file; overrides all other target flags |
+| `--config <path>` | — | nvmetcli-format JSON config (kernel nvmet's save/restore schema); supplies the listen address and subsystems, replacing `--listen`/`--subsys-nqn`/`--backend`. All other flags still apply |
 | `--listen <addr:port>` | `0.0.0.0:4420` | NVMe/TCP listen address |
 | `--io-threads <n>` | `2` | IO queue threads (admin thread is implicit); also caps the queue count offered to hosts |
 | `--backend <kind>` | `memory` | `memory`, `null`, or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
@@ -21,7 +22,7 @@ ioutgt --config target.json
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
 | `--no-pin` | pinning on | Disable topology-aware IO-thread pinning (each IO thread pins to one CPU of its `spread_cpus` group — NUMA/cluster/SMT-aware) |
 | `--send-zc` | off | **Experimental.** Ship payload-carrying send batches as `SENDMSG_ZC` (zero-copy), gating slot-buffer reuse on the kernel's notification CQE. Loopback always falls back to copying — a real NIC is needed for any benefit. Startup fails if the kernel lacks `IORING_OP_SENDMSG_ZC` |
-| `--control-socket <path>` | `$XDG_RUNTIME_DIR/ioutgt.sock`, else `/tmp/ioutgt.sock` | Runtime control API socket, created mode 0600 (same default as the `ctl`/`list` subcommands; config-file mode enables it only when the JSON sets `control_socket`) |
+| `--control-socket <path>` | `$XDG_RUNTIME_DIR/ioutgt.sock`, else `/tmp/ioutgt.sock` | Runtime control API socket, created mode 0600 (same default as the `ctl`/`list` subcommands) |
 
 Logging via `RUST_LOG` (`tracing_subscriber` env-filter syntax):
 `RUST_LOG=debug ioutgt …`, or per-module
@@ -32,58 +33,55 @@ The well-known discovery subsystem is always served; `nvme discover
 
 ## Config file
 
+The config file schema is kernel nvmet's — the JSON that `nvmetcli
+save` writes and `nvmetcli restore` reads — so an existing
+`/etc/nvmet/config.json` drives ioutgt unchanged:
+
 ```json
 {
-  "listen": "0.0.0.0:4420",
-  "io_threads": 2,
-  "header_digest": true,
-  "data_digest": true,
-  "send_zc": false,
-  "control_socket": "/tmp/ioutgt.sock",
+  "hosts": [ { "nqn": "hostnqn" } ],
+  "ports": [
+    {
+      "addr": { "adrfam": "ipv4", "traddr": "0.0.0.0",
+                "trsvcid": "4420", "trtype": "tcp" },
+      "portid": 1,
+      "subsystems": [ "nqn.2026-06.io.ioutgt:test" ]
+    }
+  ],
   "subsystems": [
     {
-      "nqn": "nqn.2026-06.io.ioutgt:test",
-      "serial": "IOUTGT0001",
+      "attr": { "allow_any_host": "1", "serial": "IOUTGT0001" },
+      "allowed_hosts": [],
       "namespaces": [
-        { "nsid": 1, "backend": { "type": "file", "path": "/var/lib/ioutgt/ns1.img" } },
-        { "nsid": 2, "backend": { "type": "memory", "size_mb": 64 } },
-        { "nsid": 3, "backend": { "type": "null", "size_mb": 1024 } }
-      ]
+        { "nsid": 1, "enable": 1,
+          "device": { "path": "/var/lib/ioutgt/ns1.img",
+                      "uuid": "6c1f8f26-8d94-46a1-9e2f-7f5a1c2d3e4f" } }
+      ],
+      "nqn": "nqn.2026-06.io.ioutgt:test"
     }
   ]
 }
 ```
 
-Per subsystem, `allow_any_host` (default true) and `allowed_hosts`
-(hostnqns admitted when it is false) give nvmet-style host ACLs; per
-namespace, an optional `"uuid"` pins the host-visible identity
-(`/dev/disk/by-id`) instead of the derived default.
+The file owns the target model, the flags own engine tuning — the same
+split as configfs vs module parameters in the kernel. The port matching
+the binary's fabric (`tcp` here, `rdma` for the RDMA binary) supplies
+the listen address; its exported subsystems are served with their host
+ACLs (`attr.allow_any_host` + `allowed_hosts`), serial/model, and
+file/bdev-backed namespaces (`device.path`; `device.uuid` pins the
+host-visible identity, `"enable": 0` keeps a namespace invisible, as in
+the kernel). Attributes with no ioutgt counterpart (`param.*`, ANA
+groups, referrals, PI/cntlid tuning, `nguid`) are accepted and ignored,
+like nvmetcli's own error-skipping restore.
 
-Validation runs before any thread spawns; unknown fields, duplicate or
-reserved NSIDs, zero sizes, and malformed addresses are rejected with
-the offending field named. A working example lives at
+Memory/null-backed namespaces cannot be expressed in this schema
+(kernel namespaces are always device-backed); use `--backend
+memory|null` or the runtime control API for those.
+
+Validation runs before any thread spawns; duplicate or reserved NSIDs,
+malformed addresses or UUIDs, and ports exporting undefined subsystems
+are rejected with the offending item named. A working example lives at
 `testing/example-config.json`.
-
-### nvmetcli config files
-
-`--config` also accepts the JSON that `nvmetcli save` writes for the
-kernel target (`/etc/nvmet/config.json`) — the two schemas are
-auto-detected, so an existing nvmet configuration drives ioutgt
-unchanged:
-
-```sh
-ioutgt --config /etc/nvmet/config.json
-```
-
-The port matching the binary's fabric (`tcp` here, `rdma` for the RDMA
-binary) supplies the listen address; its exported subsystems are served
-with their host ACLs, serial/model, and file/bdev-backed namespaces
-(`device.path`, `device.uuid`; a namespace with `"enable": 0` stays
-invisible, as in the kernel). Attributes with no ioutgt counterpart
-(`param.*`, ANA groups, referrals, PI/cntlid tuning, `nguid`) are
-accepted and ignored, like nvmetcli's own error-skipping restore.
-Engine tuning (`io_threads`, buffer sizes, digests…) has no home in
-that schema and keeps its defaults.
 
 ## Runtime control: `ioutgt ctl`
 

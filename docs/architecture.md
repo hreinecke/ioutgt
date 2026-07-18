@@ -505,17 +505,16 @@ synchronous data leases never block.
   - `ioutgt stat` renders them under a controller-identity header,
     `-i N` for iostat-style rates computed client-side, `--clear` to
     reset.
-- The target is fully constructible from a JSON config file: subsystems,
-  namespaces (backend type + path + nsid + optional UUID), listen address,
-  thread/affinity map, digest policy, inline data size. Validation produces
-  line-precise errors before any thread spawns.
-- Two config schemas, auto-detected by nvmetcli's `ports` marker:
-  ioutgt's native engine-shaped one, and nvmetcli's
-  configfs-shaped save format (`/etc/nvmet/config.json`), mapped onto
-  the native structures by `ioutgt-control`'s `nvmet` module — port
-  (selected by the binary's fabric), exported subsystems, host ACLs
-  (`allow_any_host` + `allowed_hosts`, enforced at Connect), file-backed
-  namespaces, `device.uuid`. Engine tuning keeps its defaults there.
+- The config-file schema is kernel nvmet's (the `nvmetcli save`
+  format, `/etc/nvmet/config.json`), loaded by `ioutgt-control`'s
+  `nvmet` module: the port matching the binary's fabric supplies the
+  listen address; its exported subsystems arrive with host ACLs
+  (`allow_any_host` + `allowed_hosts`, enforced at Connect),
+  serial/model, and file-backed namespaces (`device.path`,
+  `device.uuid` pinning host-visible identity). The file owns the
+  target model; engine tuning (threads, buffers, digests) stays with
+  the CLI flags — the configfs/module-param split. Validation runs
+  before any thread spawns.
 - Runtime namespace changes propagate via mailboxes and fire AER
   NS_CHANGED so connected hosts rescan without reconnect.
 

@@ -15,9 +15,10 @@ use ioutgt_nvme_rdma::transport::RdmaTransport;
 #[derive(Parser, Debug)]
 #[command(version, about = "io_uring-based NVMe/RDMA target")]
 struct Args {
-    /// JSON config file (overrides the individual flags below). Shares the
-    /// `ioutgt-nvme-tcp` schema; TCP-only fields (digests, `send_zc`,
-    /// `recv_buf_mb`) are parsed but ignored.
+    /// nvmetcli-format JSON config (kernel nvmet's save/restore
+    /// schema). Its rdma port supplies the listen address and
+    /// subsystems, replacing --listen/--subsys-nqn/--backend; the
+    /// engine flags below still apply.
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
@@ -147,38 +148,33 @@ fn main() -> std::io::Result<()> {
             } => return stat_target(&sock(socket), *interval, *clear),
         }
     }
-    let mut config = match &args.config {
-        Some(path) => TargetConfig::from_file(path, ioutgt_harness::TransportType::Rdma)?,
-        None => {
-            let mut config = TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
-            config.listen = args.listen;
-            config.io_threads = args.io_threads;
-            config.pin_threads = !args.no_pin;
-            config.poll = args.poll;
-            config.io_queue_size = args.io_queue_size;
-            config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
-            config.idle_teardown = (args.idle_teardown_secs != 0)
-                .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
-            config.control_socket =
-                Some(args.control_socket.unwrap_or_else(default_control_socket));
-            config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
-                "memory" => BackendConfig::Memory {
-                    size_mb: args.mem_size_mb,
-                },
-                "null" => BackendConfig::Null {
-                    size_mb: args.mem_size_mb,
-                },
-                path => BackendConfig::File { path: path.into() },
-            };
-            config
-        }
+    let mut config = TargetConfig::single_memory(&args.subsys_nqn, args.mem_size_mb);
+    config.listen = args.listen;
+    config.io_threads = args.io_threads;
+    config.pin_threads = !args.no_pin;
+    config.poll = args.poll;
+    config.io_queue_size = args.io_queue_size;
+    config.queue_buf_bytes = args.queue_buf_mb.saturating_mul(1024 * 1024);
+    config.idle_teardown = (args.idle_teardown_secs != 0)
+        .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
+    config.control_socket = Some(args.control_socket.unwrap_or_else(default_control_socket));
+    config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
+        "memory" => BackendConfig::Memory {
+            size_mb: args.mem_size_mb,
+        },
+        "null" => BackendConfig::Null {
+            size_mb: args.mem_size_mb,
+        },
+        path => BackendConfig::File { path: path.into() },
     };
-    // RDMA has no recv ring; force it off even if the shared config schema set
-    // recv_buf_mb (which would also flip file backends to O_DIRECT).
-    config.recv_buf_bytes = 0;
-    if args.poll {
-        config.poll = true;
+    // The config file owns the target model (listen + subsystems,
+    // replacing the flag-built ones); engine flags above still apply.
+    if let Some(path) = &args.config {
+        config.apply_file(path, ioutgt_harness::TransportType::Rdma)?;
     }
+    // RDMA has no recv ring; force it off (a nonzero value would also
+    // flip file backends to O_DIRECT).
+    config.recv_buf_bytes = 0;
 
     let addr = ioutgt_harness::spawn::<RdmaTransport>(config)?;
     eprintln!("ioutgt-nvme-rdma listening on {addr}");

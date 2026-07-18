@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ioutgt_backend::AnyBackend;
-use ioutgt_control::config::{BackendConfig, FileConfig, NamespaceConfig, SubsystemConfig};
+use ioutgt_control::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
 use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
@@ -107,9 +107,9 @@ pub trait Transport: 'static {
     fn run_queue(conn: Self::Conn, on_ctx: OnCtx) -> impl Future<Output = ()>;
 }
 
-/// Target configuration. Built from CLI flags, a JSON file
-/// ([`TargetConfig::from_file`]), or [`TargetConfig::single_memory`] in
-/// tests.
+/// Target configuration. Built from CLI flags — optionally overlaid
+/// with an nvmetcli-format file ([`TargetConfig::apply_file`]) — or
+/// [`TargetConfig::single_memory`] in tests.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
 pub struct TargetConfig {
@@ -184,28 +184,15 @@ impl TargetConfig {
         }
     }
 
-    /// Load and validate a JSON config file (native or nvmetcli
-    /// format). `trtype` is the fabric this binary serves; an
-    /// nvmetcli-format config uses it to pick the matching port.
-    pub fn from_file(path: &std::path::Path, trtype: TransportType) -> io::Result<TargetConfig> {
-        let file = FileConfig::load(path, trtype).map_err(io::Error::other)?;
-        Ok(TargetConfig {
-            listen: file.listen.parse().expect("validated"),
-            io_threads: file.io_threads,
-            allow_hdgst: file.header_digest,
-            allow_ddgst: file.data_digest,
-            pin_threads: file.pin_threads,
-            send_zc: file.send_zc,
-            io_queue_size: file.io_queue_size,
-            queue_buf_bytes: file.queue_buf_mb.saturating_mul(1024 * 1024),
-            recv_buf_bytes: file.recv_buf_mb.saturating_mul(1024 * 1024),
-            control_socket: file.control_socket,
-            idle_teardown: (file.idle_teardown_secs != 0)
-                .then(|| Duration::from_secs(file.idle_teardown_secs)),
-            mem_write_delay_us: 0,
-            poll: false,
-            subsystems: file.subsystems,
-        })
+    /// Overlay an nvmetcli-format config file (kernel nvmet's
+    /// save/restore schema): the file owns the target model — listen
+    /// address and subsystems, taken from the port serving `trtype` —
+    /// while engine tuning keeps whatever the flags/defaults set.
+    pub fn apply_file(&mut self, path: &std::path::Path, trtype: TransportType) -> io::Result<()> {
+        let target = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
+        self.listen = target.listen;
+        self.subsystems = target.subsystems;
+        Ok(())
     }
 }
 

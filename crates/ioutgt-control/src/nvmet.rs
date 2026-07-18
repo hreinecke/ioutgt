@@ -1,22 +1,42 @@
-//! nvmetcli-compatible JSON configuration.
+//! The JSON configuration schema: kernel nvmet's, as written by
+//! `nvmetcli save` and restored by `nvmetcli restore`.
 //!
-//! nvmetcli's `save`/`restore` serializes the kernel nvmet configfs
-//! tree: top-level `hosts`/`ports`/`subsystems` arrays whose attribute
-//! groups (`attr`, `addr`, `device`, …) hold string-typed configfs
-//! attributes. This module maps that schema onto [`FileConfig`] so an
-//! existing `/etc/nvmet/config.json` drives ioutgt unchanged.
+//! That format serializes the nvmet configfs tree — top-level
+//! `hosts`/`ports`/`subsystems` arrays whose attribute groups (`attr`,
+//! `addr`, `device`, …) hold string-typed configfs attributes — so an
+//! existing `/etc/nvmet/config.json` drives ioutgt unchanged. The file
+//! supplies only the target model (listen address, subsystems, host
+//! ACLs, namespaces); engine tuning stays with the CLI flags, the way
+//! configfs and module parameters split in the kernel.
 //!
 //! Attributes with no ioutgt counterpart (`param`, `ana_groups`,
 //! `referrals`, PI/cntlid tuning, …) are accepted and ignored, like
-//! nvmetcli's own error-skipping restore. Engine tuning (io_threads,
-//! buffer sizes, …) has no configfs home and keeps its defaults.
+//! nvmetcli's own error-skipping restore.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
 use ioutgt_core::subsystem::TransportType;
 use serde::Deserialize;
 
-use crate::config::{BackendConfig, FileConfig, NamespaceConfig, SubsystemConfig};
+use crate::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
+
+/// The target model a config file yields for one binary: the listen
+/// address of the port serving its fabric, and that port's exported
+/// subsystems.
+#[derive(Debug)]
+pub struct NvmetTarget {
+    /// `addr.traddr:addr.trsvcid` of the selected port.
+    pub listen: SocketAddr,
+    /// The subsystems the selected port exports.
+    pub subsystems: Vec<SubsystemConfig>,
+}
+
+/// Load and validate a config file for the port serving `trtype`.
+pub fn load(path: &std::path::Path, trtype: TransportType) -> Result<NvmetTarget, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    from_str(&text, trtype).map_err(|e| format!("{}: {e}", path.display()))
+}
 
 #[derive(Deserialize)]
 struct NvmetConfig {
@@ -68,14 +88,8 @@ fn default_enable() -> u8 {
     1
 }
 
-/// Convert a parsed nvmetcli-format document into the [`FileConfig`]
-/// for the port serving `trtype`.
-pub(crate) fn to_file_config(
-    value: serde_json::Value,
-    trtype: TransportType,
-) -> Result<FileConfig, String> {
-    let config: NvmetConfig =
-        serde_json::from_value(value).map_err(|e| format!("nvmet-format config: {e}"))?;
+fn from_str(text: &str, trtype: TransportType) -> Result<NvmetTarget, String> {
+    let config: NvmetConfig = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let want = match trtype {
         TransportType::Tcp => "tcp",
         TransportType::Rdma => "rdma",
@@ -100,7 +114,7 @@ pub(crate) fn to_file_config(
         .trsvcid
         .parse()
         .map_err(|_| format!("port trsvcid '{}' is not a port number", port.addr.trsvcid))?;
-    let listen = std::net::SocketAddr::new(ip, svc).to_string();
+    let listen = SocketAddr::new(ip, svc);
     // Only subsystems exported on the port are reachable (in configfs,
     // the port holds symlinks to them).
     let mut subsystems = Vec::new();
@@ -110,7 +124,8 @@ pub(crate) fn to_file_config(
         };
         subsystems.push(subsys.to_config()?);
     }
-    Ok(FileConfig::engine_defaults(listen, subsystems))
+    crate::config::validate_subsystems(&subsystems)?;
+    Ok(NvmetTarget { listen, subsystems })
 }
 
 impl Subsystem {
@@ -165,8 +180,8 @@ impl Subsystem {
 mod tests {
     use super::*;
 
-    fn parse(json: &str, trtype: TransportType) -> Result<FileConfig, String> {
-        FileConfig::parse(json, trtype)
+    fn parse(json: &str, trtype: TransportType) -> Result<NvmetTarget, String> {
+        from_str(json, trtype)
     }
 
     /// A one-tcp-port document exporting "nqn.a"; each test supplies
@@ -207,7 +222,7 @@ mod tests {
     #[test]
     fn nvmetcli_rdma_example_loads() {
         let config = parse(RDMA_EXAMPLE, TransportType::Rdma).unwrap();
-        assert_eq!(config.listen, "10.0.0.7:4420");
+        assert_eq!(config.listen, "10.0.0.7:4420".parse().unwrap());
         assert_eq!(config.subsystems.len(), 1);
         let subsys = &config.subsystems[0];
         assert_eq!(subsys.nqn, "nqn.2026-06.io.ioutgt:rd");
@@ -298,7 +313,7 @@ mod tests {
             TransportType::Tcp,
         )
         .unwrap();
-        assert_eq!(config.listen, "[::1]:4420");
+        assert_eq!(config.listen, "[::1]:4420".parse().unwrap());
     }
 
     #[test]
@@ -336,6 +351,31 @@ mod tests {
             )
             .unwrap_err()
             .contains("no device path")
+        );
+        // Malformed device uuid is a load error, not a silent fallback.
+        assert!(
+            parse(
+                &tcp_doc(
+                    r#"[ { "nqn": "nqn.a", "namespaces": [ { "nsid": 1,
+                       "device": { "path": "/dev/sda", "uuid": "not-a-uuid" } } ] } ]"#,
+                ),
+                TransportType::Tcp,
+            )
+            .unwrap_err()
+            .contains("hyphenated UUID")
+        );
+        // Structural validation runs on the loaded model.
+        assert!(
+            parse(
+                &tcp_doc(
+                    r#"[ { "nqn": "nqn.a", "namespaces": [
+                       { "nsid": 1, "device": { "path": "/dev/sda" } },
+                       { "nsid": 1, "device": { "path": "/dev/sdb" } } ] } ]"#,
+                ),
+                TransportType::Tcp,
+            )
+            .unwrap_err()
+            .contains("duplicate nsid")
         );
     }
 }

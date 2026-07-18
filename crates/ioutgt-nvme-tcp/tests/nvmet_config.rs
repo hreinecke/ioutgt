@@ -50,10 +50,12 @@ fn nvmetcli_config_end_to_end() {
     let path = dir.path().join("config.json");
     std::fs::write(&path, json).unwrap();
 
-    let mut config = ioutgt_nvme_tcp::TargetConfig::from_file(&path, TransportType::Tcp).unwrap();
-    // Test hygiene only; not part of the schema under test.
+    // Flags-then-overlay, as main() composes it: the file replaces the
+    // target model, engine settings stay.
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory("nqn.overridden", 8);
     config.pin_threads = false;
     config.io_threads = 1;
+    config.apply_file(&path, TransportType::Tcp).unwrap();
     let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // The file's ACL admits this hostnqn (allow_any_host is off).

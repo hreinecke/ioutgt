@@ -1,8 +1,9 @@
 //! Control plane.
 //!
-//! [`config`]: the JSON schema a target is created from (file) — also
-//! the wire form for runtime namespace operations; `nvmet` maps
-//! nvmetcli's configfs-shaped save format onto it. [`server`]: the
+//! [`nvmet`]: the config-file schema — kernel nvmet's, as written by
+//! `nvmetcli save`. [`config`]: the target-model structures it loads
+//! into, also the wire form for runtime namespace operations.
+//! [`server`]: the
 //! newline-delimited JSON API over a Unix domain socket
 //! (ADD_NAMESPACE / REMOVE_NAMESPACE / LIST_NAMESPACE / GET_STATS),
 //! running on the control thread; queue threads are reached only
@@ -10,5 +11,5 @@
 //! versioned table + an AER nudge).
 
 pub mod config;
-mod nvmet;
+pub mod nvmet;
 pub mod server;
