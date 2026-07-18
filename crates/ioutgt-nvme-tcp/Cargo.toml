@@ -35,6 +35,8 @@ zerocopy = { workspace = true }
 [dev-dependencies]
 # The control-socket integration test parses JSON responses.
 serde_json = { workspace = true }
+# The nvmetcli-config test spawns a target from a written config file.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

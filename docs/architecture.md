@@ -506,9 +506,16 @@ synchronous data leases never block.
     `-i N` for iostat-style rates computed client-side, `--clear` to
     reset.
 - The target is fully constructible from a JSON config file: subsystems,
-  namespaces (backend type + path + nsid), listen address, thread/affinity
-  map, digest policy, inline data size. Validation produces line-precise
-  errors before any thread spawns.
+  namespaces (backend type + path + nsid + optional UUID), listen address,
+  thread/affinity map, digest policy, inline data size. Validation produces
+  line-precise errors before any thread spawns.
+- Two config schemas, auto-detected by the native schema's required
+  `listen` key: ioutgt's native engine-shaped one, and nvmetcli's
+  configfs-shaped save format (`/etc/nvmet/config.json`), mapped onto
+  the native structures by `ioutgt-control`'s `nvmet` module — port
+  (selected by the binary's fabric), exported subsystems, host ACLs
+  (`allow_any_host` + `allowed_hosts`, enforced at Connect), file-backed
+  namespaces, `device.uuid`. Engine tuning keeps its defaults there.
 - Runtime namespace changes propagate via mailboxes and fire AER
   NS_CHANGED so connected hosts rescan without reconnect.
 

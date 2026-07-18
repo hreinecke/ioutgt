@@ -54,10 +54,36 @@ The well-known discovery subsystem is always served; `nvme discover
 }
 ```
 
+Per subsystem, `allow_any_host` (default true) and `allowed_hosts`
+(hostnqns admitted when it is false) give nvmet-style host ACLs; per
+namespace, an optional `"uuid"` pins the host-visible identity
+(`/dev/disk/by-id`) instead of the derived default.
+
 Validation runs before any thread spawns; unknown fields, duplicate or
 reserved NSIDs, zero sizes, and malformed addresses are rejected with
 the offending field named. A working example lives at
 `testing/example-config.json`.
+
+### nvmetcli config files
+
+`--config` also accepts the JSON that `nvmetcli save` writes for the
+kernel target (`/etc/nvmet/config.json`) — the two schemas are
+auto-detected, so an existing nvmet configuration drives ioutgt
+unchanged:
+
+```sh
+ioutgt --config /etc/nvmet/config.json
+```
+
+The port matching the binary's fabric (`tcp` here, `rdma` for the RDMA
+binary) supplies the listen address; its exported subsystems are served
+with their host ACLs, serial/model, and file/bdev-backed namespaces
+(`device.path`, `device.uuid`; a namespace with `"enable": 0` stays
+invisible, as in the kernel). Attributes with no ioutgt counterpart
+(`param.*`, ANA groups, referrals, PI/cntlid tuning, `nguid`) are
+accepted and ignored, like nvmetcli's own error-skipping restore.
+Engine tuning (`io_threads`, buffer sizes, digests…) has no home in
+that schema and keeps its defaults.
 
 ## Runtime control: `ioutgt ctl`
 
