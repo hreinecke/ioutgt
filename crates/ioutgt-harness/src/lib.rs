@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use ioutgt_backend::AnyBackend;
 use ioutgt_control::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
+use ioutgt_control::nvmet::NvmetTarget;
 use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
@@ -196,38 +197,64 @@ impl TargetConfig {
     /// configured control socket; each forked port derives
     /// `<socket>.port<id>` and dies with the parent (`PDEATHSIG`).
     ///
-    /// Must be called before [`spawn`]: forking is only sound while
-    /// the process is still single-threaded.
+    /// Must be called before [`spawn`]; the multi-port path verifies
+    /// the process is still single-threaded and errors otherwise.
     pub fn apply_file(&mut self, path: &std::path::Path, trtype: TransportType) -> io::Result<()> {
-        let mut targets = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
-        let mut mine = targets.remove(0);
-        let mut forked_child = false;
-        for target in targets {
-            // SAFETY: documented contract — called from main() before
-            // any thread or runtime exists, so the fork duplicates no
-            // locks, threads, or event loops.
-            match unsafe { libc::fork() } {
-                -1 => return Err(io::Error::last_os_error()),
-                0 => {
-                    // SAFETY: plain prctl on the calling process with
-                    // immediate integer arguments.
-                    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
-                    mine = target;
-                    forked_child = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let targets = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
+        let (mine, forked_child) = fork_extra_ports(targets)?;
         self.listen = mine.listen;
         self.subsystems = mine.subsystems;
         if forked_child && let Some(sock) = &mut self.control_socket {
-            let mut os = std::mem::take(sock).into_os_string();
-            os.push(format!(".port{}", mine.portid));
-            *sock = os.into();
+            sock.as_mut_os_string()
+                .push(format!(".port{}", mine.portid));
         }
         Ok(())
     }
+}
+
+/// Fork one process per port beyond the first; every process returns
+/// with the target it serves (`true` = a forked port process, which
+/// dies with its parent via `PDEATHSIG`). The calling process keeps
+/// the first target and stays in the foreground.
+fn fork_extra_ports(mut targets: Vec<NvmetTarget>) -> io::Result<(NvmetTarget, bool)> {
+    if targets.len() > 1 {
+        // fork() duplicates only the calling thread: any other thread's
+        // held lock (allocator, tracing) would deadlock the child. The
+        // config path runs before spawn(), so enforce that it stayed
+        // single-threaded rather than trusting the docs.
+        let threads = std::fs::read_dir("/proc/self/task")?.count();
+        if threads != 1 {
+            return Err(io::Error::other(format!(
+                "multi-port fork needs a single-threaded process ({threads} threads running)"
+            )));
+        }
+    }
+    for target in targets.drain(1..) {
+        // SAFETY: the process is single-threaded (verified above), so
+        // the fork duplicates no locks, threads, or event loops.
+        match unsafe { libc::fork() } {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {
+                // SAFETY: plain prctl on the calling process with
+                // immediate integer arguments.
+                unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+                return Ok((target, true));
+            }
+            _ => {}
+        }
+    }
+    Ok((targets.remove(0), false))
+}
+
+/// Announce the bound address on stderr as one write syscall: with a
+/// multi-port config several processes share stderr, and per-fragment
+/// writes (`eprintln!`) would interleave mid-line across them — the
+/// multi-port test parses these lines.
+pub fn announce_listening(name: &str, addr: SocketAddr) {
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        format!("{name} listening on {addr}\n").as_bytes(),
+    );
 }
 
 /// Maximum concurrent connections accepted. Bounds total preallocated

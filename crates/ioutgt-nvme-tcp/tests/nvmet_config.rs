@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Client, HOSTNQN, NQN, pattern, rw_sqe};
+use common::{Client, HOSTNQN, NQN, backing_file, pattern, rw_sqe};
 use ioutgt_harness::TransportType;
 use ioutgt_nvme::identify::IdentifyController;
 use ioutgt_nvme::{spec, status};
@@ -19,11 +19,7 @@ const UUID_BYTES: [u8; 16] = [
 #[test]
 fn nvmetcli_config_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
-    let disk = dir.path().join("ns1.img");
-    std::fs::File::create(&disk)
-        .unwrap()
-        .set_len(1 << 20)
-        .unwrap();
+    let disk = backing_file(dir.path(), "ns1.img");
 
     // The shape `nvmetcli save` writes (trsvcid 0 = ephemeral port,
     // for test isolation).

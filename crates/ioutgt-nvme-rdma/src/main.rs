@@ -177,13 +177,7 @@ fn main() -> std::io::Result<()> {
     config.recv_buf_bytes = 0;
 
     let addr = ioutgt_harness::spawn::<RdmaTransport>(config)?;
-    // One write syscall: with a multi-port config several processes
-    // share stderr, and eprintln's per-fragment writes would interleave
-    // mid-line across them.
-    let _ = std::io::Write::write_all(
-        &mut std::io::stderr(),
-        format!("ioutgt-nvme-rdma listening on {addr}\n").as_bytes(),
-    );
+    ioutgt_harness::announce_listening("ioutgt-nvme-rdma", addr);
     // The target runs on its own threads; park the main thread.
     loop {
         std::thread::park();

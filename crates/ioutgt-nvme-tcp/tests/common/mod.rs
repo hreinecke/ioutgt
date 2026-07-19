@@ -305,6 +305,27 @@ impl Client {
     }
 }
 
+/// Admin-queue Connect to `nqn` as the fixed test HOSTNQN; returns the
+/// phase-stripped CQE status (success and failure paths alike).
+pub fn connect_status(addr: std::net::SocketAddr, nqn: &str) -> u16 {
+    let mut client = Client::handshake(addr, false, false);
+    let (sqe, mut data) = connect_sqe(0, 32, 0xFFFF, 1);
+    data.subsysnqn = [0; 256];
+    data.subsysnqn[..nqn.len()].copy_from_slice(nqn.as_bytes());
+    client.send_capsule(&sqe, data.as_bytes());
+    client.recv_response().status.get() >> 1
+}
+
+/// A 1 MiB backing file for file-backed namespace configs.
+pub fn backing_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+    path
+}
+
 /// Build a Connect SQE + data capsule (for hand-driven Connect tests).
 pub fn connect_sqe(qid: u16, sqsize: u16, cntlid: u16, cid: u16) -> (spec::Sqe, ConnectData) {
     let mut cmd: ConnectCommand = FromZeros::new_zeroed();

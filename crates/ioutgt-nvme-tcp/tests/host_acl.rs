@@ -5,9 +5,8 @@
 
 mod common;
 
-use common::{Client, HOSTNQN, NQN, connect_sqe};
+use common::{HOSTNQN, NQN, connect_status};
 use ioutgt_nvme::status;
-use zerocopy::IntoBytes;
 
 /// A single-subsystem target with the given host-ACL settings.
 fn start_target(allow_any_host: bool, allowed_hosts: Vec<String>) -> std::net::SocketAddr {
@@ -19,19 +18,10 @@ fn start_target(allow_any_host: bool, allowed_hosts: Vec<String>) -> std::net::S
     ioutgt_nvme_tcp::spawn_target(config).expect("target start")
 }
 
-/// Admin-queue Connect as the fixed test HOSTNQN; returns the
-/// (phase-stripped) CQE status.
-fn connect_status(addr: std::net::SocketAddr) -> u16 {
-    let mut client = Client::handshake(addr, false, false);
-    let (sqe, data) = connect_sqe(0, 32, 0xFFFF, 1);
-    client.send_capsule(&sqe, data.as_bytes());
-    client.recv_response().status.get() >> 1
-}
-
 #[test]
 fn listed_host_admitted() {
     let addr = start_target(false, vec![HOSTNQN.into()]);
-    assert_eq!(connect_status(addr), status::SUCCESS);
+    assert_eq!(connect_status(addr, NQN), status::SUCCESS);
 }
 
 #[test]
@@ -41,7 +31,7 @@ fn unlisted_host_rejected() {
         vec!["nqn.2014-08.org.nvmexpress:uuid:someone-else".into()],
     );
     assert_eq!(
-        connect_status(addr),
+        connect_status(addr, NQN),
         status::CONNECT_INVALID_HOST | status::DNR
     );
 }
@@ -50,7 +40,7 @@ fn unlisted_host_rejected() {
 fn empty_list_rejects_all_hosts() {
     let addr = start_target(false, vec![]);
     assert_eq!(
-        connect_status(addr),
+        connect_status(addr, NQN),
         status::CONNECT_INVALID_HOST | status::DNR
     );
 }
@@ -61,5 +51,5 @@ fn allow_any_host_ignores_list() {
         true,
         vec!["nqn.2014-08.org.nvmexpress:uuid:someone-else".into()],
     );
-    assert_eq!(connect_status(addr), status::SUCCESS);
+    assert_eq!(connect_status(addr, NQN), status::SUCCESS);
 }

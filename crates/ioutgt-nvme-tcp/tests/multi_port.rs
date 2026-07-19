@@ -12,46 +12,17 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::{Client, HOSTNQN};
-use ioutgt_nvme::fabrics::{ConnectCommand, ConnectData, fctype};
-use ioutgt_nvme::{spec, status};
-use zerocopy::{FromBytes, FromZeros, IntoBytes};
+use common::{backing_file, connect_status};
+use ioutgt_nvme::status;
 
 const NQN_A: &str = "nqn.2026-06.io.ioutgt:port-a";
 const NQN_B: &str = "nqn.2026-06.io.ioutgt:port-b";
 
-/// Admin-queue Connect to `nqn`; returns the phase-stripped status.
-fn connect_status(addr: SocketAddr, nqn: &str) -> u16 {
-    let mut client = Client::handshake(addr, false, false);
-    let mut cmd: ConnectCommand = FromZeros::new_zeroed();
-    cmd.opcode = spec::admin_opcode::FABRICS;
-    cmd.fctype = fctype::CONNECT;
-    cmd.cid.set(1);
-    cmd.sqsize.set(31);
-    cmd.kato.set(60_000);
-    cmd.dptr.length.set(1024);
-    cmd.dptr.sgl_type = spec::sgl::TYPE_DATA_BLOCK_OFFSET;
-    let mut data = ConnectData::zeroed();
-    data.cntlid.set(0xFFFF);
-    data.subsysnqn[..nqn.len()].copy_from_slice(nqn.as_bytes());
-    data.hostnqn[..HOSTNQN.len()].copy_from_slice(HOSTNQN.as_bytes());
-    let sqe = spec::Sqe::read_from_bytes(cmd.as_bytes()).unwrap();
-    client.send_capsule(&sqe, data.as_bytes());
-    client.recv_response().status.get() >> 1
-}
-
 #[test]
 fn two_ports_two_processes_disjoint_subsystems() {
     let dir = tempfile::tempdir().unwrap();
-    let disk = |name: &str| {
-        let path = dir.path().join(name);
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(1 << 20)
-            .unwrap();
-        path
-    };
-    let (disk_a, disk_b) = (disk("a.img"), disk("b.img"));
+    let disk_a = backing_file(dir.path(), "a.img");
+    let disk_b = backing_file(dir.path(), "b.img");
     let config = dir.path().join("config.json");
     std::fs::write(
         &config,
@@ -92,7 +63,7 @@ fn two_ports_two_processes_disjoint_subsystems() {
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            if let Some(addr) = line.rsplit("listening on ").next()
+            if let Some((_, addr)) = line.rsplit_once("listening on ")
                 && let Ok(addr) = addr.trim().parse()
             {
                 let _ = tx.send(addr);
@@ -107,16 +78,19 @@ fn two_ports_two_processes_disjoint_subsystems() {
         }
     }
 
-    // Probe which process serves which subsystem, then assert each
-    // port exports exactly its own.
+    // Probe which process serves which subsystem (the probe doubles as
+    // the success assertion for A's port), then assert each port
+    // exports exactly its own.
     let a_first = connect_status(addrs[0], NQN_A) == status::SUCCESS;
     let (addr_a, addr_b) = if a_first {
         (addrs[0], addrs[1])
     } else {
         (addrs[1], addrs[0])
     };
+    if !a_first {
+        assert_eq!(connect_status(addr_a, NQN_A), status::SUCCESS, "A nowhere");
+    }
     let unknown = status::CONNECT_INVALID_PARAM | status::DNR;
-    assert_eq!(connect_status(addr_a, NQN_A), status::SUCCESS);
     assert_eq!(connect_status(addr_b, NQN_B), status::SUCCESS);
     assert_eq!(
         connect_status(addr_a, NQN_B),
