@@ -21,19 +21,25 @@ use serde::Deserialize;
 
 use crate::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
 
-/// The target model a config file yields for one binary: the listen
-/// address of the port serving its fabric, and that port's exported
-/// subsystems.
+/// The target model one port yields: its listen address and exported
+/// subsystems. A config may define several ports for a fabric; each is
+/// served by its own process (one process = one port).
 #[derive(Debug)]
 pub struct NvmetTarget {
-    /// `addr.traddr:addr.trsvcid` of the selected port.
+    /// The port's configfs id (unique per config; names derived
+    /// per-port resources such as the control socket).
+    pub portid: u16,
+    /// `addr.traddr:addr.trsvcid` of the port.
     pub listen: SocketAddr,
-    /// The subsystems the selected port exports.
+    /// The subsystems the port exports. A subsystem exported on
+    /// several ports is instantiated independently by each port's
+    /// process.
     pub subsystems: Vec<SubsystemConfig>,
 }
 
-/// Load and validate a config file for the port serving `trtype`.
-pub fn load(path: &std::path::Path, trtype: TransportType) -> Result<NvmetTarget, String> {
+/// Load and validate a config file: one [`NvmetTarget`] per port
+/// serving `trtype`, sorted by portid. Errors if the file defines none.
+pub fn load(path: &std::path::Path, trtype: TransportType) -> Result<Vec<NvmetTarget>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     from_str(&text, trtype).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -50,6 +56,8 @@ struct NvmetConfig {
 #[derive(Deserialize)]
 struct Port {
     addr: Addr,
+    #[serde(default)]
+    portid: u16,
     #[serde(default)]
     subsystems: Vec<String>,
 }
@@ -88,44 +96,55 @@ fn default_enable() -> u8 {
     1
 }
 
-fn from_str(text: &str, trtype: TransportType) -> Result<NvmetTarget, String> {
+fn from_str(text: &str, trtype: TransportType) -> Result<Vec<NvmetTarget>, String> {
     let config: NvmetConfig = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let want = match trtype {
         TransportType::Tcp => "tcp",
         TransportType::Rdma => "rdma",
     };
-    let mut matching = config.ports.iter().filter(|p| p.addr.trtype == want);
-    let Some(port) = matching.next() else {
+    let mut ports: Vec<&Port> = config
+        .ports
+        .iter()
+        .filter(|p| p.addr.trtype == want)
+        .collect();
+    if ports.is_empty() {
         return Err(format!("nvmet config has no {want} port"));
-    };
-    if matching.next().is_some() {
-        return Err(format!(
-            "nvmet config has multiple {want} ports; ioutgt serves one port per process"
-        ));
     }
-    // SocketAddr's Display owns the IPv6 bracketing.
-    let ip: std::net::IpAddr = port
-        .addr
-        .traddr
-        .parse()
-        .map_err(|_| format!("port traddr '{}' is not an IP address", port.addr.traddr))?;
-    let svc: u16 = port
-        .addr
-        .trsvcid
-        .parse()
-        .map_err(|_| format!("port trsvcid '{}' is not a port number", port.addr.trsvcid))?;
-    let listen = SocketAddr::new(ip, svc);
-    // Only subsystems exported on the port are reachable (in configfs,
-    // the port holds symlinks to them).
-    let mut subsystems = Vec::new();
-    for nqn in &port.subsystems {
-        let Some(subsys) = config.subsystems.iter().find(|s| &s.nqn == nqn) else {
-            return Err(format!("port exports undefined subsystem '{nqn}'"));
-        };
-        subsystems.push(subsys.to_config()?);
+    // Deterministic serving order, and unique ids for the per-port
+    // resources (control socket) derived from portid.
+    ports.sort_by_key(|p| p.portid);
+    if ports.windows(2).any(|w| w[0].portid == w[1].portid) {
+        return Err(format!("duplicate {want} portid in nvmet config"));
     }
-    crate::config::validate_subsystems(&subsystems)?;
-    Ok(NvmetTarget { listen, subsystems })
+    let mut targets = Vec::new();
+    for port in ports {
+        // SocketAddr's Display owns the IPv6 bracketing.
+        let ip: std::net::IpAddr = port
+            .addr
+            .traddr
+            .parse()
+            .map_err(|_| format!("port traddr '{}' is not an IP address", port.addr.traddr))?;
+        let svc: u16 =
+            port.addr.trsvcid.parse().map_err(|_| {
+                format!("port trsvcid '{}' is not a port number", port.addr.trsvcid)
+            })?;
+        // Only subsystems exported on the port are reachable (in
+        // configfs, the port holds symlinks to them).
+        let mut subsystems = Vec::new();
+        for nqn in &port.subsystems {
+            let Some(subsys) = config.subsystems.iter().find(|s| &s.nqn == nqn) else {
+                return Err(format!("port exports undefined subsystem '{nqn}'"));
+            };
+            subsystems.push(subsys.to_config()?);
+        }
+        crate::config::validate_subsystems(&subsystems)?;
+        targets.push(NvmetTarget {
+            portid: port.portid,
+            listen: SocketAddr::new(ip, svc),
+            subsystems,
+        });
+    }
+    Ok(targets)
 }
 
 impl Subsystem {
@@ -180,8 +199,12 @@ impl Subsystem {
 mod tests {
     use super::*;
 
+    /// Parse a document expected to define exactly one `trtype` port.
     fn parse(json: &str, trtype: TransportType) -> Result<NvmetTarget, String> {
-        from_str(json, trtype)
+        from_str(json, trtype).map(|mut targets| {
+            assert_eq!(targets.len(), 1, "single-port doc");
+            targets.remove(0)
+        })
     }
 
     /// A one-tcp-port document exporting "nqn.a"; each test supplies
@@ -317,20 +340,55 @@ mod tests {
     }
 
     #[test]
+    fn multiple_ports_yield_one_target_each() {
+        // Two tcp ports with disjoint exports and one shared subsystem:
+        // each becomes its own target (sorted by portid) carrying only
+        // its port's exports; the shared subsystem appears in both.
+        let targets = from_str(
+            r#"{ "ports": [
+                   { "addr": { "traddr": "127.0.0.1", "trsvcid": "4421", "trtype": "tcp" },
+                     "portid": 2, "subsystems": [ "nqn.b", "nqn.shared" ] },
+                   { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420", "trtype": "tcp" },
+                     "portid": 1, "subsystems": [ "nqn.a", "nqn.shared" ] } ],
+                 "subsystems": [
+                   { "nqn": "nqn.a",
+                     "namespaces": [ { "nsid": 1, "device": { "path": "/dev/sda" } } ] },
+                   { "nqn": "nqn.b",
+                     "namespaces": [ { "nsid": 1, "device": { "path": "/dev/sdb" } } ] },
+                   { "nqn": "nqn.shared",
+                     "namespaces": [ { "nsid": 1, "device": { "path": "/dev/sdc" } } ] } ] }"#,
+            TransportType::Tcp,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].portid, 1);
+        assert_eq!(targets[0].listen, "127.0.0.1:4420".parse().unwrap());
+        let nqns = |t: &NvmetTarget| -> Vec<String> {
+            t.subsystems.iter().map(|s| s.nqn.clone()).collect()
+        };
+        assert_eq!(nqns(&targets[0]), ["nqn.a", "nqn.shared"]);
+        assert_eq!(targets[1].portid, 2);
+        assert_eq!(targets[1].listen, "127.0.0.1:4421".parse().unwrap());
+        assert_eq!(nqns(&targets[1]), ["nqn.b", "nqn.shared"]);
+    }
+
+    #[test]
     fn bad_shapes_rejected() {
-        // Two ports for the serving transport: ambiguous, refuse.
+        // Two ports for the serving transport with colliding portids:
+        // per-port resource names (control socket) need distinct ids.
         assert!(
-            parse(
+            from_str(
                 r#"{ "ports": [
                    { "addr": { "traddr": "127.0.0.1", "trsvcid": "4420", "trtype": "tcp" },
-                     "subsystems": [ "nqn.a" ] },
+                     "portid": 1, "subsystems": [ "nqn.a" ] },
                    { "addr": { "traddr": "127.0.0.1", "trsvcid": "4421", "trtype": "tcp" },
-                     "subsystems": [ "nqn.a" ] } ],
-                 "subsystems": [ { "nqn": "nqn.a", "namespaces": [] } ] }"#,
+                     "portid": 1, "subsystems": [ "nqn.a" ] } ],
+                 "subsystems": [ { "nqn": "nqn.a", "namespaces": [
+                   { "nsid": 1, "device": { "path": "/dev/sda" } } ] } ] }"#,
                 TransportType::Tcp,
             )
             .unwrap_err()
-            .contains("multiple tcp ports")
+            .contains("duplicate tcp portid")
         );
         // Port symlink to a subsystem the file never defines.
         assert!(

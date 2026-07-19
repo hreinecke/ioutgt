@@ -410,6 +410,7 @@ dependencies = [
  "ioutgt-core",
  "ioutgt-cpus",
  "ioutgt-uring",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

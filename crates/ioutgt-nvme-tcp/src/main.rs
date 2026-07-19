@@ -196,7 +196,13 @@ fn main() -> std::io::Result<()> {
         config.apply_file(path, ioutgt_harness::TransportType::Tcp)?;
     }
     let addr = ioutgt_nvme_tcp::spawn_target(config)?;
-    eprintln!("ioutgt listening on {addr}");
+    // One write syscall: with a multi-port config several processes
+    // share stderr, and eprintln's per-fragment writes would interleave
+    // mid-line across them.
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        format!("ioutgt listening on {addr}\n").as_bytes(),
+    );
     // The target runs on its own threads; park the main thread.
     loop {
         std::thread::park();

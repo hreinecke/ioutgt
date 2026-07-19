@@ -186,12 +186,46 @@ impl TargetConfig {
 
     /// Overlay an nvmetcli-format config file (kernel nvmet's
     /// save/restore schema): the file owns the target model — listen
-    /// address and subsystems, taken from the port serving `trtype` —
-    /// while engine tuning keeps whatever the flags/defaults set.
+    /// address and subsystems — while engine tuning keeps whatever the
+    /// flags/defaults set.
+    ///
+    /// A file defining several ports for `trtype` is served one
+    /// process per port: this call forks the extra port processes and
+    /// returns in every one of them with its own port's model. The
+    /// calling (foreground) process keeps the lowest portid and its
+    /// configured control socket; each forked port derives
+    /// `<socket>.port<id>` and dies with the parent (`PDEATHSIG`).
+    ///
+    /// Must be called before [`spawn`]: forking is only sound while
+    /// the process is still single-threaded.
     pub fn apply_file(&mut self, path: &std::path::Path, trtype: TransportType) -> io::Result<()> {
-        let target = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
-        self.listen = target.listen;
-        self.subsystems = target.subsystems;
+        let mut targets = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
+        let mut mine = targets.remove(0);
+        let mut forked_child = false;
+        for target in targets {
+            // SAFETY: documented contract — called from main() before
+            // any thread or runtime exists, so the fork duplicates no
+            // locks, threads, or event loops.
+            match unsafe { libc::fork() } {
+                -1 => return Err(io::Error::last_os_error()),
+                0 => {
+                    // SAFETY: plain prctl on the calling process with
+                    // immediate integer arguments.
+                    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+                    mine = target;
+                    forked_child = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        self.listen = mine.listen;
+        self.subsystems = mine.subsystems;
+        if forked_child && let Some(sock) = &mut self.control_socket {
+            let mut os = std::mem::take(sock).into_os_string();
+            os.push(format!(".port{}", mine.portid));
+            *sock = os.into();
+        }
         Ok(())
     }
 }
