@@ -507,8 +507,10 @@ synchronous data leases never block.
     reset.
 - The config-file schema is kernel nvmet's (the `nvmetcli save`
   format, `/etc/nvmet/config.json`), loaded by `ioutgt-control`'s
-  `nvmet` module: the port matching the binary's fabric supplies the
-  listen address; its exported subsystems arrive with host ACLs
+  `nvmet` module: each port matching the binary's fabric supplies a
+  listen address — one process per port, forked in `main()` before any
+  thread exists (foreground = lowest portid; children carry
+  `PDEATHSIG`); its exported subsystems arrive with host ACLs
   (`allow_any_host` + `allowed_hosts`, enforced at Connect),
   serial/model, and file-backed namespaces (`device.path`,
   `device.uuid` pinning host-visible identity). The file owns the

@@ -64,15 +64,25 @@ save` writes and `nvmetcli restore` reads — so an existing
 ```
 
 The file owns the target model, the flags own engine tuning — the same
-split as configfs vs module parameters in the kernel. The port matching
-the binary's fabric (`tcp` here, `rdma` for the RDMA binary) supplies
-the listen address; its exported subsystems are served with their host
-ACLs (`attr.allow_any_host` + `allowed_hosts`), serial/model, and
-file/bdev-backed namespaces (`device.path`; `device.uuid` pins the
-host-visible identity, `"enable": 0` keeps a namespace invisible, as in
-the kernel). Attributes with no ioutgt counterpart (`param.*`, ANA
-groups, referrals, PI/cntlid tuning, `nguid`) are accepted and ignored,
-like nvmetcli's own error-skipping restore.
+split as configfs vs module parameters in the kernel. Each port
+matching the binary's fabric (`tcp` here, `rdma` for the RDMA binary)
+supplies a listen address; its exported subsystems are served with
+their host ACLs (`attr.allow_any_host` + `allowed_hosts`),
+serial/model, and file/bdev-backed namespaces (`device.path`;
+`device.uuid` pins the host-visible identity, `"enable": 0` keeps a
+namespace invisible, as in the kernel). Attributes with no ioutgt
+counterpart (`param.*`, ANA groups, referrals, PI/cntlid tuning,
+`nguid`) are accepted and ignored, like nvmetcli's own error-skipping
+restore.
+
+A config defining several ports for the fabric is served one process
+per port: the foreground process takes the lowest `portid`, one forked
+child serves each further port (children die with the parent), and
+engine flags apply to every port process alike. Each forked port's
+control socket gets a `.port<id>` suffix. One process per port also
+means one subsystem *instance* per port: a subsystem exported on two
+ports is served independently by each — runtime `ctl` namespace
+changes act on that port only.
 
 Memory/null-backed namespaces cannot be expressed in this schema
 (kernel namespaces are always device-backed); use `--backend
