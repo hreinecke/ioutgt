@@ -48,8 +48,14 @@ pub struct ControllerEntry {
 
 /// Cross-thread controller registry. Control-plane rate only (Connect /
 /// teardown); a mutex is fine.
-#[derive(Default)]
 pub struct Registry {
+    /// Allocatable cntlid range, inclusive. CNTLIDs are unique per
+    /// subsystem on the wire; a target split across processes (one per
+    /// port) gives each process a disjoint slice so two paths to the
+    /// same subsystem can never mint the same cntlid (Linux hosts
+    /// reject a duplicate: `nvme_validate_cntlid`).
+    cntlid_min: u16,
+    cntlid_max: u16,
     inner: Mutex<RegistryInner>,
 }
 
@@ -59,12 +65,24 @@ struct RegistryInner {
     controllers: HashMap<u16, ControllerEntry>,
 }
 
+/// Highest allocatable cntlid: 0xFFF0..=0xFFFF are reserved (0xFFFF is
+/// the dynamic-controller wildcard in Connect), matching kernel nvmet.
+pub const CNTLID_MAX: u16 = 0xFFEF;
+
 impl Registry {
-    /// Create a new, empty registry wrapped in an `Arc`.
-    pub fn new() -> Arc<Registry> {
+    /// Create a new, empty registry allocating cntlids from the
+    /// inclusive `[cntlid_min, cntlid_max]` slice (callers serving a
+    /// whole target pass `1..=`[`CNTLID_MAX`]).
+    pub fn new(cntlid_min: u16, cntlid_max: u16) -> Arc<Registry> {
+        assert!(
+            1 <= cntlid_min && cntlid_min <= cntlid_max && cntlid_max <= CNTLID_MAX,
+            "cntlid range {cntlid_min}..={cntlid_max} invalid"
+        );
         Arc::new(Registry {
+            cntlid_min,
+            cntlid_max,
             inner: Mutex::new(RegistryInner {
-                next_cntlid: 1,
+                next_cntlid: cntlid_min,
                 controllers: HashMap::new(),
             }),
         })
@@ -84,10 +102,13 @@ impl Registry {
         discovery: bool,
     ) -> Option<u16> {
         let mut inner = self.inner.lock().expect("registry poisoned");
-        // Linear scan for a free id: controller counts are tiny.
-        let start = inner.next_cntlid.max(1);
-        for offset in 0..u16::MAX - 1 {
-            let cntlid = 1 + (start.wrapping_add(offset).wrapping_sub(1) % (u16::MAX - 1));
+        // Linear scan for a free id within the slice: controller counts
+        // are tiny. u32 arithmetic so start+offset cannot wrap.
+        let span = u32::from(self.cntlid_max - self.cntlid_min) + 1;
+        let start = u32::from(inner.next_cntlid.clamp(self.cntlid_min, self.cntlid_max));
+        for offset in 0..span {
+            let index = (start - u32::from(self.cntlid_min) + offset) % span;
+            let cntlid = self.cntlid_min + u16::try_from(index).expect("index < span <= u16 range");
             let inserted = match inner.controllers.entry(cntlid) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(ControllerEntry {
@@ -213,7 +234,7 @@ mod tests {
 
     #[test]
     fn discovery_entries_flagged() {
-        let registry = Registry::new();
+        let registry = Registry::new(1, super::CNTLID_MAX);
         registry
             .allocate(DISCOVERY_NQN, "nqn.host", 0, 120_000, qi(0), true)
             .unwrap();
@@ -230,8 +251,37 @@ mod tests {
     }
 
     #[test]
+    fn cntlid_slice_respected_and_exhausted() {
+        // A narrow slice: every id stays inside it, allocation wraps to
+        // reclaim freed ids, and an exhausted slice refuses.
+        let registry = Registry::new(10, 12);
+        let ids: Vec<u16> = (0..3)
+            .map(|_| {
+                registry
+                    .allocate("nqn.a", "nqn.host", 1, 0, qi(0), false)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, [10, 11, 12]);
+        assert!(
+            registry
+                .allocate("nqn.a", "nqn.host", 1, 0, qi(0), false)
+                .is_none(),
+            "slice exhausted"
+        );
+        registry.remove(11).unwrap();
+        assert_eq!(
+            registry
+                .allocate("nqn.a", "nqn.host", 1, 0, qi(0), false)
+                .unwrap(),
+            11,
+            "freed id reclaimed within the slice"
+        );
+    }
+
+    #[test]
     fn registry_allocates_unique_cntlids() {
-        let registry = Registry::new();
+        let registry = Registry::new(1, super::CNTLID_MAX);
         let a = registry
             .allocate("nqn.test", "nqn.host", 4, 60_000, qi(0), false)
             .unwrap();
@@ -274,7 +324,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_queues_and_kato() {
-        let registry = Registry::new();
+        let registry = Registry::new(1, super::CNTLID_MAX);
         let a = registry
             .allocate("nqn.test", "nqn.host", 4, 5000, qi(0), false)
             .unwrap();
@@ -294,7 +344,7 @@ mod tests {
 
     #[test]
     fn snapshot_sorts_by_cntlid() {
-        let registry = Registry::new();
+        let registry = Registry::new(1, super::CNTLID_MAX);
         let mut ids: Vec<u16> = (0..3)
             .map(|_| {
                 registry

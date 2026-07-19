@@ -12,17 +12,19 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::{backing_file, connect_status};
+use common::{backing_file, connect_cqe, connect_status};
 use ioutgt_nvme::status;
 
 const NQN_A: &str = "nqn.2026-06.io.ioutgt:port-a";
 const NQN_B: &str = "nqn.2026-06.io.ioutgt:port-b";
+const NQN_SHARED: &str = "nqn.2026-06.io.ioutgt:shared";
 
 #[test]
 fn two_ports_two_processes_disjoint_subsystems() {
     let dir = tempfile::tempdir().unwrap();
     let disk_a = backing_file(dir.path(), "a.img");
     let disk_b = backing_file(dir.path(), "b.img");
+    let disk_s = backing_file(dir.path(), "shared.img");
     let config = dir.path().join("config.json");
     std::fs::write(
         &config,
@@ -30,17 +32,20 @@ fn two_ports_two_processes_disjoint_subsystems() {
             r#"{{ "ports": [
                {{ "addr": {{ "adrfam": "ipv4", "traddr": "127.0.0.1",
                              "trsvcid": "0", "trtype": "tcp" }},
-                  "portid": 1, "subsystems": [ "{NQN_A}" ] }},
+                  "portid": 1, "subsystems": [ "{NQN_A}", "{NQN_SHARED}" ] }},
                {{ "addr": {{ "adrfam": "ipv4", "traddr": "127.0.0.1",
                              "trsvcid": "0", "trtype": "tcp" }},
-                  "portid": 2, "subsystems": [ "{NQN_B}" ] }} ],
+                  "portid": 2, "subsystems": [ "{NQN_B}", "{NQN_SHARED}" ] }} ],
              "subsystems": [
                {{ "nqn": "{NQN_A}", "attr": {{ "allow_any_host": "1" }},
                   "namespaces": [ {{ "nsid": 1, "device": {{ "path": "{}" }} }} ] }},
                {{ "nqn": "{NQN_B}", "attr": {{ "allow_any_host": "1" }},
+                  "namespaces": [ {{ "nsid": 1, "device": {{ "path": "{}" }} }} ] }},
+               {{ "nqn": "{NQN_SHARED}", "attr": {{ "allow_any_host": "1" }},
                   "namespaces": [ {{ "nsid": 1, "device": {{ "path": "{}" }} }} ] }} ] }}"#,
             disk_a.display(),
             disk_b.display(),
+            disk_s.display(),
         ),
     )
     .unwrap();
@@ -101,6 +106,25 @@ fn two_ports_two_processes_disjoint_subsystems() {
         connect_status(addr_b, NQN_A),
         unknown,
         "A leaked onto port 2"
+    );
+
+    // The shared subsystem is one instance per port, so each path's
+    // cntlid must come from its port's disjoint slice — a multipath
+    // host rejects a duplicate cntlid within a subsystem
+    // (nvme_validate_cntlid).
+    let cqe_a = connect_cqe(addr_a, NQN_SHARED);
+    let cqe_b = connect_cqe(addr_b, NQN_SHARED);
+    assert_eq!(cqe_a.status.get() >> 1, status::SUCCESS);
+    assert_eq!(cqe_b.status.get() >> 1, status::SUCCESS);
+    let boundary = u32::from(ioutgt_core::registry::CNTLID_MAX / 2);
+    let (cntlid_a, cntlid_b) = (cqe_a.result.get() & 0xFFFF, cqe_b.result.get() & 0xFFFF);
+    assert!(
+        (1..=boundary).contains(&cntlid_a),
+        "port1 cntlid {cntlid_a} outside its slice"
+    );
+    assert!(
+        cntlid_b > boundary,
+        "port2 cntlid {cntlid_b} outside its slice"
     );
 
     // Killing the foreground process takes the forked port down with

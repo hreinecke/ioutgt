@@ -82,7 +82,10 @@ engine flags apply to every port process alike. Each forked port's
 control socket gets a `.port<id>` suffix. One process per port also
 means one subsystem *instance* per port: a subsystem exported on two
 ports is served independently by each — runtime `ctl` namespace
-changes act on that port only.
+changes act on that port only. Each port process allocates controller
+IDs from a disjoint slice of the cntlid space, so a multipath host
+reaching one subsystem through several ports never sees a duplicate
+cntlid (which it would reject).
 
 Memory/null-backed namespaces cannot be expressed in this schema
 (kernel namespaces are always device-backed); use `--backend

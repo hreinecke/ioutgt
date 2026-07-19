@@ -147,6 +147,11 @@ pub struct TargetConfig {
     pub idle_teardown: Option<Duration>,
     /// Subsystems served on this port.
     pub subsystems: Vec<SubsystemConfig>,
+    /// Allocatable cntlid slice, inclusive. Multi-port configs give
+    /// each port process a disjoint slice (see
+    /// [`TargetConfig::apply_file`]); single-port targets own the full
+    /// spec range.
+    pub cntlid_range: (u16, u16),
     /// Test-only: artificial per-write delay (microseconds) injected into
     /// memory-backed namespaces, emulating a slow real disk so recv-side data
     /// buffers stay referenced across the write. `0` keeps writes synchronous.
@@ -170,6 +175,7 @@ impl TargetConfig {
             idle_teardown: Some(Duration::from_secs(30)),
             mem_write_delay_us: 0,
             poll: false,
+            cntlid_range: (1, ioutgt_core::registry::CNTLID_MAX),
             subsystems: vec![SubsystemConfig {
                 nqn: nqn.into(),
                 serial: "IOUTGT0001".into(),
@@ -201,10 +207,26 @@ impl TargetConfig {
     /// the process is still single-threaded and errors otherwise.
     pub fn apply_file(&mut self, path: &std::path::Path, trtype: TransportType) -> io::Result<()> {
         let targets = ioutgt_control::nvmet::load(path, trtype).map_err(io::Error::other)?;
-        let (mine, forked_child) = fork_extra_ports(targets)?;
+        let ports = u16::try_from(targets.len()).map_err(|_| io::Error::other("too many ports"))?;
+        let (index, mine) = fork_extra_ports(targets)?;
         self.listen = mine.listen;
         self.subsystems = mine.subsystems;
-        if forked_child && let Some(sock) = &mut self.control_socket {
+        // Disjoint cntlid slice per port process: cntlids are unique
+        // per subsystem on the wire, and a subsystem exported on
+        // several ports is served by several processes — overlapping
+        // slices would hand a multipath host duplicate cntlids for one
+        // subsystem, which it rejects (nvme_validate_cntlid).
+        let slice = ioutgt_core::registry::CNTLID_MAX / ports;
+        let min = 1 + index * slice;
+        let max = if index + 1 == ports {
+            ioutgt_core::registry::CNTLID_MAX
+        } else {
+            min + slice - 1
+        };
+        self.cntlid_range = (min, max);
+        if index > 0
+            && let Some(sock) = &mut self.control_socket
+        {
             sock.as_mut_os_string()
                 .push(format!(".port{}", mine.portid));
         }
@@ -213,10 +235,10 @@ impl TargetConfig {
 }
 
 /// Fork one process per port beyond the first; every process returns
-/// with the target it serves (`true` = a forked port process, which
-/// dies with its parent via `PDEATHSIG`). The calling process keeps
-/// the first target and stays in the foreground.
-fn fork_extra_ports(mut targets: Vec<NvmetTarget>) -> io::Result<(NvmetTarget, bool)> {
+/// with the index and target it serves (index > 0 = a forked port
+/// process, which dies with its parent via `PDEATHSIG`). The calling
+/// process keeps the first target and stays in the foreground.
+fn fork_extra_ports(mut targets: Vec<NvmetTarget>) -> io::Result<(u16, NvmetTarget)> {
     if targets.len() > 1 {
         // fork() duplicates only the calling thread: any other thread's
         // held lock (allocator, tracing) would deadlock the child. The
@@ -229,7 +251,7 @@ fn fork_extra_ports(mut targets: Vec<NvmetTarget>) -> io::Result<(NvmetTarget, b
             )));
         }
     }
-    for target in targets.drain(1..) {
+    for (extra, target) in targets.drain(1..).enumerate() {
         // SAFETY: the process is single-threaded (verified above), so
         // the fork duplicates no locks, threads, or event loops.
         match unsafe { libc::fork() } {
@@ -238,12 +260,13 @@ fn fork_extra_ports(mut targets: Vec<NvmetTarget>) -> io::Result<(NvmetTarget, b
                 // SAFETY: plain prctl on the calling process with
                 // immediate integer arguments.
                 unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
-                return Ok((target, true));
+                let index = u16::try_from(extra + 1).expect("port count fits u16");
+                return Ok((index, target));
             }
             _ => {}
         }
     }
-    Ok((targets.remove(0), false))
+    Ok((0, targets.remove(0)))
 }
 
 /// Announce the bound address on stderr as one write syscall: with a
@@ -940,7 +963,7 @@ async fn control_loop<T: Transport>(
     config: TargetConfig,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
-    let registry = Registry::new();
+    let registry = Registry::new(config.cntlid_range.0, config.cntlid_range.1);
 
     // The queue-thread pool is spawned lazily on the first connection and
     // torn down after an idle grace period; `senders` is the single source
