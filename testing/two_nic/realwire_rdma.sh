@@ -175,8 +175,6 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }
 command -v rdma >/dev/null 2>&1 || { echo "the 'rdma' tool is required (install iproute2/rdma-core)"; exit 1; }
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
-
 # Target context for common.sh's nvmet_setup/ioutgt_start: BOTH targets run in
 # the ROOT netns (nvmet-rdma's listener is pinned to init_net; ioutgt-nvme-rdma
 # binds IP_T on NIC_T's rdma device, which also stays in root). So no netns
@@ -186,73 +184,11 @@ nvmet_exec() { bash -c "$1"; }
 IOUTGT_NETNS=()
 
 # =====================================================================
-cmd_up() {
-    require_nics
-    # Idempotency FIRST: clear a stale initiator namespace from a previous run,
-    # which also returns NIC_I (+ its rdma device) to root — so the nic_ibdev
-    # sysfs lookups below can see both NICs.
-    in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
-    ip netns del "$NS_I" 2>/dev/null || true
-
-    # Defend the test NICs/subnet from the host's network management, which
-    # has produced multi-day debugging wedges on this rig: an auto-DHCP
-    # NetworkManager profile on the (profile-less) test NIC re-runs a 45 s
-    # DHCP transaction forever; every timeout flushes ALL addresses on the
-    # device — deleting IP_T and its RoCE GID mid-run. Established QPs then
-    # retransmit into the void (local_ack_timeout → retries_exceeded),
-    # keep-alive dies ~45-90 s after connect, and every reconnect fails
-    # (-104) until the IP is re-added.
-    if command -v nmcli >/dev/null 2>&1; then
-        nmcli device set "$NIC_T" managed no 2>/dev/null || true
-        nmcli device set "$NIC_I" managed no 2>/dev/null || true
-    fi
-    # Pin the test subnet to the main routing table, ahead of any
-    # policy-routing rules the host may carry.
-    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-    ip rule add to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-
-    # Resolve each NIC's rdma device (both NICs are in root now).
-    local ibt ibi
-    ibt="$(nic_ibdev "$NIC_T")" || fail "no rdma (RoCE) device under /sys/class/net/$NIC_T/device/infiniband — is $NIC_T a RoCE NIC with mlx5_ib loaded?"
-    ibi="$(nic_ibdev "$NIC_I")" || fail "no rdma (RoCE) device under /sys/class/net/$NIC_I/device/infiniband — is $NIC_I a RoCE NIC?"
-    [ "$ibt" != "$ibi" ] || fail "NIC_T ($NIC_T) and NIC_I ($NIC_I) share rdma device $ibt — two ports of one card cannot be split across netns; use two separate cards"
-    echo ">> rdma devices: target $NIC_T -> $ibt (stays in root), initiator $NIC_I -> $ibi (into $NS_I)"
-    rdma_netns_exclusive || exit 1
-
-    # Target side stays in the root netns. rdma_address_nic carrier-flaps it so
-    # the RoCEv2 GID lands in the rdma_cm cache (else bind/resolve hit
-    # EADDRNOTAVAIL under exclusive mode).
-    echo ">> addressing target $NIC_T=$IP_T/$PREFIX in root netns (carrier flap to seat GID)"
-    rdma_address_nic "$NIC_T" "$IP_T" ""
-
-    # Initiator side: isolate NIC_I in NS_I, move its rdma device there, then
-    # address it (carrier flap) so its GID is usable from inside the netns.
-    echo ">> isolating initiator $NIC_I=$IP_I/$PREFIX in $NS_I"
-    ip netns add "$NS_I"
-    ip link set "$NIC_I" netns "$NS_I"
-    rdma_move_dev "$ibi" "$NS_I"   # may already have followed its netdev
-    rdma_address_nic "$NIC_I" "$IP_I" "$NS_I"
-
-    realwire_prove_wire || exit 1   # ping NS_I -> IP_T across the wire; settles carrier
-    rdma_verify_dev "$NS_I" "$ibi" || fail "$ibi is not ACTIVE in $NS_I (carrier? GID? cable?)"
-    rdma_verify_dev "" "$ibt"      || fail "$ibt is not ACTIVE in root (carrier on $NIC_T?)"
-    echo "   RoCE up: target $ibt@root ($IP_T) <-> initiator $ibi@$NS_I ($IP_I), state ACTIVE, wire proven"
-}
-
-cmd_down() {
-    echo ">> removing initiator namespace (returns NIC_I + its rdma device to root)"
-    # Stop the targets first with 'stop'. Deleting NS_I returns BOTH NIC_I and
-    # its assigned rdma device to the root netns (kernel rdma_dev_exit_net).
-    in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
-    ip netns del "$NS_I" 2>/dev/null || true
-    # The target NIC stayed in root; drop the test IP we added to it.
-    [ -n "${NIC_T:-}" ] && ip addr del "$IP_T/$PREFIX" dev "$NIC_T" 2>/dev/null || true
-    # Drop the policy-routing guard added by 'up' (NM unmanaged state is kept:
-    # re-managing would let NM's DHCP loop flush the NIC again on the next run).
-    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-    echo "   $NS_I removed; NIC_I + rdma device returned to root; $IP_T removed from ${NIC_T:-NIC_T}."
-    echo "   (rdma system netns mode left exclusive; 'rdma system set netns shared' to revert)"
-}
+# The whole one-host topology (target stays in root, initiator isolated,
+# NM/policy-routing defenses, GID seating, wire proof) is the shared
+# realwire_rdma_up/_down in common/rdma_wire.sh.
+cmd_up()   { realwire_rdma_up; }
+cmd_down() { realwire_rdma_down; }
 
 # ---- targets: 'start'/'stop [SELECTOR]' route to one (or both) ------
 start_one() {

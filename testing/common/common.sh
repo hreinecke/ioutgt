@@ -69,6 +69,8 @@ fi
 
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }; }
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
 # The target kinds a driver compares, in order. Defaults to the ioutgt-vs-nvmet
 # pair; the spdk driver overrides it (e.g. TARGET_KINDS="spdk nvmet") before
 # sourcing. Drives run_for_targets' "act on all" case and the selector check.

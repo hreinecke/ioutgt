@@ -151,45 +151,10 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)"; exit 1; }
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
-
 # ---- up/down: branch on transport ------------------------------------
-cmd_up_rdma() {
-    require_nics
-    in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
-    ip netns del "$NS_I" 2>/dev/null || true
-    if command -v nmcli >/dev/null 2>&1; then
-        nmcli device set "$NIC_T" managed no 2>/dev/null || true
-        nmcli device set "$NIC_I" managed no 2>/dev/null || true
-    fi
-    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-    ip rule add to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-    local ibt ibi
-    ibt="$(nic_ibdev "$NIC_T")" || fail "no rdma device under /sys/class/net/$NIC_T (RoCE NIC with mlx5_ib?)"
-    ibi="$(nic_ibdev "$NIC_I")" || fail "no rdma device under /sys/class/net/$NIC_I (RoCE NIC?)"
-    [ "$ibt" != "$ibi" ] || fail "NIC_T/$NIC_T and NIC_I/$NIC_I share rdma device $ibt — use two separate cards"
-    echo ">> rdma devices: target $NIC_T -> $ibt (root), initiator $NIC_I -> $ibi (into $NS_I)"
-    rdma_netns_exclusive || exit 1
-    echo ">> addressing target $NIC_T=$IP_T/$PREFIX in root (carrier flap to seat GID)"
-    rdma_address_nic "$NIC_T" "$IP_T" ""
-    echo ">> isolating initiator $NIC_I=$IP_I/$PREFIX in $NS_I"
-    ip netns add "$NS_I"
-    ip link set "$NIC_I" netns "$NS_I"
-    rdma_move_dev "$ibi" "$NS_I"
-    rdma_address_nic "$NIC_I" "$IP_I" "$NS_I"
-    realwire_prove_wire || exit 1
-    rdma_verify_dev "$NS_I" "$ibi" || fail "$ibi not ACTIVE in $NS_I (carrier/GID/cable?)"
-    rdma_verify_dev "" "$ibt"      || fail "$ibt not ACTIVE in root (carrier on $NIC_T?)"
-    echo "   RoCE up: $ibt@root ($IP_T) <-> $ibi@$NS_I ($IP_I), ACTIVE, wire proven"
-}
-cmd_down_rdma() {
-    echo ">> removing initiator namespace (returns NIC_I + rdma device to root)"
-    in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
-    ip netns del "$NS_I" 2>/dev/null || true
-    [ -n "${NIC_T:-}" ] && ip addr del "$IP_T/$PREFIX" dev "$NIC_T" 2>/dev/null || true
-    ip rule del to "$IP_T/$PREFIX" lookup main pref 5000 2>/dev/null || true
-    echo "   $NS_I removed; $IP_T removed from ${NIC_T:-NIC_T}. (rdma netns mode left exclusive)"
-}
+# The RDMA topology (target in root, initiator isolated, NM/policy-routing
+# defenses, GID seating, wire proof) is the shared realwire_rdma_up/_down
+# in common/rdma_wire.sh.
 cmd_up_tcp() {
     require_nics
     realwire_netns_create      # shared: create NS_T/NS_I, move NICs in, address + MTU
@@ -201,7 +166,7 @@ cmd_down_tcp() {
     realwire_netns_delete
 }
 cmd_up() {
-    if [ "$TRANSPORT" = rdma ]; then cmd_up_rdma; else cmd_up_tcp; fi
+    if [ "$TRANSPORT" = rdma ]; then realwire_rdma_up; else cmd_up_tcp; fi
 }
 cmd_down() {
     # If SPDK ran on its userspace NVMe driver (SPDK_BDEV=nvme), rebind the
@@ -209,7 +174,7 @@ cmd_down() {
     # failed rebind is loud and keeps its state for a retry — still tear the
     # wire down rather than aborting mid-cleanup (set -e).
     spdk_vfio_reset || true
-    if [ "$TRANSPORT" = rdma ]; then cmd_down_rdma; else cmd_down_tcp; fi
+    if [ "$TRANSPORT" = rdma ]; then realwire_rdma_down; else cmd_down_tcp; fi
 }
 
 # ---- targets: start/stop route to one (or both) ----------------------
