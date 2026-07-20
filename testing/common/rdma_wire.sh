@@ -9,6 +9,19 @@ require_nics() {
     : "${NIC_I:?set NIC_I to the initiator-side NIC, e.g. NIC_I=enp1s0f1 / mlx5p2}"
 }
 
+# Both NICs must be visible in the CURRENT (root) netns. A NIC that is
+# configured but absent here is usually held by another realwire session's
+# namespace — say so, instead of the misleading downstream failures
+# ("Cannot find device", "no rdma device under /sys/class/net/..."). Call
+# AFTER any recovery of our own stale namespace, so self-healing still works.
+require_nics_in_root() {
+    local nic
+    for nic in "$NIC_T" "$NIC_I"; do
+        [ -e "/sys/class/net/$nic" ] && continue
+        fail "NIC $nic is not present in this netns — another realwire session's namespace may hold it ('ip netns list', e.g. the TCP driver's NS_T); tear that session down first"
+    done
+}
+
 # The rdma (ibverbs) device name backing a netdev, read from sysfs while the
 # NIC is still reachable in the current netns.
 nic_ibdev() {
@@ -107,11 +120,14 @@ rdma_verify_dev() {
 
 realwire_rdma_up() {
     require_nics
-    # Idempotency FIRST: clear a stale initiator namespace from a previous run,
-    # which also returns NIC_I (+ its rdma device) to root — so the nic_ibdev
-    # sysfs lookups below can see both NICs.
+    guard_no_sessions up            # never yank the netns from under a live session
+    # Idempotency: clear a stale initiator namespace from a previous run of
+    # OURS (no live controllers exist past the guard), which also returns
+    # NIC_I (+ its rdma device) to root — so the nic_ibdev sysfs lookups
+    # below can see both NICs.
     in_net "$NS_I" ip link set "$NIC_I" netns 1 2>/dev/null || true
     ip netns del "$NS_I" 2>/dev/null || true
+    require_nics_in_root
 
     # Defend the test NICs/subnet from the host's network management, which
     # has produced multi-day debugging wedges on this rig: an auto-DHCP

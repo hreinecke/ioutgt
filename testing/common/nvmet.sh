@@ -17,6 +17,19 @@ nvmet_setup() {
     local nqn="$1" port="$2" ip="$3" backend="$4"
     modprobe nvmet; modprobe "nvmet-$TRANSPORT"
     BACKEND="$backend" ensure_backing || return 1
+    # Refuse pre-existing state instead of writing into it (mkdir -p once
+    # masked a live subsystem and the run died later on a cryptic EBUSY):
+    # our subsystem already configured, or ANY port already bound to this
+    # ip:port — e.g. another transport's driver, which shares the address
+    # plan. configfs is a global singleton, so plain (non-netns) reads see it.
+    local cfg=/sys/kernel/config/nvmet p
+    [ -d "$cfg/subsystems/$nqn" ] &&
+        fail "nvmet subsystem $nqn already configured — another session or stale state; run its driver's 'stop' first"
+    for p in "$cfg"/ports/*/; do
+        [ -e "$p/addr_traddr" ] || continue
+        [ "$(cat "$p/addr_traddr")" = "$ip" ] && [ "$(cat "$p/addr_trsvcid")" = "$port" ] &&
+            fail "nvmet configfs port $(basename "$p") ($(cat "$p/addr_trtype")) already bound to $ip:$port — another session owns this address; run its driver's 'stop' first"
+    done
     echo ">> setting up nvmet-$TRANSPORT on $ip:$port (backend $backend)"
     nvmet_exec "
         set -euo pipefail

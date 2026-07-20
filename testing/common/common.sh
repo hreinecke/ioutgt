@@ -112,11 +112,31 @@ run_for_targets() {
     for k in $TARGET_KINDS; do "$fn" "$k"; done
 }
 
+# Rig-ownership guard: abort if any nvme controller for one of this
+# driver's NQNs exists in sysfs — whatever its transport. The tcp/rdma/
+# spdk drivers share NQNs and the address plan by design, so this also
+# catches ANOTHER driver's live session, which 'up'/'start' would
+# otherwise silently dismantle ('up' deletes the initiator netns,
+# nvmet_setup collides on the shared IP:port — how a live TCP comparison
+# run got torn down mid-flight, 2026-07). $1 names the refusing verb; $2
+# restricts the check to one kind ('start X' must stay legal while kind Y
+# of OUR session is already connected — 'up' checks every kind).
+guard_no_sessions() {
+    local verb="$1" k params nqn ctrl
+    for k in ${2:-$TARGET_KINDS}; do
+        params="$(target_params "$k")" || continue
+        nqn="${params#* }"
+        ctrl="$(find_ctrl "$nqn")" || continue
+        fail "$verb: live controller $ctrl for $nqn — a session (possibly another transport's driver; they share NQNs) is using this rig. Disconnect it first: 'nvme disconnect -n $nqn', or that driver's 'disconnect' + 'stop'."
+    done
+}
+
 # Start/stop one target kind — shared by every driver (the identity block
 # above supplies NQN/port; TARGET_IP comes from the driver). The `:?`
 # aborts keep the realwire drivers' friendly "set X_BACKEND..." message;
 # local_tgt.sh never hits them (its backends default to /tmp files).
 start_one() {
+    guard_no_sessions start "$1"
     case "$1" in
         ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$TARGET_IP" \
                     "${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}" ;;
@@ -251,6 +271,8 @@ in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
 
 # Create the two namespaces, move each physical NIC in, then address + MTU + up.
 realwire_netns_create() {
+    guard_no_sessions up            # never yank NICs from under a live session
+    require_nics_in_root
     echo ">> creating namespaces $NS_T / $NS_I and moving NICs in"
     ip netns add "$NS_T"
     ip netns add "$NS_I"
