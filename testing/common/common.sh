@@ -43,6 +43,10 @@ case "$TRANSPORT" in
     *) echo "TRANSPORT must be tcp or rdma (got '$TRANSPORT')" >&2; exit 1 ;;
 esac
 
+# Was NR_QUEUES set by the user? Captured BEFORE the :-4 default below, so
+# a driver's 'up' may auto-size it from the NIC (nic_size_queues) only when
+# the user did not choose. Read by nic.sh's nrq_state_init/nic_size_queues.
+NRQ_USER_SET="${NR_QUEUES+1}"
 NR_QUEUES="${NR_QUEUES:-4}"          # IO queues  (ioutgt --io-threads; connect -i)
 QUEUE_SIZE="${QUEUE_SIZE:-128}"      # IO qdepth   (ioutgt --io-queue-size; connect -q)
 BACKEND_GB="${BACKEND_GB:-2}"        # size of an auto-created backing file

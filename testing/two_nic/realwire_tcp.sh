@@ -82,10 +82,6 @@ ini_exec() { ip netns exec "$NS_I" "$@"; }
 # disconnect/fio verbs, plus NR_QUEUES, QUEUE_SIZE, BACKEND_GB, IOUTGT_BIN,
 # IOUTGT_SENDZC and the FIO_* knobs.
 
-# Was NR_QUEUES set in the environment? Captured BEFORE common.sh applies its
-# :-4 default, so 'up' may auto-size it from the NIC only when the user did not.
-NRQ_USER_SET="${NR_QUEUES+1}"
-
 # TCP fabric: pin it before common.sh (which otherwise honors an inherited
 # TRANSPORT via ${TRANSPORT:-tcp}), mirroring realwire_rdma.sh's export=rdma, so
 # a stale TRANSPORT=rdma in the environment can't silently turn a tcp run into
@@ -93,14 +89,11 @@ NRQ_USER_SET="${NR_QUEUES+1}"
 export TRANSPORT=tcp
 . "$(dirname "$0")/../common/common.sh"
 
-# Persisted auto-sized NR_QUEUES (so the separate up/start/connect/status
-# invocations agree) and the control socket the ioutgt target binds (queried
-# by the post-connect IRQ-affinity sync via `ioutgt list`).
-NRQ_STATE="${NRQ_STATE:-/tmp/ioutgt-realwire.nrq}"
+# Adopt the NR_QUEUES persisted by the last 'up' (nic.sh nrq_state_init),
+# and the control socket the ioutgt target binds (queried by the
+# post-connect IRQ-affinity sync via `ioutgt list`).
+nrq_state_init
 IOUTGT_SOCK="${IOUTGT_SOCK:-/tmp/ioutgt-realwire.sock}"
-if [ -z "$NRQ_USER_SET" ] && [ -f "$NRQ_STATE" ]; then
-    NR_QUEUES="$(cat "$NRQ_STATE")"
-fi
 
 # Whether to touch any NIC hardware setting. NIC_TUNE=0 makes the harness only
 # create the netns, move the NICs in and address them -- no offloads toggle, no
@@ -225,43 +218,8 @@ cmd_up() {
     nic_offloads "$NIC_T" on "$NS_T"
     nic_offloads "$NIC_I" on "$NS_I"
 
-    # Size NR_QUEUES and keep the NIC's Combined channel count aligned with it,
-    # so the post-connect IRQ<->io-thread mapping (nicq = qid-1) stays 1:1.
-    # Persisted for the later 'start'/'connect'/'status' invocations.
-    if [ -n "$NRQ_USER_SET" ]; then
-        # User's NR_QUEUES wins, bounded by what the host/NIC can deliver:
-        # nproc and the NIC's hardware-max Combined. Then retune the NIC's
-        # Combined channels (up OR down) to match, so every io-thread has its
-        # own NIC queue/IRQ. If the NIC has no combined channels, fall back to
-        # capping at the current channel count and leave the NIC untouched.
-        local want="$NR_QUEUES" ncpu maxc
-        ncpu="$(nproc 2>/dev/null || echo 1)"
-        maxc="$(nic_max_combined "$NIC_T")"
-        [ "$ncpu" -lt "$NR_QUEUES" ] && NR_QUEUES="$ncpu"
-        if [ "$maxc" -ge 1 ]; then
-            [ "$maxc" -lt "$NR_QUEUES" ] && NR_QUEUES="$maxc"
-            # Stale ntuple filters from a prior run pin high RX queues and would
-            # reject a Combined reduction; clear them before retuning.
-            nic_clear_ntuple "$NIC_T"
-            if nic_exec ethtool -L "$NIC_T" combined "$NR_QUEUES" 2>/dev/null; then
-                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc); $NIC_T Combined retuned to $NR_QUEUES"
-            else
-                echo "   note: could not set $NIC_T Combined to $NR_QUEUES; affinity sync may skip unmapped queues"
-                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc)"
-            fi
-        else
-            local cur; cur="$(nic_default_queues "$NIC_T")"
-            [ "$cur" -lt "$NR_QUEUES" ] && NR_QUEUES="$cur"
-            echo "   NR_QUEUES=$NR_QUEUES (requested $want; $NIC_T has no combined channels, capped at current/$cur, NIC not retuned)"
-        fi
-        echo "$NR_QUEUES" > "$NRQ_STATE"
-    else
-        # Auto-size from NIC_T's current channels so ioutgt's --io-threads
-        # matches the NIC channel count (no retune; the NIC drives the count).
-        NR_QUEUES="$(nic_default_queues "$NIC_T")"
-        echo "$NR_QUEUES" > "$NRQ_STATE"
-        echo "   NR_QUEUES defaulted to $NR_QUEUES (min rx/tx of $NIC_T, capped at nproc)"
-    fi
+    # Size NR_QUEUES against NIC_T and persist it (nic.sh nic_size_queues).
+    nic_size_queues "$NIC_T"
 
     cmd_up_prove_wire
 }

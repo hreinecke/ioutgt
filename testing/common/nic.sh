@@ -84,6 +84,62 @@ nic_clear_ntuple() {
         | while read -r id; do ethtool -N '"$nic"' delete "$id" >/dev/null 2>&1; done' 2>/dev/null || true
 }
 
+# Persisted NR_QUEUES, so a driver's separate up/start/connect/status
+# invocations agree on the io-thread count. Drivers whose 'up' sizes
+# NR_QUEUES from the NIC (the TCP wires) call this once after common.sh:
+# it adopts the value persisted by the last 'up' unless the user set
+# NR_QUEUES explicitly (NRQ_USER_SET, captured in common.sh).
+nrq_state_init() {
+    NRQ_STATE="${NRQ_STATE:-/tmp/ioutgt-realwire.nrq}"
+    if [ -z "$NRQ_USER_SET" ] && [ -f "$NRQ_STATE" ]; then
+        NR_QUEUES="$(cat "$NRQ_STATE")"
+    fi
+}
+
+# Size NR_QUEUES for a TCP wire and keep NIC $1's Combined channel count
+# aligned with it, so the post-connect IRQ<->io-thread mapping (nicq =
+# qid-1) stays 1:1; persist the result to $NRQ_STATE for the later
+# 'start'/'connect'/'status' invocations (see nrq_state_init). Callers
+# run this only under NIC_TUNE=1 — the untuned path persists NR_QUEUES
+# as-is instead.
+nic_size_queues() {
+    local nic="$1"
+    if [ -n "$NRQ_USER_SET" ]; then
+        # User's NR_QUEUES wins, bounded by what the host/NIC can deliver:
+        # nproc and the NIC's hardware-max Combined. Then retune the NIC's
+        # Combined channels (up OR down) to match, so every io-thread has its
+        # own NIC queue/IRQ. If the NIC has no combined channels, fall back to
+        # capping at the current channel count and leave the NIC untouched.
+        local want="$NR_QUEUES" ncpu maxc
+        ncpu="$(nproc 2>/dev/null || echo 1)"
+        maxc="$(nic_max_combined "$nic")"
+        [ "$ncpu" -lt "$NR_QUEUES" ] && NR_QUEUES="$ncpu"
+        if [ "$maxc" -ge 1 ]; then
+            [ "$maxc" -lt "$NR_QUEUES" ] && NR_QUEUES="$maxc"
+            # Stale ntuple filters from a prior run pin high RX queues and would
+            # reject a Combined reduction; clear them before retuning.
+            nic_clear_ntuple "$nic"
+            if nic_exec ethtool -L "$nic" combined "$NR_QUEUES" 2>/dev/null; then
+                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc); $nic Combined retuned to $NR_QUEUES"
+            else
+                echo "   note: could not set $nic Combined to $NR_QUEUES; affinity sync may skip unmapped queues"
+                echo "   NR_QUEUES=$NR_QUEUES (requested $want, capped at nproc=$ncpu / max Combined=$maxc)"
+            fi
+        else
+            local cur; cur="$(nic_default_queues "$nic")"
+            [ "$cur" -lt "$NR_QUEUES" ] && NR_QUEUES="$cur"
+            echo "   NR_QUEUES=$NR_QUEUES (requested $want; $nic has no combined channels, capped at current/$cur, NIC not retuned)"
+        fi
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+    else
+        # Auto-size from the NIC's current channels so ioutgt's --io-threads
+        # matches the NIC channel count (no retune; the NIC drives the count).
+        NR_QUEUES="$(nic_default_queues "$nic")"
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+        echo "   NR_QUEUES defaulted to $NR_QUEUES (min rx/tx of $nic, capped at nproc)"
+    fi
+}
+
 # PCI bus address (bdf, e.g. 0000:a1:00.0) of NIC $1. Needed to match drivers
 # (mlx5) that label their IRQs by completion vector + bdf rather than the netdev
 # name. Memoized: the bdf is stable for the run and the lookup forks ethtool.

@@ -94,6 +94,9 @@ else
     nvmet_exec() { in_net "$NS_T" bash -c "$1"; }   # nvmet-tcp listener born in NS_T
     # shellcheck disable=SC2034  # SPDK_NETNS consumed by common.sh's spdk_start
     SPDK_NETNS=(ip netns exec "$NS_T")              # nvmf_tgt listener in NS_T
+    # Adopt the NR_QUEUES persisted by the last 'up' (nic.sh; TCP wires
+    # size NR_QUEUES from the NIC — see cmd_up_tcp).
+    nrq_state_init
     # shellcheck disable=SC2034
     TUNE_NIC="${NIC_T:-}"; [ "$NIC_TUNE" = 1 ] || TUNE_NIC=""
     # shellcheck disable=SC2034
@@ -154,7 +157,16 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 cmd_up_tcp() {
     require_nics
     realwire_netns_create      # shared: create NS_T/NS_I, move NICs in, address + MTU
-    [ "$NIC_TUNE" = 1 ] && { nic_offloads "$NIC_T" on "$NS_T"; nic_offloads "$NIC_I" on "$NS_I"; }
+    if [ "$NIC_TUNE" = 1 ]; then
+        nic_offloads "$NIC_T" on "$NS_T"; nic_offloads "$NIC_I" on "$NS_I"
+        # Size NR_QUEUES against NIC_T and persist it, exactly as the TCP
+        # driver does — previously spdk runs skipped the sizing, an
+        # asymmetry when comparing targets on the same wire.
+        nic_size_queues "$NIC_T"
+    else
+        echo "$NR_QUEUES" > "$NRQ_STATE"
+        echo "   NIC_TUNE=0: no NIC hardware tuning; NR_QUEUES=$NR_QUEUES, NIC settings untouched"
+    fi
     realwire_prove_wire || exit 1
 }
 cmd_down_tcp() {
