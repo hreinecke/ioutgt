@@ -78,13 +78,8 @@ PREFIX="${PREFIX:-24}"
 # Jumbo by default; RoCE large-IO benefits from fewer, bigger frames. Both NICs
 # (cabled back-to-back) must agree. Override MTU=1500 for a link that can't.
 MTU="${MTU:-9000}"
-# Distinct port + NQN per target so both run at once on the same target IP.
-IOUTGT_PORT=14420
-IOUTGT_NQN="nqn.2026-06.io.realwire:ioutgt"
-NVMET_PORT=24420
-NVMET_NQN="nqn.2026-06.io.realwire:nvmet"
-# shellcheck disable=SC2034  # HOSTNQN consumed by common.sh's connect/discover
-HOSTNQN="nqn.2026-06.io.realwire:host"
+# Ports/NQNs/HOSTNQN come from common.sh's shared identity block (ioutgt
+# 14420, nvmet 24420, distinct NQNs, so both run at once on one target IP).
 
 # Transport context consumed by common.sh: the target listens on IP_T in the
 # root netns; the initiator's nvme-cli runs inside NS_I (so its RDMA-CM resolve
@@ -190,21 +185,7 @@ IOUTGT_NETNS=()
 cmd_up()   { realwire_rdma_up; }
 cmd_down() { realwire_rdma_down; }
 
-# ---- targets: 'start'/'stop [SELECTOR]' route to one (or both) ------
-start_one() {
-    case "$1" in
-        nvmet)  nvmet_setup  "$NVMET_NQN"  "$NVMET_PORT"  "$IP_T" \
-                    "${NVMET_BACKEND:?set NVMET_BACKEND to the nvmet target backing file or block device}" ;;
-        ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$IP_T" \
-                    "${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}" ;;
-    esac
-}
-stop_one() {
-    case "$1" in
-        nvmet)  nvmet_teardown "$NVMET_NQN" ;;
-        ioutgt) ioutgt_stop ;;
-    esac
-}
+# 'start'/'stop [SELECTOR]' route to common.sh's shared start_one/stop_one.
 
 cmd_status() {
     echo "== rdma system =="; rdma system show 2>/dev/null || true

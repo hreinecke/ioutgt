@@ -61,12 +61,8 @@ IP_T="${IP_T:-192.168.50.1}"    # target IP
 IP_I="${IP_I:-192.168.50.2}"    # initiator IP
 PREFIX="${PREFIX:-24}"
 MTU="${MTU:-9000}"              # jumbo by default (both NICs must agree)
-SPDK_PORT=14420
-SPDK_NQN="nqn.2026-06.io.realwire:spdk"
-NVMET_PORT=24420
-NVMET_NQN="nqn.2026-06.io.realwire:nvmet"
-# shellcheck disable=SC2034  # HOSTNQN consumed by common.sh's connect/discover
-HOSTNQN="nqn.2026-06.io.realwire:host"
+# Ports/NQNs/HOSTNQN come from common.sh's shared identity block (spdk
+# 14420, nvmet 24420, distinct NQNs, so both run at once on one target IP).
 
 # Transport context for common.sh: the target listens on IP_T; the initiator's
 # nvme-cli runs inside NS_I so its socket / RDMA-CM resolve egresses NIC_I.
@@ -177,18 +173,7 @@ cmd_down() {
     if [ "$TRANSPORT" = rdma ]; then realwire_rdma_down; else cmd_down_tcp; fi
 }
 
-# ---- targets: start/stop route to one (or both) ----------------------
-start_one() {
-    case "$1" in
-        spdk)  spdk_start   "$SPDK_NQN"  "$SPDK_PORT"  "$IP_T" \
-                   "${SPDK_BACKEND:?set SPDK_BACKEND to the SPDK target backing file or block device (or SPDK_BDEV=malloc)}" ;;
-        nvmet) nvmet_setup  "$NVMET_NQN" "$NVMET_PORT" "$IP_T" \
-                   "${NVMET_BACKEND:?set NVMET_BACKEND to the nvmet target backing file or block device}" ;;
-    esac
-}
-stop_one() {
-    case "$1" in spdk) spdk_stop ;; nvmet) nvmet_teardown "$NVMET_NQN" ;; esac
-}
+# 'start'/'stop [SELECTOR]' route to common.sh's shared start_one/stop_one.
 
 cmd_status() {
     echo "== transport: $TRANSPORT =="

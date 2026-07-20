@@ -76,6 +76,20 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # sourcing. Drives run_for_targets' "act on all" case and the selector check.
 TARGET_KINDS="${TARGET_KINDS:-ioutgt nvmet}"
 
+# Target identity: NQN namespace + port/NQN per kind, shared by every driver
+# so the selector verbs, usage text, and start/stop agree. The two_nic
+# drivers use the realwire defaults; local_tgt.sh overrides NQN_BASE (and
+# SPDK_PORT, so all three kinds can share one IP). ioutgt and spdk share a
+# default port: no driver serves both kinds at once.
+NQN_BASE="${NQN_BASE:-nqn.2026-06.io.realwire}"
+IOUTGT_PORT="${IOUTGT_PORT:-14420}"
+IOUTGT_NQN="${IOUTGT_NQN:-$NQN_BASE:ioutgt}"
+NVMET_PORT="${NVMET_PORT:-24420}"
+NVMET_NQN="${NVMET_NQN:-$NQN_BASE:nvmet}"
+SPDK_PORT="${SPDK_PORT:-14420}"
+SPDK_NQN="${SPDK_NQN:-$NQN_BASE:spdk}"
+HOSTNQN="${HOSTNQN:-$NQN_BASE:host}"
+
 # Map a target kind ('nvmet'|'ioutgt'|'spdk') to its "PORT NQN" pair. Only the
 # kinds a given driver defines the PORT/NQN vars for are usable.
 target_params() {
@@ -96,6 +110,28 @@ run_for_targets() {
         echo "specify target: one of [$TARGET_KINDS] (or omit for all)" >&2; exit 1
     fi
     for k in $TARGET_KINDS; do "$fn" "$k"; done
+}
+
+# Start/stop one target kind — shared by every driver (the identity block
+# above supplies NQN/port; TARGET_IP comes from the driver). The `:?`
+# aborts keep the realwire drivers' friendly "set X_BACKEND..." message;
+# local_tgt.sh never hits them (its backends default to /tmp files).
+start_one() {
+    case "$1" in
+        ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$TARGET_IP" \
+                    "${IOUTGT_BACKEND:?set IOUTGT_BACKEND to the ioutgt target backing file or block device}" ;;
+        nvmet)  nvmet_setup  "$NVMET_NQN"  "$NVMET_PORT"  "$TARGET_IP" \
+                    "${NVMET_BACKEND:?set NVMET_BACKEND to the nvmet target backing file or block device}" ;;
+        spdk)   spdk_start   "$SPDK_NQN"   "$SPDK_PORT"   "$TARGET_IP" \
+                    "${SPDK_BACKEND:?set SPDK_BACKEND to the SPDK target backing file or block device (or SPDK_BDEV=malloc)}" ;;
+    esac
+}
+stop_one() {
+    case "$1" in
+        ioutgt) ioutgt_stop ;;
+        nvmet)  nvmet_teardown "$NVMET_NQN" ;;
+        spdk)   spdk_stop ;;
+    esac
 }
 
 # Ensure $BACKEND (a caller local) exists. A missing non-/dev path is

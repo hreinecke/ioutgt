@@ -32,15 +32,12 @@ set -euo pipefail
 
 # ---- config (override via environment) -------------------------------
 TARGET_IP="${TARGET_IP:-127.0.0.1}"
-# Distinct port + NQN per target so both run at once on the same IP.
-IOUTGT_PORT=14420
-IOUTGT_NQN="nqn.2026-06.io.localtgt:ioutgt"
-NVMET_PORT=24420
-NVMET_NQN="nqn.2026-06.io.localtgt:nvmet"
+# Identity: common.sh's shared block derives ports/NQNs from NQN_BASE.
+# local_tgt uses its own NQN namespace, and gives spdk its own port so all
+# three kinds can run at once on one IP (the realwire drivers never mix
+# ioutgt and spdk).
+NQN_BASE="nqn.2026-06.io.localtgt"
 SPDK_PORT=34420
-SPDK_NQN="nqn.2026-06.io.localtgt:spdk"
-# shellcheck disable=SC2034  # consumed by common.sh's connect/discover verbs
-HOSTNQN="nqn.2026-06.io.localtgt:host"
 
 # Which targets this run drives (override, e.g. TARGET_KINDS=spdk for a pure
 # SPDK loopback smoke; default keeps the ioutgt-vs-nvmet pair).
@@ -112,23 +109,9 @@ case "${1:-}" in help|usage|-h|--help) usage; exit 0 ;; esac
 
 require_root
 
-# ---- start/stop route to one (or both) targets -----------------------
-# The target setup/teardown live in common.sh (nvmet_setup/nvmet_teardown,
-# ioutgt_start/ioutgt_stop); local_tgt only supplies the loopback addressing.
-start_one() {
-    case "$1" in
-        nvmet)  nvmet_setup  "$NVMET_NQN"  "$NVMET_PORT"  "$TARGET_IP" "$NVMET_BACKEND" ;;
-        ioutgt) ioutgt_start "$IOUTGT_NQN" "$IOUTGT_PORT" "$TARGET_IP" "$IOUTGT_BACKEND" ;;
-        spdk)   spdk_start   "$SPDK_NQN"   "$SPDK_PORT"   "$TARGET_IP" "$SPDK_BACKEND" ;;
-    esac
-}
-stop_one() {
-    case "$1" in
-        nvmet)  nvmet_teardown "$NVMET_NQN" ;;
-        ioutgt) ioutgt_stop ;;
-        spdk)   spdk_stop ;;
-    esac
-}
+# 'start'/'stop' route to common.sh's shared start_one/stop_one; local_tgt
+# only supplies the loopback addressing (and defaults its backends above,
+# so the shared `:?` aborts never fire here).
 
 cmd_status() {
     echo "== listeners ($TARGET_IP) =="
