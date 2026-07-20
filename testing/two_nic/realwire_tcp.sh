@@ -330,24 +330,11 @@ cmd_iperf() {
     ip netns exec "$NS_I" "${cli[@]}"
 }
 
-# Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH.
-case "${1:-}" in
-    up)                  cmd_up ;;
-    down)                cmd_down ;;
-    start)               run_for_targets start_one      "${2:-}" ;;
-    stop)                run_for_targets stop_one       "${2:-}" ;;
-    discover)            run_for_targets discover_one   "${2:-}" ;;
-    connect)             run_for_targets connect_one    "${2:-}"
-                         # IRQ affinity sync needs the IO queues connected
-                         # (their pthread tids appear in `ioutgt list`).
-                         case "${2:-}" in ioutgt|"") tune_target_nic
-                                                     tune_initiator_tcp ;; esac ;;
-    disconnect)          run_for_targets disconnect_one "${2:-}" ;;
-    fio)                 run_for_targets fio_one        "${2:-}" ;;
-    fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
-    iperf)               cmd_iperf ;;
-    fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
-    status)              cmd_status ;;
-    help|usage)          usage ;;
-    *) usage >&2; exit 1 ;;
-esac
+# IRQ affinity sync needs the IO queues connected (their pthread tids
+# appear in `ioutgt list`).
+post_connect_tune() {
+    case "$1" in ioutgt|"") tune_target_nic; tune_initiator_tcp ;; esac
+}
+extra_verbs() { case "$1" in iperf) cmd_iperf ;; *) return 1 ;; esac; }
+
+realwire_dispatch "$@"

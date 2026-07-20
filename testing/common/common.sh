@@ -154,6 +154,42 @@ stop_one() {
     esac
 }
 
+# Shared subcommand dispatch: every driver ends with `realwire_dispatch "$@"`
+# after defining its hooks. Selector verbs act on one target kind, or on
+# every kind in TARGET_KINDS when the selector is omitted. Hooks:
+#   usage, cmd_status              required
+#   cmd_up / cmd_down              wire setup/teardown; wire-less drivers
+#                                  (local_tgt) omit them and the verbs fall
+#                                  through to the usage error
+#   post_connect_tune SELECTOR     optional, runs after 'connect'
+#   extra_verbs VERB [ARGS...]     optional, tried for verbs this table
+#                                  doesn't know (tcp: iperf; rdma: ibperf/
+#                                  stat); returns 1 to fall through to the
+#                                  usage error
+realwire_dispatch() {
+    case "${1:-}" in
+        up|down)    declare -F "cmd_$1" >/dev/null || { usage >&2; exit 1; }
+                    "cmd_$1" ;;
+        start)      run_for_targets start_one      "${2:-}" ;;
+        stop)       run_for_targets stop_one       "${2:-}" ;;
+        discover)   run_for_targets discover_one   "${2:-}" ;;
+        connect)    run_for_targets connect_one    "${2:-}"
+                    if declare -F post_connect_tune >/dev/null; then
+                        post_connect_tune "${2:-}"
+                    fi ;;
+        disconnect) run_for_targets disconnect_one "${2:-}" ;;
+        fio)        run_for_targets fio_one        "${2:-}" ;;
+        fio_verify) run_for_targets fio_verify_one "${2:-}" ;;
+        fio_perf)   run_for_targets fio_perf_one   "${2:-}" ;;
+        status)     cmd_status ;;
+        help|usage) usage ;;
+        *)          if declare -F extra_verbs >/dev/null; then
+                        extra_verbs "$@" && return 0
+                    fi
+                    usage >&2; exit 1 ;;
+    esac
+}
+
 # Ensure $BACKEND (a caller local) exists. A missing non-/dev path is
 # auto-created at BACKEND_GB; a missing /dev/* is an error.
 ensure_backing() {

@@ -89,6 +89,8 @@ Usage: $0 <subcommand> [nvmet|ioutgt]
   connect       [nvmet|ioutgt]  nvme connect; wait for the namespace device
   disconnect    [nvmet|ioutgt]  nvme disconnect
   fio           [nvmet|ioutgt]  fio on the connected device(s)
+  fio_verify    [nvmet|ioutgt]  data-integrity gate: mixed-size (4k-128k) writes
+                                + crc32c read-back verify (FIO_VERIFY_MB/job)
   fio_perf      [nvmet|ioutgt]  perf sweep: randread/randwrite x bs={4k,64k},
                                 one line per combo (iops/BW/fio_cpu)
   status                        listeners and connected devices
@@ -127,16 +129,6 @@ cmd_status() {
     echo "  nvmet  ($NVMET_NQN): $(find_dev "$NVMET_NQN" || echo none)"
 }
 
-# Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH.
-case "${1:-}" in
-    start)               run_for_targets start_one      "${2:-}" ;;
-    stop)                run_for_targets stop_one       "${2:-}" ;;
-    discover)            run_for_targets discover_one   "${2:-}" ;;
-    connect)             run_for_targets connect_one    "${2:-}" ;;
-    disconnect)          run_for_targets disconnect_one "${2:-}" ;;
-    fio)                 run_for_targets fio_one        "${2:-}" ;;
-    fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
-    status)              cmd_status ;;
-    help|usage)          usage ;;
-    *) usage >&2; exit 1 ;;
-esac
+# Shared dispatch (no cmd_up/cmd_down: loopback needs no wire, so 'up'/
+# 'down' fall through to the usage error). Gains fio_verify with it.
+realwire_dispatch "$@"

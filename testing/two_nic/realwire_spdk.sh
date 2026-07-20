@@ -191,22 +191,10 @@ cmd_status() {
 }
 
 # ---- dispatch --------------------------------------------------------
-case "${1:-}" in
-    up)         cmd_up ;;
-    down)       cmd_down ;;
-    start)      run_for_targets start_one      "${2:-}" ;;
-    stop)       run_for_targets stop_one       "${2:-}" ;;
-    discover)   run_for_targets discover_one   "${2:-}" ;;
-    connect)    run_for_targets connect_one    "${2:-}"
-                if [ "$NIC_TUNE" = 1 ]; then
-                    if [ "$TRANSPORT" = rdma ]; then tune_target_rdma
-                    else tune_target_nic; tune_initiator_tcp; fi
-                fi ;;
-    disconnect) run_for_targets disconnect_one "${2:-}" ;;
-    fio)        run_for_targets fio_one        "${2:-}" ;;
-    fio_verify) run_for_targets fio_verify_one "${2:-}" ;;
-    fio_perf)   run_for_targets fio_perf_one   "${2:-}" ;;
-    status)     cmd_status ;;
-    help|usage) usage ;;
-    *) usage >&2; exit 1 ;;
-esac
+post_connect_tune() {
+    [ "$NIC_TUNE" = 1 ] || return 0
+    if [ "$TRANSPORT" = rdma ]; then tune_target_rdma
+    else tune_target_nic; tune_initiator_tcp; fi
+}
+
+realwire_dispatch "$@"

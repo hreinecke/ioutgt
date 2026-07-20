@@ -288,34 +288,25 @@ cmd_ibperf() {
     done
 }
 
-# Selector verbs take 'nvmet' or 'ioutgt'; omitting it acts on BOTH (the
-# comparison). discover/connect/disconnect/fio/fio_perf come from common.sh.
-case "${1:-}" in
-    up)                  cmd_up ;;
-    down)                cmd_down ;;
-    start)               run_for_targets start_one      "${2:-}" ;;
-    stop)                run_for_targets stop_one       "${2:-}" ;;
-    discover)            run_for_targets discover_one   "${2:-}" ;;
-    stat)                shift
-                         exec "$IOUTGT_BIN" stat --socket "$IOUTGT_SOCK" "$@" ;;
-    connect)             run_for_targets connect_one    "${2:-}"
-                         # IRQ affinity sync needs the IO queues connected
-                         # (their pthread tids appear in `list`).
-                         case "${2:-}" in ioutgt|"") tune_target_rdma ;; esac
-                         # Initiator CQ vectors are per connected controller;
-                         # both connections share hctx maps, so idempotent.
-                         case "${2:-}" in
-                             ioutgt) tune_initiator_rdma "$IOUTGT_NQN" ;;
-                             nvmet)  tune_initiator_rdma "$NVMET_NQN" ;;
-                             "")     tune_initiator_rdma "$IOUTGT_NQN"
-                                     tune_initiator_rdma "$NVMET_NQN" ;;
-                         esac ;;
-    disconnect)          run_for_targets disconnect_one "${2:-}" ;;
-    fio)                 run_for_targets fio_one        "${2:-}" ;;
-    fio_verify)          run_for_targets fio_verify_one "${2:-}" ;;
-    ibperf)              cmd_ibperf ;;
-    fio_perf)            run_for_targets fio_perf_one   "${2:-}" ;;
-    status)              cmd_status ;;
-    help|usage)          usage ;;
-    *) usage >&2; exit 1 ;;
-esac
+# IRQ affinity sync needs the IO queues connected (their pthread tids
+# appear in `list`).
+post_connect_tune() {
+    case "$1" in ioutgt|"") tune_target_rdma ;; esac
+    # Initiator CQ vectors are per connected controller; both connections
+    # share hctx maps, so idempotent.
+    case "$1" in
+        ioutgt) tune_initiator_rdma "$IOUTGT_NQN" ;;
+        nvmet)  tune_initiator_rdma "$NVMET_NQN" ;;
+        "")     tune_initiator_rdma "$IOUTGT_NQN"
+                tune_initiator_rdma "$NVMET_NQN" ;;
+    esac
+}
+extra_verbs() {
+    case "$1" in
+        ibperf) cmd_ibperf ;;
+        stat)   shift; exec "$IOUTGT_BIN" stat --socket "$IOUTGT_SOCK" "$@" ;;
+        *)      return 1 ;;
+    esac
+}
+
+realwire_dispatch "$@"
