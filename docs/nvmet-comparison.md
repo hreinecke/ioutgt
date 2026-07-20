@@ -7,7 +7,8 @@ Format per the project specification: for each subsystem — Linux
 design, ioutgt design, differences, benefits, risks.
 
 Status: current as of the gather-send and direct-to-slot recv work
-(2026-06; §2 reflects both). Benchmark-backed claims are limited
+(2026-06; §2 reflects both) and the nvmet-JSON multi-port config
+work (2026-07; §9). Benchmark-backed claims are limited
 to ioutgt-internal A/B measurements (`docs/perf-notes.md`); the
 head-to-head against nvmet is deferred (`docs/benchmark-plan.md`).
 
@@ -298,6 +299,108 @@ per-command, §2); a hostile or buggy host gets disconnected rather
 than per-command errors. Defensible for a v1, but the gentler
 responses are catalogued in the roadmap.
 
+## 9. Target object model: ports, subsystems, controllers
+
+The nouns first. A **port** is a listening address; a **subsystem** is
+a named (NQN) set of namespaces plus a host ACL; a **namespace** binds
+an NSID to storage; a **controller** is one host's live session with a
+subsystem, created by an admin-queue Connect and gone with that
+connection. Ports, subsystems, and namespaces come from configuration
+and outlive connections; only the controller is dynamic. Both targets
+share these nouns — the NVMe-oF spec fixes them — so the comparison
+is about how each represents the *links* between them. (The Connect
+flow that creates a controller is §3's topic; this section is about
+the resulting structure.)
+
+**Linux.** A global, mutable object graph rooted in configfs.
+`nvmet_port` and `nvmet_subsys` are directories; the port↔subsystem
+link is a symlink (`ports/<id>/subsystems/<nqn>`, backed by
+`nvmet_subsys_link`), and host ACLs are `nvmet_host` objects
+symlinked into `subsystems/<nqn>/allowed_hosts`. All of it is mutable
+on a live target. `nvmet_ctrl` is allocated at admin Connect
+(`nvmet_alloc_ctrl`): cntlid from a global IDA within the subsystem's
+`cntlid_min/max` window, an entry on `subsys->ctrls`, lifetime
+kref-counted against its queues.
+
+**ioutgt.** The same graph, flattened at startup and split per
+process. The config file's `ports[].subsystems` NQN list *is* the
+symlink, in JSON (`crates/ioutgt-control/src/nvmet.rs`); parsing
+resolves it into one self-contained bundle per port, each served by
+its own process (§7). At startup `build_port`
+(`crates/ioutgt-harness/src/lib.rs`) freezes the bundle into
+`PortConfig`: an immutable NQN → `Arc<Subsystem>` map shared
+read-only with every queue thread. `Subsystem` itself
+(`crates/ioutgt-core/src/subsystem.rs`) is immutable identity
+(NQN/serial/model/ACL) around the one mutable part, the versioned
+namespace table (§6). The controller is not one struct but three
+pieces, split by which thread must see them:
+
+```
+port ──exports──▶ subsystem ──contains──▶ namespace ──backs──▶ backend
+  │                   ▲
+  │ admin Connect:    │ Arc<Subsystem>, bound per connection
+  │ resolve NQN,      │
+  ▼ admits(), cntlid  │
+controller ───────────┘
+  ├─ Registry[cntlid]  routing: hostnqn, queues   (all threads, mutex)
+  ├─ AdminState        CC/CSTS, KATO, AERs        (the qid-0 connection)
+  └─ IoState × N       cached ns table (NsCache)  (one per IO connection)
+```
+
+The `Registry` (`crates/ioutgt-core/src/registry.rs`) is the
+cross-thread record — control-plane rate only, so a mutex is fine —
+and it names the subsystem by NQN string, keeping it protocol-neutral.
+The per-connection pieces live in `ConnCtx`
+(`crates/ioutgt-nvme/src/dispatch.rs`) as plain `Cell`/`RefCell`
+state on their own thread. cntlids come from a per-process disjoint
+slice rather than a per-subsystem window: a subsystem exported on two
+ports is two independent instances in two processes but one subsystem
+on the wire, and Linux hosts reject duplicate cntlids across paths
+(`nvme_validate_cntlid`).
+
+**Differences.** (1) Link mutability: nvmet can symlink a subsystem
+into a live port; ioutgt fixes the port↔subsystem map at startup, so
+runtime mutation exists only inside a subsystem (the namespace table,
+§7) and changing the export set means restarting that port's process.
+(2) Controller shape: one kref-counted struct on `subsys->ctrls`
+versus three thread-scoped pieces with no controller list on the
+subsystem at all — and no cross-thread teardown command either
+(§6's mailbox rule): on TCP the host closes its own IO-queue sockets
+when the admin path dies (each recv loop exits on EOF) and registry
+removal is admin-teardown cleanup; the RDMA transport's IO queues,
+with no socket EOF to lean on, poll `Registry::contains` and follow
+their controller down. (3) Hosts
+are plain strings in `allowed_hosts`, not linked objects.
+
+**Benefits.** Connect-time resolution is a lock-free read of a frozen
+map. There is no teardown-ordering problem between port, subsystem,
+and controller — the `Arc` graph is acyclic and the long-lived nodes
+immutable, where nvmet needs kref + percpu_ref choreography. Process
+per port makes port isolation an OS guarantee.
+
+**Risks.** No live re-export, as above. A subsystem on several ports
+is duplicated state: serial/model/identity stay consistent only
+because they derive from the same config (deterministic namespace
+UUIDs, §4), and a runtime namespace add must be replayed against each
+port's control socket.
+
+**Could it be simpler?** One real candidate, one considered-and-kept,
+one that only looks redundant. `Subsystem::max_qid` is a port-wide
+value (always the port's IO-thread count, `build_port`) duplicated
+into every subsystem — moving it to `PortConfig` would shrink
+`Subsystem` to pure NVM-subsystem identity (discovery controllers
+keep their own zero-IO-queue defaults either way, the `map_or`
+fallbacks in `admin.rs` / `fabrics_exec.rs`). The discovery
+controller is the opposite call: nvmet models discovery as a real
+subsystem object (`nvmet_disc_subsys`); ioutgt uses a flag plus
+`Option<Arc<Subsystem>>` in `AdminState` — a namespace-less
+`Subsystem` would delete those branches, but discovery's
+Identify/log-page behavior diverges enough that the flag is the
+smaller special case today. And the three subsystem representations
+(serde shape → `SubsystemConfig` → `Subsystem`) are not duplication:
+each conversion is the single place its invariants are enforced;
+collapsing them would leak kernel-JSON quirks inward.
+
 ---
 
 ## What ioutgt deliberately does differently — summary
@@ -316,3 +419,7 @@ responses are catalogued in the roadmap.
    userspace O_DIRECT erases most of the bdev/file split.
 5. **Generation-cached namespace tables instead of RCU** — the same
    read-mostly semantics with one atomic load, no RCU machinery.
+6. **A startup-frozen object graph instead of live configfs** — the
+   port↔subsystem link is resolved once at parse time and the
+   controller is decomposed by thread visibility; runtime mutability
+   is confined to the namespace table and the controller registry.
