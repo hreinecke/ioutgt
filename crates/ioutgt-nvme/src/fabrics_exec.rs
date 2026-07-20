@@ -110,9 +110,9 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                     status::CONNECT_INVALID_PARAM | status::DNR,
                 ));
             }
-            // IO queues the controller may install: the subsystem's
-            // offered count (discovery controllers get none).
-            let max_qid = admin.subsys.borrow().as_ref().map_or(0, |s| s.max_qid);
+            // IO queues the controller may install: the port's offered
+            // count (discovery controllers get none).
+            let max_qid = if discovery { 0 } else { ctx.port.max_qid };
             // Discovery controllers default to 120s KATO, others take the
             // host's value.
             let kato = if cmd.kato.get() == 0 && discovery {

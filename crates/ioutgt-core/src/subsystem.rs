@@ -101,8 +101,6 @@ pub struct Subsystem<B> {
     pub serial: String,
     /// Model number (`mn`, ≤ 40 ASCII chars).
     pub model: String,
-    /// Highest IO queue id offered to controllers (≤ IO threads).
-    pub max_qid: u16,
     /// Accept any hostnqn, ignoring `allowed_hosts`.
     pub allow_any_host: bool,
     /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
@@ -117,7 +115,6 @@ impl<B: Backend> Subsystem<B> {
         nqn: String,
         serial: String,
         model: String,
-        max_qid: u16,
         allow_any_host: bool,
         allowed_hosts: Vec<String>,
         namespaces: BTreeMap<u32, Arc<Namespace<B>>>,
@@ -126,7 +123,6 @@ impl<B: Backend> Subsystem<B> {
             nqn,
             serial,
             model,
-            max_qid,
             allow_any_host,
             allowed_hosts,
             namespaces: RwLock::new(Arc::new(namespaces)),
@@ -221,6 +217,9 @@ pub struct PortConfig<B> {
     pub trsvcid: String,
     /// Transport serving this port (TRTYPE in discovery entries).
     pub trtype: TransportType,
+    /// Highest IO queue id offered to controllers (= the port's
+    /// IO-thread count; every subsystem on the port shares it).
+    pub max_qid: u16,
     /// Advertised IO MAXCMD ceiling (Identify Controller): the maximum
     /// IO queue depth in entries the host may use. The host clamps each
     /// IO queue to `min(its queue-size, this)`; the admin queue is

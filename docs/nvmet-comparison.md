@@ -384,13 +384,13 @@ because they derive from the same config (deterministic namespace
 UUIDs, §4), and a runtime namespace add must be replayed against each
 port's control socket.
 
-**Could it be simpler?** One real candidate, one considered-and-kept,
-one that only looks redundant. `Subsystem::max_qid` is a port-wide
-value (always the port's IO-thread count, `build_port`) duplicated
-into every subsystem — moving it to `PortConfig` would shrink
-`Subsystem` to pure NVM-subsystem identity (discovery controllers
-keep their own zero-IO-queue defaults either way, the `map_or`
-fallbacks in `admin.rs` / `fabrics_exec.rs`). The discovery
+**Could it be simpler?** One candidate found and applied, one
+considered-and-kept, one that only looks redundant.
+`Subsystem::max_qid` was a port-wide value (always the port's
+IO-thread count) duplicated into every subsystem; it now lives on
+`PortConfig`, leaving `Subsystem` pure NVM-subsystem identity —
+discovery controllers keep their explicit zero-IO-queue special case
+in `admin.rs` / `fabrics_exec.rs` either way. The discovery
 controller is the opposite call: nvmet models discovery as a real
 subsystem object (`nvmet_disc_subsys`); ioutgt uses a flag plus
 `Option<Arc<Subsystem>>` in `AdminState` — a namespace-less

@@ -3,7 +3,6 @@
 //! depends on them.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
@@ -17,7 +16,7 @@ use zerocopy::IntoBytes;
 
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
 use ioutgt_core::backend::Backend;
-use ioutgt_core::subsystem::{Subsystem, TransportType};
+use ioutgt_core::subsystem::TransportType;
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;
@@ -259,7 +258,7 @@ fn get_features<B: Backend>(ctx: &Rc<ConnCtx<B>>, admin: &AdminState<B>, sqe: &S
     let fid = (sqe.cdw10.get() & 0xFF) as u8;
     match fid {
         feat::NUM_QUEUES => {
-            let queues = u32::from(io_queue_count(admin)) - 1;
+            let queues = u32::from(io_queue_count(ctx, admin)) - 1;
             Outcome::status(ctx.cqe(queues | (queues << 16), cid, status::SUCCESS))
         }
         feat::KATO => Outcome::status(ctx.cqe(admin.kato_ms.get(), cid, status::SUCCESS)),
@@ -274,7 +273,7 @@ fn set_features<B: Backend>(ctx: &Rc<ConnCtx<B>>, admin: &AdminState<B>, sqe: &S
     match fid {
         feat::NUM_QUEUES => {
             // Grant min(requested, offered); 0-based in both directions.
-            let offered = u32::from(io_queue_count(admin)) - 1;
+            let offered = u32::from(io_queue_count(ctx, admin)) - 1;
             let requested = sqe.cdw11.get() & 0xFFFF;
             let granted = requested.min(offered);
             debug!(requested, granted, "set features NUM_QUEUES");
@@ -293,14 +292,14 @@ fn set_features<B: Backend>(ctx: &Rc<ConnCtx<B>>, admin: &AdminState<B>, sqe: &S
     }
 }
 
-/// IO queues this controller may use (subsystem max_qid; the discovery
-/// subsystem has none but hosts never ask).
-fn io_queue_count<B: Backend>(admin: &AdminState<B>) -> u16 {
-    admin
-        .subsys
-        .borrow()
-        .as_ref()
-        .map_or(1, |s: &Arc<Subsystem<B>>| s.max_qid.max(1))
+/// IO queues this controller may use (the port's max_qid; the
+/// discovery subsystem has none but hosts never ask).
+fn io_queue_count<B: Backend>(ctx: &ConnCtx<B>, admin: &AdminState<B>) -> u16 {
+    if admin.subsys.borrow().is_some() {
+        ctx.port.max_qid.max(1)
+    } else {
+        1
+    }
 }
 
 fn get_log_page<B: Backend>(
