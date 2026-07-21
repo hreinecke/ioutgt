@@ -301,9 +301,10 @@ post_connect_tune() {
                 tune_initiator_rdma "$NVMET_NQN" ;;
     esac
 }
+# Handled verbs exit/exec with their command's status (dispatch contract).
 extra_verbs() {
     case "$1" in
-        ibperf) cmd_ibperf ;;
+        ibperf) cmd_ibperf; exit ;;
         stat)   shift; exec "$IOUTGT_BIN" stat --socket "$IOUTGT_SOCK" "$@" ;;
         *)      return 1 ;;
     esac

@@ -293,6 +293,7 @@ cmd_iperf() {
 post_connect_tune() {
     case "$1" in ioutgt|"") tune_target_nic; tune_initiator_tcp ;; esac
 }
-extra_verbs() { case "$1" in iperf) cmd_iperf ;; *) return 1 ;; esac; }
+# Handled verbs exit with their command's status (dispatch contract).
+extra_verbs() { case "$1" in iperf) cmd_iperf; exit ;; *) return 1 ;; esac; }
 
 realwire_dispatch "$@"

@@ -18,7 +18,7 @@ require_nics_in_root() {
     local nic
     for nic in "$NIC_T" "$NIC_I"; do
         [ -e "/sys/class/net/$nic" ] && continue
-        fail "NIC $nic is not present in this netns — another realwire session's namespace may hold it ('ip netns list', e.g. the TCP driver's NS_T); tear that session down first"
+        fail "NIC $nic is not present in this netns — a namespace holds it ('ip netns list'): another realwire session's (tear it down via ITS driver), or a stale one from an aborted run of this driver ('down' clears it)"
     done
 }
 

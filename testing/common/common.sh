@@ -168,8 +168,12 @@ stop_one() {
 #   post_connect_tune SELECTOR     optional, runs after 'connect'
 #   extra_verbs VERB [ARGS...]     optional, tried for verbs this table
 #                                  doesn't know (tcp: iperf; rdma: ibperf/
-#                                  stat); returns 1 to fall through to the
-#                                  usage error
+#                                  stat). Handled verbs must exit/exec —
+#                                  not return — so their failure keeps its
+#                                  exit status (as an && operand the hook
+#                                  runs with errexit off, and a nonzero
+#                                  return would fall through to the usage
+#                                  error). Return 1 only for unknown verbs.
 realwire_dispatch() {
     case "${1:-}" in
         up|down)    declare -F "cmd_$1" >/dev/null || { usage >&2; exit 1; }
