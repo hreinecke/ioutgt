@@ -316,6 +316,12 @@ in_net() { nsenter --net="$NSDIR/$1" "${@:2}"; }
 # Create the two namespaces, move each physical NIC in, then address + MTU + up.
 realwire_netns_create() {
     guard_no_sessions up            # never yank NICs from under a live session
+    # Idempotency, mirroring the RDMA path's self-heal: clear stale
+    # namespaces from an aborted run (safe past the guard — no live
+    # controllers), returning the NICs to root so a re-'up' works without
+    # a manual 'down'. Wire-only setups are trivially rebuildable; two
+    # concurrent wires on different NIC pairs need distinct NS_T/NS_I.
+    realwire_netns_delete
     require_nics_in_root
     echo ">> creating namespaces $NS_T / $NS_I and moving NICs in"
     ip netns add "$NS_T"
