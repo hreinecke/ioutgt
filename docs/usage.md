@@ -16,7 +16,7 @@ ioutgt --config /etc/nvmet/config.json --io-threads 4
 | `--config <path>` | — | nvmetcli-format JSON config (kernel nvmet's save/restore schema); supplies the listen address and subsystems, replacing `--listen`/`--subsys-nqn`/`--backend`. All other flags still apply |
 | `--listen <addr:port>` | `0.0.0.0:4420` | NVMe/TCP listen address |
 | `--io-threads <n>` | `2` | IO queue threads (admin thread is implicit); also caps the queue count offered to hosts |
-| `--backend <kind>` | `memory` | `memory`, `null`, or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
+| `--backend <kind>` | `memory` | `memory`, `null`, a `sheepdog:HOST[:PORT]/VDI[@TAG]` cluster VDI (see below), or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
@@ -90,6 +90,20 @@ cntlid (which it would reject).
 Memory/null-backed namespaces cannot be expressed in this schema
 (kernel namespaces are always device-backed); use `--backend
 memory|null` or the runtime control API for those.
+
+### Sheepdog backend
+
+`--backend sheepdog:HOST[:PORT]/VDI[@TAG]` serves a namespace from a
+named VDI on a [Sheepdog](https://github.com/sheepdog/sheepdog) cluster
+over the plain-TCP gateway protocol (default port `7000`; IPv6 hosts must
+be bracketed, e.g. `sheepdog:[::1]:7000/vol`). The VDI is looked up and
+its inode read once at startup to learn the volume geometry; reads and
+writes then map logical offsets to Sheepdog data objects, allocating
+objects on first write (and copying-on-write from a parent when a `@TAG`
+snapshot is opened — snapshots themselves are read-only). Writes bypass
+the object cache, so they are durable without an explicit flush. Via the
+control API / config schema the same backend is
+`{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null}`.
 
 Validation runs before any thread spawns; duplicate or reserved NSIDs,
 malformed addresses or UUIDs, and ports exporting undefined subsystems

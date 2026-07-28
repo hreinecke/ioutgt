@@ -317,7 +317,7 @@ mode vs classic mode); the two never mix on one connection.
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--backend` | `memory` | `memory` / `null` / `file` (regular file or bdev, O_DIRECT) |
+| `--backend` | `memory` | `memory` / `null` / `file` (regular file or bdev, O_DIRECT) / `sheepdog:HOST[:PORT]/VDI[@TAG]` (cluster VDI) |
 | `--no-hdgst` / `--no-ddgst` | digests on | disable header/data digest negotiation |
 | `--send-zc` | off | `SENDMSG_ZC` batches (see size gate above) |
 | `IOUTGT_ZC_MIN_BYTES` (env) | 12288 | min average payload for a ZC batch |

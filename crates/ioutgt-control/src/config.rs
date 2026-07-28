@@ -50,6 +50,14 @@ pub enum BackendConfig {
     Null { size_mb: u64 },
     /// O_DIRECT file or block device.
     File { path: PathBuf },
+    /// A VDI on a Sheepdog cluster (`addr` is `host:port`; `tag` selects a
+    /// snapshot, read-only).
+    Sheepdog {
+        addr: String,
+        vdi: String,
+        #[serde(default)]
+        tag: Option<String>,
+    },
 }
 
 /// Structural validation of a subsystem list, whatever source built it.
@@ -77,6 +85,14 @@ pub fn validate_subsystems(subsystems: &[SubsystemConfig]) -> Result<(), String>
             {
                 return Err(format!(
                     "{}: nsid {}: size_mb must be > 0",
+                    subsys.nqn, ns.nsid
+                ));
+            }
+            if let BackendConfig::Sheepdog { addr, vdi, .. } = &ns.backend
+                && (addr.is_empty() || vdi.is_empty())
+            {
+                return Err(format!(
+                    "{}: nsid {}: sheepdog addr and vdi must be non-empty",
                     subsys.nqn, ns.nsid
                 ));
             }

@@ -103,6 +103,51 @@ fn default_control_socket() -> std::path::PathBuf {
     }
 }
 
+/// Parse a `--backend sheepdog:HOST[:PORT]/VDI[@TAG]` spec into a backend
+/// config. Port defaults to 7000; `@TAG` selects a (read-only) snapshot.
+/// IPv6 hosts must be bracketed (`sheepdog:[::1]:7000/vdi`).
+fn parse_sheepdog_backend(spec: &str) -> std::io::Result<ioutgt_control::config::BackendConfig> {
+    let rest = spec.strip_prefix("sheepdog:").expect("checked by caller");
+    let (addr_part, vdi_part) = rest.split_once('/').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sheepdog backend must be sheepdog:HOST[:PORT]/VDI[@TAG]",
+        )
+    })?;
+    if addr_part.is_empty() || vdi_part.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sheepdog backend needs a non-empty host and VDI",
+        ));
+    }
+    // Decide whether the host already carries a `:port`, defaulting to 7000.
+    let has_port = if let Some(rest) = addr_part.strip_prefix('[') {
+        // Bracketed IPv6: port present iff `]:` follows the literal.
+        rest.contains("]:")
+    } else {
+        match addr_part.matches(':').count() {
+            0 => false, // bare host / IPv4, no port
+            1 => true,  // host:port / IPv4:port
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "IPv6 sheepdog host must be bracketed, e.g. sheepdog:[::1]:7000/vdi",
+                ));
+            }
+        }
+    };
+    let addr = if has_port {
+        addr_part.to_string()
+    } else {
+        format!("{addr_part}:7000")
+    };
+    let (vdi, tag) = match vdi_part.split_once('@') {
+        Some((v, t)) => (v.to_string(), Some(t.to_string())),
+        None => (vdi_part.to_string(), None),
+    };
+    Ok(ioutgt_control::config::BackendConfig::Sheepdog { addr, vdi, tag })
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Send one JSON request to a running target's control socket.
@@ -188,6 +233,7 @@ fn main() -> std::io::Result<()> {
         "null" => ioutgt_control::config::BackendConfig::Null {
             size_mb: args.mem_size_mb,
         },
+        spec if spec.starts_with("sheepdog:") => parse_sheepdog_backend(spec)?,
         path => ioutgt_control::config::BackendConfig::File { path: path.into() },
     };
     // The config file owns the target model (listen + subsystems,

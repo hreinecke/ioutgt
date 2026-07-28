@@ -7,9 +7,10 @@
 
 #![allow(missing_docs)] // request/response fields mirror the JSON protocol
 
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
-use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend};
+use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend, SheepdogBackend};
 use ioutgt_core::Backend;
 use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{Namespace, PortConfig};
@@ -175,6 +176,16 @@ pub fn build_backend(config: &BackendConfig, ring_enabled: bool) -> Result<AnyBa
                 warn!(?path, "O_DIRECT unavailable; using buffered IO");
             }
             AnyBackend::File(file)
+        }
+        BackendConfig::Sheepdog { addr, vdi, tag } => {
+            let sockaddr = addr
+                .to_socket_addrs()
+                .map_err(|e| format!("sheepdog addr '{addr}': {e}"))?
+                .next()
+                .ok_or_else(|| format!("sheepdog addr '{addr}' resolved to no address"))?;
+            let sd = SheepdogBackend::open(sockaddr, vdi, tag.as_deref())
+                .map_err(|e| format!("sheepdog {addr}/{vdi}: {e}"))?;
+            AnyBackend::Sheepdog(sd)
         }
     })
 }

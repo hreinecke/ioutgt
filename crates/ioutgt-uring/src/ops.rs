@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -196,6 +197,89 @@ pub fn accept(fd: RawFd) -> io::Result<Accept> {
     Ok(Accept { op })
 }
 
+/// Future resolving when an outbound connect completes.
+pub struct Connect {
+    op: Op,
+}
+
+impl Future for Connect {
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (result, _) = ready!(self.op.poll_single(cx));
+        Poll::Ready(result.io().map(|_| ()))
+    }
+}
+
+/// Encode a `SocketAddr` into a boxed `sockaddr_storage` (stable address for
+/// the SQE) plus its `socklen_t`.
+// Address families and `sockaddr_*` struct sizes are small constants that fit
+// their narrower target types.
+#[allow(clippy::cast_possible_truncation)]
+fn sockaddr_storage(addr: &SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t) {
+    // SAFETY: all-zeroes is a valid (unspecified-family) sockaddr_storage.
+    let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in fits within sockaddr_storage; both are plain
+            // C structs and the write stays within the storage allocation.
+            unsafe {
+                std::ptr::write(
+                    std::ptr::from_mut(&mut *storage).cast::<libc::sockaddr_in>(),
+                    sin,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            // SAFETY: sockaddr_in6 fits within sockaddr_storage; see above.
+            unsafe {
+                std::ptr::write(
+                    std::ptr::from_mut(&mut *storage).cast::<libc::sockaddr_in6>(),
+                    sin6,
+                );
+            }
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    };
+    (storage, len)
+}
+
+/// Connect the unconnected stream socket `fd` to `addr` via
+/// `IORING_OP_CONNECT`. The client-side counterpart of [`accept`]: it lets a
+/// queue thread dial out on its own reactor (backends that talk to an external
+/// service) without blocking the thread on a synchronous `connect(2)`.
+pub fn connect(fd: RawFd, addr: &SocketAddr) -> io::Result<Connect> {
+    let (storage, len) = sockaddr_storage(addr);
+    let ptr: *const libc::sockaddr = std::ptr::from_ref(&*storage).cast();
+    let op = Op::submit(
+        |key| {
+            opcode::Connect::new(types::Fd(fd), ptr, len)
+                .build()
+                .user_data(key)
+        },
+        Resources::SockAddr(storage),
+    )?;
+    Ok(Connect { op })
+}
+
 /// Stream of accepted connections from a multishot accept.
 pub struct AcceptMulti {
     op: MultiOp,
@@ -375,6 +459,25 @@ pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> io::Result<RawOp> {
         },
         Resources::None,
         SqeClass::Recv,
+    )?;
+    Ok(RawOp { op })
+}
+
+/// Send from caller-managed memory (queue-slot buffers, protocol headers).
+///
+/// # Safety
+///
+/// `ptr..ptr+len` must remain valid (reads only) until this op's terminal
+/// CQE has been reaped — same contract as [`recv_raw`].
+pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> io::Result<RawOp> {
+    let op = Op::submit_classed(
+        |key| {
+            opcode::Send::new(types::Fd(fd), ptr, len)
+                .build()
+                .user_data(key)
+        },
+        Resources::None,
+        SqeClass::Send,
     )?;
     Ok(RawOp { op })
 }

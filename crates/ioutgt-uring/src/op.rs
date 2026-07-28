@@ -22,6 +22,8 @@ pub(crate) enum Resources {
     Buffer(Box<[u8]>),
     /// Timespec referenced by a TIMEOUT SQE.
     Timespec(#[allow(dead_code)] Box<io_uring::types::Timespec>),
+    /// Socket address referenced by a CONNECT SQE.
+    SockAddr(#[allow(dead_code)] Box<libc::sockaddr_storage>),
     /// msghdr + iovecs + buffers referenced by a SENDMSG SQE.
     Msg(Box<MsgResources>),
 }

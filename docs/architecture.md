@@ -461,8 +461,8 @@ trait Backend {
 ```
 
 (Signature sketch.) Backends: `Null`, `Memory` (bring-up + tests), `File`
-(regular file or block device), `Block` (raw bdev). Disk ops run on the
-owning queue thread's own ring. The file backend issues vectored
+(regular file or block device), `Sheepdog` (a VDI on a Sheepdog cluster).
+Disk ops run on the owning queue thread's own ring. The file backend issues vectored
 `READV`/`WRITEV` over a command's data segments (one iovec per pool
 segment — contiguous or scattered). It opens a single fd `O_DIRECT`,
 falling back to buffered only when the store refuses direct (e.g. tmpfs);
@@ -474,6 +474,20 @@ with a zero-copy recv ring, deferred.) `FSYNC` flush, `FALLOCATE`
 punch-hole/zero-range as before. IOPOLL is not used: a polled ring cannot
 carry socket ops, and a second per-thread IOPOLL ring is a measured-later
 roadmap item.
+
+The **Sheepdog** backend is a *network* backend: instead of a local fd it
+talks the plain-TCP Sheepdog gateway protocol to a cluster. It holds only
+`Send + Sync` state (cluster address, geometry learned from the VDI inode
+at open, and the mutable `data_vdi_id[]` object map as an atomic array);
+the actual TCP connections are `!Send` (their io_uring ops bind to
+`Reactor::current()`), so they live in a `thread_local` per-queue-thread
+pool, dialed lazily with the new client-side `IORING_OP_CONNECT` op
+(`ops::connect`, the outbound counterpart to `accept`). A logical read/write
+splits into per-object requests; holes read as zeroes, first writes allocate
+objects (persisting the map entry back into the inode) and snapshot parents
+copy-on-write. Requests/responses use raw io_uring send/recv with the header
+held in the awaiting slot-task frame — the same cancellation envelope as the
+file backend's vectored IO.
 
 ## 8. Buffer strategy: staged, measured
 

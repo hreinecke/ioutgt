@@ -10,10 +10,12 @@
 mod file;
 mod memory;
 mod null;
+mod sheepdog;
 
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
+pub use sheepdog::{SD_LISTEN_PORT, SheepdogBackend};
 
 use ioutgt_core::pool::Seg;
 use ioutgt_core::{Backend, BackendError, LbaRange};
@@ -26,6 +28,8 @@ pub enum AnyBackend {
     Memory(MemoryBackend),
     /// See [`FileBackend`] (regular files and block devices).
     File(FileBackend),
+    /// See [`SheepdogBackend`] (a VDI on a Sheepdog cluster).
+    Sheepdog(SheepdogBackend),
 }
 
 impl Backend for AnyBackend {
@@ -34,6 +38,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.block_shift(),
             AnyBackend::Memory(b) => b.block_shift(),
             AnyBackend::File(b) => b.block_shift(),
+            AnyBackend::Sheepdog(b) => b.block_shift(),
         }
     }
 
@@ -42,6 +47,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.nr_blocks(),
             AnyBackend::Memory(b) => b.nr_blocks(),
             AnyBackend::File(b) => b.nr_blocks(),
+            AnyBackend::Sheepdog(b) => b.nr_blocks(),
         }
     }
 
@@ -50,6 +56,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.read(slba, buf).await,
             AnyBackend::Memory(b) => b.read(slba, buf).await,
             AnyBackend::File(b) => b.read(slba, buf).await,
+            AnyBackend::Sheepdog(b) => b.read(slba, buf).await,
         }
     }
 
@@ -58,6 +65,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.write(slba, buf).await,
             AnyBackend::Memory(b) => b.write(slba, buf).await,
             AnyBackend::File(b) => b.write(slba, buf).await,
+            AnyBackend::Sheepdog(b) => b.write(slba, buf).await,
         }
     }
 
@@ -72,6 +80,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.read_segs(slba, segs, total, buf_index).await,
             AnyBackend::Memory(b) => b.read_segs(slba, segs, total, buf_index).await,
             AnyBackend::File(b) => b.read_segs(slba, segs, total, buf_index).await,
+            AnyBackend::Sheepdog(b) => b.read_segs(slba, segs, total, buf_index).await,
         }
     }
 
@@ -86,6 +95,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.write_segs(slba, segs, total, buf_index).await,
             AnyBackend::Memory(b) => b.write_segs(slba, segs, total, buf_index).await,
             AnyBackend::File(b) => b.write_segs(slba, segs, total, buf_index).await,
+            AnyBackend::Sheepdog(b) => b.write_segs(slba, segs, total, buf_index).await,
         }
     }
 
@@ -94,6 +104,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.flush().await,
             AnyBackend::Memory(b) => b.flush().await,
             AnyBackend::File(b) => b.flush().await,
+            AnyBackend::Sheepdog(b) => b.flush().await,
         }
     }
 
@@ -102,6 +113,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.discard(ranges).await,
             AnyBackend::Memory(b) => b.discard(ranges).await,
             AnyBackend::File(b) => b.discard(ranges).await,
+            AnyBackend::Sheepdog(b) => b.discard(ranges).await,
         }
     }
 
@@ -110,6 +122,7 @@ impl Backend for AnyBackend {
             AnyBackend::Null(b) => b.write_zeroes(range).await,
             AnyBackend::Memory(b) => b.write_zeroes(range).await,
             AnyBackend::File(b) => b.write_zeroes(range).await,
+            AnyBackend::Sheepdog(b) => b.write_zeroes(range).await,
         }
     }
 }
