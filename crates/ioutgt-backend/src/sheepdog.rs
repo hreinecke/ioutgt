@@ -1,6 +1,8 @@
 //! Sheepdog cluster backend: serves a namespace from a named VDI on a
 //! [Sheepdog](https://github.com/sheepdog/sheepdog) distributed-storage
-//! cluster, over the plain-TCP client/gateway protocol.
+//! cluster, over the plain-TCP client/gateway protocol. [`list_vdis`]
+//! enumerates the cluster's VDIs so a target can export one namespace per
+//! VDI.
 //!
 //! # Protocol
 //!
@@ -13,7 +15,8 @@
 //! **one request in flight per connection** (a per-thread connection pool) so
 //! no response demultiplexing is needed.
 //!
-//! A VDI is looked up by name → a 24-bit `vid`. Its *inode* object holds the
+//! A VDI is looked up by name → a 24-bit `vid` (or the whole cluster is
+//! enumerated from the VDI bitmap, `READ_VDIS`). Its *inode* object holds the
 //! volume size, the data-object size (`block_size_shift`, default 4 MiB), the
 //! replication factor, and a `data_vdi_id[]` array mapping each object index to
 //! the vid that owns that data object (`0` = unallocated hole). A logical byte
@@ -69,6 +72,7 @@ const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
+const SD_OP_READ_VDIS: u8 = 0x15;
 
 const SD_FLAG_CMD_WRITE: u16 = 0x01;
 const SD_FLAG_CMD_COW: u16 = 0x02;
@@ -85,15 +89,25 @@ const VDI_SPACE_SHIFT: u32 = 32;
 const SD_MAX_VDI_LEN: usize = 256;
 const SD_MAX_VDI_TAG_LEN: usize = 256;
 
+/// `SD_NR_VDIS` — vids in the cluster-wide VDI bitmap (one bit each).
+const SD_NR_VDIS: u32 = 1 << 24;
+/// Bytes of that bitmap, the `READ_VDIS` payload size.
+const SD_VDI_BITMAP_SIZE: usize = (SD_NR_VDIS / 8) as usize;
+
 /// Fixed request/response header size.
 const SD_HDR_SIZE: usize = 48;
 
 /// `offsetof(struct sd_inode, data_vdi_id)` — start of the object map.
 const SD_INODE_HEADER_SIZE: u64 = 4664;
+/// Bytes of the inode holding its named fields (everything ahead of the
+/// `__unused[]` padding): all this backend ever reads outside the object map.
+const SD_INODE_META_SIZE: usize = 572;
 /// `SD_INODE_DATA_INDEX` — entries in `data_vdi_id[]` (max 4 TiB at 4 MiB).
 const SD_INODE_DATA_INDEX: u64 = 1 << 20;
 
 // Inode header field offsets (little-endian).
+const INO_OFF_NAME: usize = 0;
+const INO_OFF_TAG: usize = SD_MAX_VDI_LEN;
 const INO_OFF_SNAP_CTIME: usize = 520;
 const INO_OFF_VDI_SIZE: usize = 536;
 const INO_OFF_NR_COPIES: usize = 554;
@@ -328,9 +342,9 @@ impl SheepdogBackend {
 
         let vid = sync_lookup_vdi(&mut stream, vdi, tag)?;
 
-        // Inode header, then the data_vdi_id[] slice sized to the volume.
+        // Inode metadata, then the data_vdi_id[] slice sized to the volume.
         let inode_oid = vid_to_vdi_oid(vid);
-        let mut header = vec![0u8; SD_INODE_HEADER_SIZE as usize];
+        let mut header = vec![0u8; SD_INODE_META_SIZE];
         sync_read_obj(&mut stream, inode_oid, 0, &mut header)?;
 
         let snap_ctime = read_u64(&header, INO_OFF_SNAP_CTIME);
@@ -685,6 +699,73 @@ impl Backend for SheepdogBackend {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster VDI enumeration
+// ---------------------------------------------------------------------------
+
+/// One VDI found on a cluster by [`list_vdis`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VdiInfo {
+    /// VDI name — the `dog vdi list` NAME column, unique among a cluster's
+    /// writable heads.
+    pub name: String,
+    /// Snapshot tag; empty for the writable head.
+    pub tag: String,
+    /// The 24-bit VDI id, stable for the life of the VDI.
+    pub vid: u32,
+    /// Volume size in bytes.
+    pub size: u64,
+    /// True for a snapshot: a frozen VDI, servable only read-only.
+    pub snapshot: bool,
+}
+
+/// Enumerate every VDI on the cluster at `addr`, sorted by (name, tag).
+///
+/// Reads the cluster's VDI bitmap (`READ_VDIS`, one bit per vid), then each
+/// live vid's inode metadata. Blocking and off the io_uring path, like
+/// [`SheepdogBackend::open`]: a target calls it once at startup to map the
+/// cluster onto namespaces. Vids that vanish between the bitmap snapshot and
+/// the inode read (a concurrent `dog vdi delete`), and unnamed or zero-sized
+/// inodes, are skipped rather than failing the whole enumeration.
+pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_nodelay(true).ok();
+    let bitmap = sync_read_vdi_bitmap(&mut stream)?;
+
+    let mut vdis = Vec::new();
+    let mut inode = vec![0u8; SD_INODE_META_SIZE];
+    for (byte, &bits) in bitmap.iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        for bit in 0..8u32 {
+            let vid = byte as u32 * 8 + bit;
+            // vid 0 is the "no VDI" sentinel and never a real volume.
+            if bits & (1 << bit) == 0 || vid == 0 {
+                continue;
+            }
+            if sync_try_read_obj(&mut stream, vid_to_vdi_oid(vid), 0, &mut inode)? != SD_RES_SUCCESS
+            {
+                continue;
+            }
+            let name = read_cstr(&inode[INO_OFF_NAME..INO_OFF_NAME + SD_MAX_VDI_LEN]);
+            let size = read_u64(&inode, INO_OFF_VDI_SIZE);
+            if name.is_empty() || size == 0 {
+                continue;
+            }
+            vdis.push(VdiInfo {
+                name,
+                tag: read_cstr(&inode[INO_OFF_TAG..INO_OFF_TAG + SD_MAX_VDI_TAG_LEN]),
+                vid,
+                size,
+                snapshot: read_u64(&inode, INO_OFF_SNAP_CTIME) != 0,
+            });
+        }
+    }
+    vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+    Ok(vdis)
+}
+
+// ---------------------------------------------------------------------------
 // Synchronous startup helpers (blocking TcpStream, off the io_uring path)
 // ---------------------------------------------------------------------------
 
@@ -694,6 +775,12 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 
 fn read_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().expect("8 bytes"))
+}
+
+/// Decode a fixed-width, NUL-padded inode string field.
+fn read_cstr(field: &[u8]) -> String {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
 /// Look up a VDI by name (and optional snapshot tag) → its vid.
@@ -740,10 +827,50 @@ fn sync_lookup_vdi(stream: &mut TcpStream, vdi: &str, tag: Option<&str>) -> io::
     }
 }
 
-/// Synchronously read `dst.len()` bytes of object `oid` at `offset`,
-/// zero-filling any trailing bytes the server trims.
-fn sync_read_obj(stream: &mut TcpStream, oid: u64, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+/// Synchronously read the cluster's VDI bitmap (one bit per vid, LSB-first
+/// within each byte — the kernel `test_bit` layout the `sheep` gateway uses).
+fn sync_read_vdi_bitmap(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     use std::io::{Read, Write};
+
+    let mut hdr = [0u8; SD_HDR_SIZE];
+    encode_vdi_req(&mut hdr, SD_OP_READ_VDIS, 0, SD_VDI_BITMAP_SIZE as u32, 0);
+    stream.write_all(&hdr)?;
+
+    let mut resp = [0u8; SD_HDR_SIZE];
+    stream.read_exact(&mut resp)?;
+    let result = resp_result(&resp);
+    let mut bitmap = vec![0u8; SD_VDI_BITMAP_SIZE];
+    let resp_len = read_payload(stream, &resp, &mut bitmap)?;
+    bitmap[resp_len..].fill(0);
+    if result != SD_RES_SUCCESS {
+        return Err(io::Error::other(format!(
+            "READ_VDIS failed: SD_RES {result:#x}"
+        )));
+    }
+    Ok(bitmap)
+}
+
+/// Synchronously read `dst.len()` bytes of object `oid` at `offset`,
+/// zero-filling any trailing bytes the server trims. A non-success
+/// `SD_RES_*` is an error; see [`sync_try_read_obj`] to inspect it.
+fn sync_read_obj(stream: &mut TcpStream, oid: u64, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+    match sync_try_read_obj(stream, oid, offset, dst)? {
+        SD_RES_SUCCESS => Ok(()),
+        result => Err(io::Error::other(format!(
+            "READ_OBJ failed: SD_RES {result:#x}"
+        ))),
+    }
+}
+
+/// [`sync_read_obj`] returning the raw `SD_RES_*` result, for callers that
+/// tolerate a failed object (e.g. an inode deleted under an enumeration).
+fn sync_try_read_obj(
+    stream: &mut TcpStream,
+    oid: u64,
+    offset: u64,
+    dst: &mut [u8],
+) -> io::Result<u32> {
+    use std::io::Write;
 
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_obj_req(
@@ -760,19 +887,34 @@ fn sync_read_obj(stream: &mut TcpStream, oid: u64, offset: u64, dst: &mut [u8]) 
     stream.write_all(&hdr)?;
 
     let mut resp = [0u8; SD_HDR_SIZE];
-    stream.read_exact(&mut resp)?;
-    let result = resp_result(&resp);
-    let resp_len = (resp_data_length(&resp) as usize).min(dst.len());
-    if resp_len > 0 {
-        stream.read_exact(&mut dst[..resp_len])?;
-    }
+    std::io::Read::read_exact(stream, &mut resp)?;
+    let resp_len = read_payload(stream, &resp, dst)?;
     dst[resp_len..].fill(0);
-    if result != SD_RES_SUCCESS {
-        return Err(io::Error::other(format!(
-            "READ_OBJ failed: SD_RES {result:#x}"
-        )));
+    Ok(resp_result(&resp))
+}
+
+/// Read a response's payload into `dst`, returning its length. Keeps the
+/// stream framed for the next request: an over-long payload (more than was
+/// asked for) is a protocol violation, not something to leave unread.
+fn read_payload(
+    stream: &mut TcpStream,
+    resp: &[u8; SD_HDR_SIZE],
+    dst: &mut [u8],
+) -> io::Result<usize> {
+    let resp_len = resp_data_length(resp) as usize;
+    if resp_len > dst.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "response payload {resp_len} exceeds the {} requested",
+                dst.len()
+            ),
+        ));
     }
-    Ok(())
+    if resp_len > 0 {
+        std::io::Read::read_exact(stream, &mut dst[..resp_len])?;
+    }
+    Ok(resp_len)
 }
 
 #[cfg(test)]

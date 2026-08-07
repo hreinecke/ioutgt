@@ -487,7 +487,14 @@ splits into per-object requests; holes read as zeroes, first writes allocate
 objects (persisting the map entry back into the inode) and snapshot parents
 copy-on-write. Requests/responses use raw io_uring send/recv with the header
 held in the awaiting slot-task frame — the same cancellation envelope as the
-file backend's vectored IO.
+file backend's vectored IO. A cluster can also be exported wholesale:
+`list_vdis` reads the cluster VDI bitmap (`READ_VDIS`) plus each vid's inode
+at startup, and `ioutgt_control::cli` turns that listing into one namespace
+per writable VDI, each namespace taking its VDI's bitmap position (its vid)
+as its NSID so the map is a pure function of the cluster — sparse, large
+NSIDs in exchange for a numbering no other VDI's creation can disturb —
+with UUIDs keyed to the VDI rather than to the exporting subsystem. That is
+the `--backend sheepdog:HOST` form both binaries share.
 
 ## 8. Buffer strategy: staged, measured
 

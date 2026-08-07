@@ -77,7 +77,9 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     mem_size_mb: u64,
 
-    /// Namespace backend: memory, null, or a file/blockdev path.
+    /// Namespace backend: memory, null, a file/blockdev path, or
+    /// sheepdog:HOST[:PORT][/VDI[@TAG]] (no VDI: one namespace per
+    /// cluster VDI).
     #[arg(long, default_value = "memory")]
     backend: String,
 
@@ -101,51 +103,6 @@ fn default_control_socket() -> std::path::PathBuf {
         Some(dir) if !dir.is_empty() => std::path::Path::new(&dir).join("ioutgt.sock"),
         _ => std::path::PathBuf::from("/tmp/ioutgt.sock"),
     }
-}
-
-/// Parse a `--backend sheepdog:HOST[:PORT]/VDI[@TAG]` spec into a backend
-/// config. Port defaults to 7000; `@TAG` selects a (read-only) snapshot.
-/// IPv6 hosts must be bracketed (`sheepdog:[::1]:7000/vdi`).
-fn parse_sheepdog_backend(spec: &str) -> std::io::Result<ioutgt_control::config::BackendConfig> {
-    let rest = spec.strip_prefix("sheepdog:").expect("checked by caller");
-    let (addr_part, vdi_part) = rest.split_once('/').ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "sheepdog backend must be sheepdog:HOST[:PORT]/VDI[@TAG]",
-        )
-    })?;
-    if addr_part.is_empty() || vdi_part.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "sheepdog backend needs a non-empty host and VDI",
-        ));
-    }
-    // Decide whether the host already carries a `:port`, defaulting to 7000.
-    let has_port = if let Some(rest) = addr_part.strip_prefix('[') {
-        // Bracketed IPv6: port present iff `]:` follows the literal.
-        rest.contains("]:")
-    } else {
-        match addr_part.matches(':').count() {
-            0 => false, // bare host / IPv4, no port
-            1 => true,  // host:port / IPv4:port
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "IPv6 sheepdog host must be bracketed, e.g. sheepdog:[::1]:7000/vdi",
-                ));
-            }
-        }
-    };
-    let addr = if has_port {
-        addr_part.to_string()
-    } else {
-        format!("{addr_part}:7000")
-    };
-    let (vdi, tag) = match vdi_part.split_once('@') {
-        Some((v, t)) => (v.to_string(), Some(t.to_string())),
-        None => (vdi_part.to_string(), None),
-    };
-    Ok(ioutgt_control::config::BackendConfig::Sheepdog { addr, vdi, tag })
 }
 
 #[derive(Subcommand, Debug)]
@@ -226,16 +183,9 @@ fn main() -> std::io::Result<()> {
     config.idle_teardown = (args.idle_teardown_secs != 0)
         .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
     config.control_socket = Some(args.control_socket.unwrap_or_else(default_control_socket));
-    config.subsystems[0].namespaces[0].backend = match args.backend.as_str() {
-        "memory" => ioutgt_control::config::BackendConfig::Memory {
-            size_mb: args.mem_size_mb,
-        },
-        "null" => ioutgt_control::config::BackendConfig::Null {
-            size_mb: args.mem_size_mb,
-        },
-        spec if spec.starts_with("sheepdog:") => parse_sheepdog_backend(spec)?,
-        path => ioutgt_control::config::BackendConfig::File { path: path.into() },
-    };
+    config.subsystems[0].namespaces =
+        ioutgt_control::cli::namespaces(&args.backend, args.mem_size_mb)
+            .map_err(std::io::Error::other)?;
     // The config file owns the target model (listen + subsystems,
     // replacing the flag-built ones); engine flags above still apply.
     if let Some(path) = &args.config {

@@ -15,7 +15,7 @@ mod sheepdog;
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
-pub use sheepdog::{SD_LISTEN_PORT, SheepdogBackend};
+pub use sheepdog::{SD_LISTEN_PORT, SheepdogBackend, VdiInfo, list_vdis};
 
 use ioutgt_core::pool::Seg;
 use ioutgt_core::{Backend, BackendError, LbaRange};

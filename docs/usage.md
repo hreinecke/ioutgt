@@ -16,7 +16,7 @@ ioutgt --config /etc/nvmet/config.json --io-threads 4
 | `--config <path>` | — | nvmetcli-format JSON config (kernel nvmet's save/restore schema); supplies the listen address and subsystems, replacing `--listen`/`--subsys-nqn`/`--backend`. All other flags still apply |
 | `--listen <addr:port>` | `0.0.0.0:4420` | NVMe/TCP listen address |
 | `--io-threads <n>` | `2` | IO queue threads (admin thread is implicit); also caps the queue count offered to hosts |
-| `--backend <kind>` | `memory` | `memory`, `null`, a `sheepdog:HOST[:PORT]/VDI[@TAG]` cluster VDI (see below), or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
+| `--backend <kind>` | `memory` | `memory`, `null`, `sheepdog:HOST[:PORT][/VDI[@TAG]]` — one cluster VDI, or one namespace per VDI when no VDI is named (see below) — or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
@@ -104,6 +104,40 @@ snapshot is opened — snapshots themselves are read-only). Writes bypass
 the object cache, so they are durable without an explicit flush. Via the
 control API / config schema the same backend is
 `{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null}`.
+
+#### Whole-cluster mode: one namespace per VDI
+
+Leave the VDI off — `--backend sheepdog:HOST[:PORT]` (a trailing `/` is
+also accepted) — and the target enumerates the cluster's VDI bitmap at
+startup and exports **every writable VDI as its own namespace**:
+
+```sh
+ioutgt --backend sheepdog:sheep0:7000 --subsys-nqn nqn.2026-06.io.ioutgt:sheepdog
+ioutgt list          # nsid → blocks, as the host will see them
+```
+
+**A namespace's NSID is its VDI's position in that bitmap** — the vid, the
+same 24-bit id `dog vdi list -r` prints. Nothing about the mapping depends
+on which other VDIs happen to exist: creating or deleting one never
+renumbers the rest, and two targets fronting the same cluster hand a host
+the same NSID for the same volume. The cost is sparse, large NSIDs (a vid
+is a hash of the VDI name, so `/dev/nvme0n11259375` is typical, and
+`Identify Controller`'s NN — the highest NSID in use — is large to match).
+Hosts find the namespaces through the Active Namespace List; a host that
+instead scans NSID 1..NN sequentially still works, but slowly.
+
+Snapshots are skipped (they are frozen, so they could only ever be served
+read-only); name one explicitly with `@TAG` to export it. Each namespace's
+UUID is derived from the VDI's own identity (name + vid) rather than from
+the exporting subsystem, so a host's `/dev/disk/by-id/nvme-uuid.*` link for
+a given VDI is the same through any target serving that cluster.
+
+The mapping is a startup snapshot: VDIs created afterwards need a restart,
+or an `ADD_NAMESPACE` control request naming the new VDI. Each namespace
+costs one cluster round trip at startup plus an in-memory copy of that
+VDI's object map (4 bytes per data object — 1 MiB for a 4 TiB volume at
+the default 4 MiB objects), so a cluster with very many large VDIs is
+better served by naming the VDIs it should export.
 
 Validation runs before any thread spawns; duplicate or reserved NSIDs,
 malformed addresses or UUIDs, and ports exporting undefined subsystems
