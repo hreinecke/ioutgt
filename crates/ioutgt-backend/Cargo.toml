@@ -12,6 +12,7 @@ authors.workspace = true
 ioutgt-core = { workspace = true }
 ioutgt-uring = { workspace = true }
 libc = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

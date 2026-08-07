@@ -78,8 +78,8 @@ struct Args {
     mem_size_mb: u64,
 
     /// Namespace backend: memory, null, a file/blockdev path, or
-    /// sheepdog:HOST[:PORT][/VDI[@TAG]] (no VDI: one namespace per
-    /// cluster VDI).
+    /// sheepdog:HOST[:PORT][/VDI[@TAG]][?nolock] (no VDI: one namespace
+    /// per cluster VDI; ?nolock: skip the shared VDI lock).
     #[arg(long, default_value = "memory")]
     backend: String,
 

@@ -57,7 +57,19 @@ pub enum BackendConfig {
         vdi: String,
         #[serde(default)]
         tag: Option<String>,
+        /// Take the cluster's shared VDI lock (default): other targets may
+        /// hold the same VDI — two of them exporting it for multipath, say —
+        /// but a client holding it exclusively, such as a running QEMU guest,
+        /// keeps this one out. Turn it off where exclusion is arranged some
+        /// other way. Snapshots are read-only and never locked.
+        #[serde(default = "lock_by_default")]
+        lock: bool,
     },
+}
+
+/// serde default for `Sheepdog { lock }`: locking is on.
+fn lock_by_default() -> bool {
+    true
 }
 
 /// Structural validation of a subsystem list, whatever source built it.

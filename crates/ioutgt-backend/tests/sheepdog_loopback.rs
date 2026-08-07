@@ -24,8 +24,13 @@ use ioutgt_uring::{QueueRuntime, RingConfig};
 const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
+const SD_OP_LOCK_VDI: u8 = 0x12;
+const SD_OP_RELEASE_VDI: u8 = 0x13;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
+const SD_RES_VDI_LOCKED: u32 = 0x07;
+const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
+const LOCK_TYPE_SHARED: u32 = 1;
 const SD_FLAG_CMD_COW: u16 = 0x02;
 const VDI_BIT: u64 = 1 << 63;
 const SD_INODE_HEADER_SIZE: u64 = 4664;
@@ -100,9 +105,21 @@ impl Vdi {
     }
 }
 
+/// A VDI lock held in the fake cluster: `LOCK_TYPE_NORMAL`, which stands
+/// alone, or `LOCK_TYPE_SHARED`, which counts its participants.
+#[derive(Debug, PartialEq, Eq)]
+enum Lock {
+    Exclusive,
+    Shared(u32),
+}
+
 struct Store {
     vdis: BTreeMap<u32, Vdi>,
     objects: HashMap<u64, Vec<u8>>,
+    /// Vids currently under a `LOCK_VDI`. Only `RELEASE_VDI` clears one — a
+    /// closing connection deliberately does not, so a test can tell an
+    /// explicit release from a socket that merely went away.
+    locks: BTreeMap<u32, Lock>,
 }
 
 impl Store {
@@ -113,6 +130,43 @@ impl Store {
             bitmap[(vid / 8) as usize] |= 1 << (vid % 8);
         }
         bitmap
+    }
+
+    /// Take `lock_type` on `vid` under sheepdog's compatibility rule: shared
+    /// participants stack, an exclusive holder stands alone. Either kind shuts
+    /// the other out, so `false` (→ `SD_RES_VDI_LOCKED`) means someone
+    /// incompatible already holds it.
+    fn take_lock(&mut self, vid: u32, lock_type: u32) -> bool {
+        match (self.locks.get_mut(&vid), lock_type) {
+            (Some(Lock::Shared(holders)), LOCK_TYPE_SHARED) => {
+                *holders += 1;
+                true
+            }
+            (Some(_), _) => false,
+            (None, LOCK_TYPE_SHARED) => {
+                self.locks.insert(vid, Lock::Shared(1));
+                true
+            }
+            (None, _) => {
+                self.locks.insert(vid, Lock::Exclusive);
+                true
+            }
+        }
+    }
+
+    /// Drop one holder of `vid`'s lock; `false` if it was not held at all.
+    fn release_lock(&mut self, vid: u32) -> bool {
+        match self.locks.get_mut(&vid) {
+            Some(Lock::Shared(holders)) if *holders > 1 => {
+                *holders -= 1;
+                true
+            }
+            Some(_) => {
+                self.locks.remove(&vid);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -164,7 +218,7 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
 
         let mut st = store.lock().unwrap();
         match opcode {
-            SD_OP_GET_VDI_INFO => {
+            SD_OP_GET_VDI_INFO | SD_OP_LOCK_VDI => {
                 // payload was not consumed above (not a write opcode); drain it.
                 let mut p = vec![0u8; data_length];
                 sock.read_exact(&mut p)?;
@@ -173,15 +227,33 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 let found = st
                     .vdis
                     .iter()
-                    .find(|(_, vdi)| vdi.name == name && vdi.tag == tag);
+                    .find(|(_, vdi)| vdi.name == name && vdi.tag == tag)
+                    .map(|(&vid, _)| vid);
                 match found {
-                    Some((&vid, _)) => {
+                    // LOCK_VDI answers as GET_VDI_INFO does, and takes the
+                    // lock on the way — unless an incompatible holder has it.
+                    Some(vid)
+                        if opcode == SD_OP_LOCK_VDI
+                            && !st.take_lock(vid, u32le(&hdr, 36) /* type */) =>
+                    {
+                        sock.write_all(&resp(opcode, id, SD_RES_VDI_LOCKED, 0))?;
+                    }
+                    Some(vid) => {
                         let mut r = resp(opcode, id, 0, 0);
                         r[24..28].copy_from_slice(&vid.to_le_bytes()); // vdi_id
                         sock.write_all(&r)?;
                     }
                     None => sock.write_all(&resp(opcode, id, 0x08, 0))?, // NO_VDI
                 }
+            }
+            SD_OP_RELEASE_VDI => {
+                let vid = u32le(&hdr, 24); // base_vdi_id
+                let result = if st.release_lock(vid) {
+                    0
+                } else {
+                    SD_RES_VDI_NOT_LOCKED
+                };
+                sock.write_all(&resp(opcode, id, result, 0))?;
             }
             SD_OP_READ_VDIS => {
                 let bitmap = st.vdi_bitmap();
@@ -275,7 +347,21 @@ fn fresh_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
     Arc::new(Mutex::new(Store {
         vdis,
         objects: HashMap::new(),
+        locks: BTreeMap::new(),
     }))
+}
+
+/// The vids the fake cluster currently has locked.
+fn locked(store: &Arc<Mutex<Store>>) -> Vec<u32> {
+    store.lock().unwrap().locks.keys().copied().collect()
+}
+
+/// How many shared participants hold `vid` (0 if it is free or exclusive).
+fn holders(store: &Arc<Mutex<Store>>, vid: u32) -> u32 {
+    match store.lock().unwrap().locks.get(&vid) {
+        Some(&Lock::Shared(holders)) => holders,
+        _ => 0,
+    }
 }
 
 fn filled(len: usize, seed: u8) -> AlignedBuf {
@@ -292,7 +378,7 @@ fn read_hole_write_alloc_overwrite_roundtrip() {
     let store = fresh_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-    let be = SheepdogBackend::open(addr, "testvdi", None).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, true).unwrap();
     assert_eq!(be.block_shift(), 9);
     assert_eq!(be.nr_blocks(), 256 * 1024 / 512);
 
@@ -344,6 +430,80 @@ fn read_hole_write_alloc_overwrite_roundtrip() {
 }
 
 #[test]
+fn shared_lock_stacks_across_targets_and_unwinds_on_drop() {
+    let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, true).unwrap();
+    assert_eq!(holders(&store, TEST_VID), 1, "the open took the lock");
+
+    // A second target may serve the same VDI — that is what the shared lock
+    // is for — and joins the holders rather than displacing the first.
+    let second = SheepdogBackend::open(addr, "testvdi", None, true).unwrap();
+    assert_eq!(holders(&store, TEST_VID), 2);
+
+    // An explicitly unlocked open goes through too, and disturbs nothing.
+    let waived = SheepdogBackend::open(addr, "testvdi", None, false).unwrap();
+    assert_eq!(holders(&store, TEST_VID), 2);
+    drop(waived);
+    assert_eq!(holders(&store, TEST_VID), 2);
+
+    // Each drop hands back exactly one participant's hold.
+    drop(second);
+    assert_eq!(holders(&store, TEST_VID), 1, "the first target still holds");
+    drop(be);
+    assert!(locked(&store).is_empty(), "the last drop freed the VDI");
+}
+
+/// The shared lock is shared only among shared holders: a client holding the
+/// VDI exclusively (a QEMU guest, say) still keeps the target out.
+#[test]
+fn an_exclusive_holder_locks_the_target_out() {
+    let store = fresh_store(16, 256 * 1024);
+    store
+        .lock()
+        .unwrap()
+        .locks
+        .insert(TEST_VID, Lock::Exclusive);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let err = SheepdogBackend::open(addr, "testvdi", None, true)
+        .err()
+        .expect("an exclusively locked VDI is refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy);
+    assert_eq!(locked(&store), vec![TEST_VID], "the holder keeps its lock");
+
+    // Waiving the lock is the escape hatch for exclusion arranged elsewhere.
+    let waived = SheepdogBackend::open(addr, "testvdi", None, false).unwrap();
+    drop(waived);
+    assert_eq!(
+        store.lock().unwrap().locks[&TEST_VID],
+        Lock::Exclusive,
+        "an unlocked open neither takes nor releases anything"
+    );
+}
+
+/// A failed open must not walk away holding the lock it took to get there.
+#[test]
+fn lock_released_when_the_open_fails_after_taking_it() {
+    // A zero-sized VDI passes the name lookup (so the lock is taken) and then
+    // fails the inode check.
+    let store = fresh_store(16, 256 * 1024);
+    store
+        .lock()
+        .unwrap()
+        .vdis
+        .insert(0x00_0042, Vdi::new("empty", 0, 22));
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let err = SheepdogBackend::open(addr, "empty", None, true)
+        .err()
+        .expect("a zero-sized VDI is rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(locked(&store).is_empty(), "a failed open leaves no lock");
+}
+
+#[test]
 fn cluster_enumeration_lists_every_vdi() {
     // A cluster of three writable VDIs plus one snapshot, deliberately in
     // neither vid nor name order.
@@ -379,12 +539,14 @@ fn cluster_enumeration_lists_every_vdi() {
     // Every enumerated head is openable by the name the listing reports, and
     // reports the size the listing reports.
     for vdi in vdis.iter().filter(|v| !v.snapshot) {
-        let be = SheepdogBackend::open(addr, &vdi.name, None).unwrap();
+        let be = SheepdogBackend::open(addr, &vdi.name, None, false).unwrap();
         assert_eq!(be.nr_blocks() * 512, vdi.size, "{} size", vdi.name);
     }
 
-    // The snapshot is openable by tag and refuses writes.
-    let snap = SheepdogBackend::open(addr, "alpha", Some("daily")).unwrap();
+    // The snapshot is openable by tag and refuses writes. Being frozen, it
+    // takes no lock even though this open asks for one.
+    let snap = SheepdogBackend::open(addr, "alpha", Some("daily"), true).unwrap();
+    assert!(locked(&store).is_empty(), "a snapshot open locks nothing");
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
     rt.block_on(async move {
         let data = AlignedBuf::zeroed(512);

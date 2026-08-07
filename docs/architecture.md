@@ -487,7 +487,16 @@ splits into per-object requests; holes read as zeroes, first writes allocate
 objects (persisting the map entry back into the inode) and snapshot parents
 copy-on-write. Requests/responses use raw io_uring send/recv with the header
 held in the awaiting slot-task frame — the same cancellation envelope as the
-file backend's vectored IO. A cluster can also be exported wholesale:
+file backend's vectored IO. A writable VDI is opened under the cluster's
+shared VDI lock (`LOCK_VDI` with `LOCK_TYPE_SHARED`, sheepdog's multipath
+lock type), held on the connection that took it and released from the
+backend's `Drop` — so a second target may export the same volume, but a
+volume a client holds exclusively (a QEMU guest) is refused at startup
+rather than raced; `?nolock` / `"lock": false` waives it. Sharing assumes
+non-overlapping writers: the cached object map is never invalidated, so two
+targets allocating the same object lose one of the writes. A cluster can
+also be exported
+wholesale:
 `list_vdis` reads the cluster VDI bitmap (`READ_VDIS`) plus each vid's inode
 at startup, and `ioutgt_control::cli` turns that listing into one namespace
 per writable VDI, each namespace taking its VDI's bitmap position (its vid)

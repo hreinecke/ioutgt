@@ -34,6 +34,28 @@
 //! slot-task frame, the same cancellation envelope as `FileBackend`'s vectored
 //! IO (memory outlives the op until queue-teardown drain).
 //!
+//! # VDI locking
+//!
+//! Opening a writable VDI takes the cluster's *shared* VDI lock (`LOCK_VDI`
+//! with `LOCK_TYPE_SHARED`, the type sheepdog added for iSCSI multipath — the
+//! same lookup request as `GET_VDI_INFO`, with the lock as a side effect).
+//! Several targets may hold one VDI at once, so a pair of them can export the
+//! same volume on two paths; a client holding the exclusive lock
+//! (`LOCK_TYPE_NORMAL`, what a QEMU guest takes) shuts them all out and is shut
+//! out by them in turn, so a VDI a guest is already running from is refused
+//! rather than corrupted. The lock is held on the connection that took it for
+//! the backend's lifetime and handed back (`RELEASE_VDI`) when the backend
+//! drops. Snapshot opens are read-only and never lock. `lock = false` opts out,
+//! for setups whose exclusion is arranged elsewhere.
+//!
+//! Sharing a VDI is only safe for readers and for writers that never race on
+//! the same object: this backend caches `data_vdi_id[]` at open and does not
+//! implement sheepdog's inode-invalidation notifications, so an object one
+//! holder allocates stays a hole in another's map — it reads zeroes there, and
+//! allocating it in turn loses one of the two writes. Multipath (one initiator
+//! reaching one volume two ways) is the intended case; two independent writers
+//! are not.
+//!
 //! # Writes
 //!
 //! Writes bypass the object cache (`SD_FLAG_CMD_DIRECT`) so each is durable and
@@ -71,16 +93,26 @@ pub const SD_LISTEN_PORT: u16 = 7000;
 const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
+const SD_OP_LOCK_VDI: u8 = 0x12;
+const SD_OP_RELEASE_VDI: u8 = 0x13;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
+
+/// `LOCK_TYPE_SHARED` — the multi-participant VDI lock sheepdog added for
+/// iSCSI multipath, and what this backend takes. Several targets may hold one
+/// VDI at once; a `LOCK_TYPE_NORMAL` (exclusive) holder such as a QEMU guest
+/// still shuts them all out, and is shut out by them in turn.
+const SD_LOCK_TYPE_SHARED: u32 = 1;
 
 const SD_FLAG_CMD_WRITE: u16 = 0x01;
 const SD_FLAG_CMD_COW: u16 = 0x02;
 const SD_FLAG_CMD_DIRECT: u16 = 0x08;
 
 const SD_RES_SUCCESS: u32 = 0x00;
+const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_NO_VDI: u32 = 0x08;
 const SD_RES_NO_TAG: u32 = 0x0E;
+const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_NO_SPACE: u32 = 0x15;
 const SD_RES_READONLY: u32 = 0x1A;
 
@@ -115,6 +147,9 @@ const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
 
 /// NVMe logical block shift (512 B), matching the other backends' static path.
 const BLOCK_SHIFT: u8 = 9;
+
+/// Bound on the `RELEASE_VDI` round trip at drop time.
+const LOCK_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Sentinel stored in the object map while a create is in flight. A real vid is
 /// 24-bit, so `u32::MAX` can never collide with one (nor with `0` = hole).
@@ -158,21 +193,27 @@ fn encode_obj_req(
     hdr[40..48].copy_from_slice(&offset.to_le_bytes());
 }
 
-/// Encode a 48-byte `vdi` request header (the VDI-lookup family).
+/// Encode a 48-byte `vdi` request header (the VDI lookup/lock family).
+/// `base_vdi_id` names the VDI for ops that take one directly rather than by
+/// name (`RELEASE_VDI`); `lock_type` is the `LOCK_TYPE_*` of a lock op.
 fn encode_vdi_req(
     hdr: &mut [u8; SD_HDR_SIZE],
     opcode: u8,
     flags: u16,
     data_length: u32,
     snapid: u32,
+    base_vdi_id: u32,
+    lock_type: u32,
 ) {
     hdr.fill(0);
     hdr[0] = SD_PROTO_VER;
     hdr[1] = opcode;
     hdr[2..4].copy_from_slice(&flags.to_le_bytes());
     hdr[12..16].copy_from_slice(&data_length.to_le_bytes());
-    // vdi union: snapid at byte 32.
+    // vdi union: base_vdi_id at 24, snapid at 32, lock type at 36.
+    hdr[24..28].copy_from_slice(&base_vdi_id.to_le_bytes());
     hdr[32..36].copy_from_slice(&snapid.to_le_bytes());
+    hdr[36..40].copy_from_slice(&lock_type.to_le_bytes());
 }
 
 /// The `result` (`SD_RES_*`) field of a response header.
@@ -324,13 +365,28 @@ pub struct SheepdogBackend {
     /// `data_vdi_id[]`: object index → owning vid (`0` hole, [`VID_INFLIGHT`]
     /// during a create). Lock-free reads; only first-touch writes contend.
     data_map: Box<[AtomicU32]>,
+    /// The connection this VDI's cluster lock was taken on, parked here for
+    /// the backend's lifetime and used once more to release the lock on drop.
+    /// `None` when locking is off, or the VDI is a read-only snapshot.
+    lock_conn: Option<TcpStream>,
 }
 
 impl SheepdogBackend {
     /// Look up `vdi` (optionally at snapshot `tag`) on the cluster at `addr`,
     /// read its inode, and build the backend. Performs a small synchronous
     /// handshake (blocking `TcpStream`) once at startup — off the io_uring path.
-    pub fn open(addr: SocketAddr, vdi: &str, tag: Option<&str>) -> io::Result<SheepdogBackend> {
+    ///
+    /// With `lock` set, a writable VDI is taken under the cluster's shared VDI
+    /// lock, held until this backend drops; other shared holders are welcome,
+    /// but a VDI held exclusively by another client fails the open with
+    /// [`io::ErrorKind::ResourceBusy`]. A snapshot (`tag`) is read-only and
+    /// never locked, whatever `lock` says.
+    pub fn open(
+        addr: SocketAddr,
+        vdi: &str,
+        tag: Option<&str>,
+        lock: bool,
+    ) -> io::Result<SheepdogBackend> {
         if vdi.is_empty() || vdi.len() >= SD_MAX_VDI_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -340,12 +396,42 @@ impl SheepdogBackend {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true).ok();
 
-        let vid = sync_lookup_vdi(&mut stream, vdi, tag)?;
+        let lock = lock && tag.is_none();
+        let vid = sync_lookup_vdi(&mut stream, vdi, tag, lock)?;
 
+        match Self::with_inode(addr, vid, &mut stream) {
+            Ok(mut backend) => {
+                if !lock {
+                    Ok(backend)
+                } else if backend.read_only {
+                    // A frozen snapshot reached without a tag: it can serve
+                    // nobody's writes, so it needn't keep anyone out.
+                    release_lock(&mut stream, vid);
+                    Ok(backend)
+                } else {
+                    backend.lock_conn = Some(stream);
+                    Ok(backend)
+                }
+            }
+            Err(err) => {
+                if lock {
+                    release_lock(&mut stream, vid);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Read `vid`'s inode over `stream` and assemble the (unlocked) backend.
+    fn with_inode(
+        addr: SocketAddr,
+        vid: u32,
+        stream: &mut TcpStream,
+    ) -> io::Result<SheepdogBackend> {
         // Inode metadata, then the data_vdi_id[] slice sized to the volume.
         let inode_oid = vid_to_vdi_oid(vid);
         let mut header = vec![0u8; SD_INODE_META_SIZE];
-        sync_read_obj(&mut stream, inode_oid, 0, &mut header)?;
+        sync_read_obj(stream, inode_oid, 0, &mut header)?;
 
         let snap_ctime = read_u64(&header, INO_OFF_SNAP_CTIME);
         let vdi_size = read_u64(&header, INO_OFF_VDI_SIZE);
@@ -370,7 +456,7 @@ impl SheepdogBackend {
 
         let mut map_bytes = vec![0u8; nr_objects as usize * 4];
         if !map_bytes.is_empty() {
-            sync_read_obj(&mut stream, inode_oid, SD_INODE_HEADER_SIZE, &mut map_bytes)?;
+            sync_read_obj(stream, inode_oid, SD_INODE_HEADER_SIZE, &mut map_bytes)?;
         }
         let data_map: Box<[AtomicU32]> = (0..nr_objects as usize)
             .map(|i| AtomicU32::new(read_u32(&map_bytes, i * 4)))
@@ -384,6 +470,7 @@ impl SheepdogBackend {
             nr_blocks: vdi_size >> BLOCK_SHIFT,
             read_only: snap_ctime != 0,
             data_map,
+            lock_conn: None,
         })
     }
 
@@ -627,6 +714,17 @@ impl SheepdogBackend {
     }
 }
 
+impl Drop for SheepdogBackend {
+    /// Hand the VDI lock back so the next opener — a restarted target, a
+    /// guest — is not locked out. Only a clean teardown reaches this:
+    /// a killed target leaves the lock with the cluster to reclaim.
+    fn drop(&mut self) {
+        if let Some(mut stream) = self.lock_conn.take() {
+            release_lock(&mut stream, self.vid);
+        }
+    }
+}
+
 impl Backend for SheepdogBackend {
     fn block_shift(&self) -> u8 {
         BLOCK_SHIFT
@@ -783,8 +881,16 @@ fn read_cstr(field: &[u8]) -> String {
     String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
-/// Look up a VDI by name (and optional snapshot tag) → its vid.
-fn sync_lookup_vdi(stream: &mut TcpStream, vdi: &str, tag: Option<&str>) -> io::Result<u32> {
+/// Look up a VDI by name (and optional snapshot tag) → its vid, taking the
+/// cluster's shared lock on it if `lock` is set. `LOCK_VDI` is the same
+/// lookup request as `GET_VDI_INFO` — same payload, same `vdi_id` reply — with
+/// the lock as a side effect, so one round trip covers both.
+fn sync_lookup_vdi(
+    stream: &mut TcpStream,
+    vdi: &str,
+    tag: Option<&str>,
+    lock: bool,
+) -> io::Result<u32> {
     use std::io::{Read, Write};
 
     let mut payload = vec![0u8; SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
@@ -799,10 +905,16 @@ fn sync_lookup_vdi(stream: &mut TcpStream, vdi: &str, tag: Option<&str>) -> io::
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_vdi_req(
         &mut hdr,
-        SD_OP_GET_VDI_INFO,
+        if lock {
+            SD_OP_LOCK_VDI
+        } else {
+            SD_OP_GET_VDI_INFO
+        },
         SD_FLAG_CMD_WRITE,
         payload.len() as u32,
         0,
+        0,
+        SD_LOCK_TYPE_SHARED,
     );
     stream.write_all(&hdr)?;
     stream.write_all(&payload)?;
@@ -821,9 +933,58 @@ fn sync_lookup_vdi(stream: &mut TcpStream, vdi: &str, tag: Option<&str>) -> io::
             io::ErrorKind::NotFound,
             "no such snapshot tag",
         )),
+        SD_RES_VDI_LOCKED => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "VDI is locked exclusively by another client",
+        )),
         res => Err(io::Error::other(format!(
             "VDI lookup failed: SD_RES {res:#x}"
         ))),
+    }
+}
+
+/// Release the cluster lock on `vid`, taken by an earlier `LOCK_VDI`.
+fn sync_release_vdi(stream: &mut TcpStream, vid: u32) -> io::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut hdr = [0u8; SD_HDR_SIZE];
+    encode_vdi_req(
+        &mut hdr,
+        SD_OP_RELEASE_VDI,
+        0,
+        0,
+        0,
+        vid,
+        SD_LOCK_TYPE_SHARED,
+    );
+    stream.write_all(&hdr)?;
+
+    let mut resp = [0u8; SD_HDR_SIZE];
+    stream.read_exact(&mut resp)?;
+    let resp_len = resp_data_length(&resp) as u64;
+    if resp_len > 0 {
+        io::copy(&mut stream.take(resp_len), &mut io::sink())?;
+    }
+    match resp_result(&resp) {
+        // NOT_LOCKED: the cluster let the lock go on its own (this client
+        // dropped out of the cluster's view and back in, say). Either way the
+        // postcondition holds.
+        SD_RES_SUCCESS | SD_RES_VDI_NOT_LOCKED => Ok(()),
+        res => Err(io::Error::other(format!(
+            "RELEASE_VDI failed: SD_RES {res:#x}"
+        ))),
+    }
+}
+
+/// [`sync_release_vdi`], reported rather than propagated: every caller is on
+/// a teardown path with nowhere to return an error to. Bounded, because a
+/// drop can land on a queue thread (`REMOVE_NAMESPACE`) and a cluster that
+/// has stopped answering must not stall it.
+fn release_lock(stream: &mut TcpStream, vid: u32) {
+    let _ = stream.set_write_timeout(Some(LOCK_RELEASE_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(LOCK_RELEASE_TIMEOUT));
+    if let Err(err) = sync_release_vdi(stream, vid) {
+        tracing::warn!(vid = format_args!("{vid:x}"), %err, "sheepdog: VDI lock not released");
     }
 }
 
@@ -833,7 +994,15 @@ fn sync_read_vdi_bitmap(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     use std::io::{Read, Write};
 
     let mut hdr = [0u8; SD_HDR_SIZE];
-    encode_vdi_req(&mut hdr, SD_OP_READ_VDIS, 0, SD_VDI_BITMAP_SIZE as u32, 0);
+    encode_vdi_req(
+        &mut hdr,
+        SD_OP_READ_VDIS,
+        0,
+        SD_VDI_BITMAP_SIZE as u32,
+        0,
+        0,
+        0,
+    );
     stream.write_all(&hdr)?;
 
     let mut resp = [0u8; SD_HDR_SIZE];
@@ -959,11 +1128,35 @@ mod tests {
     #[test]
     fn vdi_req_layout() {
         let mut hdr = [0u8; SD_HDR_SIZE];
-        encode_vdi_req(&mut hdr, SD_OP_GET_VDI_INFO, SD_FLAG_CMD_WRITE, 512, 0);
+        encode_vdi_req(
+            &mut hdr,
+            SD_OP_GET_VDI_INFO,
+            SD_FLAG_CMD_WRITE,
+            512,
+            0,
+            0,
+            0,
+        );
         assert_eq!(hdr[0], SD_PROTO_VER);
         assert_eq!(hdr[1], SD_OP_GET_VDI_INFO);
         assert_eq!(u16::from_le_bytes([hdr[2], hdr[3]]), SD_FLAG_CMD_WRITE);
         assert_eq!(read_u32(&hdr, 12), 512);
+
+        // RELEASE_VDI names its VDI in base_vdi_id (24) and its lock class in
+        // type (36) — the fields sd_req's vdi union puts there.
+        encode_vdi_req(
+            &mut hdr,
+            SD_OP_RELEASE_VDI,
+            0,
+            0,
+            0,
+            0xab_cdef,
+            SD_LOCK_TYPE_SHARED,
+        );
+        assert_eq!(hdr[1], SD_OP_RELEASE_VDI);
+        assert_eq!(read_u32(&hdr, 24), 0xab_cdef);
+        assert_eq!(read_u32(&hdr, 32), 0); // snapid
+        assert_eq!(read_u32(&hdr, 36), SD_LOCK_TYPE_SHARED);
     }
 
     #[test]

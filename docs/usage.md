@@ -16,7 +16,7 @@ ioutgt --config /etc/nvmet/config.json --io-threads 4
 | `--config <path>` | — | nvmetcli-format JSON config (kernel nvmet's save/restore schema); supplies the listen address and subsystems, replacing `--listen`/`--subsys-nqn`/`--backend`. All other flags still apply |
 | `--listen <addr:port>` | `0.0.0.0:4420` | NVMe/TCP listen address |
 | `--io-threads <n>` | `2` | IO queue threads (admin thread is implicit); also caps the queue count offered to hosts |
-| `--backend <kind>` | `memory` | `memory`, `null`, `sheepdog:HOST[:PORT][/VDI[@TAG]]` — one cluster VDI, or one namespace per VDI when no VDI is named (see below) — or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
+| `--backend <kind>` | `memory` | `memory`, `null`, `sheepdog:HOST[:PORT][/VDI[@TAG]][?nolock]` — one cluster VDI, or one namespace per VDI when no VDI is named (see below) — or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
@@ -103,7 +103,50 @@ objects on first write (and copying-on-write from a parent when a `@TAG`
 snapshot is opened — snapshots themselves are read-only). Writes bypass
 the object cache, so they are durable without an explicit flush. Via the
 control API / config schema the same backend is
-`{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null}`.
+`{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null,"lock":true}`.
+
+#### VDI locking
+
+Opening a writable VDI takes the cluster's **shared VDI lock**
+(`SD_OP_LOCK_VDI` with `LOCK_TYPE_SHARED`, the type Sheepdog added for
+iSCSI multipath). Several targets may hold one VDI at once, so a pair of
+them can export the same volume on two paths; a client holding the VDI
+*exclusively* (`LOCK_TYPE_NORMAL`, what QEMU's Sheepdog driver takes) is
+mutually exclusive with all of them, so a volume a guest is already
+running from is refused instead of served into a data race:
+
+```
+sheepdog 10.0.0.1:7000/vol: VDI is locked exclusively by another client (os error 16)
+```
+
+The lock is held on the connection that took it for as long as the
+namespace exists and handed back (`SD_OP_RELEASE_VDI`) when the namespace
+goes away — `REMOVE_NAMESPACE`, or a target shut down cleanly. Snapshot
+(`@TAG`) opens are read-only and never lock. Note that a target that is
+*killed* never runs that release: its hold stays with the VDI until the
+cluster reclaims it. Another ioutgt target can still open the volume (the
+stale hold is a shared one), but a QEMU guest cannot until the lock is
+cleared.
+
+Sharing a VDI is safe for readers and for writers that never touch the
+same object: the backend caches the VDI's object map at open and does not
+subscribe to Sheepdog's inode-invalidation notifications, so an object one
+target allocates stays a hole in another target's map — it will read
+zeroes there, and allocating it in turn loses one of the two writes.
+Multipath (one initiator reaching one volume two ways) is the intended
+case; two independent writers are not.
+
+Waive the lock with a `?nolock` suffix on the spec — for a target that
+must coexist with an exclusive holder, or any setup that arranges
+exclusion elsewhere:
+
+```sh
+ioutgt --backend sheepdog:sheep0/vol?nolock       # one VDI, unlocked
+ioutgt --backend sheepdog:sheep0?nolock           # whole cluster, unlocked
+```
+
+The suffix goes last, after any `@TAG`. Through the control API the same
+switch is `"lock": false` in the backend object; it defaults to `true`.
 
 #### Whole-cluster mode: one namespace per VDI
 
@@ -126,7 +169,10 @@ is a hash of the VDI name, so `/dev/nvme0n11259375` is typical, and
 Hosts find the namespaces through the Active Namespace List; a host that
 instead scans NSID 1..NN sequentially still works, but slowly.
 
-Snapshots are skipped (they are frozen, so they could only ever be served
+Every exported VDI is locked, as in single-VDI mode: one VDI held
+exclusively by another client fails the whole startup, naming the volume.
+Snapshots are
+skipped (they are frozen, so they could only ever be served
 read-only); name one explicitly with `@TAG` to export it. Each namespace's
 UUID is derived from the VDI's own identity (name + vid) rather than from
 the exporting subsystem, so a host's `/dev/disk/by-id/nvme-uuid.*` link for

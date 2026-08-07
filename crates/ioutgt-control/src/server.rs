@@ -177,13 +177,18 @@ pub fn build_backend(config: &BackendConfig, ring_enabled: bool) -> Result<AnyBa
             }
             AnyBackend::File(file)
         }
-        BackendConfig::Sheepdog { addr, vdi, tag } => {
+        BackendConfig::Sheepdog {
+            addr,
+            vdi,
+            tag,
+            lock,
+        } => {
             let sockaddr = addr
                 .to_socket_addrs()
                 .map_err(|e| format!("sheepdog addr '{addr}': {e}"))?
                 .next()
                 .ok_or_else(|| format!("sheepdog addr '{addr}' resolved to no address"))?;
-            let sd = SheepdogBackend::open(sockaddr, vdi, tag.as_deref())
+            let sd = SheepdogBackend::open(sockaddr, vdi, tag.as_deref(), *lock)
                 .map_err(|e| format!("sheepdog {addr}/{vdi}: {e}"))?;
             AnyBackend::Sheepdog(sd)
         }
