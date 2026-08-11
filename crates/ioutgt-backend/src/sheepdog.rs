@@ -1,8 +1,8 @@
 //! Sheepdog cluster backend: serves a namespace from a named VDI on a
 //! [Sheepdog](https://github.com/sheepdog/sheepdog) distributed-storage
-//! cluster, over the plain-TCP client/gateway protocol. [`list_vdis`]
-//! enumerates the cluster's VDIs so a target can export one namespace per
-//! VDI.
+//! cluster, over the plain-TCP client/gateway protocol. [`list_acls`]
+//! enumerates the cluster's ACL objects and their member VDIs, so a target
+//! can export one subsystem per ACL and one namespace per member.
 //!
 //! # Protocol
 //!
@@ -23,6 +23,17 @@
 //! offset `off` maps to `idx = off / object_size`, `in_obj = off % object_size`,
 //! and the object id `oid = (vid << 32) | idx`.
 //!
+//! # ACLs
+//!
+//! An *ACL object* is an ordinary VDI carrying `SD_VDI_FLAG_ACL` in its inode
+//! `vdi_flags`; the volumes it grants access to name it back in their own
+//! inode `acl_id`. The ACL is the cluster's access-control scope: every VDI
+//! lookup (`GET_VDI_INFO`, `LOCK_VDI`) carries an ACL id, and `sheep` only
+//! matches a name against inodes whose `acl_id` equals it — a VDI inside an
+//! ACL is invisible (`SD_RES_VDI_DENIED`) to a lookup that does not name it,
+//! and vice versa. ACL id `0` is both "belongs to no ACL" and, for the lock
+//! ops, `LOCK_TYPE_NORMAL`.
+//!
 //! # Fit with the engine
 //!
 //! The backend struct holds only `Send + Sync` state (cluster address, learned
@@ -36,17 +47,18 @@
 //!
 //! # VDI locking
 //!
-//! Opening a writable VDI takes the cluster's *shared* VDI lock (`LOCK_VDI`
-//! with `LOCK_TYPE_SHARED`, the type sheepdog added for iSCSI multipath — the
-//! same lookup request as `GET_VDI_INFO`, with the lock as a side effect).
-//! Several targets may hold one VDI at once, so a pair of them can export the
-//! same volume on two paths; a client holding the exclusive lock
-//! (`LOCK_TYPE_NORMAL`, what a QEMU guest takes) shuts them all out and is shut
-//! out by them in turn, so a VDI a guest is already running from is refused
-//! rather than corrupted. The lock is held on the connection that took it for
-//! the backend's lifetime and handed back (`RELEASE_VDI`) when the backend
-//! drops. Snapshot opens are read-only and never lock. `lock = false` opts out,
-//! for setups whose exclusion is arranged elsewhere.
+//! Opening a writable VDI takes the cluster's VDI lock (`LOCK_VDI` — the same
+//! lookup request as `GET_VDI_INFO`, with the lock as a side effect), and the
+//! ACL id the request carries picks the lock's kind. A VDI opened under its
+//! ACL takes the *shared* lock: every holder naming the same ACL joins the
+//! participant list, so a pair of targets serving one ACL can export the same
+//! volume on two paths. A VDI opened outside any ACL takes `LOCK_TYPE_NORMAL`
+//! and stands alone. The two shut each other out — a volume a QEMU guest is
+//! already running from is refused rather than corrupted, and so is a volume
+//! locked under a *different* ACL. The lock is held on the connection that
+//! took it for the backend's lifetime and handed back (`RELEASE_VDI`) when the
+//! backend drops. Snapshot opens are read-only and never lock. `lock = false`
+//! opts out, for setups whose exclusion is arranged elsewhere.
 //!
 //! Sharing a VDI is only safe for readers and for writers that never race on
 //! the same object: this backend caches `data_vdi_id[]` at open and does not
@@ -98,11 +110,15 @@ const SD_OP_RELEASE_VDI: u8 = 0x13;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
 
-/// `LOCK_TYPE_SHARED` — the multi-participant VDI lock sheepdog added for
-/// iSCSI multipath, and what this backend takes. Several targets may hold one
-/// VDI at once; a `LOCK_TYPE_NORMAL` (exclusive) holder such as a QEMU guest
-/// still shuts them all out, and is shut out by them in turn.
-const SD_LOCK_TYPE_SHARED: u32 = 1;
+/// `LOCK_TYPE_NORMAL` — the ACL id of a VDI belonging to no ACL, and the
+/// exclusive (single-holder) VDI lock such an open takes. Any non-zero ACL id
+/// is a real ACL object's vid, and locks that VDI *shared* among the holders
+/// naming that same ACL.
+const SD_ACL_NONE: u32 = 0;
+
+/// `SD_VDI_FLAG_ACL` — the inode `vdi_flags` bit marking a VDI as an ACL
+/// object rather than a volume.
+const SD_VDI_FLAG_ACL: u32 = 0x0000_0001;
 
 const SD_FLAG_CMD_WRITE: u16 = 0x01;
 const SD_FLAG_CMD_COW: u16 = 0x02;
@@ -115,6 +131,7 @@ const SD_RES_NO_TAG: u32 = 0x0E;
 const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_NO_SPACE: u32 = 0x15;
 const SD_RES_READONLY: u32 = 0x1A;
+const SD_RES_VDI_DENIED: u32 = 0x1E;
 
 const VDI_BIT: u64 = 1 << 63;
 const VDI_SPACE_SHIFT: u32 = 32;
@@ -133,7 +150,7 @@ const SD_HDR_SIZE: usize = 48;
 const SD_INODE_HEADER_SIZE: u64 = 4664;
 /// Bytes of the inode holding its named fields (everything ahead of the
 /// `__unused[]` padding): all this backend ever reads outside the object map.
-const SD_INODE_META_SIZE: usize = 572;
+const SD_INODE_META_SIZE: usize = 596;
 /// `SD_INODE_DATA_INDEX` — entries in `data_vdi_id[]` (max 4 TiB at 4 MiB).
 const SD_INODE_DATA_INDEX: u64 = 1 << 20;
 
@@ -144,6 +161,8 @@ const INO_OFF_SNAP_CTIME: usize = 520;
 const INO_OFF_VDI_SIZE: usize = 536;
 const INO_OFF_NR_COPIES: usize = 554;
 const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
+const INO_OFF_ACL_ID: usize = 572;
+const INO_OFF_VDI_FLAGS: usize = 592;
 
 /// NVMe logical block shift (512 B), matching the other backends' static path.
 const BLOCK_SHIFT: u8 = 9;
@@ -195,7 +214,8 @@ fn encode_obj_req(
 
 /// Encode a 48-byte `vdi` request header (the VDI lookup/lock family).
 /// `base_vdi_id` names the VDI for ops that take one directly rather than by
-/// name (`RELEASE_VDI`); `lock_type` is the `LOCK_TYPE_*` of a lock op.
+/// name (`RELEASE_VDI`); `acl` is the ACL id the request runs under, which for
+/// the lock ops doubles as the `LOCK_TYPE_*` (`0` = `LOCK_TYPE_NORMAL`).
 fn encode_vdi_req(
     hdr: &mut [u8; SD_HDR_SIZE],
     opcode: u8,
@@ -203,17 +223,17 @@ fn encode_vdi_req(
     data_length: u32,
     snapid: u32,
     base_vdi_id: u32,
-    lock_type: u32,
+    acl: u32,
 ) {
     hdr.fill(0);
     hdr[0] = SD_PROTO_VER;
     hdr[1] = opcode;
     hdr[2..4].copy_from_slice(&flags.to_le_bytes());
     hdr[12..16].copy_from_slice(&data_length.to_le_bytes());
-    // vdi union: base_vdi_id at 24, snapid at 32, lock type at 36.
+    // vdi union: base_vdi_id at 24, snapid at 32, acl at 36.
     hdr[24..28].copy_from_slice(&base_vdi_id.to_le_bytes());
     hdr[32..36].copy_from_slice(&snapid.to_le_bytes());
-    hdr[36..40].copy_from_slice(&lock_type.to_le_bytes());
+    hdr[36..40].copy_from_slice(&acl.to_le_bytes());
 }
 
 /// The `result` (`SD_RES_*`) field of a response header.
@@ -355,6 +375,10 @@ pub struct SheepdogBackend {
     addr: SocketAddr,
     /// The (writable head) VDI id.
     vid: u32,
+    /// The ACL this VDI is served under ([`SD_ACL_NONE`] for a VDI in no
+    /// ACL): the scope its name was looked up in and its lock taken under,
+    /// so `RELEASE_VDI` can name the same one back.
+    acl: u32,
     /// Data-object size in bytes (`1 << inode.block_size_shift`).
     object_size: u32,
     /// Replication factor to request on object writes.
@@ -376,15 +400,22 @@ impl SheepdogBackend {
     /// read its inode, and build the backend. Performs a small synchronous
     /// handshake (blocking `TcpStream`) once at startup — off the io_uring path.
     ///
-    /// With `lock` set, a writable VDI is taken under the cluster's shared VDI
-    /// lock, held until this backend drops; other shared holders are welcome,
-    /// but a VDI held exclusively by another client fails the open with
-    /// [`io::ErrorKind::ResourceBusy`]. A snapshot (`tag`) is read-only and
-    /// never locked, whatever `lock` says.
+    /// `acl` names the ACL object the VDI belongs to; every lookup and lock
+    /// runs under it, so it must match the VDI's inode `acl_id` or the cluster
+    /// will not admit the name at all ([`io::ErrorKind::PermissionDenied`]).
+    /// `None` addresses a VDI in no ACL.
+    ///
+    /// With `lock` set, a writable VDI is taken under the cluster's VDI lock,
+    /// held until this backend drops: shared with the other holders naming the
+    /// same ACL, exclusive when there is no ACL. A VDI already locked
+    /// incompatibly — by a QEMU guest, or under a different ACL — fails the
+    /// open with [`io::ErrorKind::ResourceBusy`]. A snapshot (`tag`) is
+    /// read-only and never locked, whatever `lock` says.
     pub fn open(
         addr: SocketAddr,
         vdi: &str,
         tag: Option<&str>,
+        acl: Option<&str>,
         lock: bool,
     ) -> io::Result<SheepdogBackend> {
         if vdi.is_empty() || vdi.len() >= SD_MAX_VDI_LEN {
@@ -396,17 +427,21 @@ impl SheepdogBackend {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true).ok();
 
+        let acl = match acl {
+            Some(name) => sync_lookup_acl(&mut stream, name)?,
+            None => SD_ACL_NONE,
+        };
         let lock = lock && tag.is_none();
-        let vid = sync_lookup_vdi(&mut stream, vdi, tag, lock)?;
+        let vid = sync_lookup_vdi(&mut stream, vdi, tag, acl, lock)?;
 
-        match Self::with_inode(addr, vid, &mut stream) {
+        match Self::with_inode(addr, vid, acl, &mut stream) {
             Ok(mut backend) => {
                 if !lock {
                     Ok(backend)
                 } else if backend.read_only {
                     // A frozen snapshot reached without a tag: it can serve
                     // nobody's writes, so it needn't keep anyone out.
-                    release_lock(&mut stream, vid);
+                    release_lock(&mut stream, vid, acl);
                     Ok(backend)
                 } else {
                     backend.lock_conn = Some(stream);
@@ -415,7 +450,7 @@ impl SheepdogBackend {
             }
             Err(err) => {
                 if lock {
-                    release_lock(&mut stream, vid);
+                    release_lock(&mut stream, vid, acl);
                 }
                 Err(err)
             }
@@ -426,6 +461,7 @@ impl SheepdogBackend {
     fn with_inode(
         addr: SocketAddr,
         vid: u32,
+        acl: u32,
         stream: &mut TcpStream,
     ) -> io::Result<SheepdogBackend> {
         // Inode metadata, then the data_vdi_id[] slice sized to the volume.
@@ -465,6 +501,7 @@ impl SheepdogBackend {
         Ok(SheepdogBackend {
             addr,
             vid,
+            acl,
             object_size,
             nr_copies,
             nr_blocks: vdi_size >> BLOCK_SHIFT,
@@ -720,7 +757,7 @@ impl Drop for SheepdogBackend {
     /// a killed target leaves the lock with the cluster to reclaim.
     fn drop(&mut self) {
         if let Some(mut stream) = self.lock_conn.take() {
-            release_lock(&mut stream, self.vid);
+            release_lock(&mut stream, self.vid, self.acl);
         }
     }
 }
@@ -797,14 +834,14 @@ impl Backend for SheepdogBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster VDI enumeration
+// Cluster VDI / ACL enumeration
 // ---------------------------------------------------------------------------
 
-/// One VDI found on a cluster by [`list_vdis`].
+/// One VDI found on a cluster by [`list_vdis`] or [`list_acls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VdiInfo {
     /// VDI name — the `dog vdi list` NAME column, unique among a cluster's
-    /// writable heads.
+    /// writable heads *within one ACL*.
     pub name: String,
     /// Snapshot tag; empty for the writable head.
     pub tag: String,
@@ -814,22 +851,109 @@ pub struct VdiInfo {
     pub size: u64,
     /// True for a snapshot: a frozen VDI, servable only read-only.
     pub snapshot: bool,
+    /// The vid of the ACL object this VDI belongs to (inode `acl_id`), `0`
+    /// for a VDI in no ACL. Every lookup of this VDI's name must carry it.
+    pub acl: u32,
 }
 
-/// Enumerate every VDI on the cluster at `addr`, sorted by (name, tag).
+/// One ACL object found on a cluster by [`list_acls`]: a VDI carrying
+/// `SD_VDI_FLAG_ACL`, together with the volumes that name it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclInfo {
+    /// ACL object name — the `dog acl list` NAME column.
+    pub name: String,
+    /// The ACL object's own 24-bit vid: the `acl_id` its members carry and
+    /// the value every lookup and lock of a member passes.
+    pub vid: u32,
+    /// The ACL's member VDIs, sorted by (name, tag), snapshots included.
+    pub vdis: Vec<VdiInfo>,
+}
+
+/// One live entry of the cluster's VDI table, as [`scan_vdi_table`] reads it.
+struct TableEntry {
+    info: VdiInfo,
+    /// The entry is an ACL object (`SD_VDI_FLAG_ACL`), not a volume.
+    is_acl: bool,
+}
+
+/// Enumerate every volume on the cluster at `addr`, sorted by (name, tag).
 ///
-/// Reads the cluster's VDI bitmap (`READ_VDIS`, one bit per vid), then each
-/// live vid's inode metadata. Blocking and off the io_uring path, like
-/// [`SheepdogBackend::open`]: a target calls it once at startup to map the
-/// cluster onto namespaces. Vids that vanish between the bitmap snapshot and
-/// the inode read (a concurrent `dog vdi delete`), and unnamed or zero-sized
-/// inodes, are skipped rather than failing the whole enumeration.
+/// ACL objects are VDIs too, but not volumes: they are left out here and
+/// enumerated by [`list_acls`] instead. Reported volumes carry the ACL they
+/// belong to in [`VdiInfo::acl`], which [`SheepdogBackend::open`] needs to
+/// reach them.
 pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
-    let bitmap = sync_read_vdi_bitmap(&mut stream)?;
 
-    let mut vdis = Vec::new();
+    let mut vdis: Vec<VdiInfo> = scan_vdi_table(&mut stream)?
+        .into_iter()
+        .filter(|entry| !entry.is_acl)
+        .map(|entry| entry.info)
+        .collect();
+    vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+    Ok(vdis)
+}
+
+/// Enumerate the cluster's ACL objects, each with its member VDIs, sorted by
+/// ACL name.
+///
+/// Membership is read from the members' side — an inode's `acl_id`, which is
+/// what `sheep` itself enforces on every lookup — rather than from the ACL's
+/// own `data_vdi_id[]` list, so an ACL admits exactly the VDIs the cluster
+/// will actually resolve under it. An empty ACL is still reported: it is a
+/// subsystem with no namespaces yet, not an error. Volumes belonging to no
+/// ACL appear in no entry; use [`list_vdis`] for those.
+pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_nodelay(true).ok();
+    let entries = scan_vdi_table(&mut stream)?;
+
+    let mut acls: Vec<AclInfo> = entries
+        .iter()
+        .filter(|entry| entry.is_acl)
+        .map(|entry| AclInfo {
+            name: entry.info.name.clone(),
+            vid: entry.info.vid,
+            vdis: Vec::new(),
+        })
+        .collect();
+    for entry in entries
+        .iter()
+        .filter(|e| !e.is_acl && e.info.acl != SD_ACL_NONE)
+    {
+        match acls.iter_mut().find(|acl| acl.vid == entry.info.acl) {
+            Some(acl) => acl.vdis.push(entry.info.clone()),
+            // The named ACL object is gone (or was never one): the cluster
+            // will refuse every lookup of this VDI, so there is nothing to
+            // export it under — say so rather than silently dropping it.
+            None => tracing::warn!(
+                vdi = %entry.info.name,
+                acl = format_args!("{:x}", entry.info.acl),
+                "sheepdog: VDI names an ACL that is not on the cluster"
+            ),
+        }
+    }
+    for acl in &mut acls {
+        acl.vdis
+            .sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+    }
+    acls.sort_by(|a, b| (&a.name, a.vid).cmp(&(&b.name, b.vid)));
+    Ok(acls)
+}
+
+/// Walk the cluster's VDI bitmap (`READ_VDIS`, one bit per vid) and read each
+/// live vid's inode metadata.
+///
+/// Blocking and off the io_uring path, like [`SheepdogBackend::open`]: a
+/// target calls it once at startup to map the cluster onto subsystems and
+/// namespaces. Vids that vanish between the bitmap snapshot and the inode
+/// read (a concurrent `dog vdi delete`), and unnamed or zero-sized inodes,
+/// are skipped rather than failing the whole enumeration.
+fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
+    let bitmap = sync_read_vdi_bitmap(stream)?;
+
+    let mut entries = Vec::new();
     let mut inode = vec![0u8; SD_INODE_META_SIZE];
     for (byte, &bits) in bitmap.iter().enumerate() {
         if bits == 0 {
@@ -841,8 +965,7 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
             if bits & (1 << bit) == 0 || vid == 0 {
                 continue;
             }
-            if sync_try_read_obj(&mut stream, vid_to_vdi_oid(vid), 0, &mut inode)? != SD_RES_SUCCESS
-            {
+            if sync_try_read_obj(stream, vid_to_vdi_oid(vid), 0, &mut inode)? != SD_RES_SUCCESS {
                 continue;
             }
             let name = read_cstr(&inode[INO_OFF_NAME..INO_OFF_NAME + SD_MAX_VDI_LEN]);
@@ -850,17 +973,20 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
             if name.is_empty() || size == 0 {
                 continue;
             }
-            vdis.push(VdiInfo {
-                name,
-                tag: read_cstr(&inode[INO_OFF_TAG..INO_OFF_TAG + SD_MAX_VDI_TAG_LEN]),
-                vid,
-                size,
-                snapshot: read_u64(&inode, INO_OFF_SNAP_CTIME) != 0,
+            entries.push(TableEntry {
+                info: VdiInfo {
+                    name,
+                    tag: read_cstr(&inode[INO_OFF_TAG..INO_OFF_TAG + SD_MAX_VDI_TAG_LEN]),
+                    vid,
+                    size,
+                    snapshot: read_u64(&inode, INO_OFF_SNAP_CTIME) != 0,
+                    acl: read_u32(&inode, INO_OFF_ACL_ID),
+                },
+                is_acl: read_u32(&inode, INO_OFF_VDI_FLAGS) & SD_VDI_FLAG_ACL != 0,
             });
         }
     }
-    vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
-    Ok(vdis)
+    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -881,14 +1007,41 @@ fn read_cstr(field: &[u8]) -> String {
     String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
-/// Look up a VDI by name (and optional snapshot tag) → its vid, taking the
-/// cluster's shared lock on it if `lock` is set. `LOCK_VDI` is the same
-/// lookup request as `GET_VDI_INFO` — same payload, same `vdi_id` reply — with
-/// the lock as a side effect, so one round trip covers both.
+/// Look up an ACL object by name → its vid, checking that it really is one.
+///
+/// An ACL object belongs to no ACL itself, so it is looked up unscoped; the
+/// `SD_VDI_FLAG_ACL` check then keeps an ordinary VDI that happens to share
+/// the name from being mistaken for an access-control scope (the same guard
+/// `dog acl` applies).
+fn sync_lookup_acl(stream: &mut TcpStream, acl: &str) -> io::Result<u32> {
+    if acl.is_empty() || acl.len() >= SD_MAX_VDI_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid ACL name",
+        ));
+    }
+    let vid = sync_lookup_vdi(stream, acl, None, SD_ACL_NONE, false)?;
+    let mut meta = vec![0u8; SD_INODE_META_SIZE];
+    sync_read_obj(stream, vid_to_vdi_oid(vid), 0, &mut meta)?;
+    if read_u32(&meta, INO_OFF_VDI_FLAGS) & SD_VDI_FLAG_ACL == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{acl}' is an ordinary VDI, not an ACL object"),
+        ));
+    }
+    Ok(vid)
+}
+
+/// Look up a VDI by name (and optional snapshot tag) within ACL `acl` → its
+/// vid, taking the cluster's lock on it if `lock` is set. `LOCK_VDI` is the
+/// same lookup request as `GET_VDI_INFO` — same payload, same `vdi_id` reply —
+/// with the lock as a side effect, so one round trip covers both; `acl` is
+/// that lock's kind as well as the lookup's scope (see the module docs).
 fn sync_lookup_vdi(
     stream: &mut TcpStream,
     vdi: &str,
     tag: Option<&str>,
+    acl: u32,
     lock: bool,
 ) -> io::Result<u32> {
     use std::io::{Read, Write};
@@ -914,7 +1067,7 @@ fn sync_lookup_vdi(
         payload.len() as u32,
         0,
         0,
-        SD_LOCK_TYPE_SHARED,
+        acl,
     );
     stream.write_all(&hdr)?;
     stream.write_all(&payload)?;
@@ -935,7 +1088,13 @@ fn sync_lookup_vdi(
         )),
         SD_RES_VDI_LOCKED => Err(io::Error::new(
             io::ErrorKind::ResourceBusy,
-            "VDI is locked exclusively by another client",
+            "VDI is locked incompatibly by another client",
+        )),
+        // Locked under some other ACL, or named from outside the ACL it
+        // belongs to: the cluster admits the name, but not to us.
+        SD_RES_VDI_DENIED => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("VDI is not reachable under ACL {acl:#x}"),
         )),
         res => Err(io::Error::other(format!(
             "VDI lookup failed: SD_RES {res:#x}"
@@ -943,20 +1102,13 @@ fn sync_lookup_vdi(
     }
 }
 
-/// Release the cluster lock on `vid`, taken by an earlier `LOCK_VDI`.
-fn sync_release_vdi(stream: &mut TcpStream, vid: u32) -> io::Result<()> {
+/// Release the cluster lock on `vid`, taken by an earlier `LOCK_VDI` under
+/// ACL `acl` — the same one, or the cluster refuses to let go.
+fn sync_release_vdi(stream: &mut TcpStream, vid: u32, acl: u32) -> io::Result<()> {
     use std::io::{Read, Write};
 
     let mut hdr = [0u8; SD_HDR_SIZE];
-    encode_vdi_req(
-        &mut hdr,
-        SD_OP_RELEASE_VDI,
-        0,
-        0,
-        0,
-        vid,
-        SD_LOCK_TYPE_SHARED,
-    );
+    encode_vdi_req(&mut hdr, SD_OP_RELEASE_VDI, 0, 0, 0, vid, acl);
     stream.write_all(&hdr)?;
 
     let mut resp = [0u8; SD_HDR_SIZE];
@@ -980,10 +1132,10 @@ fn sync_release_vdi(stream: &mut TcpStream, vid: u32) -> io::Result<()> {
 /// a teardown path with nowhere to return an error to. Bounded, because a
 /// drop can land on a queue thread (`REMOVE_NAMESPACE`) and a cluster that
 /// has stopped answering must not stall it.
-fn release_lock(stream: &mut TcpStream, vid: u32) {
+fn release_lock(stream: &mut TcpStream, vid: u32, acl: u32) {
     let _ = stream.set_write_timeout(Some(LOCK_RELEASE_TIMEOUT));
     let _ = stream.set_read_timeout(Some(LOCK_RELEASE_TIMEOUT));
-    if let Err(err) = sync_release_vdi(stream, vid) {
+    if let Err(err) = sync_release_vdi(stream, vid, acl) {
         tracing::warn!(vid = format_args!("{vid:x}"), %err, "sheepdog: VDI lock not released");
     }
 }
@@ -1142,31 +1294,28 @@ mod tests {
         assert_eq!(u16::from_le_bytes([hdr[2], hdr[3]]), SD_FLAG_CMD_WRITE);
         assert_eq!(read_u32(&hdr, 12), 512);
 
-        // RELEASE_VDI names its VDI in base_vdi_id (24) and its lock class in
-        // type (36) — the fields sd_req's vdi union puts there.
-        encode_vdi_req(
-            &mut hdr,
-            SD_OP_RELEASE_VDI,
-            0,
-            0,
-            0,
-            0xab_cdef,
-            SD_LOCK_TYPE_SHARED,
-        );
+        // RELEASE_VDI names its VDI in base_vdi_id (24) and the ACL it was
+        // locked under in acl (36) — the fields sd_req's vdi union puts there.
+        encode_vdi_req(&mut hdr, SD_OP_RELEASE_VDI, 0, 0, 0, 0xab_cdef, 0x4711);
         assert_eq!(hdr[1], SD_OP_RELEASE_VDI);
         assert_eq!(read_u32(&hdr, 24), 0xab_cdef);
         assert_eq!(read_u32(&hdr, 32), 0); // snapid
-        assert_eq!(read_u32(&hdr, 36), SD_LOCK_TYPE_SHARED);
+        assert_eq!(read_u32(&hdr, 36), 0x4711); // acl / lock type
     }
 
     #[test]
     fn inode_header_offsets_match_struct() {
         // The header offsets are computed from the C struct layout; guard the
-        // arithmetic (name[256]+tag[256] + fixed fields ... + __unused[1023]).
+        // arithmetic (name[256]+tag[256] + fixed fields ... + __unused[]).
         assert_eq!(INO_OFF_SNAP_CTIME, 520);
         assert_eq!(INO_OFF_VDI_SIZE, 536);
         assert_eq!(INO_OFF_NR_COPIES, 554);
         assert_eq!(INO_OFF_BLOCK_SIZE_SHIFT, 555);
+        // acl_id (572) + uuid[16] (576) + vdi_flags (592) were carved out of
+        // the leading __unused words; the metadata read must cover them.
+        assert_eq!(INO_OFF_ACL_ID, 572);
+        assert_eq!(INO_OFF_VDI_FLAGS, 592);
+        assert_eq!(SD_INODE_META_SIZE, INO_OFF_VDI_FLAGS + 4);
         // offsetof(sd_inode, data_vdi_id): 572 (btree_counter) + 4092 (__unused).
         assert_eq!(SD_INODE_HEADER_SIZE, 572 + 4 * 1023);
     }

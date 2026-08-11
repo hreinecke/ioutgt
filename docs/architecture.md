@@ -487,23 +487,37 @@ splits into per-object requests; holes read as zeroes, first writes allocate
 objects (persisting the map entry back into the inode) and snapshot parents
 copy-on-write. Requests/responses use raw io_uring send/recv with the header
 held in the awaiting slot-task frame — the same cancellation envelope as the
-file backend's vectored IO. A writable VDI is opened under the cluster's
-shared VDI lock (`LOCK_VDI` with `LOCK_TYPE_SHARED`, sheepdog's multipath
-lock type), held on the connection that took it and released from the
-backend's `Drop` — so a second target may export the same volume, but a
-volume a client holds exclusively (a QEMU guest) is refused at startup
-rather than raced; `?nolock` / `"lock": false` waives it. Sharing assumes
-non-overlapping writers: the cached object map is never invalidated, so two
-targets allocating the same object lose one of the writes. A cluster can
-also be exported
-wholesale:
-`list_vdis` reads the cluster VDI bitmap (`READ_VDIS`) plus each vid's inode
-at startup, and `ioutgt_control::cli` turns that listing into one namespace
-per writable VDI, each namespace taking its VDI's bitmap position (its vid)
-as its NSID so the map is a pure function of the cluster — sparse, large
-NSIDs in exchange for a numbering no other VDI's creation can disturb —
-with UUIDs keyed to the VDI rather than to the exporting subsystem. That is
-the `--backend sheepdog:HOST` form both binaries share.
+file backend's vectored IO.
+
+Access control on the cluster side is the **ACL object**: a VDI carrying
+`SD_VDI_FLAG_ACL`, named back by the volumes it grants access to (their
+inode `acl_id`). Every lookup and lock carries an ACL id, and `sheep`
+resolves a name only within it, so the backend's `open` takes the ACL as
+well as the VDI name. A writable VDI is opened under the cluster's VDI lock
+(`LOCK_VDI`), held on the connection that took it and released from the
+backend's `Drop`; the ACL id doubles as the lock type, so an open under an
+ACL takes the *shared* lock (a second target serving the same ACL may
+export the same volume) while one outside any ACL takes `LOCK_TYPE_NORMAL`
+and stands alone. Either way a volume a client holds incompatibly (a QEMU
+guest, or a different ACL) is refused at startup rather than raced;
+`?nolock` / `"lock": false` waives it. Sharing assumes non-overlapping
+writers: the cached object map is never invalidated, so two targets
+allocating the same object lose one of the writes.
+
+A cluster can also be exported wholesale, and the ACL is what the target
+model hangs off: `list_acls` reads the cluster VDI bitmap (`READ_VDIS`)
+plus each vid's inode at startup, groups the volumes by the ACL their
+inodes name, and `ioutgt_control::cli` turns that into **one subsystem per
+ACL object — NQN = the ACL's name verbatim — holding one namespace per
+writable member**. The port's discovery log therefore lists one record per
+cluster ACL (`build_discovery_log` already emits one per subsystem on the
+port). Each namespace takes its VDI's bitmap position (its vid) as its NSID
+so the map is a pure function of the cluster — sparse, large NSIDs in
+exchange for a numbering no other VDI's creation can disturb — with UUIDs
+keyed to the VDI rather than to the exporting subsystem. Volumes in no ACL
+are exported by no subsystem; the cluster would refuse an ACL-scoped lookup
+of their names anyway. That is the `--backend sheepdog:HOST` form both
+binaries share (`--subsys-nqn` is unused in it).
 
 ## 8. Buffer strategy: staged, measured
 

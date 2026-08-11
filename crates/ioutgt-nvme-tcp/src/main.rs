@@ -78,8 +78,9 @@ struct Args {
     mem_size_mb: u64,
 
     /// Namespace backend: memory, null, a file/blockdev path, or
-    /// sheepdog:HOST[:PORT][/VDI[@TAG]][?nolock] (no VDI: one namespace
-    /// per cluster VDI; ?nolock: skip the shared VDI lock).
+    /// sheepdog:HOST[:PORT][/VDI[@TAG][%ACL]][?nolock] (no VDI: one
+    /// subsystem per cluster ACL object, named by it, holding one
+    /// namespace per VDI in that ACL; ?nolock: skip the VDI lock).
     #[arg(long, default_value = "memory")]
     backend: String,
 
@@ -183,8 +184,11 @@ fn main() -> std::io::Result<()> {
     config.idle_teardown = (args.idle_teardown_secs != 0)
         .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
     config.control_socket = Some(args.control_socket.unwrap_or_else(default_control_socket));
-    config.subsystems[0].namespaces =
-        ioutgt_control::cli::namespaces(&args.backend, args.mem_size_mb)
+    // A cluster-wide sheepdog backend names its own subsystems (one per ACL
+    // object), so this replaces the whole flag-built list, not just its
+    // namespaces.
+    config.subsystems =
+        ioutgt_control::cli::subsystems(&args.backend, args.mem_size_mb, &args.subsys_nqn)
             .map_err(std::io::Error::other)?;
     // The config file owns the target model (listen + subsystems,
     // replacing the flag-built ones); engine flags above still apply.

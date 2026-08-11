@@ -16,7 +16,7 @@ ioutgt --config /etc/nvmet/config.json --io-threads 4
 | `--config <path>` | — | nvmetcli-format JSON config (kernel nvmet's save/restore schema); supplies the listen address and subsystems, replacing `--listen`/`--subsys-nqn`/`--backend`. All other flags still apply |
 | `--listen <addr:port>` | `0.0.0.0:4420` | NVMe/TCP listen address |
 | `--io-threads <n>` | `2` | IO queue threads (admin thread is implicit); also caps the queue count offered to hosts |
-| `--backend <kind>` | `memory` | `memory`, `null`, `sheepdog:HOST[:PORT][/VDI[@TAG]][?nolock]` — one cluster VDI, or one namespace per VDI when no VDI is named (see below) — or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
+| `--backend <kind>` | `memory` | `memory`, `null`, `sheepdog:HOST[:PORT][/VDI[@TAG][%ACL]][?nolock]` — one cluster VDI, or one subsystem per cluster ACL object when no VDI is named (see below) — or a **path** (regular file or block device, opened O_DIRECT with buffered fallback) |
 | `--mem-size-mb <n>` | `64` | Namespace size for `memory`/`null` backends |
 | `--subsys-nqn <nqn>` | `nqn.2026-06.io.ioutgt:test` | Subsystem NQN |
 | `--no-hdgst` / `--no-ddgst` | off | Refuse header/data digest negotiation |
@@ -93,7 +93,7 @@ memory|null` or the runtime control API for those.
 
 ### Sheepdog backend
 
-`--backend sheepdog:HOST[:PORT]/VDI[@TAG]` serves a namespace from a
+`--backend sheepdog:HOST[:PORT]/VDI[@TAG][%ACL]` serves a namespace from a
 named VDI on a [Sheepdog](https://github.com/sheepdog/sheepdog) cluster
 over the plain-TCP gateway protocol (default port `7000`; IPv6 hosts must
 be bracketed, e.g. `sheepdog:[::1]:7000/vol`). The VDI is looked up and
@@ -103,20 +103,46 @@ objects on first write (and copying-on-write from a parent when a `@TAG`
 snapshot is opened — snapshots themselves are read-only). Writes bypass
 the object cache, so they are durable without an explicit flush. Via the
 control API / config schema the same backend is
-`{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null,"lock":true}`.
+`{"type":"sheepdog","addr":"HOST:PORT","vdi":"VDI","tag":null,"acl":null,"lock":true}`.
+
+#### ACLs
+
+Sheepdog's access-control scope is the **ACL object**: an ordinary VDI
+marked as one (`dog acl create <name>`), which the volumes it grants access
+to name back in their inodes (`dog acl add <name> <vdi>`). The cluster
+resolves a VDI's name only for a lookup that carries the ACL its inode
+records — a volume inside an ACL is invisible from outside it, and vice
+versa:
+
+```
+sheepdog 10.0.0.1:7000/vol: VDI is not reachable under ACL 0x0 (os error 13)
+```
+
+So a VDI in an ACL needs `%ACL` on the spec (`"acl": "<name>"` through the
+control API); a VDI in no ACL needs it left off. An ACL name that turns out
+to be an ordinary VDI is refused rather than used as a scope.
+
+Because an ACL is exactly "which volumes belong together, reachable by
+whom", **whole-cluster mode maps one ACL object to one NVM subsystem**
+(below), naming the subsystem after the ACL. Name ACLs accordingly: the
+subsystem NQN is the ACL name verbatim, so `dog acl create
+nqn.2026-06.io.ioutgt:group-a` is the useful spelling. A target warns about
+an ACL whose name is not an NQN — it will export it, but hosts will not
+connect to it.
 
 #### VDI locking
 
-Opening a writable VDI takes the cluster's **shared VDI lock**
-(`SD_OP_LOCK_VDI` with `LOCK_TYPE_SHARED`, the type Sheepdog added for
-iSCSI multipath). Several targets may hold one VDI at once, so a pair of
-them can export the same volume on two paths; a client holding the VDI
-*exclusively* (`LOCK_TYPE_NORMAL`, what QEMU's Sheepdog driver takes) is
-mutually exclusive with all of them, so a volume a guest is already
+Opening a writable VDI takes the cluster's **VDI lock**
+(`SD_OP_LOCK_VDI`), and the ACL the open runs under picks the lock's kind.
+Under an ACL the lock is *shared*: every holder naming that same ACL joins
+the participant list, so a pair of targets serving one ACL can export the
+same volume on two paths. Without an ACL it is `LOCK_TYPE_NORMAL` and
+stands alone — what QEMU's Sheepdog driver takes. The kinds are mutually
+exclusive, and so are two different ACLs, so a volume a guest is already
 running from is refused instead of served into a data race:
 
 ```
-sheepdog 10.0.0.1:7000/vol: VDI is locked exclusively by another client (os error 16)
+sheepdog 10.0.0.1:7000/vol: VDI is locked incompatibly by another client (os error 16)
 ```
 
 The lock is held on the connection that took it for as long as the
@@ -141,22 +167,37 @@ must coexist with an exclusive holder, or any setup that arranges
 exclusion elsewhere:
 
 ```sh
-ioutgt --backend sheepdog:sheep0/vol?nolock       # one VDI, unlocked
+ioutgt --backend sheepdog:sheep0/vol%grp?nolock   # one VDI, unlocked
 ioutgt --backend sheepdog:sheep0?nolock           # whole cluster, unlocked
 ```
 
-The suffix goes last, after any `@TAG`. Through the control API the same
-switch is `"lock": false` in the backend object; it defaults to `true`.
+The suffix goes last, after any `@TAG` and `%ACL`. Through the control API
+the same switch is `"lock": false` in the backend object; it defaults to
+`true`.
 
-#### Whole-cluster mode: one namespace per VDI
+#### Whole-cluster mode: one subsystem per ACL
 
 Leave the VDI off — `--backend sheepdog:HOST[:PORT]` (a trailing `/` is
 also accepted) — and the target enumerates the cluster's VDI bitmap at
-startup and exports **every writable VDI as its own namespace**:
+startup and exports **every ACL object as its own subsystem**, holding one
+namespace per writable VDI in that ACL:
 
 ```sh
-ioutgt --backend sheepdog:sheep0:7000 --subsys-nqn nqn.2026-06.io.ioutgt:sheepdog
-ioutgt list          # nsid → blocks, as the host will see them
+ioutgt --backend sheepdog:sheep0:7000
+ioutgt list          # subsystem → nsid → blocks, as the host will see them
+```
+
+The subsystem NQN is the ACL object's name verbatim, so hosts see the
+cluster's own grouping, and the port's discovery log lists one record per
+ACL — `nvme discover` against this target enumerates the cluster's ACLs.
+`--subsys-nqn` is ignored in this mode; the cluster names the subsystems.
+Volumes in no ACL are exported by nobody (the cluster would not resolve
+their names under one anyway); name such a volume explicitly to serve it.
+A cluster with no ACL objects fails startup rather than serving nothing:
+
+```
+sheepdog sheep0:7000: the cluster has no ACL objects, so there is nothing to
+name a subsystem after — create one with `dog acl create <nqn>` ...
 ```
 
 **A namespace's NSID is its VDI's position in that bitmap** — the vid, the
@@ -169,11 +210,11 @@ is a hash of the VDI name, so `/dev/nvme0n11259375` is typical, and
 Hosts find the namespaces through the Active Namespace List; a host that
 instead scans NSID 1..NN sequentially still works, but slowly.
 
-Every exported VDI is locked, as in single-VDI mode: one VDI held
-exclusively by another client fails the whole startup, naming the volume.
-Snapshots are
+Every exported VDI is locked under its ACL, as in single-VDI mode: one VDI
+held incompatibly by another client fails the whole startup, naming the
+volume. Snapshots are
 skipped (they are frozen, so they could only ever be served
-read-only); name one explicitly with `@TAG` to export it. Each namespace's
+read-only); name one explicitly with `@TAG%ACL` to export it. Each namespace's
 UUID is derived from the VDI's own identity (name + vid) rather than from
 the exporting subsystem, so a host's `/dev/disk/by-id/nvme-uuid.*` link for
 a given VDI is the same through any target serving that cluster.
