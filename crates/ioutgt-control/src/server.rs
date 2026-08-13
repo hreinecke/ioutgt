@@ -223,14 +223,18 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 Ok(backend) => backend,
                 Err(err) => return Response::err(err),
             };
+            // The storage's own identity where it has one (a Sheepdog VDI's
+            // inode uuid), else derived from the resolved subsystem NQN (not
+            // the request's optional selector), unique per subsystem.
+            // Deliberately no uuid in this payload: only the config file can
+            // pin one; runtime adds always take the storage's or the derived.
+            let uuid = backend
+                .uuid()
+                .unwrap_or_else(|| ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid));
             let ns = Namespace {
                 nsid,
                 backend: Arc::new(backend),
-                // Derived from the resolved subsystem NQN (not the request's
-                // optional selector), unique per subsystem. Deliberately no
-                // uuid in this payload: only the config file can pin one;
-                // runtime adds always take the derived identity.
-                uuid: ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid),
+                uuid,
             };
             if let Err(err) = subsys.add_namespace(ns) {
                 return Response::err(err);

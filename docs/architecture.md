@@ -513,8 +513,11 @@ writable member**. The port's discovery log therefore lists one record per
 cluster ACL (`build_discovery_log` already emits one per subsystem on the
 port). Each namespace takes its VDI's bitmap position (its vid) as its NSID
 so the map is a pure function of the cluster — sparse, large NSIDs in
-exchange for a numbering no other VDI's creation can disturb — with UUIDs
-keyed to the VDI rather than to the exporting subsystem. Volumes in no ACL
+exchange for a numbering no other VDI's creation can disturb — and reports
+the VDI's inode `uuid[16]`, the cluster's own identity for the volume, as
+the namespace UUID (`AnyBackend::uuid`, consulted wherever a namespace is
+built: config file, CLI spec, `ADD_NAMESPACE`, ahead of the derivation from
+NQN + NSID). Volumes in no ACL
 are exported by no subsystem; the cluster would refuse an ACL-scoped lookup
 of their names anyway. That is the `--backend sheepdog:HOST` form both
 binaries share (`--subsys-nqn` is unused in it).

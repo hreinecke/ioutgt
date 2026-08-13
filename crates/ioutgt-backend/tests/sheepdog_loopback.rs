@@ -70,6 +70,9 @@ struct Vdi {
     acl_id: u32,
     /// `SD_VDI_FLAG_ACL` marks the VDI as an ACL object itself.
     vdi_flags: u32,
+    /// Leave the inode's `uuid[16]` all-zero, as a `sheep` predating the
+    /// field wrote it.
+    no_uuid: bool,
     data_vdi_id: Vec<u32>,
 }
 
@@ -85,8 +88,28 @@ impl Vdi {
             nr_copies: 1,
             acl_id: SD_ACL_NONE,
             vdi_flags: 0,
+            no_uuid: false,
             data_vdi_id: vec![0u32; nr_objects],
         }
+    }
+
+    /// An inode from a `sheep` that never wrote `uuid[16]`.
+    fn no_uuid(mut self) -> Vdi {
+        self.no_uuid = true;
+        self
+    }
+
+    /// The `uuid[16]` this VDI was created with: one per (name, tag), and
+    /// never all-zero, so it is always distinguishable from "unset".
+    fn uuid(&self) -> Option<[u8; 16]> {
+        if self.no_uuid {
+            return None;
+        }
+        let mut uuid = [0x5du8; 16];
+        for (i, b) in format!("{}@{}", self.name, self.tag).bytes().enumerate() {
+            uuid[i % 16] ^= b.rotate_left(i as u32 % 8);
+        }
+        Some(uuid)
     }
 
     fn snapshot(mut self, tag: &str) -> Vdi {
@@ -121,6 +144,9 @@ impl Vdi {
         b[554] = self.nr_copies;
         b[555] = self.block_size_shift;
         b[572..576].copy_from_slice(&self.acl_id.to_le_bytes());
+        if let Some(uuid) = self.uuid() {
+            b[576..592].copy_from_slice(&uuid);
+        }
         b[592..596].copy_from_slice(&self.vdi_flags.to_le_bytes());
         for (i, v) in self.data_vdi_id.iter().enumerate() {
             let o = SD_INODE_HEADER_SIZE as usize + i * 4;
@@ -606,6 +632,36 @@ fn lock_released_when_the_open_fails_after_taking_it() {
     assert!(locked(&store).is_empty(), "a failed open leaves no lock");
 }
 
+/// The VDI's identity comes from the cluster: the `uuid[16]` `sheep` wrote
+/// into the inode at creation, which a target reports as the namespace UUID
+/// instead of inventing one.
+#[test]
+fn the_inode_uuid_is_read_back_as_the_vdi_identity() {
+    let store = fresh_store(16, 256 * 1024);
+    store
+        .lock()
+        .unwrap()
+        .vdis
+        .insert(0x00_0050, Vdi::new("legacy", 1 << 20, 22).no_uuid());
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let expected = store.lock().unwrap().vdis[&TEST_VID].uuid();
+    assert!(expected.is_some(), "the fixture wrote a uuid");
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, false).unwrap();
+    assert_eq!(be.uuid(), expected, "open reports the inode's uuid");
+
+    // An inode from a sheep predating the field carries an all-zero uuid,
+    // which is "unset" rather than an identity to hand a host.
+    let legacy = SheepdogBackend::open(addr, "legacy", None, None, false).unwrap();
+    assert_eq!(legacy.uuid(), None);
+
+    // The enumeration path reads the same field, so a target mapping the
+    // cluster and one opening a single VDI agree on every volume's identity.
+    let vdis = list_vdis(addr).unwrap();
+    let seen: Vec<_> = vdis.iter().map(|v| (v.name.as_str(), v.uuid)).collect();
+    assert_eq!(seen, vec![("legacy", None), ("testvdi", expected)]);
+}
+
 /// A cluster of loose volumes plus one snapshot, deliberately in neither vid
 /// nor name order, and one ACL object holding two of them.
 fn enumeration_store() -> Arc<Mutex<Store>> {
@@ -664,6 +720,13 @@ fn cluster_enumeration_lists_every_vdi() {
         vdis.iter().filter(|v| v.snapshot).count() == 2,
         "both snapshots flagged"
     );
+    // Each VDI carries its own cluster-assigned uuid — a snapshot's differs
+    // from its head's, so the two never collide as namespace identities.
+    let uuids: Vec<_> = vdis.iter().map(|v| v.uuid.expect(&v.name)).collect();
+    let mut unique = uuids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), uuids.len(), "one identity per VDI");
 
     // Every enumerated head is openable under the ACL the listing reports, and
     // reports the size the listing reports.

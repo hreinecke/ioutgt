@@ -624,9 +624,11 @@ fn build_port(
             {
                 m.set_write_delay_us(config.mem_write_delay_us);
             }
-            // Configured identity wins; otherwise derive from (NQN, nsid).
+            // Configured identity wins, then the storage's own (a Sheepdog
+            // VDI's inode uuid); otherwise derive from (NQN, nsid).
             let uuid = ns
                 .uuid
+                .or_else(|| backend.uuid())
                 .unwrap_or_else(|| ioutgt_core::subsystem::namespace_uuid(&spec.nqn, ns.nsid));
             namespaces.insert(
                 ns.nsid,

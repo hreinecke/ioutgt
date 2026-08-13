@@ -4,7 +4,7 @@
 //! VDI bitmap and inode reads it issues are plain blocking TCP (no io_uring,
 //! no queue threads), so a ~60-line fake gateway exercises it end to end — one
 //! subsystem per ACL object named by the ACL, NSID assignment, snapshot
-//! filtering, and VDI-derived namespace UUIDs.
+//! filtering, and namespace UUIDs taken from the VDIs' inodes.
 
 // Test-only length arithmetic on a 64-bit host; the payloads are kilobytes.
 #![allow(clippy::cast_possible_truncation)]
@@ -36,6 +36,9 @@ struct Inode {
     snapshot: bool,
     acl_id: u32,
     is_acl: bool,
+    /// The inode carries a `uuid[16]`; false for one written by a `sheep`
+    /// predating the field (all-zero, i.e. no identity of its own).
+    has_uuid: bool,
 }
 
 /// A volume in ACL `acl_id`.
@@ -47,6 +50,15 @@ const fn vol(vid: u32, name: &'static str, size: u64, snapshot: bool, acl_id: u3
         snapshot,
         acl_id,
         is_acl: false,
+        has_uuid: true,
+    }
+}
+
+/// A volume whose inode predates `uuid[16]`.
+const fn legacy_vol(vid: u32, name: &'static str, size: u64, acl_id: u32) -> Inode {
+    Inode {
+        has_uuid: false,
+        ..vol(vid, name, size, false, acl_id)
     }
 }
 
@@ -59,6 +71,7 @@ const fn acl(vid: u32, name: &'static str) -> Inode {
         snapshot: false,
         acl_id: 0,
         is_acl: true,
+        has_uuid: true,
     }
 }
 
@@ -69,10 +82,19 @@ const CLUSTER: &[Inode] = &[
     vol(0x21, "vol-a", 32 << 20, false, ACL_A),
     vol(0x22, "vol-a", 32 << 20, true, ACL_A), // a snapshot of vol-a
     vol(0x23, "vol-c", 16 << 20, false, ACL_B),
-    vol(0x24, "loose", 8 << 20, false, 0), // in no ACL: exported by nobody
+    legacy_vol(0x25, "vol-d", 8 << 20, ACL_B), // no inode uuid to export
+    vol(0x24, "loose", 8 << 20, false, 0),     // in no ACL: exported by nobody
     acl(ACL_A, NQN_A),
     acl(ACL_B, NQN_B),
 ];
+
+/// The `uuid[16]` the fake cluster generated for `vid` when the VDI was
+/// created: one per VDI and never all-zero.
+fn fixture_uuid(vid: u32) -> [u8; 16] {
+    let mut uuid = [0xa5u8; 16];
+    uuid[..4].copy_from_slice(&vid.to_be_bytes());
+    uuid
+}
 
 fn inode_bytes(inode: &Inode) -> Vec<u8> {
     let mut b = vec![0u8; SD_INODE_HEADER_SIZE];
@@ -85,6 +107,9 @@ fn inode_bytes(inode: &Inode) -> Vec<u8> {
     b[554] = 1; // nr_copies
     b[555] = 22; // 4 MiB objects
     b[572..576].copy_from_slice(&inode.acl_id.to_le_bytes());
+    if inode.has_uuid {
+        b[576..592].copy_from_slice(&fixture_uuid(inode.vid));
+    }
     let flags = if inode.is_acl { SD_VDI_FLAG_ACL } else { 0 };
     b[592..596].copy_from_slice(&flags.to_le_bytes());
     b
@@ -190,7 +215,10 @@ fn cluster_spec_expands_to_one_subsystem_per_acl() {
                 NQN_A,
                 vec![(0x21, "vol-a".to_string()), (0x20, "vol-b".to_string())]
             ),
-            (NQN_B, vec![(0x23, "vol-c".to_string())]),
+            (
+                NQN_B,
+                vec![(0x23, "vol-c".to_string()), (0x25, "vol-d".to_string())]
+            ),
         ]
     );
 
@@ -198,18 +226,23 @@ fn cluster_spec_expands_to_one_subsystem_per_acl() {
     assert_eq!(subsystems[0].serial, format!("SHEEPDOG{ACL_A:06X}"));
     assert_ne!(subsystems[0].serial, subsystems[1].serial);
 
-    // Identity is keyed to the VDI (name + vid) rather than to the exporting
-    // subsystem, so one volume looks the same through any target.
-    let uuid_of = |name: &str, vid: u32| {
-        Some(ioutgt_core::subsystem::namespace_uuid(
-            &format!("sheepdog:{name}"),
-            vid,
-        ))
-    };
+    // Identity comes from the cluster — the VDI's own inode uuid — not from
+    // the exporting subsystem, so one volume looks the same through any
+    // target, and through QEMU or `dog vdi list --json` for that matter.
     let ns = &subsystems[0].namespaces;
-    assert_eq!(ns[0].uuid, uuid_of("vol-a", 0x21));
-    assert_eq!(ns[1].uuid, uuid_of("vol-b", 0x20));
+    assert_eq!(ns[0].uuid, Some(fixture_uuid(0x21))); // vol-a
+    assert_eq!(ns[1].uuid, Some(fixture_uuid(0x20))); // vol-b
     assert_ne!(ns[0].uuid, ns[1].uuid);
+
+    // An inode with no uuid of its own falls back to one derived from the
+    // VDI's name and vid, which are just as cluster-wide.
+    assert_eq!(
+        subsystems[1].namespaces[1].uuid, // vol-d
+        Some(ioutgt_core::subsystem::namespace_uuid(
+            "sheepdog:vol-d",
+            0x25
+        )),
+    );
 }
 
 /// A single-VDI spec still builds exactly one subsystem, the flag-named one,

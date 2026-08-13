@@ -215,9 +215,15 @@ held incompatibly by another client fails the whole startup, naming the
 volume. Snapshots are
 skipped (they are frozen, so they could only ever be served
 read-only); name one explicitly with `@TAG%ACL` to export it. Each namespace's
-UUID is derived from the VDI's own identity (name + vid) rather than from
-the exporting subsystem, so a host's `/dev/disk/by-id/nvme-uuid.*` link for
-a given VDI is the same through any target serving that cluster.
+UUID is the VDI's own — the `uuid[16]` `sheep` generated into its inode when
+the volume was created, the one `dog vdi list --json` reports — rather than
+anything derived from the exporting subsystem, so a host's
+`/dev/disk/by-id/nvme-uuid.*` link for a given VDI is the same through any
+target serving that cluster. (A VDI whose inode predates that field carries
+an all-zero uuid; those fall back to a UUID derived from the VDI's name and
+vid, which are equally cluster-wide.) The same applies to a single-VDI
+export and to a `sheepdog` namespace in a config file: unless the file pins
+`device.uuid` explicitly, the namespace reports the VDI's inode uuid.
 
 The mapping is a startup snapshot: VDIs created afterwards need a restart,
 or an `ADD_NAMESPACE` control request naming the new VDI. Each namespace

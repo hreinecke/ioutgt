@@ -87,9 +87,10 @@ pub fn subsystems(spec: &str, mem_size_mb: u64, nqn: &str) -> Result<Vec<Subsyst
 ///
 /// Snapshots are skipped: they are frozen and would only ever be servable
 /// read-only — name one explicitly (`sheepdog:HOST/VDI@TAG%ACL`) to export
-/// it. Namespace UUIDs are derived from the VDI's own identity (name + vid)
-/// rather than from the subsystem NQN, so the volume keeps one host-visible
-/// identity (`/dev/disk/by-id`) no matter which subsystem exports it.
+/// it. A namespace's UUID is the VDI's own — the `uuid[16]` `sheep` put in
+/// its inode when the volume was created — rather than anything derived from
+/// the subsystem NQN, so the volume keeps one host-visible identity
+/// (`/dev/disk/by-id`) no matter which subsystem or which target exports it.
 ///
 /// `lock` (on unless the spec said `?nolock`) reaches every exported VDI:
 /// each is opened under the cluster's VDI lock, shared with the other targets
@@ -158,10 +159,15 @@ fn acl_subsystem(addr: &str, acl: &AclInfo, lock: bool) -> SubsystemConfig {
                     acl: Some(acl.name.clone()),
                     lock,
                 },
-                uuid: Some(ioutgt_core::subsystem::namespace_uuid(
-                    &format!("sheepdog:{}", vdi.name),
-                    vdi.vid,
-                )),
+                // The cluster's own UUID for the volume, and — for an inode
+                // written by a sheep predating the field — one derived from
+                // the VDI's name and vid, which are equally cluster-wide.
+                uuid: Some(vdi.uuid.unwrap_or_else(|| {
+                    ioutgt_core::subsystem::namespace_uuid(
+                        &format!("sheepdog:{}", vdi.name),
+                        vdi.vid,
+                    )
+                })),
             }
         })
         .collect();

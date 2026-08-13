@@ -32,6 +32,23 @@ pub enum AnyBackend {
     Sheepdog(SheepdogBackend),
 }
 
+impl AnyBackend {
+    /// The storage's own identity for this volume, to report as the
+    /// namespace UUID (Identify CNS 03h) ahead of any derived one.
+    ///
+    /// Only a Sheepdog VDI has one — the `uuid[16]` the cluster wrote into
+    /// its inode at creation, which outlives every target exporting it (see
+    /// [`SheepdogBackend::uuid`]). The local backends carry no identity a
+    /// second target would agree on, so they leave it to the caller's
+    /// derivation.
+    pub fn uuid(&self) -> Option<[u8; 16]> {
+        match self {
+            AnyBackend::Sheepdog(b) => b.uuid(),
+            AnyBackend::Null(_) | AnyBackend::Memory(_) | AnyBackend::File(_) => None,
+        }
+    }
+}
+
 impl Backend for AnyBackend {
     fn block_shift(&self) -> u8 {
         match self {

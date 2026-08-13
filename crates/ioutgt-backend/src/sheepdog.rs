@@ -23,6 +23,17 @@
 //! offset `off` maps to `idx = off / object_size`, `in_obj = off % object_size`,
 //! and the object id `oid = (vid << 32) | idx`.
 //!
+//! # Identity
+//!
+//! `sheep` generates a `uuid[16]` into every inode header when the VDI is
+//! created, and `dog vdi list --json` reports it: the cluster's own identity
+//! for the volume, outliving any target that exports it. [`VdiInfo::uuid`] and
+//! [`SheepdogBackend::uuid`] hand it up so a target can report it verbatim as
+//! the namespace UUID (Identify CNS 03h) — one volume then looks like one
+//! namespace (`/dev/disk/by-id`) through every target fronting the cluster.
+//! An inode written by an older `sheep` has the field all-zero (the field was
+//! carved out of `__unused[]`), reported as `None`.
+//!
 //! # ACLs
 //!
 //! An *ACL object* is an ordinary VDI carrying `SD_VDI_FLAG_ACL` in its inode
@@ -162,7 +173,11 @@ const INO_OFF_VDI_SIZE: usize = 536;
 const INO_OFF_NR_COPIES: usize = 554;
 const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
 const INO_OFF_ACL_ID: usize = 572;
+const INO_OFF_UUID: usize = 576;
 const INO_OFF_VDI_FLAGS: usize = 592;
+
+/// Bytes of the inode's `uuid[16]`.
+const SD_UUID_LEN: usize = 16;
 
 /// NVMe logical block shift (512 B), matching the other backends' static path.
 const BLOCK_SHIFT: u8 = 9;
@@ -379,6 +394,8 @@ pub struct SheepdogBackend {
     /// ACL): the scope its name was looked up in and its lock taken under,
     /// so `RELEASE_VDI` can name the same one back.
     acl: u32,
+    /// The inode's `uuid[16]`, or `None` when the cluster never wrote one.
+    uuid: Option<[u8; SD_UUID_LEN]>,
     /// Data-object size in bytes (`1 << inode.block_size_shift`).
     object_size: u32,
     /// Replication factor to request on object writes.
@@ -502,6 +519,7 @@ impl SheepdogBackend {
             addr,
             vid,
             acl,
+            uuid: read_uuid(&header),
             object_size,
             nr_copies,
             nr_blocks: vdi_size >> BLOCK_SHIFT,
@@ -509,6 +527,13 @@ impl SheepdogBackend {
             data_map,
             lock_conn: None,
         })
+    }
+
+    /// The VDI's cluster-assigned UUID (inode `uuid[16]`), for a target to
+    /// report as this namespace's NVMe UUID. `None` when the inode carries
+    /// none — an all-zero field, as written by a `sheep` predating it.
+    pub fn uuid(&self) -> Option<[u8; SD_UUID_LEN]> {
+        self.uuid
     }
 
     /// Issue one object request on a pooled connection, releasing the
@@ -851,6 +876,9 @@ pub struct VdiInfo {
     pub size: u64,
     /// True for a snapshot: a frozen VDI, servable only read-only.
     pub snapshot: bool,
+    /// The VDI's cluster-assigned UUID (inode `uuid[16]`) — the identity to
+    /// export as the namespace UUID. `None` for an inode carrying none.
+    pub uuid: Option<[u8; SD_UUID_LEN]>,
     /// The vid of the ACL object this VDI belongs to (inode `acl_id`), `0`
     /// for a VDI in no ACL. Every lookup of this VDI's name must carry it.
     pub acl: u32,
@@ -980,6 +1008,7 @@ fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
                     vid,
                     size,
                     snapshot: read_u64(&inode, INO_OFF_SNAP_CTIME) != 0,
+                    uuid: read_uuid(&inode),
                     acl: read_u32(&inode, INO_OFF_ACL_ID),
                 },
                 is_acl: read_u32(&inode, INO_OFF_VDI_FLAGS) & SD_VDI_FLAG_ACL != 0,
@@ -999,6 +1028,16 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 
 fn read_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().expect("8 bytes"))
+}
+
+/// Decode the inode header's `uuid[16]`, `None` for the all-zero value —
+/// `uuid_is_null()`, the same "unset" test `dog vdi list` applies before
+/// reporting the field.
+fn read_uuid(inode: &[u8]) -> Option<[u8; SD_UUID_LEN]> {
+    let uuid: [u8; SD_UUID_LEN] = inode[INO_OFF_UUID..INO_OFF_UUID + SD_UUID_LEN]
+        .try_into()
+        .expect("16 bytes");
+    (uuid != [0u8; SD_UUID_LEN]).then_some(uuid)
 }
 
 /// Decode a fixed-width, NUL-padded inode string field.
@@ -1254,6 +1293,20 @@ mod tests {
     }
 
     #[test]
+    fn uuid_is_none_only_when_the_inode_carries_none() {
+        let mut inode = vec![0u8; SD_INODE_META_SIZE];
+        assert_eq!(read_uuid(&inode), None, "all-zero uuid[16] is unset");
+        // A neighbouring field set does not make one appear...
+        inode[INO_OFF_ACL_ID..INO_OFF_ACL_ID + 4].copy_from_slice(&0x4711u32.to_le_bytes());
+        inode[INO_OFF_VDI_FLAGS..INO_OFF_VDI_FLAGS + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(read_uuid(&inode), None);
+        // ...and a real one is read back verbatim, in inode byte order.
+        let uuid: [u8; SD_UUID_LEN] = std::array::from_fn(|i| i as u8 + 1);
+        inode[INO_OFF_UUID..INO_OFF_UUID + SD_UUID_LEN].copy_from_slice(&uuid);
+        assert_eq!(read_uuid(&inode), Some(uuid));
+    }
+
+    #[test]
     fn obj_req_layout() {
         let mut hdr = [0u8; SD_HDR_SIZE];
         encode_obj_req(
@@ -1314,7 +1367,8 @@ mod tests {
         // acl_id (572) + uuid[16] (576) + vdi_flags (592) were carved out of
         // the leading __unused words; the metadata read must cover them.
         assert_eq!(INO_OFF_ACL_ID, 572);
-        assert_eq!(INO_OFF_VDI_FLAGS, 592);
+        assert_eq!(INO_OFF_UUID, INO_OFF_ACL_ID + 4);
+        assert_eq!(INO_OFF_VDI_FLAGS, INO_OFF_UUID + SD_UUID_LEN);
         assert_eq!(SD_INODE_META_SIZE, INO_OFF_VDI_FLAGS + 4);
         // offsetof(sd_inode, data_vdi_id): 572 (btree_counter) + 4092 (__unused).
         assert_eq!(SD_INODE_HEADER_SIZE, 572 + 4 * 1023);
