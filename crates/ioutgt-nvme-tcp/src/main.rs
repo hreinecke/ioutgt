@@ -195,10 +195,12 @@ fn main() -> std::io::Result<()> {
     if let Some(path) = &args.config {
         config.apply_file(path, ioutgt_harness::TransportType::Tcp)?;
     }
+    // Before the backends open: a Sheepdog namespace takes its VDI lock
+    // inside spawn_target, and a Ctrl-C landing there must still release it.
+    ioutgt_harness::install_shutdown_handler()?;
     let addr = ioutgt_nvme_tcp::spawn_target(config)?;
     ioutgt_harness::announce_listening("ioutgt", addr);
-    // The target runs on its own threads; park the main thread.
-    loop {
-        std::thread::park();
-    }
+    // The target runs on its own threads; park the main thread until Ctrl-C
+    // (or SIGTERM), then release what the backends hold on the way out.
+    ioutgt_harness::wait_for_shutdown()
 }

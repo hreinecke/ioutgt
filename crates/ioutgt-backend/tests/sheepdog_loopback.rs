@@ -537,6 +537,40 @@ fn shared_lock_stacks_across_targets_and_unwinds_on_drop() {
     assert!(locked(&store).is_empty(), "the last drop freed the VDI");
 }
 
+/// The shutdown path: a target asked to stop releases its VDI lock while the
+/// backend is still alive (its queue threads hold `Arc`s to it, so no drop is
+/// coming), and the later drop must not release it a second time.
+#[test]
+fn an_explicit_release_hands_the_lock_back_before_drop() {
+    let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    assert_eq!(locked(&store), vec![TEST_VID], "the open took the lock");
+
+    be.release_lock();
+    assert!(locked(&store).is_empty(), "shutdown freed the VDI");
+
+    // Idempotent: neither a repeat call nor the drop that follows it names
+    // the lock again — the cluster would refuse a release it does not hold,
+    // and a *new* holder's lock must survive both.
+    be.release_lock();
+    let next = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    drop(be);
+    assert_eq!(
+        locked(&store),
+        vec![TEST_VID],
+        "the released backend's drop left the next holder alone"
+    );
+    drop(next);
+    assert!(locked(&store).is_empty());
+
+    // A backend that never locked (`?nolock`) shuts down just as quietly.
+    let waived = SheepdogBackend::open(addr, "testvdi", None, None, false).unwrap();
+    waived.release_lock();
+    assert!(locked(&store).is_empty());
+}
+
 /// A VDI in no ACL locks exclusively, so a second target is kept out — the
 /// counterpart of the shared case above.
 #[test]

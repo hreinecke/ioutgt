@@ -57,8 +57,13 @@ pub struct QueueConn<B> {
 /// Drive one queue connection to completion (EOF, error, or term).
 ///
 /// `on_ctx` runs once the dispatch context exists — the binary's admin
-/// thread uses it to register live controllers for AER nudges.
-pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<ConnCtx<B>>)) {
+/// thread uses it to register live controllers for AER nudges — and is
+/// additionally handed this connection's stop hook ([`stop_hook`]) for the
+/// shutdown handshake.
+pub async fn run_queue<B: Backend>(
+    conn: QueueConn<B>,
+    on_ctx: impl FnOnce(&Rc<ConnCtx<B>>, Box<dyn Fn()>),
+) {
     // Admin: a pool sized so its (synchronous) data leases never block.
     // IO: a shared pool deliberately smaller than depth × MDTS — slots
     // lease on demand and park / fall back under pressure.
@@ -103,7 +108,10 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
             ),
         }
     }
-    let fd = conn.fd.as_raw_fd();
+    // Shared so the stop hook can hold a `Weak` on it; nothing else clones it,
+    // so the socket still closes exactly when this function returns.
+    let owned_fd = Rc::new(conn.fd);
+    let fd = owned_fd.as_raw_fd();
     let peer = peer_of(fd);
     let ctx = if conn.qid == 0 {
         ConnCtx::new_admin(
@@ -123,7 +131,7 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
         )
     };
 
-    on_ctx(&ctx);
+    on_ctx(&ctx, stop_hook(&owned_fd));
 
     let mut tasks = spawn_slot_tasks(&queue, &ctx);
     if let Role::Admin(_) = &ctx.role {
@@ -164,8 +172,28 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     }
 
     teardown(&queue, &ctx, fd, send_task, tasks).await;
-    // conn.fd drops here, closing the socket; in-flight ops orphan and
+    // owned_fd drops here, closing the socket; in-flight ops orphan and
     // drain through the reactor.
+}
+
+/// This connection's stop hook: shut the socket down both ways, which the
+/// recv loop sees as EOF and answers with the normal teardown — the same
+/// nudge the keep-alive watchdog and the dead-send-path guard use. Safe to
+/// call more than once (`shutdown` on an already-shut socket just fails).
+///
+/// Holds a `Weak`, not the raw fd number: the queue thread keeps the hook
+/// until it prunes the entry, which can outlast the connection, and by then
+/// that number may belong to a *different* socket. A `Weak` that no longer
+/// upgrades is exactly "this connection is already gone".
+fn stop_hook(fd: &Rc<OwnedFd>) -> Box<dyn Fn()> {
+    let fd = Rc::downgrade(fd);
+    Box::new(move || {
+        if let Some(fd) = fd.upgrade() {
+            // SAFETY: the upgraded `Rc` keeps the fd open across the call,
+            // and shutdown only signals — it never frees.
+            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+    })
 }
 
 /// One persistent task per command slot: each waits for its tag's next

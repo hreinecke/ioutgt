@@ -44,6 +44,16 @@ pub struct ConnHandles {
     /// connections without async events, e.g. IO queues — those never
     /// reach the admin thread's nudge list anyway).
     pub ns_changed: NsNudge,
+    /// Ask this connection to wind down: unwedge whatever its `run_queue`
+    /// is parked on (NVMe/TCP: `shutdown(2)` on the socket; NVMe/RDMA: the
+    /// connection's stop `Notify`) so it runs its normal teardown — drain
+    /// executing slots, join the send path, free the queue — and returns.
+    ///
+    /// The shutdown handshake ([`shutdown`]) fires this on every connection
+    /// a queue thread is running, then waits for the tasks to finish. It
+    /// must be safe to call at any time, including after the connection is
+    /// already gone (then it does nothing).
+    pub stop: Box<dyn Fn()>,
 }
 
 /// A connection's namespace-change nudge: a side-effect-free liveness
@@ -281,6 +291,229 @@ pub fn announce_listening(name: &str, addr: SocketAddr) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/// Every port this process built ([`build_port`]), kept for the shutdown
+/// walk. Nothing here is dropped on the way out — the queue threads own
+/// `Arc`s to the same namespaces for the process's lifetime — so state a
+/// backend holds *outside* the process (a Sheepdog VDI's cluster lock) has
+/// to be handed back explicitly instead. Control plane only: appended at
+/// startup, drained once at exit.
+static LIVE_PORTS: Mutex<Vec<Arc<PortConfig<AnyBackend>>>> = Mutex::new(Vec::new());
+
+/// One entry per control thread this process started ([`control_loop`]): send
+/// it a reply channel to ask that target to stop serving IO, and it answers
+/// once its queue threads have quiesced. The control thread returns right
+/// after — a target that has been asked to stop stays stopped.
+static QUIESCE_REQS: Mutex<Vec<QuiesceHandle>> = Mutex::new(Vec::new());
+
+/// The control thread's end of the quiesce handshake. Two channel flavours
+/// because the two ends live in different worlds: the request goes into the
+/// control thread's `select!` (Tokio), the reply comes back to a plain thread
+/// blocking in [`shutdown`] (std).
+type QuiesceHandle = tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::SyncSender<()>>;
+
+/// Read end of the self-pipe [`wait_for_shutdown`] sleeps on, `-1` before the
+/// handler is installed.
+static SHUTDOWN_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Write end of that pipe: the only state the signal handler touches, so it
+/// is a plain atomic (nothing else would be async-signal-safe).
+static SHUTDOWN_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// SIGINT/SIGTERM handler: wake [`wait_for_shutdown`] with the signal number.
+/// A relaxed atomic load and a one-byte `write` are async-signal-safe; the
+/// real work happens back on the waiting thread.
+extern "C" fn on_shutdown_signal(sig: libc::c_int) {
+    // SAFETY: `__errno_location` yields this thread's errno slot, which the
+    // `write` below may clobber — a handler must leave it as it found it.
+    let errno = unsafe { libc::__errno_location() };
+    // SAFETY: as above; the pointer is valid for the handler's lifetime.
+    let saved = unsafe { *errno };
+    let byte = u8::try_from(sig).unwrap_or(0);
+    // SAFETY: the fd is our own pipe's write end (or -1, which `write` just
+    // rejects with EBADF), and `byte` is a live one-byte local. A full pipe
+    // (a second signal, nobody reading yet) fails with EAGAIN — the pending
+    // byte already says what this one would.
+    unsafe {
+        libc::write(
+            SHUTDOWN_WRITE.load(Ordering::Relaxed),
+            std::ptr::from_ref(&byte).cast(),
+            1,
+        )
+    };
+    // SAFETY: as above.
+    unsafe { *errno = saved };
+}
+
+/// Catch SIGINT (Ctrl-C) and SIGTERM instead of dying on them, so
+/// [`wait_for_shutdown`] can release what the backends hold before exit.
+///
+/// Call it early in `main`: a target opening a Sheepdog cluster takes its VDI
+/// locks inside [`spawn`], and a Ctrl-C arriving mid-open would otherwise
+/// leave them behind. Idempotent, and [`wait_for_shutdown`] installs the
+/// handler itself if the binary did not.
+///
+/// A *second* signal is not caught (`SA_RESETHAND`): it takes the default
+/// action, so a shutdown wedged on an unresponsive cluster stays killable.
+pub fn install_shutdown_handler() -> io::Result<()> {
+    if SHUTDOWN_WRITE.load(Ordering::Relaxed) >= 0 {
+        return Ok(());
+    }
+    let mut fds = [-1 as libc::c_int; 2];
+    // SAFETY: `fds` is a live two-element array, exactly what pipe2 fills.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    SHUTDOWN_READ.store(fds[0], Ordering::Relaxed);
+    // Published before the handler can run, so a signal never finds -1.
+    SHUTDOWN_WRITE.store(fds[1], Ordering::Relaxed);
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: an all-zero `sigaction` is its documented empty state; the
+        // fields that matter are filled in below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_shutdown_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
+        // SAFETY: clears the mask of a live, owned `sigaction`.
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        // SAFETY: `action` is live for the call, which reads it and returns;
+        // a null third argument means "old action not wanted".
+        if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Park the calling thread until this process is asked to stop — SIGINT
+/// (Ctrl-C) or SIGTERM (what a forked port process gets when its parent
+/// dies) — then [`shutdown`] the targets and return, for the caller to exit.
+///
+/// Every connection is dropped on the way out, so a host sees what any target
+/// restart gives it; the difference is that IO stops *before* anything the
+/// backends hold is handed back, rather than racing it.
+pub fn wait_for_shutdown() -> io::Result<()> {
+    install_shutdown_handler()?;
+    let fd = SHUTDOWN_READ.load(Ordering::Relaxed);
+    let mut sig = 0u8;
+    loop {
+        // SAFETY: one byte into a live local, from our own pipe's read end.
+        let n = unsafe { libc::read(fd, std::ptr::from_mut(&mut sig).cast(), 1) };
+        if n == 1 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        // The handler runs on whichever thread takes the signal, so this read
+        // is itself interruptible; EOF is impossible while we hold the write
+        // end.
+        if n < 0 && err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+    let name = match libc::c_int::from(sig) {
+        libc::SIGINT => "SIGINT",
+        libc::SIGTERM => "SIGTERM",
+        _ => "signal",
+    };
+    info!(signal = name, "shutting down");
+    let released = shutdown();
+    info!(namespaces = released, "backends released");
+    Ok(())
+}
+
+/// Stop this process's targets and hand back the external state their
+/// backends hold — Sheepdog VDI locks — so the next opener is not locked out.
+/// Returns the number of namespaces walked.
+///
+/// Two phases, in this order:
+///
+/// 1. **Stop IO.** Every target's control thread stops accepting, winds its
+///    connections down, and waits for its queue threads to report that no
+///    command is executing and no backend op is in flight.
+/// 2. **Release.** With nothing left to issue IO, walk the namespaces and let
+///    each backend give up what it holds outside the process.
+///
+/// Doing it the other way round would let an in-flight write land on a VDI
+/// this process no longer holds the lock for. Neither phase can hang: a
+/// target that does not answer in [`TARGET_QUIESCE_BUDGET`] is reported and
+/// the release goes ahead regardless — better a racy release than none.
+///
+/// Idempotent: both registries are taken, so a second call (or one from a
+/// binary with no targets) finds nothing to do. A stopped target does not
+/// come back. Belongs immediately before process exit; [`wait_for_shutdown`]
+/// pairs the two.
+pub fn shutdown() -> usize {
+    quiesce_targets();
+    let ports = std::mem::take(&mut *live_ports());
+    let mut walked = 0;
+    for port in ports {
+        for subsys in port.subsystems.values() {
+            for ns in subsys.snapshot().values() {
+                ns.backend.shutdown();
+                walked += 1;
+            }
+        }
+    }
+    walked
+}
+
+/// How long [`shutdown`] waits for all targets to stop serving IO. The
+/// outermost of the three nested budgets: over what a control thread allows
+/// its pool ([`POOL_QUIESCE_BUDGET`]), which is over what a queue thread
+/// allows its connections ([`CONN_DRAIN_BUDGET_MS`]).
+const TARGET_QUIESCE_BUDGET: Duration = Duration::from_secs(12);
+
+/// Phase one of [`shutdown`]: ask every target to stop serving IO and wait
+/// for them all to confirm. The requests go out first so the targets quiesce
+/// in parallel, and the whole wait shares one deadline.
+fn quiesce_targets() {
+    let handles = std::mem::take(&mut *quiesce_reqs());
+    let mut replies = Vec::with_capacity(handles.len());
+    for handle in handles {
+        // Rendezvous depth 1: the control thread must not block handing the
+        // reply over if this side has already given up on it.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        // An `Err` is a control thread that already returned (bind failure,
+        // an earlier stop) — nothing left to quiesce.
+        if handle.send(tx).is_ok() {
+            replies.push(rx);
+        }
+    }
+    let deadline = Instant::now() + TARGET_QUIESCE_BUDGET;
+    let mut wedged = 0;
+    for rx in replies {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if rx.recv_timeout(left).is_err() {
+            wedged += 1;
+        }
+    }
+    if wedged > 0 {
+        warn!(
+            targets = wedged,
+            "did not stop serving IO before the release"
+        );
+    }
+}
+
+/// [`LIVE_PORTS`], recovered from poisoning: a shutdown path that skipped the
+/// release because some unrelated thread panicked would be the worse outcome.
+fn live_ports() -> std::sync::MutexGuard<'static, Vec<Arc<PortConfig<AnyBackend>>>> {
+    LIVE_PORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// [`QUIESCE_REQS`], recovered from poisoning — for the same reason
+/// [`live_ports`] is.
+fn quiesce_reqs() -> std::sync::MutexGuard<'static, Vec<QuiesceHandle>> {
+    QUIESCE_REQS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Maximum concurrent connections accepted. Bounds total preallocated
 /// queue memory; a host that exceeds it is rejected at accept. (Deeper
 /// mitigation — lazy slot-buffer allocation — is in the roadmap.)
@@ -310,9 +543,11 @@ enum IoMsg<C> {
         reply: StatsRequest,
         clear: bool,
     },
-    /// Exit the mailbox loop so the thread (and its io_uring ring) is torn
-    /// down. Sent only when the pool is idle (zero active connections).
-    Shutdown,
+    /// Stop this thread's connections, then exit the mailbox loop so the
+    /// thread (and its io_uring ring) is torn down. See [`ShutdownAck`].
+    Shutdown {
+        ack: ShutdownAck,
+    },
 }
 
 /// Messages to the admin queue thread. Generic over the transport's connection
@@ -325,9 +560,102 @@ enum AdminMsg<C> {
         reply: StatsRequest,
         clear: bool,
     },
-    /// Exit the mailbox loop so the thread (and its io_uring ring) is torn
-    /// down. Sent only when the pool is idle (zero active connections).
-    Shutdown,
+    /// Stop this thread's connections, then exit the mailbox loop so the
+    /// thread (and its io_uring ring) is torn down. See [`ShutdownAck`].
+    Shutdown {
+        ack: ShutdownAck,
+    },
+}
+
+/// How a queue thread reports that it has stopped: `Some` on the shutdown
+/// handshake, where the control thread waits for every thread to quiesce
+/// before the process releases anything the backends hold; `None` on the
+/// idle teardown, which sends `Shutdown` only when there is nothing left to
+/// stop and nobody waiting.
+type ShutdownAck = Option<tokio::sync::oneshot::Sender<()>>;
+
+/// Where a connection's stop hook lands. The task is spawned first and
+/// reports its [`ConnHandles`] a moment later (from inside `run_queue`, once
+/// its dispatch context exists), so the queue thread hands the callback this
+/// slot and finds the hook in it afterwards.
+type StopSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
+/// The connections one queue thread is running: each `run_queue` task and
+/// the hook that asks it to wind down. Thread-local by construction (`Rc`),
+/// like everything else a queue thread owns.
+#[derive(Default)]
+struct ConnTracker {
+    conns: Vec<ConnEntry>,
+}
+
+struct ConnEntry {
+    task: tokio::task::JoinHandle<()>,
+    stop: StopSlot,
+}
+
+/// How long a queue thread waits for its stopped connections to finish
+/// before reporting the stragglers and exiting anyway. Comfortably over a
+/// healthy teardown (drain executing slots, join the send path) but well
+/// under the control thread's wait for the ack.
+const CONN_DRAIN_BUDGET_MS: u32 = 5_000;
+
+impl ConnTracker {
+    /// Track a freshly spawned connection task and the slot its `on_ctx`
+    /// fills with the stop hook, first dropping the entries of connections
+    /// that have since ended (the same prune-on-handoff the stats and nudge
+    /// lists do, which bounds the list under connect churn).
+    fn track(&mut self, task: tokio::task::JoinHandle<()>, stop: StopSlot) {
+        self.conns.retain(|conn| !conn.task.is_finished());
+        self.conns.push(ConnEntry { task, stop });
+    }
+
+    /// The queue half of the shutdown handshake: ask every connection to
+    /// wind down, then wait for their tasks to return — so no command is
+    /// still executing, and no backend op still in flight, when the caller
+    /// goes on to release what the backends hold. Returns the number of
+    /// connections still running when the budget ran out (0 = quiesced).
+    async fn quiesce(&mut self) -> usize {
+        for conn in &self.conns {
+            if let Some(stop) = conn.stop.borrow().as_ref() {
+                stop();
+            }
+        }
+        let running =
+            |conns: &Vec<ConnEntry>| conns.iter().filter(|c| !c.task.is_finished()).count();
+        let mut waited = 0;
+        while running(&self.conns) > 0 && waited < CONN_DRAIN_BUDGET_MS {
+            // Poll rather than await the handles: a connection whose backend
+            // op is wedged leaks its tasks (they never finish), and shutdown
+            // must not hang on one. Same 2 ms cadence as a connection's own
+            // teardown quiesce.
+            let Ok(sleep) = ioutgt_uring::ops::sleep(Duration::from_millis(2)) else {
+                break;
+            };
+            if sleep.await.is_err() {
+                break;
+            }
+            waited += 2;
+        }
+        running(&self.conns)
+    }
+}
+
+/// A queue thread's last act before it leaves its mailbox loop: report any
+/// connection that outlasted the drain budget, then ack the handshake. The
+/// ack is what lets the shutdown path conclude that this thread's IO has
+/// stopped, so it is sent last — and unconditionally, or the waiter would
+/// sit out its whole timeout for nothing.
+fn finish_shutdown(name: &str, straggling: usize, ack: ShutdownAck) {
+    if straggling > 0 {
+        warn!(
+            thread = %name,
+            connections = straggling,
+            "shutdown drain timed out; connections still running"
+        );
+    }
+    if let Some(ack) = ack {
+        let _ = ack.send(());
+    }
 }
 
 /// Zero everything a queue thread counts: every live queue's counters,
@@ -452,20 +780,29 @@ fn make_io_thread<T: Transport>(
             rt.block_on(async move {
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
                 let mut retired = QueueStatsSnapshot::default();
+                let mut conns = ConnTracker::default();
                 loop {
                     match rx.recv().await {
                         Ok(IoMsg::Conn(conn)) => {
                             prune_dead_queues(&queues, &mut retired);
-                            let queues = Rc::clone(&queues);
-                            let on_ctx: OnCtx = Box::new(move |handles| {
-                                queues.borrow_mut().push(Rc::clone(&handles.stats));
-                            });
-                            tokio::task::spawn_local(T::run_queue(conn, on_ctx));
+                            let stop: StopSlot = Rc::new(RefCell::new(None));
+                            let on_ctx: OnCtx = {
+                                let queues = Rc::clone(&queues);
+                                let stop = Rc::clone(&stop);
+                                Box::new(move |handles| {
+                                    queues.borrow_mut().push(Rc::clone(&handles.stats));
+                                    *stop.borrow_mut() = Some(handles.stop);
+                                })
+                            };
+                            conns.track(tokio::task::spawn_local(T::run_queue(conn, on_ctx)), stop);
                         }
                         Ok(IoMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
-                        Ok(IoMsg::Shutdown) => return,
+                        Ok(IoMsg::Shutdown { ack }) => {
+                            finish_shutdown(&name, conns.quiesce().await, ack);
+                            return;
+                        }
                         Err(err) => {
                             warn!("io mailbox failed: {err}");
                             return;
@@ -498,18 +835,24 @@ fn make_admin_thread<T: Transport>(
                 let live: Rc<RefCell<Vec<NsNudge>>> = Rc::new(RefCell::new(Vec::new()));
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
                 let mut retired = QueueStatsSnapshot::default();
+                let mut conns = ConnTracker::default();
                 loop {
                     match rx.recv().await {
                         Ok(AdminMsg::Conn(conn)) => {
                             prune_dead_queues(&queues, &mut retired);
                             live.borrow_mut().retain(|n| (n.alive)());
-                            let live = Rc::clone(&live);
-                            let queues = Rc::clone(&queues);
-                            let on_ctx: OnCtx = Box::new(move |handles| {
-                                queues.borrow_mut().push(Rc::clone(&handles.stats));
-                                live.borrow_mut().push(handles.ns_changed);
-                            });
-                            tokio::task::spawn_local(T::run_queue(conn, on_ctx));
+                            let stop: StopSlot = Rc::new(RefCell::new(None));
+                            let on_ctx: OnCtx = {
+                                let live = Rc::clone(&live);
+                                let queues = Rc::clone(&queues);
+                                let stop = Rc::clone(&stop);
+                                Box::new(move |handles| {
+                                    queues.borrow_mut().push(Rc::clone(&handles.stats));
+                                    live.borrow_mut().push(handles.ns_changed);
+                                    *stop.borrow_mut() = Some(handles.stop);
+                                })
+                            };
+                            conns.track(tokio::task::spawn_local(T::run_queue(conn, on_ctx)), stop);
                         }
                         Ok(AdminMsg::NsChanged) => {
                             live.borrow_mut().retain(|n| {
@@ -523,7 +866,10 @@ fn make_admin_thread<T: Transport>(
                         Ok(AdminMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
-                        Ok(AdminMsg::Shutdown) => return,
+                        Ok(AdminMsg::Shutdown { ack }) => {
+                            finish_shutdown(&name, conns.quiesce().await, ack);
+                            return;
+                        }
                         Err(err) => {
                             warn!("admin mailbox failed: {err}");
                             return;
@@ -655,7 +1001,7 @@ fn build_port(
         );
         subsystems.insert(spec.nqn.clone(), subsystem);
     }
-    Ok(Arc::new(PortConfig {
+    let port = Arc::new(PortConfig {
         traddr: bound.ip().to_string(),
         trsvcid: bound.port().to_string(),
         trtype,
@@ -665,7 +1011,11 @@ fn build_port(
         recv_buf_bytes: config.recv_buf_bytes,
         poll: config.poll,
         subsystems,
-    }))
+    });
+    // The backends are now open — and a Sheepdog one holds its VDI lock on
+    // the cluster. Register the port so [`shutdown`] can hand that back.
+    live_ports().push(Arc::clone(&port));
+    Ok(port)
 }
 
 /// The live mailbox senders for a spawned queue-thread pool: the admin
@@ -737,11 +1087,57 @@ fn teardown_pool<C: Send>(senders: &Mutex<Option<PoolSenders<C>>>) {
         return;
     };
     for io_tx in &pool.io {
-        io_tx.send(IoMsg::Shutdown);
+        io_tx.send(IoMsg::Shutdown { ack: None });
     }
-    pool.admin.send(AdminMsg::Shutdown);
+    pool.admin.send(AdminMsg::Shutdown { ack: None });
     info!("queue-thread pool torn down after idle");
     // `pool` (the last sender clones) drops here.
+}
+
+/// How long the control thread waits for the whole pool to report its IO
+/// stopped. Over a queue thread's own drain budget ([`CONN_DRAIN_BUDGET_MS`],
+/// which the threads run in parallel) plus slack, and under the shutdown
+/// path's wait on this reply ([`TARGET_QUIESCE_BUDGET`]) — each layer gives
+/// up before the one above it, so no layer can hang on a wedged one below.
+const POOL_QUIESCE_BUDGET: Duration = Duration::from_secs(8);
+
+/// Stop this target's IO: tell every queue thread to wind its connections
+/// down and exit, then wait for all of them to report back. Unlike
+/// [`teardown_pool`] (idle reclaim, fire-and-forget with no connections to
+/// stop) this is the shutdown handshake — when it returns, no command is
+/// executing and no backend op is in flight, so the caller may release what
+/// the backends hold outside the process.
+///
+/// Returns `true` if the whole pool acked in time. On timeout it returns
+/// anyway: a queue thread wedged on an unresponsive backend must not keep the
+/// process from getting the rest of its shutdown done.
+async fn quiesce_pool<C: Send>(senders: &Mutex<Option<PoolSenders<C>>>) -> bool {
+    let Some(pool) = senders.lock().expect("pool senders mutex").take() else {
+        return true; // pool down (never connected, or idle-torn-down)
+    };
+    // Fan the requests out first, then collect: the threads drain their
+    // connections in parallel, so the wait is the slowest one, not the sum.
+    let mut acks = Vec::with_capacity(pool.io.len() + 1);
+    for io_tx in &pool.io {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        io_tx.send(IoMsg::Shutdown { ack: Some(tx) });
+        acks.push(rx);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.admin.send(AdminMsg::Shutdown { ack: Some(tx) });
+    acks.push(rx);
+    let collect = async {
+        for ack in acks {
+            // An `Err` is a thread that died without acking — as quiesced as
+            // it will ever be, and not worth waiting the budget out for.
+            let _ = ack.await;
+        }
+    };
+    tokio::time::timeout(POOL_QUIESCE_BUDGET, collect)
+        .await
+        .is_ok()
+    // `pool` (the last sender clones) drops here — held until now so a
+    // thread's mailbox stays open while it is still draining.
 }
 
 /// A zeroed per-thread stats snapshot, the reply for a stats query while
@@ -1024,6 +1420,15 @@ async fn control_loop<T: Transport>(
         return;
     }
 
+    // Register for the shutdown handshake before reporting the address:
+    // `spawn` returns on that report, and a caller that shut down immediately
+    // afterwards must not find this target unregistered. Everything that can
+    // fail is above, so an entry here always belongs to a target that came up
+    // — and once this loop returns, its closed channel is what tells
+    // [`quiesce_targets`] there is nothing left here to stop.
+    let (quiesce_tx, mut quiesce_rx) = tokio::sync::mpsc::unbounded_channel();
+    quiesce_reqs().push(quiesce_tx);
+
     let _ = addr_tx.send(Ok(local));
     info!(%local, "ioutgt listening");
 
@@ -1043,6 +1448,19 @@ async fn control_loop<T: Transport>(
                 handle_accept::<T>(accepted, &config, &senders, &io_cpus, &active, &registry, &port);
             }
             _ = idle.tick() => idle.maybe_teardown(&senders, &active),
+            Some(reply) = quiesce_rx.recv() => {
+                // Stop serving: nothing new is accepted from here on (this
+                // loop is the only reader of `listener`), the pool winds its
+                // connections down, and only then do we answer — the reply is
+                // the caller's proof that this target's IO has stopped.
+                if quiesce_pool(&senders).await {
+                    info!(%local, "target stopped serving");
+                } else {
+                    warn!(%local, "target stopped accepting, but its queue threads did not report back");
+                }
+                let _ = reply.send(());
+                return;
+            }
         }
     }
 }

@@ -47,6 +47,22 @@ impl AnyBackend {
             AnyBackend::Null(_) | AnyBackend::Memory(_) | AnyBackend::File(_) => None,
         }
     }
+
+    /// Hand back whatever this backend holds *outside* the process, ahead of
+    /// an exit that will not drop it (the queue threads still own `Arc`s to
+    /// their namespaces when the target is asked to stop).
+    ///
+    /// Only a Sheepdog VDI holds any: its cluster lock, which would otherwise
+    /// keep the next opener out until the cluster reclaims it (see
+    /// [`SheepdogBackend::release_lock`]). The local backends own nothing a
+    /// process exit does not already release, so this is a no-op for them.
+    /// Idempotent.
+    pub fn shutdown(&self) {
+        match self {
+            AnyBackend::Sheepdog(b) => b.release_lock(),
+            AnyBackend::Null(_) | AnyBackend::Memory(_) | AnyBackend::File(_) => {}
+        }
+    }
 }
 
 impl Backend for AnyBackend {

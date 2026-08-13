@@ -161,6 +161,36 @@ machinery.
 is a kernel-feature probe plus `ioutgt_harness::spawn::<TcpTransport>()`;
 the RDMA binary passes `RdmaTransport` through the same seam.
 
+`main()` brackets that call with the harness's shutdown pair:
+`install_shutdown_handler()` before it (the backends take their Sheepdog
+VDI locks inside `spawn`, so the window has to be covered) and
+`wait_for_shutdown()` after, which parks the main thread until SIGINT or
+SIGTERM. The handler itself only writes the signal number to a self-pipe;
+the waiting thread does the work, in `shutdown()`, in two phases:
+
+1. **Stop IO** — the teardown handshake. Each control thread registered a
+   quiesce channel in `control_loop`; `shutdown()` sends every one of them a
+   reply channel and then waits. A control thread that gets the request
+   leaves its accept loop for good, `quiesce_pool()`s (a `Shutdown` message
+   carrying a oneshot ack to every queue thread, all in flight at once), and
+   answers only once they have all acked. A queue thread acks from inside its
+   mailbox loop, after firing each connection's `stop` hook (`ConnHandles`:
+   `shutdown(2)` on the socket for TCP, the CM stop `Notify` for RDMA) and
+   waiting for the `run_queue` tasks to return through their normal teardown
+   — so nothing is executing a command or holding a backend op in flight.
+2. **Release** — the walk over every port `build_port()` registered, calling
+   `AnyBackend::shutdown()` on each namespace, so external state (that VDI
+   lock) goes back.
+
+The order is the point: releasing first would let an in-flight write land on
+a VDI this process no longer holds the lock for. Three nested budgets keep
+any of it from hanging — 5 s for a queue thread's connections, 8 s for a
+control thread's pool, 12 s for the whole set of targets — each layer
+reporting stragglers and carrying on rather than waiting on the one below.
+A host sees the connection drop it would see on any restart, just before the
+release instead of racing it. `SA_RESETHAND` leaves a second signal to the
+default action: a shutdown wedged on an unresponsive cluster stays killable.
+
 **`spawn::<T>()` — the control thread**
 
 ```text
@@ -171,8 +201,9 @@ spawn::<T>(config)                                     [ioutgt-harness]
        build_port(): Subsystem / Namespace → AnyBackend [core, backend]
        spawn_control_api(): UDS server                 [ioutgt-control]
        loop select!
-         ├─ T::accept() ──► handle_accept()
-         └─ idle tick   ──► teardown pool after the grace window
+         ├─ T::accept()  ──► handle_accept()
+         ├─ idle tick    ──► teardown pool after the grace window
+         └─ quiesce req  ──► quiesce_pool(), ack, leave the loop (§3.1 above)
 ```
 
 **`handle_accept()` — pool bring-up, handshake, routing**
@@ -182,9 +213,10 @@ handle_accept(raw)
   ensure_pool_up(): pool down? build admin + N IO threads, each:
       mailbox (MPSC + eventfd) ⇄ pinned OS thread + QueueRuntime (own ring)
       loop mailbox.recv():
-        Conn(conn) → spawn T::run_queue(conn)          [transport crate]
+        Conn(conn) → spawn T::run_queue(conn), track task + stop hook
         Stats      → snapshot own counters, reply
-        Shutdown   → return (ring drops)
+        Shutdown   → stop each connection, await its task, ack, return
+                     (ring drops)
   ConnPermit: count connection, reject past the limit
   spawn T::handshake(raw) → (qid, conn)
     qid 0 → admin mailbox          qid n → io[(n-1) % N] mailbox
@@ -216,6 +248,10 @@ source of truth (`None` = down):
 - While the pool is down: a stats query answers with a zeroed snapshot
   (never blocks, never mis-reports), and a namespace-change nudge no-ops —
   the edit still lands in the port model for the next connect.
+- Idle teardown sends the same `Shutdown` message the handshake does, but
+  with no ack and (by construction) no connections to stop, and does not
+  wait for the threads to die: the next connect respawns the pool, and the
+  two sets briefly overlapping is harmless.
 
 ### 3.2 Queue thread: the per-connection task set
 
@@ -495,7 +531,12 @@ inode `acl_id`). Every lookup and lock carries an ACL id, and `sheep`
 resolves a name only within it, so the backend's `open` takes the ACL as
 well as the VDI name. A writable VDI is opened under the cluster's VDI lock
 (`LOCK_VDI`), held on the connection that took it and released from the
-backend's `Drop`; the ACL id doubles as the lock type, so an open under an
+backend's `Drop` — or, on the way out of a target whose namespaces the
+queue threads still own, from the shutdown walk (`ioutgt-harness`'s
+`install_shutdown_handler` / `wait_for_shutdown`: SIGINT/SIGTERM → stop
+serving IO, then `AnyBackend::shutdown()` over every port this process
+built — §3.1);
+the ACL id doubles as the lock type, so an open under an
 ACL takes the *shared* lock (a second target serving the same ACL may
 export the same volume) while one outside any ACL takes `LOCK_TYPE_NORMAL`
 and stands alone. Either way a volume a client holds incompatibly (a QEMU

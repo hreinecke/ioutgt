@@ -175,10 +175,12 @@ fn main() -> std::io::Result<()> {
     // flip file backends to O_DIRECT).
     config.recv_buf_bytes = 0;
 
+    // Before the backends open: a Sheepdog namespace takes its VDI lock
+    // inside spawn, and a Ctrl-C landing there must still release it.
+    ioutgt_harness::install_shutdown_handler()?;
     let addr = ioutgt_harness::spawn::<RdmaTransport>(config)?;
     ioutgt_harness::announce_listening("ioutgt-nvme-rdma", addr);
-    // The target runs on its own threads; park the main thread.
-    loop {
-        std::thread::park();
-    }
+    // The target runs on its own threads; park the main thread until Ctrl-C
+    // (or SIGTERM), then release what the backends hold on the way out.
+    ioutgt_harness::wait_for_shutdown()
 }

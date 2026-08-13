@@ -97,11 +97,12 @@ impl Transport for TcpTransport {
     fn run_queue(conn: Self::Conn, on_ctx: OnCtx) -> impl Future<Output = ()> {
         // Adapt the harness callback: hand it the queue's stats and a
         // weak namespace-change nudge instead of the dispatch context.
-        tcp_run_queue(conn, |ctx| {
+        tcp_run_queue(conn, |ctx, stop| {
             let (alive, fire) = ctx.ns_nudge();
             on_ctx(ConnHandles {
                 stats: std::rc::Rc::clone(&ctx.queue.stats),
                 ns_changed: NsNudge { alive, fire },
+                stop,
             });
         })
     }

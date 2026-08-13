@@ -157,12 +157,19 @@ sheepdog 10.0.0.1:7000/vol: VDI is locked incompatibly by another client (os err
 
 The lock is held on the connection that took it for as long as the
 namespace exists and handed back (`SD_OP_RELEASE_VDI`) when the namespace
-goes away — `REMOVE_NAMESPACE`, or a target shut down cleanly. Snapshot
-(`@TAG`) opens are read-only and never lock. Note that a target that is
-*killed* never runs that release: its hold stays with the VDI until the
-cluster reclaims it. Another ioutgt target can still open the volume (the
-stale hold is a shared one), but a QEMU guest cannot until the lock is
-cleared.
+goes away — `REMOVE_NAMESPACE`, or a target shut down cleanly. **Ctrl-C
+counts as clean**: the binary catches `SIGINT` and `SIGTERM`, stops serving
+IO (connections are wound down and their in-flight commands drained, so no
+write can outlive the lock that covered it), releases every VDI it holds,
+and then exits. A second Ctrl-C skips all of that and kills the process
+outright, for a cluster that has stopped answering; so does a shutdown that
+overruns its budget (~12 s), which logs what it gave up on and releases
+anyway.
+Snapshot (`@TAG`) opens are read-only and never lock. Note that a target
+killed outright (`SIGKILL`) never runs that release: its hold stays with
+the VDI until the cluster reclaims it. Another ioutgt target can still
+open the volume (the stale hold is a shared one), but a QEMU guest cannot
+until the lock is cleared.
 
 Sharing a VDI is safe for readers and for writers that never touch the
 same object: the backend caches the VDI's object map at open and does not

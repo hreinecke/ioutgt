@@ -129,6 +129,12 @@ impl Transport for RdmaTransport {
     }
 
     async fn run_queue(conn: RdmaConn, on_ctx: OnCtx) {
+        // The shutdown handshake stops this connection the same way a host's
+        // CM `Disconnected` event does: fire the queue's stop `Notify`, which
+        // the reap loop selects on and answers with its normal teardown.
+        // Notified before the loop gets there? `notify_one` leaves a permit,
+        // so the very first `notified()` returns immediately.
+        let stop = Arc::clone(&conn.stop);
         // Adapt the harness callback: hand it the queue's stats and a
         // weak namespace-change nudge instead of the dispatch context.
         let adapted = |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<AnyBackend>>| {
@@ -136,6 +142,7 @@ impl Transport for RdmaTransport {
             on_ctx(ConnHandles {
                 stats: std::rc::Rc::clone(&ctx.queue.stats),
                 ns_changed: NsNudge { alive, fire },
+                stop: Box::new(move || stop.notify_one()),
             });
         };
         if let Err(e) = run_conn(conn, adapted).await {

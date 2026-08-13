@@ -77,8 +77,10 @@
 //! already running from is refused rather than corrupted, and so is a volume
 //! locked under a *different* ACL. The lock is held on the connection that
 //! took it for the backend's lifetime and handed back (`RELEASE_VDI`) when the
-//! backend drops. Snapshot opens are read-only and never lock. `lock = false`
-//! opts out, for setups whose exclusion is arranged elsewhere.
+//! backend drops, or earlier at [`SheepdogBackend::release_lock`] — the
+//! shutdown path, where the backend outlives the target it served. Snapshot
+//! opens are read-only and never lock. `lock = false` opts out, for setups
+//! whose exclusion is arranged elsewhere.
 //!
 //! Sharing a VDI is only safe for readers and for writers that never race on
 //! the same object: this backend caches `data_vdi_id[]` at open and does not
@@ -108,6 +110,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ioutgt_core::buf::AlignedBuf;
@@ -417,9 +420,12 @@ pub struct SheepdogBackend {
     /// during a create). Lock-free reads; only first-touch writes contend.
     data_map: Box<[AtomicU32]>,
     /// The connection this VDI's cluster lock was taken on, parked here for
-    /// the backend's lifetime and used once more to release the lock on drop.
-    /// `None` when locking is off, or the VDI is a read-only snapshot.
-    lock_conn: Option<TcpStream>,
+    /// the backend's lifetime and used once more to release the lock on drop
+    /// or at [`SheepdogBackend::release_lock`]. `None` when locking is off,
+    /// the VDI is a read-only snapshot, or the lock has already gone back.
+    /// Control-plane state only (open, shutdown, drop) — never the IO path,
+    /// hence a plain `Mutex`.
+    lock_conn: Mutex<Option<TcpStream>>,
 }
 
 impl SheepdogBackend {
@@ -471,7 +477,7 @@ impl SheepdogBackend {
                     release_lock(&mut stream, vid, acl);
                     Ok(backend)
                 } else {
-                    backend.lock_conn = Some(stream);
+                    backend.lock_conn = Mutex::new(Some(stream));
                     Ok(backend)
                 }
             }
@@ -535,7 +541,7 @@ impl SheepdogBackend {
             nr_blocks: vdi_size >> BLOCK_SHIFT,
             read_only: snap_ctime != 0,
             data_map,
-            lock_conn: None,
+            lock_conn: Mutex::new(None),
         })
     }
 
@@ -544,6 +550,28 @@ impl SheepdogBackend {
     /// none — an all-zero field, as written by a `sheep` predating it.
     pub fn uuid(&self) -> Option<[u8; SD_UUID_LEN]> {
         self.uuid
+    }
+
+    /// Hand the VDI lock back now instead of at drop, for a target shutting
+    /// down while its backends are still shared: the queue threads hold
+    /// `Arc`s to this namespace, so nothing here is dropped before the
+    /// process exits and only an explicit release keeps the next opener —
+    /// a restarted target, a QEMU guest — from finding the VDI locked.
+    ///
+    /// Idempotent and cheap when there is no lock to give back (`?nolock`,
+    /// a snapshot, an already-released backend): a later drop finds the
+    /// connection gone and does nothing.
+    pub fn release_lock(&self) {
+        // A poisoned lock still holds a usable connection: a shutdown path
+        // has nowhere better to go than to try the release anyway.
+        let conn = self
+            .lock_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(mut stream) = conn {
+            release_lock(&mut stream, self.vid, self.acl);
+        }
     }
 
     /// Issue one object request on a pooled connection, releasing the
@@ -791,9 +819,7 @@ impl Drop for SheepdogBackend {
     /// guest — is not locked out. Only a clean teardown reaches this:
     /// a killed target leaves the lock with the cluster to reclaim.
     fn drop(&mut self) {
-        if let Some(mut stream) = self.lock_conn.take() {
-            release_lock(&mut stream, self.vid, self.acl);
-        }
+        self.release_lock();
     }
 }
 
