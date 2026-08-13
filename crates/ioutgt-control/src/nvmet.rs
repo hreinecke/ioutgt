@@ -190,6 +190,8 @@ impl Subsystem {
             // Kernel default: deny unless listed.
             allow_any_host: self.attr.get("allow_any_host").is_some_and(|v| v == "1"),
             allowed_hosts: self.allowed_hosts.clone(),
+            // Left at zero ("no more than NN"), as the kernel does.
+            mnan: None,
             namespaces,
         })
     }

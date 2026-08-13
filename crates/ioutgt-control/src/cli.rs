@@ -57,6 +57,7 @@ pub fn subsystems(spec: &str, mem_size_mb: u64, nqn: &str) -> Result<Vec<Subsyst
         model: default_model(),
         allow_any_host: true,
         allowed_hosts: vec![],
+        mnan: None,
         namespaces: vec![NamespaceConfig {
             nsid: 1,
             backend,
@@ -185,6 +186,11 @@ fn acl_subsystem(addr: &str, acl: &AclInfo, lock: bool) -> SubsystemConfig {
         model: default_model(),
         allow_any_host: true,
         allowed_hosts: vec![],
+        // The cluster's own count of the volumes in this ACL
+        // (`max_data_id_nr`), rather than one derived from the namespaces
+        // this target managed to build out of them. NN cannot carry it: with
+        // a vid for an NSID, NN is the highest vid, not a count.
+        mnan: Some(acl.max_data_id_nr),
         namespaces,
     }
 }

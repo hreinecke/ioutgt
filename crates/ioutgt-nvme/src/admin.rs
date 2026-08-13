@@ -211,6 +211,10 @@ fn build_id_ctrl<B: Backend>(
         id.nn.set(0);
     } else {
         id.nn.set(subsys.as_ref().map_or(0, |s| s.max_nsid()));
+        // MNAN: how many namespaces the subsystem actually holds, where the
+        // storage knows (a Sheepdog ACL). With sparse NSIDs, NN — the highest
+        // valid one — says nothing about the count; 0 means "no more than NN".
+        id.mnan.set(subsys.as_ref().map_or(0, |s| s.mnan()));
         id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
         // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA
         // advertises one page of in-capsule data (nvmet parity): small write

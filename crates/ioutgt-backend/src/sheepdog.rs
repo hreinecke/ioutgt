@@ -45,6 +45,15 @@
 //! and vice versa. ACL id `0` is both "belongs to no ACL" and, for the lock
 //! ops, `LOCK_TYPE_NORMAL`.
 //!
+//! The membership list itself lives in the ACL object's inode: `dog acl add`
+//! writes the member's vid into the ACL's `data_vdi_id[]` array — the same
+//! array an ordinary VDI uses as its object map — and sizes it with the header
+//! field `max_data_id_nr`. `dog acl remove` clears an entry in place, so the
+//! array is sparse: a zero is a hole, not the end of the list. [`list_acls`]
+//! walks `data_vdi_id[0..max_data_id_nr]` and hands both the members and the
+//! slot count up, the latter for a target to report as Identify Controller
+//! `nn` (each member's vid *is* its NSID).
+//!
 //! # Fit with the engine
 //!
 //! The backend struct holds only `Send + Sync` state (cluster address, learned
@@ -169,6 +178,7 @@ const SD_INODE_DATA_INDEX: u64 = 1 << 20;
 const INO_OFF_NAME: usize = 0;
 const INO_OFF_TAG: usize = SD_MAX_VDI_LEN;
 const INO_OFF_SNAP_CTIME: usize = 520;
+const INO_OFF_MAX_DATA_ID_NR: usize = 528;
 const INO_OFF_VDI_SIZE: usize = 536;
 const INO_OFF_NR_COPIES: usize = 554;
 const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
@@ -885,7 +895,7 @@ pub struct VdiInfo {
 }
 
 /// One ACL object found on a cluster by [`list_acls`]: a VDI carrying
-/// `SD_VDI_FLAG_ACL`, together with the volumes that name it back.
+/// `SD_VDI_FLAG_ACL`, together with the volumes its `data_vdi_id[]` lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclInfo {
     /// ACL object name — the `dog acl list` NAME column.
@@ -893,6 +903,10 @@ pub struct AclInfo {
     /// The ACL object's own 24-bit vid: the `acl_id` its members carry and
     /// the value every lookup and lock of a member passes.
     pub vid: u32,
+    /// Slots of the ACL inode's member array in use (`max_data_id_nr`), holes
+    /// included: the cluster's own count of the volumes in this ACL, for a
+    /// target to report as Identify Controller `nn`. Never below `vdis.len()`.
+    pub max_data_id_nr: u32,
     /// The ACL's member VDIs, sorted by (name, tag), snapshots included.
     pub vdis: Vec<VdiInfo>,
 }
@@ -902,6 +916,9 @@ struct TableEntry {
     info: VdiInfo,
     /// The entry is an ACL object (`SD_VDI_FLAG_ACL`), not a volume.
     is_acl: bool,
+    /// Slots of `data_vdi_id[]` in use (`max_data_id_nr`): the object-map
+    /// extent of a volume, the member count of an ACL object.
+    max_data_id_nr: u32,
 }
 
 /// Enumerate every volume on the cluster at `addr`, sorted by (name, tag).
@@ -926,48 +943,110 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
 /// Enumerate the cluster's ACL objects, each with its member VDIs, sorted by
 /// ACL name.
 ///
-/// Membership is read from the members' side — an inode's `acl_id`, which is
-/// what `sheep` itself enforces on every lookup — rather than from the ACL's
-/// own `data_vdi_id[]` list, so an ACL admits exactly the VDIs the cluster
-/// will actually resolve under it. An empty ACL is still reported: it is a
-/// subsystem with no namespaces yet, not an error. Volumes belonging to no
-/// ACL appear in no entry; use [`list_vdis`] for those.
+/// Membership comes from the ACL object's own inode: the vids in
+/// `data_vdi_id[0..max_data_id_nr]`, which is the list `dog acl add`/`remove`
+/// maintain and `dog acl info` prints. Zero entries are holes left by a
+/// removal, not the end of the list. Each vid is then resolved against the
+/// VDI table this scan already read, for the member's name, size and identity.
+///
+/// A listed vid that is not a volume on the cluster, or whose inode names some
+/// other ACL, is dropped with a warning — `dog acl add` writes the array entry
+/// before the member's `acl_id`, so a half-completed add leaves exactly that,
+/// and the cluster would refuse to resolve the name under this ACL anyway. A
+/// volume whose `acl_id` names this ACL but that the array does not list is
+/// dropped the same way: the ACL's list is what `dog` shows and what an
+/// administrator edits.
+///
+/// An empty ACL is still reported: it is a subsystem with no namespaces yet,
+/// not an error. Volumes belonging to no ACL appear in no entry; use
+/// [`list_vdis`] for those.
 pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
     let entries = scan_vdi_table(&mut stream)?;
 
-    let mut acls: Vec<AclInfo> = entries
-        .iter()
-        .filter(|entry| entry.is_acl)
-        .map(|entry| AclInfo {
+    let mut acls = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.is_acl) {
+        let members = sync_read_acl_members(&mut stream, entry.info.vid, entry.max_data_id_nr)?;
+        let mut vdis: Vec<VdiInfo> = Vec::new();
+        for vid in members.iter().copied().filter(|&vid| vid != 0) {
+            match entries.iter().find(|e| e.info.vid == vid && !e.is_acl) {
+                Some(member) if member.info.acl == entry.info.vid => {
+                    vdis.push(member.info.clone());
+                }
+                // The member's own inode disagrees (or is not there at all):
+                // the cluster will refuse every lookup of it under this ACL,
+                // so there is nothing to export — say so rather than
+                // silently dropping it.
+                Some(member) => tracing::warn!(
+                    acl = %entry.info.name,
+                    vdi = %member.info.name,
+                    vid = format_args!("{vid:x}"),
+                    acl_id = format_args!("{:x}", member.info.acl),
+                    "sheepdog: ACL lists a VDI whose inode names another ACL"
+                ),
+                None => tracing::warn!(
+                    acl = %entry.info.name,
+                    vid = format_args!("{vid:x}"),
+                    "sheepdog: ACL lists a vid that is not a volume on the cluster"
+                ),
+            }
+        }
+        for orphan in entries
+            .iter()
+            .filter(|e| !e.is_acl && e.info.acl == entry.info.vid && !members.contains(&e.info.vid))
+        {
+            tracing::warn!(
+                acl = %entry.info.name,
+                vdi = %orphan.info.name,
+                vid = format_args!("{:x}", orphan.info.vid),
+                "sheepdog: VDI names an ACL that does not list it"
+            );
+        }
+        vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+        acls.push(AclInfo {
             name: entry.info.name.clone(),
             vid: entry.info.vid,
-            vdis: Vec::new(),
-        })
-        .collect();
-    for entry in entries
-        .iter()
-        .filter(|e| !e.is_acl && e.info.acl != SD_ACL_NONE)
-    {
-        match acls.iter_mut().find(|acl| acl.vid == entry.info.acl) {
-            Some(acl) => acl.vdis.push(entry.info.clone()),
-            // The named ACL object is gone (or was never one): the cluster
-            // will refuse every lookup of this VDI, so there is nothing to
-            // export it under — say so rather than silently dropping it.
-            None => tracing::warn!(
-                vdi = %entry.info.name,
-                acl = format_args!("{:x}", entry.info.acl),
-                "sheepdog: VDI names an ACL that is not on the cluster"
-            ),
-        }
+            max_data_id_nr: entry.max_data_id_nr,
+            vdis,
+        });
     }
-    for acl in &mut acls {
-        acl.vdis
-            .sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+    for entry in entries.iter().filter(|e| {
+        !e.is_acl && e.info.acl != SD_ACL_NONE && !acls.iter().any(|acl| acl.vid == e.info.acl)
+    }) {
+        // The named ACL object is gone (or was never one): the cluster will
+        // refuse every lookup of this VDI, so nothing can export it.
+        tracing::warn!(
+            vdi = %entry.info.name,
+            acl = format_args!("{:x}", entry.info.acl),
+            "sheepdog: VDI names an ACL that is not on the cluster"
+        );
     }
     acls.sort_by(|a, b| (&a.name, a.vid).cmp(&(&b.name, b.vid)));
     Ok(acls)
+}
+
+/// Read an ACL object's member list: `data_vdi_id[0..max_data_id_nr]`, which
+/// starts at [`SD_INODE_HEADER_SIZE`] in the inode object. Zero entries are
+/// holes and stay in the returned vector, so its length is the `nn` an ACL
+/// reports. A count past the array's end is clamped rather than trusted.
+fn sync_read_acl_members(
+    stream: &mut TcpStream,
+    vid: u32,
+    max_data_id_nr: u32,
+) -> io::Result<Vec<u32>> {
+    let count = u64::from(max_data_id_nr).min(SD_INODE_DATA_INDEX) as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = vec![0u8; count * 4];
+    sync_read_obj(
+        stream,
+        vid_to_vdi_oid(vid),
+        SD_INODE_HEADER_SIZE,
+        &mut bytes,
+    )?;
+    Ok((0..count).map(|i| read_u32(&bytes, i * 4)).collect())
 }
 
 /// Walk the cluster's VDI bitmap (`READ_VDIS`, one bit per vid) and read each
@@ -1012,6 +1091,7 @@ fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
                     acl: read_u32(&inode, INO_OFF_ACL_ID),
                 },
                 is_acl: read_u32(&inode, INO_OFF_VDI_FLAGS) & SD_VDI_FLAG_ACL != 0,
+                max_data_id_nr: read_u32(&inode, INO_OFF_MAX_DATA_ID_NR),
             });
         }
     }
@@ -1361,6 +1441,7 @@ mod tests {
         // The header offsets are computed from the C struct layout; guard the
         // arithmetic (name[256]+tag[256] + fixed fields ... + __unused[]).
         assert_eq!(INO_OFF_SNAP_CTIME, 520);
+        assert_eq!(INO_OFF_MAX_DATA_ID_NR, 528);
         assert_eq!(INO_OFF_VDI_SIZE, 536);
         assert_eq!(INO_OFF_NR_COPIES, 554);
         assert_eq!(INO_OFF_BLOCK_SIZE_SHIFT, 555);

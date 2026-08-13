@@ -506,10 +506,16 @@ allocating the same object lose one of the writes.
 
 A cluster can also be exported wholesale, and the ACL is what the target
 model hangs off: `list_acls` reads the cluster VDI bitmap (`READ_VDIS`)
-plus each vid's inode at startup, groups the volumes by the ACL their
-inodes name, and `ioutgt_control::cli` turns that into **one subsystem per
-ACL object — NQN = the ACL's name verbatim — holding one namespace per
-writable member**. The port's discovery log therefore lists one record per
+plus each vid's inode at startup, then takes each ACL object's membership
+from its *own* inode — the vids in `data_vdi_id[0..max_data_id_nr]`, the
+list `dog acl add`/`remove` maintain, zeroes being holes — and
+`ioutgt_control::cli` turns that into **one subsystem per ACL object — NQN
+= the ACL's name verbatim — holding one namespace per writable member**. A
+listed vid the members' side contradicts (no such volume, or an inode
+naming another ACL, as a half-completed `dog acl add` leaves) is skipped
+with a warning, as is a volume naming an ACL that does not list it: the
+cluster resolves neither under that ACL. The port's discovery log
+therefore lists one record per
 cluster ACL (`build_discovery_log` already emits one per subsystem on the
 port). Each namespace takes its VDI's bitmap position (its vid) as its NSID
 so the map is a pure function of the cluster — sparse, large NSIDs in
@@ -517,7 +523,12 @@ exchange for a numbering no other VDI's creation can disturb — and reports
 the VDI's inode `uuid[16]`, the cluster's own identity for the volume, as
 the namespace UUID (`AnyBackend::uuid`, consulted wherever a namespace is
 built: config file, CLI spec, `ADD_NAMESPACE`, ahead of the derivation from
-NQN + NSID). Volumes in no ACL
+NQN + NSID). Identify Controller `NN` stays the highest valid NSID
+(`Subsystem::max_nsid`, which also bounds the invalid-vs-inactive NSID
+decision); the ACL inode's `max_data_id_nr` — the cluster's own count of
+the group's volumes, which sparse NSIDs put out of NN's reach — is reported
+as `MNAN` (`Subsystem::with_mnan`, from `SubsystemConfig::mnan`; 0
+elsewhere). Volumes in no ACL
 are exported by no subsystem; the cluster would refuse an ACL-scoped lookup
 of their names anyway. That is the `--backend sheepdog:HOST` form both
 binaries share (`--subsys-nqn` is unused in it).

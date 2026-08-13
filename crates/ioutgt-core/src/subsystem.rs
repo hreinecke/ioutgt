@@ -105,6 +105,7 @@ pub struct Subsystem<B> {
     pub allow_any_host: bool,
     /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
     pub allowed_hosts: Vec<String>,
+    mnan: Option<u32>,
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
 }
@@ -125,9 +126,24 @@ impl<B: Backend> Subsystem<B> {
             model,
             allow_any_host,
             allowed_hosts,
+            mnan: None,
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
         }
+    }
+
+    /// Report `mnan` namespaces as Identify Controller `MNAN` (Maximum Number
+    /// of Allocated Namespaces).
+    ///
+    /// Set it where the storage carries its own notion of how many namespaces
+    /// the subsystem holds — a Sheepdog ACL object, whose inode sizes its
+    /// member table with `max_data_id_nr` — which for sparse NSIDs is the only
+    /// count a host can get: `NN` is the highest valid NSID, not a count.
+    /// `None` leaves the field zero, the spec's "no more than `NN`".
+    #[must_use]
+    pub fn with_mnan(mut self, mnan: Option<u32>) -> Self {
+        self.mnan = mnan;
+        self
     }
 
     /// Host admission (nvmet semantics): any host, or membership in
@@ -173,9 +189,16 @@ impl<B: Backend> Subsystem<B> {
         Ok(())
     }
 
-    /// Highest allocated NSID (Identify Controller `nn`).
+    /// Highest allocated NSID (Identify Controller `nn`): the largest NSID a
+    /// host may ask about.
     pub fn max_nsid(&self) -> u32 {
         self.snapshot().keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// Identify Controller `MNAN` ([`Subsystem::with_mnan`]); `0` where the
+    /// storage supplies no count, meaning "no more than `NN`".
+    pub fn mnan(&self) -> u32 {
+        self.mnan.unwrap_or(0)
     }
 }
 

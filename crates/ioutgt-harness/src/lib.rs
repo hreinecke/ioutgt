@@ -182,6 +182,7 @@ impl TargetConfig {
                 model: "ioutgt".into(),
                 allow_any_host: true,
                 allowed_hosts: vec![],
+                mnan: None,
                 namespaces: vec![NamespaceConfig {
                     nsid: 1,
                     backend: BackendConfig::Memory { size_mb },
@@ -639,14 +640,19 @@ fn build_port(
                 }),
             );
         }
-        let subsystem = Arc::new(Subsystem::new(
+        let subsystem = Arc::new(
+            Subsystem::new(
             spec.nqn.clone(),
             spec.serial.clone(),
             spec.model.clone(),
             spec.allow_any_host,
             spec.allowed_hosts.clone(),
             namespaces,
-        ));
+        )
+        // Where the storage carries its own namespace count (a Sheepdog ACL
+        // object's `max_data_id_nr`), report it as MNAN.
+        .with_mnan(spec.mnan),
+        );
         subsystems.insert(spec.nqn.clone(), subsystem);
     }
     Ok(Arc::new(PortConfig {

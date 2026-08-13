@@ -122,6 +122,16 @@ So a VDI in an ACL needs `%ACL` on the spec (`"acl": "<name>"` through the
 control API); a VDI in no ACL needs it left off. An ACL name that turns out
 to be an ordinary VDI is refused rather than used as a scope.
 
+The membership list lives in the ACL object's own inode: `dog acl add`
+writes the member's vid into the ACL's `data_vdi_id[]` array — the array an
+ordinary VDI uses as its object map — and counts the slots in use in
+`max_data_id_nr`; `dog acl remove` clears an entry in place, leaving a hole.
+That list, the one `dog acl info` prints, is what whole-cluster mode reads.
+A VDI that names the ACL but is not in its list, or a listed vid whose own
+inode names some other ACL (what a half-completed `dog acl add` leaves
+behind), is not a member: it is skipped with a warning, since the cluster
+would refuse to resolve it under this ACL anyway.
+
 Because an ACL is exactly "which volumes belong together, reachable by
 whom", **whole-cluster mode maps one ACL object to one NVM subsystem**
 (below), naming the subsystem after the ACL. Name ACLs accordingly: the
@@ -180,7 +190,7 @@ the same switch is `"lock": false` in the backend object; it defaults to
 Leave the VDI off — `--backend sheepdog:HOST[:PORT]` (a trailing `/` is
 also accepted) — and the target enumerates the cluster's VDI bitmap at
 startup and exports **every ACL object as its own subsystem**, holding one
-namespace per writable VDI in that ACL:
+namespace per writable VDI the ACL's own member list names:
 
 ```sh
 ioutgt --backend sheepdog:sheep0:7000
@@ -204,11 +214,20 @@ name a subsystem after — create one with `dog acl create <nqn>` ...
 same 24-bit id `dog vdi list -r` prints. Nothing about the mapping depends
 on which other VDIs happen to exist: creating or deleting one never
 renumbers the rest, and two targets fronting the same cluster hand a host
-the same NSID for the same volume. The cost is sparse, large NSIDs (a vid
-is a hash of the VDI name, so `/dev/nvme0n11259375` is typical, and
-`Identify Controller`'s NN — the highest NSID in use — is large to match).
-Hosts find the namespaces through the Active Namespace List; a host that
-instead scans NSID 1..NN sequentially still works, but slowly.
+the same NSID for the same volume. The cost is sparse, large NSIDs: a vid
+is a hash of the VDI name, so `/dev/nvme0n11259375` is typical. Hosts find
+the namespaces through the Active Namespace List.
+
+`Identify Controller`'s NN is the highest NSID in use, as everywhere else
+in the target — with vids for NSIDs that is a large number and says nothing
+about how many namespaces there are. The count goes in **MNAN** (Maximum
+Number of Allocated Namespaces) instead: the ACL inode's `max_data_id_nr`,
+the cluster's own tally of the volumes in the group, holes and snapshots
+included, so it can exceed the number of namespaces actually exported. Every
+other subsystem leaves MNAN at 0, the spec's "no more than NN". Note that a
+host scanning NSID 1..NN sequentially instead of reading the Active Namespace
+List — a pre-4.x Linux kernel, say — will take a very long time to find these
+namespaces.
 
 Every exported VDI is locked under its ACL, as in single-VDI mode: one VDI
 held incompatibly by another client fails the whole startup, naming the

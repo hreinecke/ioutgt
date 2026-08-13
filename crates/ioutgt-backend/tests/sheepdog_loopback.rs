@@ -124,9 +124,12 @@ impl Vdi {
         self
     }
 
-    /// Make this VDI an ACL object (`dog acl create`) rather than a volume.
-    fn acl_object(mut self) -> Vdi {
+    /// Make this VDI an ACL object (`dog acl create`) rather than a volume,
+    /// listing `members` in the `data_vdi_id[]` array `dog acl add` writes —
+    /// a `0` entry being the hole `dog acl remove` leaves behind.
+    fn acl_object(mut self, members: &[u32]) -> Vdi {
         self.vdi_flags |= SD_VDI_FLAG_ACL;
+        self.data_vdi_id = members.to_vec();
         self
     }
 
@@ -140,6 +143,9 @@ impl Vdi {
         b[..self.name.len()].copy_from_slice(self.name.as_bytes());
         b[SD_MAX_VDI_LEN..SD_MAX_VDI_LEN + self.tag.len()].copy_from_slice(self.tag.as_bytes());
         b[520..528].copy_from_slice(&self.snap_ctime.to_le_bytes());
+        // max_data_id_nr: the object-map extent of a volume, the member-array
+        // extent (holes included) of an ACL object.
+        b[528..532].copy_from_slice(&(self.data_vdi_id.len() as u32).to_le_bytes());
         b[536..544].copy_from_slice(&self.vdi_size.to_le_bytes()); // vdi_size
         b[554] = self.nr_copies;
         b[555] = self.block_size_shift;
@@ -417,8 +423,10 @@ fn acl_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
     let store = fresh_store(block_size_shift, vdi_size);
     {
         let mut st = store.lock().unwrap();
-        st.vdis
-            .insert(ACL_VID, Vdi::new(ACL_NQN, 1 << 22, 22).acl_object());
+        st.vdis.insert(
+            ACL_VID,
+            Vdi::new(ACL_NQN, 1 << 22, 22).acl_object(&[TEST_VID]),
+        );
         st.vdis.get_mut(&TEST_VID).unwrap().acl_id = ACL_VID;
     }
     store
@@ -675,9 +683,12 @@ fn enumeration_store() -> Arc<Mutex<Store>> {
         // Unnamed / zero-sized inodes are not exportable volumes.
         st.vdis.insert(0x00_0012, Vdi::new("", 1 << 20, 22));
         st.vdis.insert(0x00_0013, Vdi::new("empty", 0, 22));
-        // An ACL object and its two members, plus an empty second ACL.
-        st.vdis
-            .insert(ACL_VID, Vdi::new(ACL_NQN, 1 << 22, 22).acl_object());
+        // An ACL object and its two members — with the hole a third, since
+        // removed, member left in the array — plus an empty second ACL.
+        st.vdis.insert(
+            ACL_VID,
+            Vdi::new(ACL_NQN, 1 << 22, 22).acl_object(&[0x00_0020, 0, 0x00_0021]),
+        );
         st.vdis
             .insert(0x00_0020, Vdi::new("shared", 8 << 20, 22).in_acl(ACL_VID));
         st.vdis.insert(
@@ -688,7 +699,7 @@ fn enumeration_store() -> Arc<Mutex<Store>> {
         );
         st.vdis.insert(
             0x00_0030,
-            Vdi::new("nqn.2026-06.io.ioutgt:idle", 1 << 22, 22).acl_object(),
+            Vdi::new("nqn.2026-06.io.ioutgt:idle", 1 << 22, 22).acl_object(&[]),
         );
     }
     store
@@ -752,17 +763,29 @@ fn cluster_enumeration_lists_every_vdi() {
 }
 
 /// `list_acls` is what maps a cluster onto subsystems: every ACL object, named
-/// as the cluster names it, with the members that name it back.
+/// as the cluster names it, holding the VDIs its own `data_vdi_id[]` lists.
 #[test]
-fn acl_enumeration_groups_members_under_their_acl() {
+fn acl_enumeration_follows_the_acls_member_array() {
     let store = enumeration_store();
-    // A member whose ACL object no longer exists belongs to no subsystem; it
-    // is dropped with a warning rather than inventing one.
-    store
-        .lock()
-        .unwrap()
-        .vdis
-        .insert(0x00_0040, Vdi::new("orphan", 1 << 20, 22).in_acl(0x00_0099));
+    {
+        let mut st = store.lock().unwrap();
+        // A VDI whose ACL object no longer exists belongs to no subsystem; it
+        // is dropped with a warning rather than inventing one.
+        st.vdis
+            .insert(0x00_0040, Vdi::new("orphan", 1 << 20, 22).in_acl(0x00_0099));
+        // `dog acl add` writes the array entry before the member's acl_id, so
+        // a half-completed add leaves a listed VDI whose inode disagrees...
+        st.vdis
+            .insert(0x00_0041, Vdi::new("halfadded", 1 << 20, 22));
+        // ...and a VDI naming the ACL that the ACL does not list is not a
+        // member of it either. Both are dropped with a warning: the cluster
+        // resolves neither name under this ACL.
+        st.vdis
+            .insert(0x00_0042, Vdi::new("unlisted", 1 << 20, 22).in_acl(ACL_VID));
+        let acl = st.vdis.get_mut(&ACL_VID).unwrap();
+        acl.data_vdi_id.push(0x00_0041);
+        acl.data_vdi_id.push(0x00_0050); // listed, but no such VDI at all
+    }
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
     let acls = list_acls(addr).unwrap();
@@ -774,19 +797,22 @@ fn acl_enumeration_groups_members_under_their_acl() {
                 .iter()
                 .map(|v| (v.name.as_str(), v.tag.as_str(), v.vid))
                 .collect();
-            (acl.name.as_str(), acl.vid, members)
+            (acl.name.as_str(), acl.vid, acl.max_data_id_nr, members)
         })
         .collect();
     assert_eq!(
         seen,
         vec![
             // Sorted by ACL name; an ACL with no members is still an ACL.
+            // max_data_id_nr counts array slots, not usable members: the hole
+            // and the two unresolvable entries are in it too.
             (
                 "nqn.2026-06.io.ioutgt:grp",
                 ACL_VID,
+                5,
                 vec![("shared", "", 0x20), ("shared", "daily", 0x21)]
             ),
-            ("nqn.2026-06.io.ioutgt:idle", 0x30, vec![]),
+            ("nqn.2026-06.io.ioutgt:idle", 0x30, 0, vec![]),
         ]
     );
 }

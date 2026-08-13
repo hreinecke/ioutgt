@@ -17,6 +17,11 @@ pub struct SubsystemConfig {
     pub allow_any_host: bool,
     /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
     pub allowed_hosts: Vec<String>,
+    /// Identify Controller `MNAN` (Maximum Number of Allocated Namespaces)
+    /// to report; `None` leaves it zero, the spec's "no more than `NN`". Set
+    /// where the storage carries its own namespace count — a Sheepdog ACL
+    /// object's `max_data_id_nr`.
+    pub mnan: Option<u32>,
     pub namespaces: Vec<NamespaceConfig>,
 }
 
@@ -132,6 +137,7 @@ mod tests {
             model: default_model(),
             allow_any_host: true,
             allowed_hosts: vec![],
+            mnan: None,
             namespaces,
         }
     }

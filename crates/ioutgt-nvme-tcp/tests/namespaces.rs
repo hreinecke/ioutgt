@@ -32,13 +32,20 @@ fn mem(nsid: u32, size_mb: u64) -> NamespaceConfig {
 }
 
 /// A target whose single subsystem is configured with exactly
-/// `namespaces` from the start.
-fn start_target(namespaces: Vec<NamespaceConfig>) -> std::net::SocketAddr {
+/// `namespaces` from the start, reporting `mnan` (`None`: zero).
+fn start_target_mnan(namespaces: Vec<NamespaceConfig>, mnan: Option<u32>) -> std::net::SocketAddr {
     let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 8);
     config.listen = "127.0.0.1:0".parse().unwrap();
     config.io_threads = 1;
     config.subsystems[0].namespaces = namespaces;
+    config.subsystems[0].mnan = mnan;
     ioutgt_nvme_tcp::spawn_target(config).expect("target start")
+}
+
+/// [`start_target_mnan`] with no MNAN, as every config-file and flag-built
+/// subsystem but a Sheepdog ACL's has it.
+fn start_target(namespaces: Vec<NamespaceConfig>) -> std::net::SocketAddr {
+    start_target_mnan(namespaces, None)
 }
 
 /// Write one 4096-byte block to `nsid` at LBA 0, asserting success.
@@ -92,6 +99,7 @@ fn static_multi_namespace_isolation_and_identify() {
     let ctrl = admin.identify(spec::cns::CONTROLLER, 0, 4);
     let ctrl = IdentifyController::read_from_bytes(&ctrl).expect("identify controller");
     assert_eq!(ctrl.nn.get(), 3, "NN reports the highest NSID");
+    assert_eq!(ctrl.mnan.get(), 0, "no storage-supplied count: MNAN is 0");
 
     // Identify Namespace reports each backend's own size (512-byte blocks,
     // as the config path builds them): 8 MiB → 16384 blocks, 16 MiB → 32768.
@@ -181,4 +189,34 @@ fn noncontiguous_nsids_report_max_nn_and_reject_gap() {
         data,
         "nsid 3 across the gap works"
     );
+}
+
+/// A subsystem whose storage carries its own namespace count reports it as
+/// MNAN — a Sheepdog ACL object, which sizes its member list with
+/// `max_data_id_nr` while each member's NSID is its (large, sparse) vid. NN
+/// stays the highest valid NSID, and the inventory and the namespaces
+/// themselves are exactly the ones configured.
+#[test]
+fn a_storage_supplied_namespace_count_is_reported_as_mnan() {
+    let addr = start_target_mnan(vec![mem(0x20, 8), mem(0x21, 8)], Some(3));
+
+    let mut admin = Client::handshake(addr, false, false);
+    let cntlid = admin.connect(0, 32, 0xFFFF, 1);
+    admin.enable_controller(2);
+
+    let ctrl = admin.identify(spec::cns::CONTROLLER, 0, 3);
+    let ctrl = IdentifyController::read_from_bytes(&ctrl).expect("identify controller");
+    assert_eq!(ctrl.mnan.get(), 3, "MNAN is the storage's count");
+    assert_eq!(ctrl.nn.get(), 0x21, "NN stays the highest valid NSID");
+
+    // The host finds the namespaces through the Active Namespace List, which
+    // still names the vids themselves.
+    let list = admin.identify(spec::cns::ACTIVE_NS_LIST, 0, 4);
+    assert_eq!(active_nsids(&list), vec![0x20, 0x21]);
+
+    let mut io = Client::handshake(addr, false, false);
+    io.connect(1, 32, cntlid, 1);
+    let data = pattern(4096, 0x5a);
+    write_ns(&mut io, 0x21, 0x50, &data);
+    assert_eq!(read_ns(&mut io, 0x21, 0x51), data, "nsid 0x21 serves IO");
 }

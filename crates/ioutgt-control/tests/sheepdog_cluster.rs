@@ -39,6 +39,10 @@ struct Inode {
     /// The inode carries a `uuid[16]`; false for one written by a `sheep`
     /// predating the field (all-zero, i.e. no identity of its own).
     has_uuid: bool,
+    /// An ACL object's `data_vdi_id[]`: the member vids `dog acl add` wrote,
+    /// `0` being a hole left by `dog acl remove`. Empty for a volume — its own
+    /// object map is of no interest to the enumeration.
+    members: &'static [u32],
 }
 
 /// A volume in ACL `acl_id`.
@@ -51,6 +55,7 @@ const fn vol(vid: u32, name: &'static str, size: u64, snapshot: bool, acl_id: u3
         acl_id,
         is_acl: false,
         has_uuid: true,
+        members: &[],
     }
 }
 
@@ -62,8 +67,9 @@ const fn legacy_vol(vid: u32, name: &'static str, size: u64, acl_id: u32) -> Ino
     }
 }
 
-/// An ACL object (`dog acl create`), which belongs to no ACL itself.
-const fn acl(vid: u32, name: &'static str) -> Inode {
+/// An ACL object (`dog acl create`), which belongs to no ACL itself, listing
+/// `members` in its `data_vdi_id[]`.
+const fn acl(vid: u32, name: &'static str, members: &'static [u32]) -> Inode {
     Inode {
         vid,
         name,
@@ -72,6 +78,7 @@ const fn acl(vid: u32, name: &'static str) -> Inode {
         acl_id: 0,
         is_acl: true,
         has_uuid: true,
+        members,
     }
 }
 
@@ -84,8 +91,10 @@ const CLUSTER: &[Inode] = &[
     vol(0x23, "vol-c", 16 << 20, false, ACL_B),
     legacy_vol(0x25, "vol-d", 8 << 20, ACL_B), // no inode uuid to export
     vol(0x24, "loose", 8 << 20, false, 0),     // in no ACL: exported by nobody
-    acl(ACL_A, NQN_A),
-    acl(ACL_B, NQN_B),
+    // ACL A lists its three VDIs (two heads and a snapshot); ACL B lists its
+    // two, plus the hole a since-removed third left behind.
+    acl(ACL_A, NQN_A, &[0x20, 0x21, 0x22]),
+    acl(ACL_B, NQN_B, &[0x23, 0, 0x25]),
 ];
 
 /// The `uuid[16]` the fake cluster generated for `vid` when the VDI was
@@ -97,12 +106,14 @@ fn fixture_uuid(vid: u32) -> [u8; 16] {
 }
 
 fn inode_bytes(inode: &Inode) -> Vec<u8> {
-    let mut b = vec![0u8; SD_INODE_HEADER_SIZE];
+    let mut b = vec![0u8; SD_INODE_HEADER_SIZE + inode.members.len() * 4];
     b[..inode.name.len()].copy_from_slice(inode.name.as_bytes());
     if inode.snapshot {
         b[520..528].copy_from_slice(&1u64.to_le_bytes()); // snap_ctime
         b[SD_MAX_VDI_LEN..SD_MAX_VDI_LEN + 5].copy_from_slice(b"daily");
     }
+    // max_data_id_nr: the extent of data_vdi_id[], holes included.
+    b[528..532].copy_from_slice(&(inode.members.len() as u32).to_le_bytes());
     b[536..544].copy_from_slice(&inode.size.to_le_bytes()); // vdi_size
     b[554] = 1; // nr_copies
     b[555] = 22; // 4 MiB objects
@@ -112,6 +123,10 @@ fn inode_bytes(inode: &Inode) -> Vec<u8> {
     }
     let flags = if inode.is_acl { SD_VDI_FLAG_ACL } else { 0 };
     b[592..596].copy_from_slice(&flags.to_le_bytes());
+    for (i, vid) in inode.members.iter().enumerate() {
+        let o = SD_INODE_HEADER_SIZE + i * 4;
+        b[o..o + 4].copy_from_slice(&vid.to_le_bytes());
+    }
     b
 }
 
@@ -124,6 +139,7 @@ fn serve(mut sock: TcpStream) -> std::io::Result<()> {
         }
         let data_length = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
         let oid = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        let offset = u64::from_le_bytes(hdr[40..48].try_into().unwrap()) as usize;
         let vid = ((oid & 0x00FF_FFFF_0000_0000) >> 32) as u32;
 
         let payload = match hdr[1] {
@@ -145,6 +161,9 @@ fn serve(mut sock: TcpStream) -> std::io::Result<()> {
             },
             _ => Vec::new(),
         };
+        // Honour the request's offset: the member array is read separately
+        // from the header, at offsetof(sd_inode, data_vdi_id).
+        let payload = &payload[payload.len().min(offset)..];
         let payload = &payload[..payload.len().min(data_length)];
         let mut resp = [0u8; HDR];
         resp[0] = 0x02; // proto_ver
@@ -225,6 +244,13 @@ fn cluster_spec_expands_to_one_subsystem_per_acl() {
     // One serial per ACL: the group's cluster-wide identity, not the target's.
     assert_eq!(subsystems[0].serial, format!("SHEEPDOG{ACL_A:06X}"));
     assert_ne!(subsystems[0].serial, subsystems[1].serial);
+
+    // Identify Controller MNAN is the ACL inode's own max_data_id_nr — three
+    // member slots either way, though ACL A spends one on a snapshot and ACL B
+    // one on the hole a removed member left. (NN cannot carry the count: with
+    // a vid for an NSID it is the highest vid in the ACL.)
+    assert_eq!(subsystems[0].mnan, Some(3));
+    assert_eq!(subsystems[1].mnan, Some(3));
 
     // Identity comes from the cluster — the VDI's own inode uuid — not from
     // the exporting subsystem, so one volume looks the same through any
