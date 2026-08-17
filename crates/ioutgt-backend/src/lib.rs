@@ -15,7 +15,9 @@ mod sheepdog;
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
-pub use sheepdog::{AclInfo, SD_LISTEN_PORT, SheepdogBackend, VdiInfo, list_acls, list_vdis};
+pub use sheepdog::{
+    AclInfo, SD_LISTEN_PORT, SheepdogBackend, VdiHolder, VdiInfo, list_acls, list_vdis, vdi_holders,
+};
 
 use ioutgt_core::pool::Seg;
 use ioutgt_core::{Backend, BackendError, LbaRange};
@@ -44,6 +46,17 @@ impl AnyBackend {
     pub fn uuid(&self) -> Option<[u8; 16]> {
         match self {
             AnyBackend::Sheepdog(b) => b.uuid(),
+            AnyBackend::Null(_) | AnyBackend::Memory(_) | AnyBackend::File(_) => None,
+        }
+    }
+
+    /// The cluster backend behind this namespace, if that is what it is:
+    /// the handle for everything only a Sheepdog VDI has — its cluster
+    /// registration, and through it the list of targets serving the volume
+    /// that a subsystem advertises as its paths.
+    pub fn as_sheepdog(&self) -> Option<&SheepdogBackend> {
+        match self {
+            AnyBackend::Sheepdog(b) => Some(b),
             AnyBackend::Null(_) | AnyBackend::Memory(_) | AnyBackend::File(_) => None,
         }
     }

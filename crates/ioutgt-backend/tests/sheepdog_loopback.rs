@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use ioutgt_backend::{SheepdogBackend, list_acls, list_vdis};
+use ioutgt_backend::{SheepdogBackend, VdiHolder, list_acls, list_vdis, vdi_holders};
 use ioutgt_core::buf::AlignedBuf;
 use ioutgt_core::{Backend, BackendError, LbaRange};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -26,15 +26,24 @@ use ioutgt_uring::{QueueRuntime, RingConfig};
 const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
-const SD_OP_LOCK_VDI: u8 = 0x12;
-const SD_OP_RELEASE_VDI: u8 = 0x13;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
+const SD_OP_REGISTER_VDI: u8 = 0x19;
+const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
+const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_VDI_DENIED: u32 = 0x1E;
+const SD_RES_BUFFER_SMALL: u32 = 0x88;
 /// `LOCK_TYPE_NORMAL`: no ACL, and the exclusive lock such an open takes.
 const SD_ACL_NONE: u32 = 0;
+/// `LOCK_STATE_UNLOCKED` / `LOCK_STATE_SHARED`.
+const LOCK_STATE_UNLOCKED: u32 = 1;
+const LOCK_STATE_SHARED: u32 = 3;
+/// `sizeof(struct vdi_state)`, the GET_VDI_COPIES record.
+const VDI_STATE: usize = 1432;
+/// `SD_MAX_COPIES`: participants a VDI's lock can have.
+const SD_MAX_COPIES: usize = 31;
 const SD_VDI_FLAG_ACL: u32 = 0x01;
 const SD_FLAG_CMD_COW: u16 = 0x02;
 const VDI_BIT: u64 = 1 << 63;
@@ -174,10 +183,14 @@ enum Lock {
 struct Store {
     vdis: BTreeMap<u32, Vdi>,
     objects: HashMap<u64, Vec<u8>>,
-    /// Vids currently under a `LOCK_VDI`. Only `RELEASE_VDI` clears one — a
-    /// closing connection deliberately does not, so a test can tell an
+    /// Vids currently locked by a `REGISTER_VDI`. Only `UNREGISTER_VDI` clears
+    /// one — a closing connection deliberately does not, so a test can tell an
     /// explicit release from a socket that merely went away.
     locks: BTreeMap<u32, Lock>,
+    /// The participant list `REGISTER_VDI` builds, per vid: the owner each
+    /// registration named, and how many it has (`sheep` refcounts repeats of
+    /// one owner into a single entry rather than listing it twice).
+    participants: BTreeMap<u32, Vec<(SocketAddr, u32)>>,
 }
 
 impl Store {
@@ -231,6 +244,88 @@ impl Store {
     }
 }
 
+impl Store {
+    /// `add_participant`: a repeat registration from one owner bumps its
+    /// count, a new owner takes the next free slot (`SD_MAX_COPIES` of them).
+    fn add_participant(&mut self, vid: u32, owner: SocketAddr) -> bool {
+        let list = self.participants.entry(vid).or_default();
+        if let Some(entry) = list.iter_mut().find(|(addr, _)| *addr == owner) {
+            entry.1 += 1;
+            return true;
+        }
+        if list.len() >= SD_MAX_COPIES {
+            return false;
+        }
+        list.push((owner, 1));
+        true
+    }
+
+    /// `del_participant`: decrement, and compact the list when the last
+    /// registration of an owner goes.
+    fn del_participant(&mut self, vid: u32, owner: SocketAddr) -> bool {
+        let Some(list) = self.participants.get_mut(&vid) else {
+            return false;
+        };
+        let Some(i) = list.iter().position(|(addr, _)| *addr == owner) else {
+            return false;
+        };
+        list[i].1 -= 1;
+        if list[i].1 == 0 {
+            list.remove(i);
+        }
+        if list.is_empty() {
+            self.participants.remove(&vid);
+        }
+        true
+    }
+
+    /// The `GET_VDI_COPIES` payload: one `vdi_state` per VDI the cluster
+    /// knows, carrying its participant list.
+    fn vdi_states(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.vdis.len() * VDI_STATE];
+        for (i, vid) in self.vdis.keys().enumerate() {
+            let vs = &mut out[i * VDI_STATE..(i + 1) * VDI_STATE];
+            vs[0..4].copy_from_slice(&vid.to_le_bytes());
+            let empty = Vec::new();
+            let list = self.participants.get(vid).unwrap_or(&empty);
+            let state = if list.is_empty() {
+                LOCK_STATE_UNLOCKED
+            } else {
+                LOCK_STATE_SHARED
+            };
+            vs[20..24].copy_from_slice(&state.to_le_bytes());
+            vs[64..68].copy_from_slice(&(list.len() as u32).to_le_bytes());
+            for (j, (owner, count)) in list.iter().enumerate() {
+                // participants_state[j]: SHARED_LOCK_STATE_SHARED, count above.
+                let word = 2u32 | (count << 8);
+                vs[68 + j * 4..72 + j * 4].copy_from_slice(&word.to_le_bytes());
+                let nid = 192 + j * 40;
+                match owner.ip() {
+                    std::net::IpAddr::V4(v4) => {
+                        vs[nid + 12..nid + 16].copy_from_slice(&v4.octets());
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        vs[nid..nid + 16].copy_from_slice(&v6.octets());
+                    }
+                }
+                vs[nid + 16..nid + 18].copy_from_slice(&owner.port().to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
+/// The owner a `vdi_lock` request names: addr[16] at 24, port at 40.
+fn req_owner(hdr: &[u8; HDR]) -> SocketAddr {
+    let addr: [u8; 16] = hdr[24..40].try_into().unwrap();
+    let ip = if addr[12] != 0 && addr[..12].iter().all(|&b| b == 0) {
+        std::net::IpAddr::V4(<[u8; 4]>::try_from(&addr[12..]).unwrap().into())
+    } else {
+        std::net::IpAddr::V6(addr.into())
+    };
+    SocketAddr::new(ip, u16le(hdr, 40))
+}
+
 fn resp(opcode: u8, id: u32, result: u32, data_len: u32) -> [u8; HDR] {
     let mut r = [0u8; HDR];
     r[0] = 0x02; // proto_ver
@@ -279,13 +374,13 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
 
         let mut st = store.lock().unwrap();
         match opcode {
-            SD_OP_GET_VDI_INFO | SD_OP_LOCK_VDI => {
+            SD_OP_GET_VDI_INFO => {
                 // payload was not consumed above (not a write opcode); drain it.
                 let mut p = vec![0u8; data_length];
                 sock.read_exact(&mut p)?;
                 let name = cstr(&p[..SD_MAX_VDI_LEN]);
                 let tag = cstr(&p[SD_MAX_VDI_LEN..]);
-                let acl = u32le(&hdr, 36); // sd_req.vdi.acl / lock type
+                let acl = u32le(&hdr, 36); // sd_req.vdi.acl
                 let named = st
                     .vdis
                     .iter()
@@ -297,11 +392,6 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                     Some((_, vdi_acl)) if vdi_acl != acl => {
                         sock.write_all(&resp(opcode, id, SD_RES_VDI_DENIED, 0))?;
                     }
-                    // LOCK_VDI answers as GET_VDI_INFO does, and takes the
-                    // lock on the way — unless an incompatible holder has it.
-                    Some((vid, _)) if opcode == SD_OP_LOCK_VDI && !st.take_lock(vid, acl) => {
-                        sock.write_all(&resp(opcode, id, SD_RES_VDI_LOCKED, 0))?;
-                    }
                     Some((vid, _)) => {
                         let mut r = resp(opcode, id, 0, 0);
                         r[24..28].copy_from_slice(&vid.to_le_bytes()); // vdi_id
@@ -310,14 +400,56 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                     None => sock.write_all(&resp(opcode, id, 0x08, 0))?, // NO_VDI
                 }
             }
-            SD_OP_RELEASE_VDI => {
-                let vid = u32le(&hdr, 24); // base_vdi_id
-                let result = if st.release_lock(vid, u32le(&hdr, 36)) {
+            SD_OP_REGISTER_VDI => {
+                // The lock op, looking its VDI up by name as GET_VDI_INFO does
+                // but naming its own owner: under an ACL it joins the volume's
+                // participant list, outside one it claims the volume alone.
+                let mut p = vec![0u8; data_length];
+                sock.read_exact(&mut p)?;
+                let name = cstr(&p[..SD_MAX_VDI_LEN]);
+                let acl = u32le(&hdr, 44); // sd_req.vdi_lock.acl
+                let owner = req_owner(&hdr);
+                let named = st
+                    .vdis
+                    .iter()
+                    .find(|(_, vdi)| vdi.name == name && vdi.tag.is_empty())
+                    .map(|(&vid, vdi)| (vid, vdi.acl_id));
+                let result = match named {
+                    None => 0x08, // NO_VDI
+                    Some((_, vdi_acl)) if vdi_acl != acl => SD_RES_VDI_DENIED,
+                    Some((vid, _)) if !st.take_lock(vid, acl) => SD_RES_VDI_LOCKED,
+                    // The exclusive lock has one owner and no list; only a
+                    // shared one records its holders as participants.
+                    Some((vid, _)) if acl != SD_ACL_NONE && !st.add_participant(vid, owner) => {
+                        st.release_lock(vid, acl);
+                        0x15 // NO_SPACE: SD_MAX_COPIES participants already
+                    }
+                    Some(_) => 0,
+                };
+                sock.write_all(&resp(opcode, id, result, 0))?;
+            }
+            SD_OP_UNREGISTER_VDI => {
+                let vid = u32le(&hdr, 16); // sd_req.vdi_lock.vid
+                let acl = u32le(&hdr, 44);
+                let owner = req_owner(&hdr);
+                let held = st.release_lock(vid, acl);
+                let listed = acl == SD_ACL_NONE || st.del_participant(vid, owner);
+                let result = if held && listed {
                     0
                 } else {
                     SD_RES_VDI_NOT_LOCKED
                 };
                 sock.write_all(&resp(opcode, id, result, 0))?;
+            }
+            SD_OP_GET_VDI_COPIES => {
+                // The whole table or nothing: a caller that asked for too
+                // small a buffer is told to come back with a bigger one.
+                let states = st.vdi_states();
+                if data_length < states.len() {
+                    sock.write_all(&resp(opcode, id, SD_RES_BUFFER_SMALL, 0))?;
+                } else {
+                    send_slice(&mut sock, opcode, id, &states, 0, data_length)?;
+                }
             }
             SD_OP_READ_VDIS => {
                 let bitmap = st.vdi_bitmap();
@@ -414,6 +546,7 @@ fn fresh_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
         vdis,
         objects: HashMap::new(),
         locks: BTreeMap::new(),
+        participants: BTreeMap::new(),
     }))
 }
 
@@ -430,6 +563,12 @@ fn acl_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
         st.vdis.get_mut(&TEST_VID).unwrap().acl_id = ACL_VID;
     }
     store
+}
+
+/// The fabric address of target `n`: what an open registers as the volume's
+/// holder, and what the cluster hands back as a path to it.
+fn target(n: u8) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, n], 4420))
 }
 
 /// The vids the fake cluster currently has locked.
@@ -459,7 +598,7 @@ fn read_hole_write_alloc_overwrite_roundtrip() {
     let store = fresh_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-    let be = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
     assert_eq!(be.block_shift(), 9);
     assert_eq!(be.nr_blocks(), 256 * 1024 / 512);
 
@@ -516,16 +655,17 @@ fn shared_lock_stacks_across_targets_and_unwinds_on_drop() {
     let store = acl_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), true).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(target(1))).unwrap();
     assert_eq!(holders(&store, TEST_VID), 1, "the open took the lock");
 
     // A second target may serve the same VDI — that is what the shared lock
     // is for — and joins the holders rather than displacing the first.
-    let second = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), true).unwrap();
+    let second =
+        SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(target(2))).unwrap();
     assert_eq!(holders(&store, TEST_VID), 2);
 
     // An explicitly unlocked open goes through too, and disturbs nothing.
-    let waived = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), false).unwrap();
+    let waived = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), None).unwrap();
     assert_eq!(holders(&store, TEST_VID), 2);
     drop(waived);
     assert_eq!(holders(&store, TEST_VID), 2);
@@ -545,7 +685,7 @@ fn an_explicit_release_hands_the_lock_back_before_drop() {
     let store = fresh_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    let be = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
     assert_eq!(locked(&store), vec![TEST_VID], "the open took the lock");
 
     be.release_lock();
@@ -555,7 +695,7 @@ fn an_explicit_release_hands_the_lock_back_before_drop() {
     // the lock again — the cluster would refuse a release it does not hold,
     // and a *new* holder's lock must survive both.
     be.release_lock();
-    let next = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    let next = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(2))).unwrap();
     drop(be);
     assert_eq!(
         locked(&store),
@@ -566,7 +706,7 @@ fn an_explicit_release_hands_the_lock_back_before_drop() {
     assert!(locked(&store).is_empty());
 
     // A backend that never locked (`?nolock`) shuts down just as quietly.
-    let waived = SheepdogBackend::open(addr, "testvdi", None, None, false).unwrap();
+    let waived = SheepdogBackend::open(addr, "testvdi", None, None, None).unwrap();
     waived.release_lock();
     assert!(locked(&store).is_empty());
 }
@@ -578,13 +718,13 @@ fn a_vdi_outside_any_acl_locks_exclusively() {
     let store = fresh_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    let be = SheepdogBackend::open(addr, "testvdi", None, None, true).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
     assert_eq!(
         store.lock().unwrap().locks[&TEST_VID],
         Lock::Exclusive,
         "no ACL means LOCK_TYPE_NORMAL"
     );
-    let err = SheepdogBackend::open(addr, "testvdi", None, None, true)
+    let err = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(2)))
         .err()
         .expect("a second exclusive open is refused");
     assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy);
@@ -604,14 +744,14 @@ fn an_exclusive_holder_locks_the_target_out() {
         .insert(TEST_VID, Lock::Exclusive);
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    let err = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), true)
+    let err = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(target(1)))
         .err()
         .expect("an exclusively locked VDI is refused");
     assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy);
     assert_eq!(locked(&store), vec![TEST_VID], "the holder keeps its lock");
 
     // Waiving the lock is the escape hatch for exclusion arranged elsewhere.
-    let waived = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), false).unwrap();
+    let waived = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), None).unwrap();
     drop(waived);
     assert_eq!(
         store.lock().unwrap().locks[&TEST_VID],
@@ -636,7 +776,7 @@ fn an_acl_scopes_which_names_resolve() {
     // A member named from outside its ACL, and a non-member named from inside
     // one: the cluster denies both.
     for (vdi, acl) in [("testvdi", None), ("loose", Some(ACL_NQN))] {
-        let err = SheepdogBackend::open(addr, vdi, None, acl, true)
+        let err = SheepdogBackend::open(addr, vdi, None, acl, Some(target(1)))
             .err()
             .unwrap_or_else(|| panic!("{vdi} should be denied under {acl:?}"));
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{vdi}");
@@ -644,21 +784,21 @@ fn an_acl_scopes_which_names_resolve() {
     assert!(locked(&store).is_empty(), "a denied open takes no lock");
 
     // An ordinary VDI is refused as an ACL even though the name resolves.
-    let err = SheepdogBackend::open(addr, "testvdi", None, Some("loose"), true)
+    let err = SheepdogBackend::open(addr, "testvdi", None, Some("loose"), Some(target(1)))
         .err()
         .expect("'loose' is no ACL object");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     // Named correctly, the member opens.
-    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), true).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(target(1))).unwrap();
     assert_eq!(be.nr_blocks(), 256 * 1024 / 512);
 }
 
-/// A failed open must not walk away holding the lock it took to get there.
+/// A failed open must not walk away holding a lock: the registration is the
+/// last thing it takes, after the inode is in hand.
 #[test]
-fn lock_released_when_the_open_fails_after_taking_it() {
-    // A zero-sized VDI passes the name lookup (so the lock is taken) and then
-    // fails the inode check.
+fn a_failed_open_leaves_no_registration() {
+    // A zero-sized VDI passes the name lookup and fails the inode check.
     let store = fresh_store(16, 256 * 1024);
     store
         .lock()
@@ -667,7 +807,7 @@ fn lock_released_when_the_open_fails_after_taking_it() {
         .insert(0x00_0042, Vdi::new("empty", 0, 22));
     let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    let err = SheepdogBackend::open(addr, "empty", None, None, true)
+    let err = SheepdogBackend::open(addr, "empty", None, None, Some(target(1)))
         .err()
         .expect("a zero-sized VDI is rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -689,12 +829,12 @@ fn the_inode_uuid_is_read_back_as_the_vdi_identity() {
 
     let expected = store.lock().unwrap().vdis[&TEST_VID].uuid();
     assert!(expected.is_some(), "the fixture wrote a uuid");
-    let be = SheepdogBackend::open(addr, "testvdi", None, None, false).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, None).unwrap();
     assert_eq!(be.uuid(), expected, "open reports the inode's uuid");
 
     // An inode from a sheep predating the field carries an all-zero uuid,
     // which is "unset" rather than an identity to hand a host.
-    let legacy = SheepdogBackend::open(addr, "legacy", None, None, false).unwrap();
+    let legacy = SheepdogBackend::open(addr, "legacy", None, None, None).unwrap();
     assert_eq!(legacy.uuid(), None);
 
     // The enumeration path reads the same field, so a target mapping the
@@ -777,13 +917,13 @@ fn cluster_enumeration_lists_every_vdi() {
     // reports the size the listing reports.
     for vdi in vdis.iter().filter(|v| !v.snapshot) {
         let acl = (vdi.acl != 0).then_some(ACL_NQN);
-        let be = SheepdogBackend::open(addr, &vdi.name, None, acl, false).unwrap();
+        let be = SheepdogBackend::open(addr, &vdi.name, None, acl, None).unwrap();
         assert_eq!(be.nr_blocks() * 512, vdi.size, "{} size", vdi.name);
     }
 
     // The snapshot is openable by tag and refuses writes. Being frozen, it
     // takes no lock even though this open asks for one.
-    let snap = SheepdogBackend::open(addr, "alpha", Some("daily"), None, true).unwrap();
+    let snap = SheepdogBackend::open(addr, "alpha", Some("daily"), None, Some(target(1))).unwrap();
     assert!(locked(&store).is_empty(), "a snapshot open locks nothing");
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
     rt.block_on(async move {
@@ -848,5 +988,155 @@ fn acl_enumeration_follows_the_acls_member_array() {
             ),
             ("nqn.2026-06.io.ioutgt:idle", 0x30, 0, vec![]),
         ]
+    );
+}
+
+/// The discovery path: opening a volume under an ACL registers this target's
+/// fabric address as one of its holders, and reading the holders back names
+/// every target serving it — the paths a subsystem advertises.
+#[test]
+fn the_holders_of_a_volume_are_the_targets_serving_it() {
+    let store = acl_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+    let (us, peer) = (target(1), target(2));
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(us)).unwrap();
+    assert_eq!(be.vid(), TEST_VID);
+    assert_eq!(be.owner(), Some(us), "the open registered our own address");
+    assert_eq!(
+        vdi_holders(addr, &[be.vid()]).unwrap(),
+        vec![vec![VdiHolder {
+            addr: us,
+            index: 0,
+            registrations: 1
+        }]]
+    );
+
+    // A second target opens the same volume: both are paths to it now, each
+    // with its own participant slot.
+    let other = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(peer)).unwrap();
+    assert_eq!(
+        vdi_holders(addr, &[TEST_VID]).unwrap()[0],
+        vec![
+            VdiHolder {
+                addr: us,
+                index: 0,
+                registrations: 1
+            },
+            VdiHolder {
+                addr: peer,
+                index: 1,
+                registrations: 1
+            },
+        ]
+    );
+
+    // Shutting one down hands its registration back and the cluster compacts
+    // the list — the other keeps serving the volume.
+    other.release_lock();
+    assert_eq!(
+        vdi_holders(addr, &[TEST_VID]).unwrap()[0],
+        vec![VdiHolder {
+            addr: us,
+            index: 0,
+            registrations: 1
+        }]
+    );
+
+    // Nobody holds an unopened volume, and a vid the cluster never heard of
+    // has no list at all: both answer empty, in the order asked.
+    drop(be);
+    assert_eq!(
+        vdi_holders(addr, &[TEST_VID, ACL_VID, 0x00_dead]).unwrap(),
+        vec![vec![], vec![], vec![]]
+    );
+}
+
+/// A volume in no ACL is held exclusively, which has an owner but no
+/// participant list: nobody else can serve it, so it advertises no paths.
+#[test]
+fn an_exclusively_held_volume_reports_no_holders() {
+    let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
+    assert_eq!(locked(&store), vec![TEST_VID]);
+    assert_eq!(vdi_holders(addr, &[be.vid()]).unwrap(), vec![vec![]]);
+
+    // An open that took no registration has none to retake either.
+    let waived = SheepdogBackend::open(addr, "testvdi", None, None, None).unwrap();
+    waived.reregister().unwrap();
+    assert_eq!(locked(&store), vec![TEST_VID], "and took none doing so");
+}
+
+/// A cluster that lost this target's registration — a `sheep` restart, or an
+/// eviction and rejoin — gets it back from the refresh, without the namespace
+/// being reopened.
+#[test]
+fn a_dropped_registration_is_retaken() {
+    let store = acl_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+    let us = target(1);
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(us)).unwrap();
+    {
+        let mut st = store.lock().unwrap();
+        st.locks.clear();
+        st.participants.clear();
+    }
+    assert!(vdi_holders(addr, &[TEST_VID]).unwrap()[0].is_empty());
+
+    be.reregister().unwrap();
+    assert_eq!(
+        vdi_holders(addr, &[TEST_VID]).unwrap()[0],
+        vec![VdiHolder {
+            addr: us,
+            index: 0,
+            registrations: 1
+        }]
+    );
+
+    // A volume deleted and recreated under this namespace's feet resolves to a
+    // different vid; registering on it would advertise a path to storage this
+    // namespace is not reading, so it is refused.
+    {
+        let mut st = store.lock().unwrap();
+        let vdi = st.vdis.remove(&TEST_VID).unwrap();
+        st.vdis.insert(0x00_0099, vdi);
+    }
+    let err = be.reregister().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::StaleNetworkFileHandle);
+
+    // A backend that has already handed its registration back has nothing to
+    // retake: a refresh arriving behind a shutdown must not undo it.
+    be.release_lock();
+    be.reregister().unwrap();
+    assert!(store.lock().unwrap().participants.is_empty());
+}
+
+/// The holder list arrives whole however many VDIs the cluster has: the fetch
+/// retries with a bigger buffer for as long as `sheep` says it is too small.
+#[test]
+fn holder_list_survives_a_cluster_larger_than_one_buffer() {
+    let store = acl_store(16, 256 * 1024);
+    {
+        // Past DEFAULT_VDI_STATE_COUNT (512), so the first request bounces.
+        let mut st = store.lock().unwrap();
+        for i in 0..600u32 {
+            st.vdis
+                .insert(0x10_0000 + i, Vdi::new("filler", 1 << 22, 22));
+        }
+    }
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+    let us = target(1);
+
+    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(us)).unwrap();
+    assert_eq!(
+        vdi_holders(addr, &[be.vid()]).unwrap()[0],
+        vec![VdiHolder {
+            addr: us,
+            index: 0,
+            registrations: 1
+        }]
     );
 }

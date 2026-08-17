@@ -158,6 +158,12 @@ pub mod trtype {
     pub const TCP: u8 = 3;
 }
 
+/// Address family constants for `DiscoveryLogEntry::adrfam`.
+pub mod adrfam {
+    pub const IPV4: u8 = 1;
+    pub const IPV6: u8 = 2;
+}
+
 /// Subsystem type constants.
 pub mod subtype {
     pub const DISCOVERY: u8 = 3;

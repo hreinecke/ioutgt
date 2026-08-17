@@ -192,6 +192,8 @@ impl Subsystem {
             allowed_hosts: self.allowed_hosts.clone(),
             // Left at zero ("no more than NN"), as the kernel does.
             mnan: None,
+            // An nvmetcli config names its subsystems itself; no cluster
+            // publishes who else serves them.
             namespaces,
         })
     }

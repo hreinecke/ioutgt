@@ -16,7 +16,7 @@ use zerocopy::IntoBytes;
 
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
 use ioutgt_core::backend::Backend;
-use ioutgt_core::subsystem::TransportType;
+use ioutgt_core::subsystem::{SubsystemPort, TransportType};
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;
@@ -358,39 +358,73 @@ fn get_log_page<B: Backend>(
     }
 }
 
-/// Discovery log: header + one entry per NVM subsystem on this port.
+/// Discovery log: header + one entry per path to each NVM subsystem on this
+/// port.
+///
+/// A subsystem usually has exactly one path — this target's own port — and
+/// then this is nvmet's one-entry-per-subsystem log. A subsystem the control
+/// plane gave a path list (`Subsystem::set_ports`) instead contributes one
+/// entry per path, so a host learns every target serving it, not only the one
+/// it happened to ask. For Sheepdog that list is the set of targets
+/// registered on the subsystem's cluster ACL.
 fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
     let subsystems = &ctx.port.subsystems;
-    let mut log = Vec::with_capacity(1024 * (1 + subsystems.len()));
+    // The port's own transport and address, for subsystems with no path list.
+    let local = SubsystemPort {
+        traddr: ctx.port.traddr.clone(),
+        trsvcid: ctx.port.trsvcid.clone(),
+        trtype: ctx.port.trtype,
+        portid: 0,
+    };
 
+    let mut entries = Vec::with_capacity(subsystems.len());
+    for (nqn, subsys) in subsystems {
+        let ports = subsys.ports();
+        if ports.is_empty() {
+            entries.push(discovery_entry(nqn, &local));
+        } else {
+            entries.extend(ports.iter().map(|port| discovery_entry(nqn, port)));
+        }
+    }
+
+    let mut log = Vec::with_capacity(1024 * (1 + entries.len()));
     let header = DiscoveryLogHeader {
         genctr: 1.into(),
-        numrec: (subsystems.len() as u64).into(),
+        numrec: (entries.len() as u64).into(),
         recfmt: 0.into(),
         resv: [0; 1006],
     };
     log.extend_from_slice(header.as_bytes());
-
-    for (index, (nqn, _subsys)) in subsystems.iter().enumerate() {
-        let mut entry = DiscoveryLogEntry::zeroed();
-        // The model's transport enum is protocol-neutral; the NVMe-oF
-        // TRTYPE byte it maps to is this crate's concern.
-        entry.trtype = match ctx.port.trtype {
-            TransportType::Tcp => fabrics::trtype::TCP,
-            TransportType::Rdma => fabrics::trtype::RDMA,
-        };
-        entry.adrfam = 1; // IPv4
-        entry.subtype = fabrics::subtype::NVM;
-        entry.treq = 0;
-        entry.portid.set(u16::try_from(index).unwrap_or(0));
-        entry.cntlid.set(0xFFFF); // dynamic controllers
-        entry.asqsz.set(32);
-        ascii_pad(&mut entry.trsvcid, &ctx.port.trsvcid);
-        ascii_pad(&mut entry.traddr, &ctx.port.traddr);
-        entry.subnqn.fill(0);
-        let n = nqn.len().min(255);
-        entry.subnqn[..n].copy_from_slice(&nqn.as_bytes()[..n]);
+    for entry in &entries {
         log.extend_from_slice(entry.as_bytes());
     }
     log
+}
+
+/// One discovery log entry: subsystem `nqn` reachable over `port`.
+fn discovery_entry(nqn: &str, port: &SubsystemPort) -> DiscoveryLogEntry {
+    let mut entry = DiscoveryLogEntry::zeroed();
+    // The model's transport enum is protocol-neutral; the NVMe-oF
+    // TRTYPE byte it maps to is this crate's concern.
+    entry.trtype = match port.trtype {
+        TransportType::Tcp => fabrics::trtype::TCP,
+        TransportType::Rdma => fabrics::trtype::RDMA,
+    };
+    // A traddr that does not parse is a hostname, which the spec allows only
+    // for FC/loop; IPv4 is the better guess for one on an IP transport.
+    entry.adrfam = match port.traddr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => fabrics::adrfam::IPV6,
+        _ => fabrics::adrfam::IPV4,
+    };
+    entry.subtype = fabrics::subtype::NVM;
+    entry.treq = 0;
+    entry.portid.set(port.portid);
+    entry.cntlid.set(0xFFFF); // dynamic controllers
+    entry.asqsz.set(32);
+    ascii_pad(&mut entry.trsvcid, &port.trsvcid);
+    ascii_pad(&mut entry.traddr, &port.traddr);
+    entry.subnqn.fill(0);
+    let n = nqn.len().min(255);
+    entry.subnqn[..n].copy_from_slice(&nqn.as_bytes()[..n]);
+    entry
 }

@@ -28,7 +28,7 @@ use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
 pub use ioutgt_core::subsystem::TransportType;
-use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem};
+use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, SubsystemPort};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -433,8 +433,10 @@ pub fn wait_for_shutdown() -> io::Result<()> {
 /// 1. **Stop IO.** Every target's control thread stops accepting, winds its
 ///    connections down, and waits for its queue threads to report that no
 ///    command is executing and no backend op is in flight.
-/// 2. **Release.** With nothing left to issue IO, walk the namespaces and let
-///    each backend give up what it holds outside the process.
+/// 2. **Release.** With nothing left to issue IO, stop refreshing the cluster
+///    path lists, then walk the namespaces and let each backend give up what
+///    it holds outside the process — its VDI registration, which is also what
+///    advertised this target as a path to the volume.
 ///
 /// Doing it the other way round would let an in-flight write land on a VDI
 /// this process no longer holds the lock for. Neither phase can hang: a
@@ -447,6 +449,7 @@ pub fn wait_for_shutdown() -> io::Result<()> {
 /// pairs the two.
 pub fn shutdown() -> usize {
     quiesce_targets();
+    stop_path_refresh();
     let ports = std::mem::take(&mut *live_ports());
     let mut walked = 0;
     for port in ports {
@@ -496,6 +499,16 @@ fn quiesce_targets() {
             "did not stop serving IO before the release"
         );
     }
+}
+
+/// Every port this process is currently serving, in the order they were built
+/// — the same `Arc`s the queue threads hold, so the subsystem model reached
+/// through them is the live one (a path list set here shows up in the next
+/// discovery log a host reads).
+///
+/// Empty once [`shutdown`] has run.
+pub fn ports() -> Vec<Arc<PortConfig<AnyBackend>>> {
+    live_ports().clone()
 }
 
 /// [`LIVE_PORTS`], recovered from poisoning: a shutdown path that skipped the
@@ -962,9 +975,12 @@ fn build_port(
     let mut subsystems = BTreeMap::new();
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
+        // The Sheepdog namespaces that registered this target as a holder of
+        // their volume: what the subsystem's path list is read back from.
+        let mut registered: Vec<Arc<AnyBackend>> = Vec::new();
         for ns in &spec.namespaces {
-            let backend =
-                build_backend(&ns.backend, config.recv_buf_bytes > 0).map_err(io::Error::other)?;
+            let backend = build_backend(&ns.backend, config.recv_buf_bytes > 0, Some(bound))
+                .map_err(io::Error::other)?;
             // Test-only slow-disk emulation for memory namespaces.
             if config.mem_write_delay_us > 0
                 && let AnyBackend::Memory(m) = &backend
@@ -977,11 +993,15 @@ fn build_port(
                 .uuid
                 .or_else(|| backend.uuid())
                 .unwrap_or_else(|| ioutgt_core::subsystem::namespace_uuid(&spec.nqn, ns.nsid));
+            let backend = Arc::new(backend);
+            if backend.as_sheepdog().is_some_and(|sd| sd.owner().is_some()) {
+                registered.push(Arc::clone(&backend));
+            }
             namespaces.insert(
                 ns.nsid,
                 Arc::new(Namespace {
                     nsid: ns.nsid,
-                    backend: Arc::new(backend),
+                    backend,
                     uuid,
                 }),
             );
@@ -999,6 +1019,9 @@ fn build_port(
         // object's `max_data_id_nr`), report it as MNAN.
         .with_mnan(spec.mnan),
         );
+        // A subsystem holding cluster volumes advertises every target that
+        // holds them too, itself included, as a path to it.
+        track_cluster_paths(&subsystem, registered, trtype);
         subsystems.insert(spec.nqn.clone(), subsystem);
     }
     let port = Arc::new(PortConfig {
@@ -1016,6 +1039,197 @@ fn build_port(
     // the cluster. Register the port so [`shutdown`] can hand that back.
     live_ports().push(Arc::clone(&port));
     Ok(port)
+}
+
+// ---------------------------------------------------------------------------
+// Cluster paths: who else serves this subsystem's volumes
+// ---------------------------------------------------------------------------
+
+/// One subsystem's cluster-backed namespaces, and the path list they feed.
+///
+/// Opening a Sheepdog namespace registers this target's fabric address as a
+/// holder of that volume (`SheepdogBackend::open`); the cluster's list of
+/// holders is therefore the list of targets serving it, and the union across
+/// the subsystem's volumes is the set of paths its discovery entries
+/// advertise. Nothing here is a separate cluster object: the namespaces the
+/// subsystem already opened *are* the registration.
+struct ClusterPaths {
+    /// The cluster the volumes live on.
+    cluster: SocketAddr,
+    /// The address this target registered as their holder, and the one its own
+    /// discovery entry carries: what a host must connect to to reach it.
+    owner: SocketAddr,
+    /// The registered namespaces' backends, read for their vids and
+    /// re-registered when the cluster stops listing us.
+    namespaces: Vec<Arc<AnyBackend>>,
+    /// Transport of the port that opened them.
+    trtype: TransportType,
+    /// The subsystem whose path list the holders feed.
+    subsystem: Arc<Subsystem<AnyBackend>>,
+}
+
+/// Every subsystem with cluster-backed paths. Same lifetime rule as
+/// [`LIVE_PORTS`]: appended at startup, drained once by [`shutdown`] — which
+/// is what stops the refresh thread. The registrations themselves are handed
+/// back by the backends (`AnyBackend::shutdown`), not from here.
+static CLUSTER_PATHS: Mutex<Vec<Arc<ClusterPaths>>> = Mutex::new(Vec::new());
+
+/// [`CLUSTER_PATHS`], recovered from poisoning (see [`live_ports`]).
+fn cluster_paths() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterPaths>>> {
+    CLUSTER_PATHS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How often the refresh thread re-reads the holder lists. Discovery is a cold
+/// path and a target joining or leaving is rare, so this only has to be well
+/// inside the time a host takes to notice a path — seconds, not milliseconds.
+const PATH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Seed `subsystem`'s path list from the holders of the cluster volumes it
+/// just registered for, and arrange for it to be kept up.
+///
+/// `registered` are the namespace backends that took a registration — Sheepdog
+/// ones with an owner. A subsystem with none of those (no cluster storage, or
+/// locking turned off) keeps the default path list: this target alone.
+///
+/// Best-effort by design: a cluster that will not answer costs this target its
+/// multi-path discovery entries, not its ability to serve the namespaces it
+/// already opened.
+fn track_cluster_paths(
+    subsystem: &Arc<Subsystem<AnyBackend>>,
+    registered: Vec<Arc<AnyBackend>>,
+    trtype: TransportType,
+) {
+    let Some((cluster, owner)) = registered.first().and_then(|b| {
+        let sd = b.as_sheepdog()?;
+        Some((sd.cluster(), sd.owner()?))
+    }) else {
+        return;
+    };
+    // Volumes on a second cluster have their own holder lists, which say
+    // nothing about who serves *this* one's; a subsystem spanning clusters
+    // advertises the paths of the first and warns about the rest.
+    let (namespaces, other): (Vec<_>, Vec<_>) = registered
+        .into_iter()
+        .partition(|b| b.as_sheepdog().is_some_and(|sd| sd.cluster() == cluster));
+    if !other.is_empty() {
+        warn!(subsystem = %subsystem.nqn, %cluster, ignored = other.len(),
+              "sheepdog: namespaces on another cluster do not contribute paths");
+    }
+    let paths = Arc::new(ClusterPaths {
+        cluster,
+        owner,
+        namespaces,
+        trtype,
+        subsystem: Arc::clone(subsystem),
+    });
+    refresh_cluster_paths(&paths);
+    cluster_paths().push(paths);
+    start_path_refresh();
+}
+
+/// Re-read the holders of a subsystem's volumes into its path list,
+/// re-registering any volume this target is no longer listed for (the cluster
+/// dropped us while we were away — a restart, or an eviction and rejoin).
+fn refresh_cluster_paths(paths: &ClusterPaths) {
+    let vids: Vec<u32> = paths
+        .namespaces
+        .iter()
+        .filter_map(|b| Some(b.as_sheepdog()?.vid()))
+        .collect();
+    let mut holders = match ioutgt_backend::vdi_holders(paths.cluster, &vids) {
+        Ok(holders) => holders,
+        Err(err) => {
+            warn!(subsystem = %paths.subsystem.nqn, %err,
+                  "sheepdog: holder list unavailable");
+            return;
+        }
+    };
+    let mut retaken = false;
+    for (backend, holders) in paths.namespaces.iter().zip(&holders) {
+        if holders.iter().any(|h| h.addr == paths.owner) {
+            continue;
+        }
+        let Some(sd) = backend.as_sheepdog() else {
+            continue;
+        };
+        match sd.reregister() {
+            // A namespace whose registration cannot be retaken keeps serving
+            // IO; it just stops contributing this target to its own holder
+            // list until the cluster takes it again.
+            Err(err) => warn!(subsystem = %paths.subsystem.nqn, vid = sd.vid(), %err,
+                              "sheepdog: re-registration failed"),
+            Ok(()) => retaken = true,
+        }
+    }
+    if retaken {
+        holders = ioutgt_backend::vdi_holders(paths.cluster, &vids).unwrap_or(holders);
+    }
+    // The union across the subsystem's volumes: a target holding any of them
+    // is a path to the subsystem. Sorted so every target computes the same
+    // PORTID — the index in this list — for the same peer.
+    let mut addrs: Vec<SocketAddr> = holders.into_iter().flatten().map(|h| h.addr).collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    // Nobody holds anything: a cluster mid-restart, most likely. Leave the
+    // path list as it was rather than flapping the hosts' view of it.
+    if addrs.is_empty() {
+        return;
+    }
+    // Every holder is another ioutgt target fronting the same cluster, so it
+    // speaks the fabric this one does; the cluster records an address, not a
+    // transport.
+    paths.subsystem.set_ports(
+        addrs
+            .iter()
+            .enumerate()
+            .map(|(index, addr)| SubsystemPort {
+                traddr: addr.ip().to_string(),
+                trsvcid: addr.port().to_string(),
+                trtype: paths.trtype,
+                portid: u16::try_from(index).unwrap_or(u16::MAX),
+            })
+            .collect(),
+    );
+}
+
+/// Start the one thread that keeps every cluster path list current, if it is
+/// not running already.
+///
+/// A plain OS thread rather than anything on a queue thread: the refresh is
+/// blocking cluster IO, and a queue thread must never block. It ends when
+/// [`shutdown`] drains the registry.
+fn start_path_refresh() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("ioutgt-acl".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(PATH_REFRESH_INTERVAL);
+                let tracked = cluster_paths().clone();
+                if tracked.is_empty() {
+                    // Shutdown drained them; nothing left to refresh.
+                    return;
+                }
+                for paths in &tracked {
+                    refresh_cluster_paths(paths);
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "sheepdog: cluster path lists will not be refreshed");
+    }
+}
+
+/// Stop tracking cluster paths, on the way into [`shutdown`]'s release phase.
+/// Ends the refresh thread, so nothing re-registers a volume behind the
+/// backend that is about to hand it back.
+fn stop_path_refresh() {
+    cluster_paths().clear();
 }
 
 /// The live mailbox senders for a spawned queue-thread pool: the admin

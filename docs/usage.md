@@ -143,11 +143,15 @@ connect to it.
 #### VDI locking
 
 Opening a writable VDI takes the cluster's **VDI lock**
-(`SD_OP_LOCK_VDI`), and the ACL the open runs under picks the lock's kind.
+(`SD_OP_REGISTER_VDI`, the lock op that lets the client say who the owner
+is — the target registers the address its own fabric listens on, where
+`SD_OP_LOCK_VDI` would have recorded the relaying `sheep`), and the ACL the
+open runs under picks the lock's kind.
 Under an ACL the lock is *shared*: every holder naming that same ACL joins
-the participant list, so a pair of targets serving one ACL can export the
-same volume on two paths. Without an ACL it is `LOCK_TYPE_NORMAL` and
-stands alone — what QEMU's Sheepdog driver takes. The kinds are mutually
+the volume's participant list, so a pair of targets serving one ACL can
+export the same volume on two paths — and that list is what the discovery
+log's paths are read from (below). Without an ACL it is `LOCK_TYPE_NORMAL`
+and stands alone — what QEMU's Sheepdog driver takes. The kinds are mutually
 exclusive, and so are two different ACLs, so a volume a guest is already
 running from is refused instead of served into a data race:
 
@@ -156,7 +160,7 @@ sheepdog 10.0.0.1:7000/vol: VDI is locked incompatibly by another client (os err
 ```
 
 The lock is held on the connection that took it for as long as the
-namespace exists and handed back (`SD_OP_RELEASE_VDI`) when the namespace
+namespace exists and handed back (`SD_OP_UNREGISTER_VDI`) when the namespace
 goes away — `REMOVE_NAMESPACE`, or a target shut down cleanly. **Ctrl-C
 counts as clean**: the binary catches `SIGINT` and `SIGTERM`, stops serving
 IO (connections are wound down and their in-flight commands drained, so no
@@ -205,8 +209,8 @@ ioutgt list          # subsystem → nsid → blocks, as the host will see them
 ```
 
 The subsystem NQN is the ACL object's name verbatim, so hosts see the
-cluster's own grouping, and the port's discovery log lists one record per
-ACL — `nvme discover` against this target enumerates the cluster's ACLs.
+cluster's own grouping, and `nvme discover` against this target enumerates
+the cluster's ACLs — one record per *path* to each (see below).
 `--subsys-nqn` is ignored in this mode; the cluster names the subsystems.
 Volumes in no ACL are exported by nobody (the cluster would not resolve
 their names under one anyway); name such a volume explicitly to serve it.
@@ -250,6 +254,42 @@ an all-zero uuid; those fall back to a UUID derived from the VDI's name and
 vid, which are equally cluster-wide.) The same applies to a single-VDI
 export and to a `sheepdog` namespace in a config file: unless the file pins
 `device.uuid` explicitly, the namespace reports the VDI's inode uuid.
+
+#### Discovery: every target serving an ACL is a path
+
+Several targets can front the same cluster ACL, and a host connecting to
+any one of them discovers all of them — and it takes no extra bookkeeping,
+because the VDI lock each namespace already takes at open (above) registers
+the target's own listen address as a holder of that volume. A target reads
+the holder lists back (`GET_VDI_COPIES`, what `dog vdi lock list` prints)
+and a subsystem's paths are the union of the holders of its volumes: a
+target serving any volume of the ACL is a way to reach the subsystem. The
+discovery log then carries **one record per (subsystem, holder)**: same
+SUBNQN, each holder's `traddr`/`trsvcid`, and as PORTID its index in that
+list sorted by address — an ordering every target in the cluster computes
+identically, so a given target is the same PORTID in everyone's log.
+
+```sh
+dog vdi lock list                # the cluster's view: holders per ACL
+nvme discover -t tcp -a 10.0.0.1 -s 14420   # the host's: one entry per holder
+```
+
+So `nvme connect-all` against any one target sets up every path to a
+subsystem, and a target that stops (or is Ctrl-C'd — the shutdown releases
+the VDI locks, which is the same thing as handing the registrations back)
+disappears from the others' discovery logs within the refresh interval,
+10 s. That refresh also re-registers a namespace the cluster has dropped us
+from. A target bound to the wildcard address registers
+the local address of a route to the cluster, since `0.0.0.0` is nothing a
+host can connect to.
+
+This is discovery only — the target does not report ANA, and nothing
+coordinates writes between paths beyond the shared VDI lock (see the
+sharing caveat above). If the cluster refuses the registration the target
+logs a warning and advertises only itself, which is what every non-cluster
+subsystem does; an unreadable holder list leaves the paths as they were
+rather than flapping them away. A subsystem whose namespaces span two
+clusters takes its paths from the first one and warns about the rest.
 
 The mapping is a startup snapshot: VDIs created afterwards need a restart,
 or an `ADD_NAMESPACE` control request naming the new VDI. Each namespace

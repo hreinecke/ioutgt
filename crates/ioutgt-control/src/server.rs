@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)] // request/response fields mirror the JSON protocol
 
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use ioutgt_backend::{AnyBackend, FileBackend, MemoryBackend, NullBackend, SheepdogBackend};
@@ -160,7 +160,17 @@ fn resolve<'a>(
 /// O_DIRECT on `statx` DIO alignment when the ring is on (it may then write
 /// from 4-byte-aligned ring memory); with the ring off it keeps O_DIRECT
 /// whenever the fd opened (writes come from page-aligned pool buffers).
-pub fn build_backend(config: &BackendConfig, ring_enabled: bool) -> Result<AnyBackend, String> {
+///
+/// `fabric` is the address the port serves on, which a locked Sheepdog
+/// namespace registers as the volume's holder: the cluster's record of who to
+/// reach this namespace at. A backend that wants the lock and has no address
+/// to register is a configuration error rather than a silently unlocked
+/// volume.
+pub fn build_backend(
+    config: &BackendConfig,
+    ring_enabled: bool,
+    fabric: Option<SocketAddr>,
+) -> Result<AnyBackend, String> {
     const BLOCK_SHIFT: u8 = 9;
     Ok(match config {
         BackendConfig::Memory { size_mb } => {
@@ -189,7 +199,17 @@ pub fn build_backend(config: &BackendConfig, ring_enabled: bool) -> Result<AnyBa
                 .map_err(|e| format!("sheepdog addr '{addr}': {e}"))?
                 .next()
                 .ok_or_else(|| format!("sheepdog addr '{addr}' resolved to no address"))?;
-            let sd = SheepdogBackend::open(sockaddr, vdi, tag.as_deref(), acl.as_deref(), *lock)
+            let register = match (*lock, fabric) {
+                (false, _) => None,
+                (true, Some(fabric)) => Some(fabric),
+                (true, None) => {
+                    return Err(format!(
+                        "sheepdog {addr}/{vdi}: lock requested but the port has no \
+                         fabric address to register as the volume's holder"
+                    ));
+                }
+            };
+            let sd = SheepdogBackend::open(sockaddr, vdi, tag.as_deref(), acl.as_deref(), register)
                 .map_err(|e| format!("sheepdog {addr}/{vdi}: {e}"))?;
             AnyBackend::Sheepdog(sd)
         }
@@ -219,7 +239,11 @@ async fn handle(state: &CtlState, request: Request) -> Response {
             if nsid == 0 || nsid == u32::MAX {
                 return Response::err("nsid reserved");
             }
-            let backend = match build_backend(&backend, state.port.recv_buf_bytes > 0) {
+            let backend = match build_backend(
+                &backend,
+                state.port.recv_buf_bytes > 0,
+                state.port.listen_addr(),
+            ) {
                 Ok(backend) => backend,
                 Err(err) => return Response::err(err),
             };

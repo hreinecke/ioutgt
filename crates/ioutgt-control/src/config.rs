@@ -68,13 +68,15 @@ pub enum BackendConfig {
         /// addresses a VDI in no ACL.
         #[serde(default)]
         acl: Option<String>,
-        /// Take the cluster's VDI lock (default). Under an ACL the lock is
-        /// shared: other targets serving the same ACL may hold the same VDI —
-        /// two of them exporting it for multipath, say — while a client
-        /// holding it exclusively, such as a running QEMU guest, keeps this
-        /// one out. Without an ACL the lock is itself exclusive. Turn it off
-        /// where exclusion is arranged some other way. Snapshots are read-only
-        /// and never locked.
+        /// Take the cluster's VDI lock (default), registering the address this
+        /// target serves on as one of the volume's holders — which is also how
+        /// the other targets serving it learn this one is a path to it. Under
+        /// an ACL the lock is shared: other targets serving the same ACL may
+        /// hold the same VDI — two of them exporting it for multipath, say —
+        /// while a client holding it exclusively, such as a running QEMU
+        /// guest, keeps this one out. Without an ACL the lock is itself
+        /// exclusive. Turn it off where exclusion is arranged some other way.
+        /// Snapshots are read-only and never locked.
         #[serde(default = "lock_by_default")]
         lock: bool,
     },

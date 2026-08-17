@@ -92,6 +92,28 @@ pub fn format_uuid(bytes: &[u8; 16]) -> String {
 /// Immutable namespace-table snapshot.
 pub type NsMap<B> = Arc<BTreeMap<u32, Arc<Namespace<B>>>>;
 
+/// One path to a subsystem — a target that serves it, addressed the way a
+/// discovery-log entry advertises it.
+///
+/// A subsystem served by several targets (Sheepdog: every target registered on
+/// the cluster ACL of that name) has one of these per target, so a host that
+/// discovers it learns every path, not just the one it happened to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemPort {
+    /// Transport address (`TRADDR`) the target listens on.
+    pub traddr: String,
+    /// Service id (`TRSVCID`) — the port, as a string.
+    pub trsvcid: String,
+    /// Transport serving this path (`TRTYPE`).
+    pub trtype: TransportType,
+    /// `PORTID`: distinguishes this path from the subsystem's others. Only
+    /// its distinctness matters to a host — it keys the ANA/path bookkeeping.
+    pub portid: u16,
+}
+
+/// Immutable path-list snapshot.
+pub type PortList = Arc<Vec<SubsystemPort>>;
+
 /// An NVM subsystem. Identity is immutable; the namespace table is
 /// versioned (see module docs).
 pub struct Subsystem<B> {
@@ -108,6 +130,7 @@ pub struct Subsystem<B> {
     mnan: Option<u32>,
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
+    ports: RwLock<PortList>,
 }
 
 impl<B: Backend> Subsystem<B> {
@@ -129,6 +152,7 @@ impl<B: Backend> Subsystem<B> {
             mnan: None,
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
+            ports: RwLock::new(Arc::new(Vec::new())),
         }
     }
 
@@ -143,6 +167,30 @@ impl<B: Backend> Subsystem<B> {
     #[must_use]
     pub fn with_mnan(mut self, mnan: Option<u32>) -> Self {
         self.mnan = mnan;
+        self
+    }
+
+    /// The paths this subsystem is reachable by ([`Subsystem::set_ports`]);
+    /// empty until something tells us, which is every subsystem whose paths
+    /// are not published anywhere.
+    pub fn ports(&self) -> PortList {
+        Arc::clone(&self.ports.read().expect("port list poisoned"))
+    }
+
+    /// Replace the path list, as the control plane learns it — for Sheepdog,
+    /// each refresh of the holders registered on the subsystem's cluster ACL.
+    ///
+    /// Cold path: discovery reads a snapshot per Get Log Page, and IO never
+    /// looks at all, so the list needs no generation dance like the namespace
+    /// table's.
+    pub fn set_ports(&self, ports: Vec<SubsystemPort>) {
+        *self.ports.write().expect("port list poisoned") = Arc::new(ports);
+    }
+
+    /// Builder form of [`Subsystem::set_ports`], for a list known at startup.
+    #[must_use]
+    pub fn with_ports(self, ports: Vec<SubsystemPort>) -> Self {
+        self.set_ports(ports);
         self
     }
 
@@ -269,6 +317,17 @@ impl<B: Backend> PortConfig<B> {
     /// Look up a subsystem by NQN.
     pub fn subsystem(&self, nqn: &str) -> Option<&Arc<Subsystem<B>>> {
         self.subsystems.get(nqn)
+    }
+
+    /// The endpoint this port serves on, put back together from the strings
+    /// the discovery log carries. `None` for a transport whose `traddr` is
+    /// not an IP address at all (nothing built today), or an unparseable
+    /// `trsvcid`.
+    pub fn listen_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(std::net::SocketAddr::new(
+            self.traddr.parse().ok()?,
+            self.trsvcid.parse().ok()?,
+        ))
     }
 }
 

@@ -4,65 +4,10 @@
 
 mod common;
 
-use common::{Client, NQN};
-use ioutgt_nvme::fabrics::{self, ConnectCommand, ConnectData, fctype};
-use ioutgt_nvme::pdu::PduKind;
-use ioutgt_nvme::{spec, status};
-use zerocopy::{FromBytes, FromZeros, IntoBytes};
+use common::{Client, NQN, ascii, connect_discovery, get_disc_log};
+use ioutgt_nvme::fabrics;
 
 const HOSTNQN: &str = "nqn.2014-08.org.nvmexpress:uuid:dddddddd-1111-2222-3333-444444444444";
-
-/// Connect to the discovery subsystem with CATTR sq-flow-control
-/// disabled, as the Linux host does.
-fn connect_discovery(client: &mut Client) {
-    let mut cmd: ConnectCommand = FromZeros::new_zeroed();
-    cmd.opcode = spec::admin_opcode::FABRICS;
-    cmd.fctype = fctype::CONNECT;
-    cmd.cid.set(1);
-    cmd.qid.set(0);
-    cmd.sqsize.set(31);
-    cmd.cattr = 1 << 2; // DISABLE_SQFLOW
-    cmd.kato.set(120_000);
-    cmd.dptr.length.set(1024);
-    cmd.dptr.sgl_type = spec::sgl::TYPE_DATA_BLOCK_OFFSET;
-    let mut data = ConnectData::zeroed();
-    data.cntlid.set(0xFFFF);
-    let disc = fabrics::DISCOVERY_NQN.as_bytes();
-    data.subsysnqn[..disc.len()].copy_from_slice(disc);
-    data.hostnqn[..HOSTNQN.len()].copy_from_slice(HOSTNQN.as_bytes());
-    let sqe = spec::Sqe::read_from_bytes(cmd.as_bytes()).unwrap();
-    client.send_capsule(&sqe, data.as_bytes());
-    let cqe = client.recv_response();
-    assert_eq!(cqe.status.get() >> 1, status::SUCCESS, "discovery connect");
-}
-
-/// Get Log Page DISCOVERY: returns the payload (data may arrive as
-/// C2HData with SUCCESS elision — no response capsule follows).
-fn get_disc_log(client: &mut Client, cid: u16, offset: u64, len: u32) -> Vec<u8> {
-    let mut sqe = spec::Sqe::zeroed();
-    sqe.opcode = spec::admin_opcode::GET_LOG_PAGE;
-    sqe.flags = spec::CMD_FLAGS_SGL_METABUF;
-    sqe.cid.set(cid);
-    let numd = len / 4 - 1;
-    sqe.cdw10
-        .set(u32::from(spec::log_page::DISCOVERY) | (numd << 16));
-    #[allow(clippy::cast_possible_truncation)]
-    sqe.cdw12.set(offset as u32);
-    sqe.cdw13.set(u32::try_from(offset >> 32).unwrap());
-    sqe.dptr.length.set(len);
-    sqe.dptr.sgl_type = spec::sgl::TYPE_TRANSPORT_DATA_BLOCK;
-    client.send_capsule(&sqe, &[]);
-    let (decoded, payload) = client.recv_pdu();
-    let PduKind::C2HData { success, last, .. } = decoded.kind else {
-        panic!("expected C2HData, got {:?}", decoded.kind);
-    };
-    assert!(last);
-    if !success {
-        let cqe = client.recv_response();
-        assert_eq!(cqe.status.get() >> 1, status::SUCCESS, "get log page");
-    }
-    payload
-}
 
 #[test]
 fn discovery_log_is_intact_with_sqflow_disabled() {
@@ -72,7 +17,7 @@ fn discovery_log_is_intact_with_sqflow_disabled() {
     let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     let mut client = Client::handshake(addr, false, false);
-    connect_discovery(&mut client);
+    connect_discovery(&mut client, HOSTNQN);
     client.enable_controller(2);
 
     // Host pattern: probe the header first, then read the whole log.
@@ -88,4 +33,65 @@ fn discovery_log_is_intact_with_sqflow_disabled() {
     assert_eq!(entry[2], fabrics::subtype::NVM, "subtype");
     let subnqn = &entry[256..256 + NQN.len()];
     assert_eq!(subnqn, NQN.as_bytes(), "entry subnqn");
+}
+
+/// A subsystem served by several targets — every holder of a Sheepdog ACL's
+/// shared lock — is advertised as one entry per path, so a host discovers all
+/// of them through whichever one it happened to connect to.
+#[test]
+fn every_path_to_a_subsystem_gets_its_own_entry() {
+    let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(NQN, 16);
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    config.io_threads = 1;
+    let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
+
+    // What the ACL's holder list turns into: this target and two peers, one
+    // of them on IPv6.
+    let paths = [
+        (addr.ip().to_string(), addr.port().to_string(), 0u16),
+        ("10.9.8.7".to_string(), "4420".to_string(), 1),
+        ("fd00::2".to_string(), "4420".to_string(), 2),
+    ];
+    let port = ioutgt_harness::ports()
+        .into_iter()
+        .find(|p| p.trsvcid == addr.port().to_string())
+        .expect("the port this test just spawned");
+    port.subsystem(NQN).expect("test subsystem").set_ports(
+        paths
+            .iter()
+            .map(
+                |(traddr, trsvcid, portid)| ioutgt_core::subsystem::SubsystemPort {
+                    traddr: traddr.clone(),
+                    trsvcid: trsvcid.clone(),
+                    trtype: ioutgt_core::subsystem::TransportType::Tcp,
+                    portid: *portid,
+                },
+            )
+            .collect(),
+    );
+
+    let mut client = Client::handshake(addr, false, false);
+    connect_discovery(&mut client, HOSTNQN);
+    client.enable_controller(2);
+
+    let header = get_disc_log(&mut client, 3, 0, 16);
+    let numrec = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    assert_eq!(numrec, 3, "one entry per path to the subsystem");
+
+    let log = get_disc_log(&mut client, 4, 0, 4096);
+    for (i, (traddr, trsvcid, portid)) in paths.iter().enumerate() {
+        let entry = &log[1024 * (i + 1)..1024 * (i + 2)];
+        assert_eq!(entry[0], fabrics::trtype::TCP, "entry {i} trtype");
+        // The address family follows the address, not the port's own.
+        let adrfam = if traddr.contains(':') { 2 } else { 1 };
+        assert_eq!(entry[1], adrfam, "entry {i} adrfam");
+        assert_eq!(u16::from_le_bytes([entry[4], entry[5]]), *portid, "portid");
+        assert_eq!(ascii(&entry[32..64]), *trsvcid, "entry {i} trsvcid");
+        assert_eq!(ascii(&entry[512..768]), *traddr, "entry {i} traddr");
+        assert_eq!(
+            &entry[256..256 + NQN.len()],
+            NQN.as_bytes(),
+            "entry {i} subnqn: every path leads to the same subsystem"
+        );
+    }
 }

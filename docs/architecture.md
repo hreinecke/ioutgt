@@ -529,17 +529,21 @@ Access control on the cluster side is the **ACL object**: a VDI carrying
 `SD_VDI_FLAG_ACL`, named back by the volumes it grants access to (their
 inode `acl_id`). Every lookup and lock carries an ACL id, and `sheep`
 resolves a name only within it, so the backend's `open` takes the ACL as
-well as the VDI name. A writable VDI is opened under the cluster's VDI lock
-(`LOCK_VDI`), held on the connection that took it and released from the
-backend's `Drop` — or, on the way out of a target whose namespaces the
-queue threads still own, from the shutdown walk (`ioutgt-harness`'s
-`install_shutdown_handler` / `wait_for_shutdown`: SIGINT/SIGTERM → stop
-serving IO, then `AnyBackend::shutdown()` over every port this process
-built — §3.1);
-the ACL id doubles as the lock type, so an open under an
+well as the VDI name. A writable VDI is opened under the cluster's VDI lock,
+taken with `REGISTER_VDI` — the lock op whose *owner* the client supplies
+(`LOCK_VDI` records the relaying `sheep` gateway, which is no use as a
+`traddr`), so the holder the cluster records is the address this target's
+fabric listens on. The lock is held on the connection that took it and
+released with `UNREGISTER_VDI` from the backend's `Drop` — or, on the way
+out of a target whose namespaces the queue threads still own, from the
+shutdown walk (`ioutgt-harness`'s `install_shutdown_handler` /
+`wait_for_shutdown`: SIGINT/SIGTERM → stop serving IO, then
+`AnyBackend::shutdown()` over every port this process built — §3.1).
+The ACL id doubles as the lock type, so an open under an
 ACL takes the *shared* lock (a second target serving the same ACL may
-export the same volume) while one outside any ACL takes `LOCK_TYPE_NORMAL`
-and stands alone. Either way a volume a client holds incompatibly (a QEMU
+export the same volume, and both appear in the volume's participant list)
+while one outside any ACL takes `LOCK_TYPE_NORMAL` and stands alone. Either
+way a volume a client holds incompatibly (a QEMU
 guest, or a different ACL) is refused at startup rather than raced;
 `?nolock` / `"lock": false` waives it. Sharing assumes non-overlapping
 writers: the cached object map is never invalidated, so two targets
@@ -555,10 +559,7 @@ list `dog acl add`/`remove` maintain, zeroes being holes — and
 listed vid the members' side contradicts (no such volume, or an inode
 naming another ACL, as a half-completed `dog acl add` leaves) is skipped
 with a warning, as is a volume naming an ACL that does not list it: the
-cluster resolves neither under that ACL. The port's discovery log
-therefore lists one record per
-cluster ACL (`build_discovery_log` already emits one per subsystem on the
-port). Each namespace takes its VDI's bitmap position (its vid) as its NSID
+cluster resolves neither under that ACL. Each namespace takes its VDI's bitmap position (its vid) as its NSID
 so the map is a pure function of the cluster — sparse, large NSIDs in
 exchange for a numbering no other VDI's creation can disturb — and reports
 the VDI's inode `uuid[16]`, the cluster's own identity for the volume, as
@@ -573,6 +574,36 @@ elsewhere). Volumes in no ACL
 are exported by no subsystem; the cluster would refuse an ACL-scoped lookup
 of their names anyway. That is the `--backend sheepdog:HOST` form both
 binaries share (`--subsys-nqn` is unused in it).
+
+**Who serves a subsystem — the discovery log's port list.** In cluster mode
+several targets front the same ACL, so a subsystem has as many paths as
+there are targets registered on it, and the discovery log says so: one
+record per `(subsystem, path)` rather than the one-per-subsystem nvmet
+emits. The path list comes from the cluster itself, and needs no extra
+bookkeeping: the `REGISTER_VDI` each locked namespace already issues at open
+(above) names this target's fabric address as the volume's owner, so the
+volume's participant list *is* the list of targets serving it. There is no
+registration on the ACL object and no per-IO-thread registration —
+one per namespace open, which is what a holder's count normally reads.
+Reading the list back is `GET_VDI_COPIES` — the `dog vdi lock list` query —
+whose `vdi_state` record for a vid carries `participants[]`. A subsystem's
+paths are the *union* of the holders of its Sheepdog volumes (a target that
+serves any of them is reachable for the subsystem), deduplicated and sorted
+by address so every target in the cluster computes the same order: each
+entry becomes a `SubsystemPort` (`ioutgt-core`) on `Subsystem`, and each of
+those a discovery entry with the holder's address, its index in that sorted
+list as PORTID, and ADRFAM from the address family. Namespaces on a second
+cluster contribute no paths (a warning; the first backend's cluster wins).
+A background thread (`ioutgt-harness`, 10 s) re-reads the holders so a
+target joining or leaving turns into a path appearing or disappearing, and
+re-registers a namespace whose holder list no longer names us; `shutdown()`
+stops that thread before the backends hand their registrations back, so a
+refresh cannot re-take a lock behind a release. Every step is best-effort:
+an unreadable or empty holder list leaves the previous paths in place rather
+than flapping, and a cluster that will not take the registration costs the
+target its extra entries — it falls back to advertising itself, exactly as a
+non-cluster subsystem does (empty port list) — not its ability to serve IO.
+All of it is blocking TCP on the control plane, never on a queue thread.
 
 ## 8. Buffer strategy: staged, measured
 

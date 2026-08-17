@@ -265,7 +265,7 @@ fn with_default_port(host: &str) -> Result<String, String> {
 }
 
 /// Resolve a `host:port` string to one socket address.
-fn resolve(addr: &str) -> Result<SocketAddr, String> {
+pub fn resolve(addr: &str) -> Result<SocketAddr, String> {
     std::net::ToSocketAddrs::to_socket_addrs(addr)
         .map_err(|e| format!("sheepdog addr '{addr}': {e}"))?
         .next()
