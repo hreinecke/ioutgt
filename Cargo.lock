@@ -373,6 +373,7 @@ dependencies = [
  "ioutgt-uring",
  "libc",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 

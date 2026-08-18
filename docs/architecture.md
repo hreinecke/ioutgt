@@ -516,15 +516,30 @@ The **Sheepdog** backend is a *network* backend: instead of a local fd it
 talks the plain-TCP Sheepdog gateway protocol to a cluster. It holds only
 `Send + Sync` state (cluster address, geometry learned from the VDI inode
 at open, and the mutable `data_vdi_id[]` object map as an atomic array);
-the actual TCP connections are `!Send` (their io_uring ops bind to
-`Reactor::current()`), so they live in a `thread_local` per-queue-thread
-pool, dialed lazily with the new client-side `IORING_OP_CONNECT` op
-(`ops::connect`, the outbound counterpart to `accept`). A logical read/write
+the actual TCP connection is `!Send` (its io_uring ops bind to
+`Reactor::current()`), so it lives in a `thread_local`, dialed lazily with
+the client-side `IORING_OP_CONNECT` op (`ops::connect`, the outbound
+counterpart to `accept`). A logical read/write
 splits into per-object requests; holes read as zeroes, first writes allocate
 objects (persisting the map entry back into the inode) and snapshot parents
 copy-on-write. Requests/responses use raw io_uring send/recv with the header
 held in the awaiting slot-task frame — the same cancellation envelope as the
 file backend's vectored IO.
+
+**One connection per queue thread** (`sheepdog::mux`), shared by every
+namespace on that cluster and pipelined rather than one connection per
+concurrent command: `sheep` hands each request to a worker and answers in
+completion order, echoing the client's request `id`, so responses come back
+out of order and are routed by that id. Each thread's connection has a slot
+table of in-flight requests, a **send gate** (a request's header and payload
+must reach the wire back to back; nothing else is serialized) and a **pump**
+task — the connection's only reader, which reads the 48-byte response header,
+lands the payload straight in the waiting caller's buffer and wakes it. With
+nothing outstanding the pump parks on a waker, not on the socket, so an idle
+thread arms no op. Any IO error, EOF, or cancellation mid-send poisons the
+connection: all its waiters fail with `EIO` (the host retries; a shared
+connection means a wider blast radius than the per-command connections this
+replaced) and the next request dials a fresh one.
 
 Access control on the cluster side is the **ACL object**: a VDI carrying
 `SD_VDI_FLAG_ACL`, named back by the volumes it grants access to (their

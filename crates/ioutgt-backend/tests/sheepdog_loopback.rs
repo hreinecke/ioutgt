@@ -12,9 +12,12 @@
 // Test-only offset/size arithmetic on a 64-bit host; values are small and bounded.
 #![allow(clippy::cast_possible_truncation)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ioutgt_backend::{
@@ -62,6 +65,11 @@ const HDR: usize = 48;
 /// namespace's ANA state.
 fn vdi_oid(vid: u32) -> u64 {
     (u64::from(vid) << 32) | VDI_BIT
+}
+
+/// The oid of data object `idx` of a vid.
+fn data_oid(vid: u32, idx: u64) -> u64 {
+    (u64::from(vid) << 32) | idx
 }
 
 /// The vid owning an object id (inode or data).
@@ -208,6 +216,11 @@ struct Store {
     /// this from the hash ring; the fake just lists them. Only `SD_OP_EXIST`
     /// looks at it — every other op is answered cluster-wide, as a gateway.
     local: HashSet<u64>,
+    /// Oids whose `READ_OBJ` is answered late, off a thread of its own, so a
+    /// pipelining client gets its responses out of order — which a real
+    /// `sheep` does routinely (each request goes to a worker and is answered
+    /// in completion order).
+    slow_reads: HashSet<u64>,
 }
 
 impl Store {
@@ -356,7 +369,7 @@ fn resp(opcode: u8, id: u32, result: u32, data_len: u32) -> [u8; HDR] {
 /// Reply with `bytes[offset..offset+data_length]`, the trim-to-what-exists
 /// behavior a real `sheep` has.
 fn send_slice(
-    sock: &mut TcpStream,
+    out: &Mutex<TcpStream>,
     opcode: u8,
     id: u32,
     bytes: &[u8],
@@ -365,11 +378,20 @@ fn send_slice(
 ) -> std::io::Result<()> {
     let end = (offset + data_length).min(bytes.len());
     let slice = &bytes[offset.min(bytes.len())..end];
+    let mut sock = out.lock().unwrap();
     sock.write_all(&resp(opcode, id, 0, slice.len() as u32))?;
     sock.write_all(slice)
 }
 
+/// How late a `slow_reads` response is: long enough that a request issued
+/// after it is answered first, short enough not to drag the suite.
+const SLOW_READ: std::time::Duration = std::time::Duration::from_millis(60);
+
 fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<()> {
+    // Requests are read in order; responses may be written by a delayed
+    // responder thread, so the write half is shared and one lock covers a
+    // whole (header, payload) reply.
+    let out = Arc::new(Mutex::new(sock.try_clone()?));
     loop {
         let mut hdr = [0u8; HDR];
         if sock.read_exact(&mut hdr).is_err() {
@@ -407,14 +429,14 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                     // The cluster resolves a name only within the ACL the
                     // request carries; from outside it, the VDI is denied.
                     Some((_, vdi_acl)) if vdi_acl != acl => {
-                        sock.write_all(&resp(opcode, id, SD_RES_VDI_DENIED, 0))?;
+                        write_resp(&out, &resp(opcode, id, SD_RES_VDI_DENIED, 0))?;
                     }
                     Some((vid, _)) => {
                         let mut r = resp(opcode, id, 0, 0);
                         r[24..28].copy_from_slice(&vid.to_le_bytes()); // vdi_id
-                        sock.write_all(&r)?;
+                        write_resp(&out, &r)?;
                     }
-                    None => sock.write_all(&resp(opcode, id, 0x08, 0))?, // NO_VDI
+                    None => write_resp(&out, &resp(opcode, id, 0x08, 0))?, // NO_VDI
                 }
             }
             SD_OP_REGISTER_VDI => {
@@ -443,7 +465,7 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                     }
                     Some(_) => 0,
                 };
-                sock.write_all(&resp(opcode, id, result, 0))?;
+                write_resp(&out, &resp(opcode, id, result, 0))?;
             }
             SD_OP_UNREGISTER_VDI => {
                 let vid = u32le(&hdr, 16); // sd_req.vdi_lock.vid
@@ -456,26 +478,26 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 } else {
                     SD_RES_VDI_NOT_LOCKED
                 };
-                sock.write_all(&resp(opcode, id, result, 0))?;
+                write_resp(&out, &resp(opcode, id, result, 0))?;
             }
             SD_OP_GET_VDI_COPIES => {
                 // The whole table or nothing: a caller that asked for too
                 // small a buffer is told to come back with a bigger one.
                 let states = st.vdi_states();
                 if data_length < states.len() {
-                    sock.write_all(&resp(opcode, id, SD_RES_BUFFER_SMALL, 0))?;
+                    write_resp(&out, &resp(opcode, id, SD_RES_BUFFER_SMALL, 0))?;
                 } else {
-                    send_slice(&mut sock, opcode, id, &states, 0, data_length)?;
+                    send_slice(&out, opcode, id, &states, 0, data_length)?;
                 }
             }
             SD_OP_READ_VDIS => {
                 let bitmap = st.vdi_bitmap();
-                send_slice(&mut sock, opcode, id, &bitmap, 0, data_length)?;
+                send_slice(&out, opcode, id, &bitmap, 0, data_length)?;
             }
             SD_OP_READ_OBJ => {
                 let vid = oid_to_vid(oid);
                 let Some(vdi) = st.vdis.get(&vid) else {
-                    sock.write_all(&resp(opcode, id, 0x02, 0))?; // NO_OBJ
+                    write_resp(&out, &resp(opcode, id, 0x02, 0))?; // NO_OBJ
                     continue;
                 };
                 let bytes = if oid & VDI_BIT != 0 {
@@ -487,7 +509,15 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                         .cloned()
                         .unwrap_or_else(|| vec![0u8; osz])
                 };
-                send_slice(&mut sock, opcode, id, &bytes, offset, data_length)?;
+                if st.slow_reads.contains(&oid) {
+                    let out = Arc::clone(&out);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(SLOW_READ);
+                        let _ = send_slice(&out, opcode, id, &bytes, offset, data_length);
+                    });
+                } else {
+                    send_slice(&out, opcode, id, &bytes, offset, data_length)?;
+                }
             }
             SD_OP_WRITE_OBJ => {
                 let vid = oid_to_vid(oid);
@@ -503,7 +533,7 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                     let obj = st.objects.entry(oid).or_insert_with(|| vec![0u8; osz]);
                     obj[offset..offset + payload.len()].copy_from_slice(&payload);
                 }
-                sock.write_all(&resp(opcode, id, 0, 0))?;
+                write_resp(&out, &resp(opcode, id, 0, 0))?;
             }
             SD_OP_CREATE_AND_WRITE_OBJ => {
                 let osz = st.vdis[&oid_to_vid(oid)].object_size();
@@ -517,7 +547,7 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 };
                 obj[offset..offset + payload.len()].copy_from_slice(&payload);
                 st.objects.insert(oid, obj);
-                sock.write_all(&resp(opcode, id, 0, 0))?;
+                write_resp(&out, &resp(opcode, id, 0, 0))?;
             }
             // A local op: answered out of this node's own store rather than
             // routed to whichever node owns the object.
@@ -528,13 +558,18 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 } else {
                     SD_RES_NO_OBJ
                 };
-                sock.write_all(&resp(opcode, id, result, 0))?;
+                write_resp(&out, &resp(opcode, id, result, 0))?;
             }
             other => {
-                sock.write_all(&resp(other, id, 0x01, 0))?; // UNKNOWN
+                write_resp(&out, &resp(other, id, 0x01, 0))?; // UNKNOWN
             }
         }
     }
+}
+
+/// Write a header-only response under the shared write half.
+fn write_resp(out: &Mutex<TcpStream>, hdr: &[u8; HDR]) -> std::io::Result<()> {
+    out.lock().unwrap().write_all(hdr)
 }
 
 fn cstr(field: &[u8]) -> String {
@@ -548,11 +583,17 @@ fn is_write(opcode: u8) -> bool {
 
 /// Spawn the fake sheep; returns its address and the shared store.
 fn spawn_fake_sheep(store: Arc<Mutex<Store>>) -> SocketAddr {
+    spawn_counting_sheep(store, Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`spawn_fake_sheep`], counting the connections the target opens to it.
+fn spawn_counting_sheep(store: Arc<Mutex<Store>>, conns: Arc<AtomicUsize>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for sock in listener.incoming() {
             let Ok(sock) = sock else { break };
+            conns.fetch_add(1, Ordering::SeqCst);
             sock.set_nodelay(true).ok();
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
@@ -576,6 +617,7 @@ fn fresh_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
         locks: BTreeMap::new(),
         participants: BTreeMap::new(),
         local: HashSet::new(),
+        slow_reads: HashSet::new(),
     }))
 }
 
@@ -1204,4 +1246,67 @@ fn object_locality_reports_which_inodes_this_node_stores() {
     // still answers empty.
     let nowhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
     assert!(vdi_objects_local(nowhere, &[]).unwrap().is_empty());
+}
+
+/// One connection per thread, pipelined: a queue thread runs every namespace's
+/// object IO over a single socket, and routes each response back to its caller
+/// by the request id the server echoes — including when the cluster answers
+/// out of order, which it does whenever one request outruns another.
+#[test]
+fn one_connection_carries_concurrent_requests_answered_out_of_order() {
+    // 64 KiB data objects, 256 KiB volume; object 0 is answered late.
+    let store = fresh_store(16, 256 * 1024);
+    let conns = Arc::new(AtomicUsize::new(0));
+    let addr = spawn_counting_sheep(Arc::clone(&store), Arc::clone(&conns));
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let be = Rc::new(SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap());
+    // The open's own lookups went over blocking control-plane connections.
+    let before = conns.load(Ordering::SeqCst);
+
+    let obj = 64 * 1024 / 512; // LBAs per object
+    let done = Rc::new(RefCell::new(Vec::new()));
+    rt.block_on({
+        let (be, done) = (Rc::clone(&be), Rc::clone(&done));
+        async move {
+            // Give both objects distinct contents to read back.
+            for (i, seed) in [(0u64, 11u8), (1, 22)] {
+                let pat = filled(4096, seed);
+                be.write(i * obj, &pat[..4096]).await.unwrap();
+            }
+            store
+                .lock()
+                .unwrap()
+                .slow_reads
+                .insert(data_oid(TEST_VID, 0));
+
+            // Both reads are in flight on the one connection at once; the
+            // second is answered first.
+            let readers: Vec<_> = [(0u64, 11u8), (1, 22)]
+                .into_iter()
+                .map(|(i, seed)| {
+                    let (be, done) = (Rc::clone(&be), Rc::clone(&done));
+                    tokio::task::spawn_local(async move {
+                        let mut got = AlignedBuf::zeroed(4096);
+                        be.read(i * obj, &mut got[..4096]).await.unwrap();
+                        assert_eq!(
+                            &got[..],
+                            &filled(4096, seed)[..],
+                            "object {i} got its own response"
+                        );
+                        done.borrow_mut().push(i);
+                    })
+                })
+                .collect();
+            for r in readers {
+                r.await.unwrap();
+            }
+        }
+    });
+
+    assert_eq!(*done.borrow(), vec![1, 0], "the late response came last");
+    assert_eq!(
+        conns.load(Ordering::SeqCst) - before,
+        1,
+        "all of that data path went over one connection"
+    );
 }

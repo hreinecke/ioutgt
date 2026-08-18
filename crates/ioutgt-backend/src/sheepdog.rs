@@ -11,9 +11,10 @@
 //! request headers (`proto_ver = 0x02`) optionally followed by a data payload,
 //! and reads a 48-byte response header (carrying an `SD_RES_*` result and a
 //! `data_length`) optionally followed by payload. Requests carry an `id` the
-//! server echoes; a connection may pipeline requests, but this backend keeps
-//! **one request in flight per connection** (a per-thread connection pool) so
-//! no response demultiplexing is needed.
+//! server echoes, and `sheep` hands each request to a worker and answers in
+//! completion order — so a connection pipelines freely, and this backend runs
+//! **one connection per queue thread** with every request in flight on it at
+//! once, routing responses back by that id ([`mux`]).
 //!
 //! A VDI is looked up by name → a 24-bit `vid` (or the whole cluster is
 //! enumerated from the VDI bitmap, `READ_VDIS`). Its *inode* object holds the
@@ -58,12 +59,14 @@
 //!
 //! The backend struct holds only `Send + Sync` state (cluster address, learned
 //! geometry, and the mutable `data_vdi_id[]` map as an atomic array). The TCP
-//! connections are `!Send` (their io_uring ops bind to `Reactor::current()`) so
-//! they live in a `thread_local` pool, lazily dialed on each queue thread with
-//! the reactor's [`ops::connect`]. Reads/writes issue raw io_uring send/recv on
-//! a pooled connection; the request/response headers live in the awaiting
-//! slot-task frame, the same cancellation envelope as `FileBackend`'s vectored
-//! IO (memory outlives the op until queue-teardown drain).
+//! connection is `!Send` (its io_uring ops bind to `Reactor::current()`), so it
+//! lives in a `thread_local`, lazily dialed on each queue thread with the
+//! reactor's [`ops::connect`] — one per thread, shared by every namespace on
+//! the same cluster and multiplexed by request id ([`mux`]). Reads/writes issue
+//! raw io_uring send/recv on it; the request header and the write payload live
+//! in the awaiting slot-task frame and the response payload lands straight in
+//! the caller's buffer, the same cancellation envelope as `FileBackend`'s
+//! vectored IO (memory outlives the op until queue-teardown drain).
 //!
 //! # VDI locking (and who serves a volume)
 //!
@@ -121,11 +124,8 @@
 // is 64-bit Linux, so these conversions cannot truncate.
 #![allow(clippy::cast_possible_truncation)]
 
-use std::cell::Cell;
-use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -407,6 +407,17 @@ fn decode_node_addr(addr: &[u8; 16]) -> std::net::IpAddr {
     }
 }
 
+/// Stamp the `id` a response will be routed back by (see [`mux`]).
+fn set_req_id(hdr: &mut [u8; SD_HDR_SIZE], id: u32) {
+    hdr[8..12].copy_from_slice(&id.to_le_bytes());
+}
+
+/// The `id` field of a response header — the one the request carried, echoed
+/// back verbatim (`sheep`'s `tx_work`).
+fn resp_id(hdr: &[u8; SD_HDR_SIZE]) -> u32 {
+    u32::from_le_bytes(hdr[8..12].try_into().expect("4 bytes"))
+}
+
 /// The `result` (`SD_RES_*`) field of a response header.
 fn resp_result(hdr: &[u8; SD_HDR_SIZE]) -> u32 {
     u32::from_le_bytes(hdr[16..20].try_into().expect("4 bytes"))
@@ -431,111 +442,10 @@ fn io_to_backend(err: &io::Error) -> BackendError {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread connection pool (data path)
+// Per-thread multiplexed connection (data path)
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// Idle connections keyed by cluster address, reused across requests on
-    /// this queue thread. Connections are `!Send`, so they never leave the
-    /// thread that dialed them.
-    static POOL: std::cell::RefCell<HashMap<SocketAddr, Vec<OwnedFd>>> =
-        std::cell::RefCell::new(HashMap::new());
-    /// Per-thread request-id counter (echoed by the server; informational,
-    /// since only one request is ever in flight per connection).
-    static NEXT_ID: Cell<u32> = const { Cell::new(0) };
-}
-
-fn next_id() -> u32 {
-    NEXT_ID.with(|c| {
-        let id = c.get().wrapping_add(1);
-        c.set(id);
-        id
-    })
-}
-
-/// Create a non-blocking-free stream socket suitable for `IORING_OP_CONNECT`,
-/// with `TCP_NODELAY` set.
-fn new_stream_socket(addr: &SocketAddr) -> io::Result<OwnedFd> {
-    let domain = match addr {
-        SocketAddr::V4(_) => libc::AF_INET,
-        SocketAddr::V6(_) => libc::AF_INET6,
-    };
-    // SAFETY: plain socket(2) with constant args; the returned fd is owned.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fresh fd, exclusively owned.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let one: libc::c_int = 1;
-    // SAFETY: valid fd; `one` outlives the call; length matches its type.
-    unsafe {
-        libc::setsockopt(
-            owned.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            std::ptr::from_ref(&one).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-    Ok(owned)
-}
-
-/// Take an idle pooled connection for `addr`, or dial a fresh one.
-async fn get_conn(addr: SocketAddr) -> io::Result<OwnedFd> {
-    if let Some(fd) = POOL.with(|p| p.borrow_mut().get_mut(&addr).and_then(Vec::pop)) {
-        return Ok(fd);
-    }
-    let fd = new_stream_socket(&addr)?;
-    ops::connect(fd.as_raw_fd(), &addr)?.await?;
-    Ok(fd)
-}
-
-/// Return a healthy connection to the pool for reuse.
-fn put_conn(addr: SocketAddr, fd: OwnedFd) {
-    POOL.with(|p| p.borrow_mut().entry(addr).or_default().push(fd));
-}
-
-/// Send all of `ptr..ptr+len` on `fd`, resuming across short sends.
-///
-/// # Safety
-/// `ptr..ptr+len` must stay valid (reads) until the returned future completes
-/// or the reactor drains — the raw-op contract of [`ops::send_raw`].
-async unsafe fn send_all(fd: RawFd, ptr: *const u8, len: usize) -> io::Result<()> {
-    let mut off = 0usize;
-    while off < len {
-        let want = u32::try_from(len - off).unwrap_or(u32::MAX);
-        // SAFETY: `ptr.add(off)` stays within the caller's buffer; the buffer
-        // is kept valid per this function's safety contract.
-        let n = unsafe { ops::send_raw(fd, ptr.add(off), want) }?.await?;
-        if n == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        off += n as usize;
-    }
-    Ok(())
-}
-
-/// Receive up to `len` bytes into `ptr`, resuming across short receives.
-/// Returns the number of bytes read; fewer than `len` only on EOF.
-///
-/// # Safety
-/// `ptr..ptr+len` must stay valid and unaliased for writes until the returned
-/// future completes or the reactor drains — the contract of [`ops::recv_raw`].
-async unsafe fn recv_all(fd: RawFd, ptr: *mut u8, len: usize) -> io::Result<usize> {
-    let mut off = 0usize;
-    while off < len {
-        let want = u32::try_from(len - off).unwrap_or(u32::MAX);
-        // SAFETY: `ptr.add(off)` stays within the caller's buffer, kept valid
-        // per this function's safety contract.
-        let n = unsafe { ops::recv_raw(fd, ptr.add(off), want) }?.await? as usize;
-        if n == 0 {
-            break; // EOF
-        }
-        off += n;
-    }
-    Ok(off)
-}
+mod mux;
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -792,48 +702,13 @@ impl SheepdogBackend {
         Ok(())
     }
 
-    /// Issue one object request on a pooled connection, releasing the
-    /// connection back to the pool on success and closing it on error.
-    /// `write` is the payload to send (writes); `read` is the destination for
-    /// the response payload (reads).
+    /// Issue one object request on this thread's multiplexed connection to
+    /// the cluster ([`mux`]) and wait for its response. `write` is the payload
+    /// to send (writes); `read` is the destination for the response payload
+    /// (reads), which the connection's pump fills directly.
     #[allow(clippy::too_many_arguments)]
     async fn obj_request(
         &self,
-        opcode: u8,
-        flags: u16,
-        oid: u64,
-        cow_oid: u64,
-        offset: u64,
-        write: Option<&[u8]>,
-        read: Option<&mut [u8]>,
-    ) -> Result<(), BackendError> {
-        let fd = get_conn(self.addr).await.map_err(|e| io_to_backend(&e))?;
-        match self
-            .obj_request_on(
-                fd.as_raw_fd(),
-                opcode,
-                flags,
-                oid,
-                cow_oid,
-                offset,
-                write,
-                read,
-            )
-            .await
-        {
-            Ok(()) => {
-                put_conn(self.addr, fd);
-                Ok(())
-            }
-            // Drop (close) a connection whose protocol state is now uncertain.
-            Err(e) => Err(e),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn obj_request_on(
-        &self,
-        fd: RawFd,
         opcode: u8,
         flags: u16,
         oid: u64,
@@ -854,56 +729,20 @@ impl SheepdogBackend {
             &mut hdr,
             opcode,
             flags,
-            next_id(),
+            // The id is the response's routing key, so the connection — not
+            // the encoder — picks it.
+            0,
             data_length,
             oid,
             cow_oid,
             self.nr_copies,
             offset,
         );
-
-        // Request: header, then payload for writes. `hdr` and the payload live
-        // in this awaiting frame (the slot task's), valid until the ops'
-        // terminal CQEs — the FileBackend raw-op envelope.
-        // SAFETY: `hdr` is a live local held across the await.
-        unsafe { send_all(fd, hdr.as_ptr(), SD_HDR_SIZE) }
+        // `hdr` and the payload live in this awaiting frame (the slot task's),
+        // valid until the ops' terminal CQEs — the FileBackend raw-op envelope.
+        let result = mux::request(self.addr, &mut hdr, write, read)
             .await
             .map_err(|e| io_to_backend(&e))?;
-        if let Some(w) = write {
-            // SAFETY: `w` is the caller's buffer, valid across the await.
-            unsafe { send_all(fd, w.as_ptr(), w.len()) }
-                .await
-                .map_err(|e| io_to_backend(&e))?;
-        }
-
-        // Response header.
-        let mut resp = [0u8; SD_HDR_SIZE];
-        // SAFETY: `resp` is a live local held across the await.
-        let got = unsafe { recv_all(fd, resp.as_mut_ptr(), SD_HDR_SIZE) }
-            .await
-            .map_err(|e| io_to_backend(&e))?;
-        if got < SD_HDR_SIZE {
-            return Err(BackendError::Io(libc::EIO));
-        }
-        let result = resp_result(&resp);
-        let resp_len = resp_data_length(&resp) as usize;
-
-        // Response payload for reads (server may trim trailing zeroes).
-        if let Some(dst) = read {
-            let n = resp_len.min(dst.len());
-            let got = if n > 0 {
-                // SAFETY: `dst` is the caller's buffer, valid across the await.
-                unsafe { recv_all(fd, dst.as_mut_ptr(), n) }
-                    .await
-                    .map_err(|e| io_to_backend(&e))?
-            } else {
-                0
-            };
-            if got < dst.len() {
-                dst[got..].fill(0);
-            }
-        }
-
         if result != SD_RES_SUCCESS {
             return Err(sd_res_to_backend(result));
         }
