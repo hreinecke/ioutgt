@@ -6,20 +6,25 @@ use std::rc::Rc;
 
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
-    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, cmic, nmic,
-    oncs,
+    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
+    nmic, oncs,
 };
-use crate::spec::{Sqe, admin_opcode, cns, feat, log_page};
+use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
 use tracing::debug;
 use zerocopy::IntoBytes;
 
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
 use ioutgt_core::backend::Backend;
-use ioutgt_core::subsystem::{SubsystemPort, TransportType};
+use ioutgt_core::subsystem::{ANA_GROUPS, Namespace, Subsystem, SubsystemPort, TransportType};
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;
+
+/// ANATT: seconds a namespace may spend in the ANA Change state before the
+/// host gives up on the transition. We never report ANA Change — a group move
+/// is atomic here — so this only bounds the host's patience; 10 s, as nvmet.
+const ANATT_SECS: u8 = 10;
 
 fn ascii_pad(dst: &mut [u8], src: &str) {
     dst.fill(b' ');
@@ -97,7 +102,7 @@ fn identify<B: Backend>(
             let table = subsys.snapshot();
             match table.get(&sqe.nsid.get()) {
                 Some(ns) => {
-                    let id = build_id_ns(ns.backend.as_ref());
+                    let id = build_id_ns(subsys, ns);
                     let len = fill_slot(ctx, tag, id.as_bytes());
                     Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
                 }
@@ -152,6 +157,15 @@ fn build_id_ctrl<B: Backend>(
     let mut id = Box::new(IdentifyController::zeroed());
     let discovery = admin.discovery.get();
     let subsys = admin.subsys.borrow();
+    // NN doubles as the ceiling on MNAN, which reporting ANA makes
+    // load-bearing (below), so an ANA subsystem that has lost its last
+    // namespace reports no ANA rather than an MNAN the host must reject.
+    let nn = if discovery {
+        0
+    } else {
+        subsys.as_ref().map_or(0, |s| s.max_nsid())
+    };
+    let ana = nn > 0 && subsys.as_ref().is_some_and(|s| s.ana());
 
     id.vid.set(0);
     id.ssvid.set(0);
@@ -172,17 +186,31 @@ fn build_id_ctrl<B: Backend>(
     id.ver.set(0x0001_0300);
     // OAES: the host masks its AEC against this; without the NS_ATTR
     // bit it never enables namespace-change notices.
-    id.oaes.set(crate::AEN_CFG_NS_ATTR);
+    let mut oaes = crate::AEN_CFG_NS_ATTR;
     id.cntrltype = if discovery { 2 } else { 1 };
     if !discovery {
         // Advertise multi-controller capability so the host's NVMe-multipath
         // layer builds a namespace head plus a per-controller path device
-        // (/dev/nvmeXcYnZ), as it does for kernel nvmet. ANA (CMIC bit 3) is
-        // deliberately left clear — we serve no ANA log page. Discovery
+        // (/dev/nvmeXcYnZ), as it does for kernel nvmet. Discovery
         // controllers have no namespaces, so (like nvmet) they advertise no
         // CMIC.
         id.cmic = cmic::MULTI_CTRL;
     }
+    if ana {
+        // The whole ANA feature set moves together: the host validates these
+        // fields, sizes its log buffer from them, and rejects the controller
+        // if they disagree (`nvme_mpath_init_identify`).
+        id.cmic |= cmic::ANA_REPORTING;
+        id.anatt = ANATT_SECS;
+        // Only the two states we ever report. ANACAP bit 6 stays clear: a
+        // namespace changes group exactly when its path locality changes.
+        id.anacap = anacap::OPTIMIZED | anacap::NON_OPTIMIZED;
+        let groups = u32::try_from(ANA_GROUPS.len()).expect("two groups");
+        id.anagrpmax.set(groups);
+        id.nanagrpid.set(groups);
+        oaes |= crate::AEN_CFG_ANA_CHANGE;
+    }
+    id.oaes.set(oaes);
     id.kas.set(KAS_UNITS);
     id.sqes = 0x66;
     id.cqes = 0x44;
@@ -206,15 +234,27 @@ fn build_id_ctrl<B: Backend>(
     }
     id.sgls.set(sgls);
 
+    id.nn.set(nn);
     if discovery {
         // Discovery controllers: no namespaces, no IO command set.
-        id.nn.set(0);
     } else {
-        id.nn.set(subsys.as_ref().map_or(0, |s| s.max_nsid()));
         // MNAN: how many namespaces the subsystem actually holds, where the
         // storage knows (a Sheepdog ACL). With sparse NSIDs, NN — the highest
         // valid one — says nothing about the count; 0 means "no more than NN".
-        id.mnan.set(subsys.as_ref().map_or(0, |s| s.mnan()));
+        //
+        // Reporting ANA takes that freedom away: the host sizes its ANA log
+        // buffer as 16 + NANAGRPID*32 + MNAN*4 and refuses a controller whose
+        // MNAN is zero or above NN. So there MNAN is pinned into a range that
+        // both passes that check and leaves room for every NSID we list in
+        // the log page.
+        let mut mnan = subsys.as_ref().map_or(0, |s| s.mnan());
+        if ana {
+            let count = subsys
+                .as_ref()
+                .map_or(0, |s| u32::try_from(s.snapshot().len()).unwrap_or(nn));
+            mnan = mnan.clamp(count.clamp(1, nn), nn);
+        }
+        id.mnan.set(mnan);
         id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
         // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA
         // advertises one page of in-capsule data (nvmet parity): small write
@@ -238,8 +278,9 @@ fn nul_terminate(dst: &mut [u8; 256], s: &str) {
     dst[..n].copy_from_slice(&s.as_bytes()[..n]);
 }
 
-fn build_id_ns<B: Backend>(backend: &B) -> Box<IdentifyNamespace> {
+fn build_id_ns<B: Backend>(subsys: &Subsystem<B>, ns: &Namespace<B>) -> Box<IdentifyNamespace> {
     let mut id = Box::new(IdentifyNamespace::zeroed());
+    let backend = ns.backend.as_ref();
     let blocks = backend.nr_blocks();
     id.nsze.set(blocks);
     id.ncap.set(blocks);
@@ -253,7 +294,11 @@ fn build_id_ns<B: Backend>(backend: &B) -> Box<IdentifyNamespace> {
     id.dlfeat = 0x01; // deallocated blocks read zeroes
     id.lbaf[0].lbads = backend.block_shift();
     id.lbaf[0].ms.set(0);
-    id.anagrpid.set(0);
+    // The namespace's ANA group — which for us *is* its state. Zero (no
+    // group) on a subsystem that does not report ANA, where the host ignores
+    // the field anyway.
+    id.anagrpid
+        .set(if subsys.ana() { ns.ana_grpid() } else { 0 });
     id
 }
 
@@ -330,6 +375,24 @@ fn get_log_page<B: Backend>(
             let n = fill_slot(ctx, tag, window);
             Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n)
         }
+        log_page::ANA => {
+            let subsys = admin.subsys.borrow();
+            let Some(subsys) = subsys.as_ref().filter(|s| s.ana()) else {
+                return Outcome::status(ctx.cqe(0, cid, status::INVALID_LOG_PAGE | status::DNR));
+            };
+            // LSP (cdw10 bits 11:8) bit 0 = RGO: group states without the
+            // NSID lists, which is what the host polls on an ANA change it
+            // only needs the states from.
+            let lsp = u8::try_from((sqe.cdw10.get() >> 8) & 0xF).expect("four bits");
+            let rgo = lsp & ana::LSP_RGO != 0;
+            let log = build_ana_log(subsys, rgo);
+            let end = offset.saturating_add(len).min(log.len() as u64);
+            let start = offset.min(end);
+            let window = &log[usize::try_from(start).expect("log fits")
+                ..usize::try_from(end).expect("log fits")];
+            let n = fill_slot(ctx, tag, window);
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), n)
+        }
         log_page::CHANGED_NS => {
             // 0xFFFFFFFF in the first entry: "more changed than fits";
             // the Linux host rescans everything. Reading clears it.
@@ -356,6 +419,54 @@ fn get_log_page<B: Backend>(
         }
         _ => Outcome::status(ctx.cqe(0, cid, status::INVALID_LOG_PAGE | status::DNR)),
     }
+}
+
+/// ANA log page: the header, then one descriptor per ANA group listing the
+/// NSIDs currently in it (ascending, as the host's walk assumes).
+///
+/// Both groups are always reported, empty ones included, so the log's shape
+/// never depends on where the namespaces happen to sit and `NANAGRPID` — from
+/// which the host sizes its buffer once, at Identify time — always matches.
+/// `rgo` drops the NSID lists.
+fn build_ana_log<B: Backend>(subsys: &Subsystem<B>, rgo: bool) -> Vec<u8> {
+    let table = subsys.snapshot();
+    let chgcnt = subsys.ana_chgcnt();
+    let mut log = Vec::with_capacity(
+        size_of::<ana::LogHeader>()
+            + ANA_GROUPS.len() * size_of::<ana::GroupDesc>()
+            + table.len() * 4,
+    );
+    let header = ana::LogHeader {
+        chgcnt: chgcnt.into(),
+        ngrps: u16::try_from(ANA_GROUPS.len()).expect("two groups").into(),
+        rsvd10: Default::default(),
+    };
+    log.extend_from_slice(header.as_bytes());
+    for state in ANA_GROUPS {
+        let nsids: Vec<u32> = if rgo {
+            Vec::new()
+        } else {
+            table
+                .values()
+                .filter(|ns| ns.ana_state() == state)
+                .map(|ns| ns.nsid)
+                .collect()
+        };
+        let desc = ana::GroupDesc {
+            grpid: state.grpid().into(),
+            nnsids: u32::try_from(nsids.len())
+                .expect("namespace count fits")
+                .into(),
+            chgcnt: chgcnt.into(),
+            state: state.code(),
+            rsvd17: [0; 15],
+        };
+        log.extend_from_slice(desc.as_bytes());
+        for nsid in nsids {
+            log.extend_from_slice(&nsid.to_le_bytes());
+        }
+    }
+    log
 }
 
 /// Discovery log: header + one entry per path to each NVM subsystem on this

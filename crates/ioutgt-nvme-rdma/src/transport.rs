@@ -21,7 +21,7 @@ use ioutgt_backend::AnyBackend;
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::registry::Registry;
 use ioutgt_core::subsystem::{PortConfig, TransportType};
-use ioutgt_harness::{ConnHandles, NsNudge, OnCtx, TargetConfig, Transport};
+use ioutgt_harness::{ChangeNudge, ConnHandles, OnCtx, TargetConfig, Transport};
 use ioutgt_uring::{QueueRuntime, RingConfig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -135,13 +135,17 @@ impl Transport for RdmaTransport {
         // Notified before the loop gets there? `notify_one` leaves a permit,
         // so the very first `notified()` returns immediately.
         let stop = Arc::clone(&conn.stop);
-        // Adapt the harness callback: hand it the queue's stats and a
-        // weak namespace-change nudge instead of the dispatch context.
+        // Adapt the harness callback: hand it the queue's stats and weak
+        // async-event nudges instead of the dispatch context.
         let adapted = |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<AnyBackend>>| {
-            let (alive, fire) = ctx.ns_nudge();
+            let (alive, ns_changed, ana_changed) = ctx.change_nudge();
             on_ctx(ConnHandles {
                 stats: std::rc::Rc::clone(&ctx.queue.stats),
-                ns_changed: NsNudge { alive, fire },
+                changes: ChangeNudge {
+                    alive,
+                    ns_changed,
+                    ana_changed,
+                },
                 stop: Box::new(move || stop.notify_one()),
             });
         };

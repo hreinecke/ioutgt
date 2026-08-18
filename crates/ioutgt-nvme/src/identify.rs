@@ -48,7 +48,17 @@ pub struct IdentifyController {
     pub rsvd270: [u8; 50],
     /// Keep-alive support granularity in 100ms units.
     pub kas: U16,
-    pub rsvd322: [u8; 190],
+    pub rsvd322: [u8; 20],
+    /// ANA Transition Time: seconds a namespace may stay in the ANA Change
+    /// state before the host may consider the transition failed.
+    pub anatt: u8,
+    /// ANA capabilities ([`anacap`]).
+    pub anacap: u8,
+    /// Largest ANA group id this controller ever reports.
+    pub anagrpmax: U32,
+    /// Number of ANA groups the controller reports in the ANA log page.
+    pub nanagrpid: U32,
+    pub rsvd352: [u8; 160],
     /// SQ entry size (required 0x66 on fabrics).
     pub sqes: u8,
     /// CQ entry size (required 0x44 on fabrics).
@@ -103,6 +113,29 @@ pub mod cmic {
     /// per-controller path device (`/dev/nvmeXcYnZ`) — see the host gate
     /// `nvme_mpath_alloc_disk` (`NVME_CTRL_CMIC_MULTI_CTRL`).
     pub const MULTI_CTRL: u8 = 1 << 1;
+    /// The subsystem reports Asymmetric Namespace Access: the ANA fields of
+    /// Identify Controller, `ANAGRPID` in Identify Namespace, and the ANA log
+    /// page (`NVME_CTRL_CMIC_ANA`). The host validates the whole set when it
+    /// sees this bit (`nvme_mpath_init_identify`), so nothing here is optional.
+    pub const ANA_REPORTING: u8 = 1 << 3;
+}
+
+/// ANACAP bits (Identify Controller: ANA capabilities).
+pub mod anacap {
+    /// The controller may report ANA Optimized.
+    pub const OPTIMIZED: u8 = 1 << 0;
+    /// The controller may report ANA Non-Optimized.
+    pub const NON_OPTIMIZED: u8 = 1 << 1;
+    /// The controller may report ANA Inaccessible.
+    pub const INACCESSIBLE: u8 = 1 << 2;
+    /// The controller may report ANA Persistent Loss.
+    pub const PERSISTENT_LOSS: u8 = 1 << 3;
+    /// The controller may report ANA Change.
+    pub const CHANGE: u8 = 1 << 4;
+    /// A namespace's `ANAGRPID` never changes while it is attached. Left
+    /// clear here: a namespace moves group exactly when its path locality
+    /// changes, which is the point of reporting ANA at all.
+    pub const STATIC_GRPID: u8 = 1 << 6;
 }
 
 /// NMIC bits (Identify Namespace: multi-path I/O & namespace sharing).
@@ -195,6 +228,10 @@ const _: () = {
     // Spot-check critical offsets against the spec.
     assert!(core::mem::offset_of!(IdentifyController, cntlid) == 78);
     assert!(core::mem::offset_of!(IdentifyController, kas) == 320);
+    assert!(core::mem::offset_of!(IdentifyController, anatt) == 342);
+    assert!(core::mem::offset_of!(IdentifyController, anacap) == 343);
+    assert!(core::mem::offset_of!(IdentifyController, anagrpmax) == 344);
+    assert!(core::mem::offset_of!(IdentifyController, nanagrpid) == 348);
     assert!(core::mem::offset_of!(IdentifyController, sqes) == 512);
     assert!(core::mem::offset_of!(IdentifyController, sgls) == 536);
     assert!(core::mem::offset_of!(IdentifyController, subnqn) == 768);

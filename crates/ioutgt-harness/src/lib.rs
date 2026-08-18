@@ -28,7 +28,7 @@ use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
 pub use ioutgt_core::subsystem::TransportType;
-use ioutgt_core::subsystem::{Namespace, PortConfig, Subsystem, SubsystemPort};
+use ioutgt_core::subsystem::{AnaState, Namespace, PortConfig, Subsystem, SubsystemPort};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -40,10 +40,10 @@ use tracing::{error, info, warn};
 pub struct ConnHandles {
     /// The queue's lifetime stats, recorded for GET_STATS aggregation.
     pub stats: Rc<QueueStats>,
-    /// Namespace-change nudge for this connection (a no-op on
-    /// connections without async events, e.g. IO queues — those never
-    /// reach the admin thread's nudge list anyway).
-    pub ns_changed: NsNudge,
+    /// Async-event nudges for this connection (a no-op on connections
+    /// without async events, e.g. IO queues — those never reach the admin
+    /// thread's nudge list anyway).
+    pub changes: ChangeNudge,
     /// Ask this connection to wind down: unwedge whatever its `run_queue`
     /// is parked on (NVMe/TCP: `shutdown(2)` on the socket; NVMe/RDMA: the
     /// connection's stop `Notify`) so it runs its normal teardown — drain
@@ -56,14 +56,17 @@ pub struct ConnHandles {
     pub stop: Box<dyn Fn()>,
 }
 
-/// A connection's namespace-change nudge: a side-effect-free liveness
-/// probe (so the pool can prune dead entries without firing events)
-/// plus the fire itself.
-pub struct NsNudge {
+/// A connection's async-event nudges: a side-effect-free liveness probe (so
+/// the pool can prune dead entries without firing events) plus one fire per
+/// event the control plane raises.
+pub struct ChangeNudge {
     /// `true` while the connection is alive; no side effects.
     pub alive: Box<dyn Fn() -> bool>,
     /// Fire the namespace-changed async event (a no-op once dead).
-    pub fire: Box<dyn Fn()>,
+    pub ns_changed: Box<dyn Fn()>,
+    /// Fire the ANA-changed async event (a no-op once dead, and on a
+    /// connection whose subsystem does not report ANA).
+    pub ana_changed: Box<dyn Fn()>,
 }
 
 /// Install callback, run once a connection's dispatch context exists: the admin
@@ -449,7 +452,7 @@ pub fn wait_for_shutdown() -> io::Result<()> {
 /// pairs the two.
 pub fn shutdown() -> usize {
     quiesce_targets();
-    stop_path_refresh();
+    stop_cluster_refresh();
     let ports = std::mem::take(&mut *live_ports());
     let mut walked = 0;
     for port in ports {
@@ -569,6 +572,8 @@ enum AdminMsg<C> {
     Conn(C),
     /// A namespace changed: nudge every live controller's AERs.
     NsChanged,
+    /// A namespace changed ANA group: same, with the ANA Change notice.
+    AnaChanged,
     Stats {
         reply: StatsRequest,
         clear: bool,
@@ -828,9 +833,21 @@ fn make_io_thread<T: Transport>(
     Ok((tx, spawn))
 }
 
+/// Fire one nudge on every live connection, dropping the dead ones on the way
+/// through. `pick` selects which event of the [`ChangeNudge`] to raise.
+fn nudge_live(live: &Rc<RefCell<Vec<ChangeNudge>>>, pick: impl Fn(&ChangeNudge) -> &dyn Fn()) {
+    live.borrow_mut().retain(|n| {
+        let alive = (n.alive)();
+        if alive {
+            (pick(n))();
+        }
+        alive
+    });
+}
+
 /// Create the admin queue thread's mailbox and return its sender plus a
 /// deferred spawn closure. The admin thread additionally keeps the live
-/// connections' namespace-change nudges.
+/// connections' async-event nudges.
 fn make_admin_thread<T: Transport>(
     name: String,
 ) -> io::Result<(MailboxSender<AdminMsg<T::Conn>>, PendingThread)> {
@@ -841,11 +858,10 @@ fn make_admin_thread<T: Transport>(
                 return;
             };
             rt.block_on(async move {
-                // Namespace-change nudges for the live admin connections;
-                // pruned alongside the stats list on every handoff so the
-                // list stays bounded under connect churn even if no
-                // namespace ever changes.
-                let live: Rc<RefCell<Vec<NsNudge>>> = Rc::new(RefCell::new(Vec::new()));
+                // Async-event nudges for the live admin connections; pruned
+                // alongside the stats list on every handoff so the list stays
+                // bounded under connect churn even if nothing ever changes.
+                let live: Rc<RefCell<Vec<ChangeNudge>>> = Rc::new(RefCell::new(Vec::new()));
                 let queues: Rc<RefCell<Vec<Rc<QueueStats>>>> = Rc::new(RefCell::new(Vec::new()));
                 let mut retired = QueueStatsSnapshot::default();
                 let mut conns = ConnTracker::default();
@@ -861,21 +877,14 @@ fn make_admin_thread<T: Transport>(
                                 let stop = Rc::clone(&stop);
                                 Box::new(move |handles| {
                                     queues.borrow_mut().push(Rc::clone(&handles.stats));
-                                    live.borrow_mut().push(handles.ns_changed);
+                                    live.borrow_mut().push(handles.changes);
                                     *stop.borrow_mut() = Some(handles.stop);
                                 })
                             };
                             conns.track(tokio::task::spawn_local(T::run_queue(conn, on_ctx)), stop);
                         }
-                        Ok(AdminMsg::NsChanged) => {
-                            live.borrow_mut().retain(|n| {
-                                let alive = (n.alive)();
-                                if alive {
-                                    (n.fire)();
-                                }
-                                alive
-                            });
-                        }
+                        Ok(AdminMsg::NsChanged) => nudge_live(&live, |n| n.ns_changed.as_ref()),
+                        Ok(AdminMsg::AnaChanged) => nudge_live(&live, |n| n.ana_changed.as_ref()),
                         Ok(AdminMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
@@ -971,13 +980,18 @@ fn build_port(
     config: &TargetConfig,
     bound: SocketAddr,
     trtype: TransportType,
-) -> io::Result<Arc<PortConfig<AnyBackend>>> {
+) -> io::Result<(Arc<PortConfig<AnyBackend>>, Vec<AnaSpec>)> {
     let mut subsystems = BTreeMap::new();
+    let mut ana_specs = Vec::new();
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
         // The Sheepdog namespaces that registered this target as a holder of
         // their volume: what the subsystem's path list is read back from.
         let mut registered: Vec<Arc<AnyBackend>> = Vec::new();
+        // Every Sheepdog namespace, by cluster: what ANA reporting tracks.
+        // Registration plays no part — a volume opened with locking off still
+        // has a home node, and this target is still either on it or not.
+        let mut cluster_ns: BTreeMap<SocketAddr, ClusterNamespaces> = BTreeMap::new();
         for ns in &spec.namespaces {
             let backend = build_backend(&ns.backend, config.recv_buf_bytes > 0, Some(bound))
                 .map_err(io::Error::other)?;
@@ -997,14 +1011,14 @@ fn build_port(
             if backend.as_sheepdog().is_some_and(|sd| sd.owner().is_some()) {
                 registered.push(Arc::clone(&backend));
             }
-            namespaces.insert(
-                ns.nsid,
-                Arc::new(Namespace {
-                    nsid: ns.nsid,
-                    backend,
-                    uuid,
-                }),
-            );
+            let namespace = Arc::new(Namespace::new(ns.nsid, Arc::clone(&backend), uuid));
+            if let Some(sd) = backend.as_sheepdog() {
+                cluster_ns
+                    .entry(sd.cluster())
+                    .or_default()
+                    .push((Arc::clone(&namespace), sd.vid()));
+            }
+            namespaces.insert(ns.nsid, namespace);
         }
         let subsystem = Arc::new(
             Subsystem::new(
@@ -1017,8 +1031,16 @@ fn build_port(
         )
         // Where the storage carries its own namespace count (a Sheepdog ACL
         // object's `max_data_id_nr`), report it as MNAN.
-        .with_mnan(spec.mnan),
+        .with_mnan(spec.mnan)
+        // Cluster storage: the paths to a volume are unequal, and which one
+        // this is depends on where its objects live, so report ANA.
+        .with_ana(!cluster_ns.is_empty()),
         );
+        ana_specs.extend(cluster_ns.into_iter().map(|(cluster, namespaces)| AnaSpec {
+            cluster,
+            subsystem: Arc::clone(&subsystem),
+            namespaces,
+        }));
         // A subsystem holding cluster volumes advertises every target that
         // holds them too, itself included, as a path to it.
         track_cluster_paths(&subsystem, registered, trtype);
@@ -1038,7 +1060,7 @@ fn build_port(
     // The backends are now open — and a Sheepdog one holds its VDI lock on
     // the cluster. Register the port so [`shutdown`] can hand that back.
     live_ports().push(Arc::clone(&port));
-    Ok(port)
+    Ok((port, ana_specs))
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,10 +1103,11 @@ fn cluster_paths() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterPaths>>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// How often the refresh thread re-reads the holder lists. Discovery is a cold
-/// path and a target joining or leaving is rare, so this only has to be well
-/// inside the time a host takes to notice a path — seconds, not milliseconds.
-const PATH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the refresh thread re-reads the holder lists and object
+/// locality. Both are cold paths — a target joining or leaving is rare, and a
+/// volume's objects move only on a cluster rebalance — so this only has to be
+/// well inside the time a host takes to notice, seconds not milliseconds.
+const CLUSTER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Seed `subsystem`'s path list from the holders of the cluster volumes it
 /// just registered for, and arrange for it to be kept up.
@@ -1126,7 +1149,7 @@ fn track_cluster_paths(
     });
     refresh_cluster_paths(&paths);
     cluster_paths().push(paths);
-    start_path_refresh();
+    start_cluster_refresh();
 }
 
 /// Re-read the holders of a subsystem's volumes into its path list,
@@ -1194,13 +1217,134 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
     );
 }
 
-/// Start the one thread that keeps every cluster path list current, if it is
-/// not running already.
+// ---------------------------------------------------------------------------
+// Cluster ANA: which of a subsystem's volumes live on the node we talk to
+// ---------------------------------------------------------------------------
+
+/// Cluster-backed namespaces of one subsystem, each with the vid behind it.
+type ClusterNamespaces = Vec<(Arc<Namespace<AnyBackend>>, u32)>;
+
+/// One subsystem's Sheepdog namespaces on one cluster, before the queue-thread
+/// pool that will carry their ANA notices exists ([`build_port`] runs first).
+struct AnaSpec {
+    /// The cluster gateway those namespaces are served through.
+    cluster: SocketAddr,
+    /// The subsystem they belong to; the one whose ANA state they are.
+    subsystem: Arc<Subsystem<AnyBackend>>,
+    /// Each namespace and the vid behind it.
+    namespaces: ClusterNamespaces,
+}
+
+/// An [`AnaSpec`] wired to the target serving it.
+struct ClusterAna {
+    spec: AnaSpec,
+    /// Raise an ANA Change notice on this target's live controllers.
+    notify: Box<dyn Fn() + Send + Sync>,
+}
+
+/// Every subsystem reporting cluster-derived ANA. Same lifetime rule as
+/// [`CLUSTER_PATHS`]: appended at startup, drained once by [`shutdown`].
+static CLUSTER_ANA: Mutex<Vec<Arc<ClusterAna>>> = Mutex::new(Vec::new());
+
+/// [`CLUSTER_ANA`], recovered from poisoning (see [`live_ports`]).
+fn cluster_ana() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterAna>>> {
+    CLUSTER_ANA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seed the ANA state of every cluster-backed namespace `build_port` found,
+/// and arrange for it to be kept up.
+///
+/// `senders` is the target's queue-thread pool, still being built: an ANA
+/// change reaches the hosts as an async event on the admin thread's live
+/// controllers, and a change that happens before the pool exists needs no
+/// event at all (the state is already right when the host first reads it).
+fn track_cluster_ana<C>(specs: Vec<AnaSpec>, senders: &Arc<Mutex<Option<PoolSenders<C>>>>)
+where
+    C: Send + 'static,
+{
+    if specs.is_empty() {
+        return;
+    }
+    for spec in specs {
+        let pool = Arc::clone(senders);
+        let ana = Arc::new(ClusterAna {
+            spec,
+            notify: Box::new(move || {
+                if let Some(pool) = pool.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    pool.admin.send(AdminMsg::AnaChanged);
+                }
+            }),
+        });
+        refresh_cluster_ana(&ana);
+        cluster_ana().push(ana);
+    }
+    start_cluster_refresh();
+}
+
+/// Re-derive the ANA state of a subsystem's cluster namespaces: a volume whose
+/// inode object the gateway we talk to stores itself is reached without a hop,
+/// so this target is an optimized path to it; any other volume is reachable
+/// here, just not preferentially.
+///
+/// Best-effort, like the path refresh: a cluster that will not answer leaves
+/// every namespace in the state it was last known to be in rather than
+/// flapping the hosts' path choice on a transient failure.
+fn refresh_cluster_ana(ana: &ClusterAna) {
+    let spec = &ana.spec;
+    let vids: Vec<u32> = spec.namespaces.iter().map(|&(_, vid)| vid).collect();
+    let local = match ioutgt_backend::vdi_objects_local(spec.cluster, &vids) {
+        Ok(local) => local,
+        Err(err) => {
+            warn!(subsystem = %spec.subsystem.nqn, cluster = %spec.cluster, %err,
+                  "sheepdog: object locality unavailable, ANA states unchanged");
+            return;
+        }
+    };
+    let mut changed = false;
+    for ((ns, vid), local) in spec.namespaces.iter().zip(local) {
+        let state = if local {
+            AnaState::Optimized
+        } else {
+            AnaState::NonOptimized
+        };
+        if spec.subsystem.set_ana_state(ns, state) {
+            info!(subsystem = %spec.subsystem.nqn, nsid = ns.nsid,
+                  vid = format_args!("{vid:x}"), ?state, "ANA state changed");
+            changed = true;
+        }
+    }
+    if changed {
+        (ana.notify)();
+    }
+}
+
+/// Re-derive every tracked cluster's path list and ANA state now instead of
+/// waiting for the next [`CLUSTER_REFRESH_INTERVAL`] tick, and return how many
+/// clusters were visited. Hosts see whatever changed exactly as they would
+/// from the refresh thread: a new discovery log, an ANA Change notice.
+///
+/// Blocking cluster IO — call it from a plain thread, never a queue thread.
+pub fn refresh_clusters() -> usize {
+    let paths = cluster_paths().clone();
+    let ana = cluster_ana().clone();
+    for paths in &paths {
+        refresh_cluster_paths(paths);
+    }
+    for ana in &ana {
+        refresh_cluster_ana(ana);
+    }
+    paths.len() + ana.len()
+}
+
+/// Start the one thread that keeps every cluster path list and ANA state
+/// current, if it is not running already.
 ///
 /// A plain OS thread rather than anything on a queue thread: the refresh is
 /// blocking cluster IO, and a queue thread must never block. It ends when
 /// [`shutdown`] drains the registry.
-fn start_path_refresh() {
+fn start_cluster_refresh() {
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
@@ -1209,27 +1353,24 @@ fn start_path_refresh() {
         .name("ioutgt-acl".into())
         .spawn(|| {
             loop {
-                std::thread::sleep(PATH_REFRESH_INTERVAL);
-                let tracked = cluster_paths().clone();
-                if tracked.is_empty() {
-                    // Shutdown drained them; nothing left to refresh.
+                std::thread::sleep(CLUSTER_REFRESH_INTERVAL);
+                if refresh_clusters() == 0 {
+                    // Shutdown drained the registries; nothing left to refresh.
                     return;
-                }
-                for paths in &tracked {
-                    refresh_cluster_paths(paths);
                 }
             }
         });
     if let Err(err) = spawned {
-        warn!(%err, "sheepdog: cluster path lists will not be refreshed");
+        warn!(%err, "sheepdog: cluster path lists and ANA states will not be refreshed");
     }
 }
 
-/// Stop tracking cluster paths, on the way into [`shutdown`]'s release phase.
-/// Ends the refresh thread, so nothing re-registers a volume behind the
+/// Stop tracking cluster paths and ANA, on the way into [`shutdown`]'s release
+/// phase. Ends the refresh thread, so nothing re-registers a volume behind the
 /// backend that is about to hand it back.
-fn stop_path_refresh() {
+fn stop_cluster_refresh() {
     cluster_paths().clear();
+    cluster_ana().clear();
 }
 
 /// The live mailbox senders for a spawned queue-thread pool: the admin
@@ -1613,13 +1754,16 @@ async fn control_loop<T: Transport>(
             return;
         }
     };
-    let port = match build_port(&config, local, T::trtype()) {
-        Ok(port) => port,
+    let (port, ana_specs) = match build_port(&config, local, T::trtype()) {
+        Ok(built) => built,
         Err(err) => {
             let _ = addr_tx.send(Err(err));
             return;
         }
     };
+    // Cluster-backed namespaces: seed their ANA state now — before the first
+    // host can ask — and keep it current from the refresh thread.
+    track_cluster_ana(ana_specs, &senders);
     if let Some(path) = &config.control_socket
         && let Err(err) = spawn_control_api(
             path,

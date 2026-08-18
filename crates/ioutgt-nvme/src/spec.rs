@@ -48,7 +48,50 @@ pub mod log_page {
     pub const SMART: u8 = 0x02;
     pub const FW_SLOT: u8 = 0x03;
     pub const CHANGED_NS: u8 = 0x04;
+    /// Asymmetric Namespace Access log.
+    pub const ANA: u8 = 0x0C;
     pub const DISCOVERY: u8 = 0x70;
+}
+
+/// Asymmetric Namespace Access log page (LID 0Ch): a header followed by one
+/// group descriptor per ANA group, each carrying the NSIDs in that group.
+pub mod ana {
+    use zerocopy::little_endian::{U16, U32, U64};
+    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+    /// Get Log Page LSP bit 0: Return Groups Only — send the descriptors
+    /// with `nnsids` = 0 and no NSID lists.
+    pub const LSP_RGO: u8 = 1 << 0;
+
+    /// ANA log page header (`struct nvme_ana_rsp_hdr`).
+    #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Default)]
+    #[repr(C)]
+    pub struct LogHeader {
+        /// Change count: bumped by the controller on every ANA change.
+        pub chgcnt: U64,
+        /// Number of group descriptors that follow.
+        pub ngrps: U16,
+        pub rsvd10: [U16; 3],
+    }
+
+    /// ANA group descriptor (`struct nvme_ana_group_desc`), followed on the
+    /// wire by `nnsids` little-endian NSIDs.
+    #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Default)]
+    #[repr(C)]
+    pub struct GroupDesc {
+        pub grpid: U32,
+        /// NSIDs listed after this descriptor.
+        pub nnsids: U32,
+        pub chgcnt: U64,
+        /// ANA state of every namespace in the group.
+        pub state: u8,
+        pub rsvd17: [u8; 15],
+    }
+
+    const _: () = {
+        assert!(size_of::<LogHeader>() == 16);
+        assert!(size_of::<GroupDesc>() == 32);
+    };
 }
 
 /// PSDT field (bits 7:6 of SQE `flags`): fabrics requires SGL for all

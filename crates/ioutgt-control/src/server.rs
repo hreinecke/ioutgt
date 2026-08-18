@@ -255,11 +255,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
             let uuid = backend
                 .uuid()
                 .unwrap_or_else(|| ioutgt_core::subsystem::namespace_uuid(&subsys.nqn, nsid));
-            let ns = Namespace {
-                nsid,
-                backend: Arc::new(backend),
-                uuid,
-            };
+            let ns = Namespace::new(nsid, Arc::new(backend), uuid);
             if let Err(err) = subsys.add_namespace(ns) {
                 return Response::err(err);
             }

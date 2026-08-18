@@ -449,7 +449,8 @@ Port ──┬── Subsystem (NQN) ──┬── Namespace (nsid → Backend
 Controller (cntlid) ── created by fabrics Connect on the admin queue
   ├── CC/CSTS register state machine (enable → ready, shutdown)
   ├── Keep-alive timer (KAS granularity 10 s; teardown on expiry)
-  ├── AER pool (4 outstanding; NS_CHANGED fired on namespace add/remove)
+  ├── AER pool (4 outstanding; NS_CHANGED on namespace add/remove,
+  │   ANA_CHANGE when a cluster namespace changes path locality)
   └── queues: admin (qid 0) + up to N IO queues (clamped to thread count
       via Set Features NUM_QUEUES)
 ```
@@ -474,7 +475,7 @@ Namespace table — versioned for runtime add/remove:
 
 Admin command surface (interop-minimal, values per nvmet): Identify CNS
 0x00/0x01/0x02/0x03, Get/Set Features (NUM_QUEUES, KATO, async event
-config), Keep Alive, AER, Get Log Page (error/SMART/firmware/discovery),
+config), Keep Alive, AER, Get Log Page (error/SMART/firmware/discovery/ANA),
 Property Get/Set (CAP/VS/CC/CSTS), fabrics Connect. IO commands: Read,
 Write, Flush, then Write Zeroes and DSM-deallocate advertised via ONCS once
 backend support lands.
@@ -604,6 +605,42 @@ than flapping, and a cluster that will not take the registration costs the
 target its extra entries — it falls back to advertising itself, exactly as a
 non-cluster subsystem does (empty port list) — not its ability to serve IO.
 All of it is blocking TCP on the control plane, never on a queue thread.
+
+**Which path is the good one — ANA.** Those paths are not equal. A `sheep`
+serves any object in the cluster, but only some of them out of its own
+store; the rest it fetches from the node that has them, one hop further.
+So a target whose gateway stores a volume's objects is the path a host
+should prefer for that namespace, and NVMe has exactly the vocabulary for
+saying so: **Asymmetric Namespace Access**. A subsystem with any Sheepdog
+namespace reports ANA — CMIC bit 3, the ANA fields of Identify Controller,
+`ANAGRPID` in Identify Namespace, Get Log Page 0Ch, and the ANA Change
+notice in OAES — and every other subsystem leaves the bit clear, so a
+local-storage target is unchanged. There are two ANA groups, fixed:
+group 1 *optimized*, group 2 *non-optimized*, and a namespace's group **is**
+its state (`AnaState` in `ioutgt-core`), which keeps `ANAGRPMAX` =
+`NANAGRPID` = 2 and the host's log-page buffer a constant size. Both
+descriptors are always emitted, empty ones included; NSIDs within one
+ascend, as `nvme_update_ana_state` assumes.
+
+The state itself is one question per namespace, asked of the gateway this
+target is connected to: *do you store this volume's inode object?* That is
+`SD_OP_EXIST` on `vid_to_vdi_oid(vid)` — a **local** op, which `sheep`
+answers from its own store rather than routing (`dog vdi object`'s
+per-node probe) — SD_RES_SUCCESS meaning optimized, SD_RES_NO_OBJ
+non-optimized. The inode stands in for the volume: it is the one object
+every VDI has, and Sheepdog's hash ring places a volume's data objects
+around the same nodes. It rides the same 10 s refresh thread as the path
+list, per (subsystem, cluster) — unlike paths, namespaces on a second
+cluster are not dropped but asked of *their* gateway, since locality is a
+per-object, per-gateway fact. A state that changes bumps the subsystem's
+ANA change count and posts an ANA Change AER to the live controllers
+through the admin thread's mailbox, so hosts re-read 0Ch instead of
+polling it. Unlike the discovery paths this does not depend on the VDI
+lock: a namespace opened `?nolock` reports ANA like any other, because
+`EXIST` asks the cluster about an object, not about a registration. A
+cluster that will not answer leaves the states as they were — the same
+best-effort rule as the paths, and for the same reason: flapping a host's
+path choice is worse than a stale preference.
 
 ## 8. Buffer strategy: staged, measured
 

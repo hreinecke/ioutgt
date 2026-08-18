@@ -1,8 +1,9 @@
 //! ioutgt advertises NVMe multi-path capability like kernel nvmet — CMIC
 //! multi-controller (Identify Controller) and NMIC shared (Identify
 //! Namespace) — so the host's multipath layer builds a namespace head
-//! plus a per-controller path device (`/dev/nvmeXcYnZ`). ANA is *not*
-//! advertised (no ANA log page).
+//! plus a per-controller path device (`/dev/nvmeXcYnZ`). ANA is reported
+//! only where path locality is a real question — a cluster-backed subsystem
+//! (`cluster_ana.rs`) — so a local-storage target leaves CMIC bit 3 clear.
 
 mod common;
 
@@ -32,8 +33,13 @@ fn advertises_multipath_caps() {
         cmic::MULTI_CTRL,
         "CMIC must advertise multi-controller so the host enables multipath"
     );
-    // ANA (CMIC bit 3) must stay clear — we serve no ANA log page.
-    assert_eq!(ctrl.cmic & (1 << 3), 0, "ANA must not be advertised");
+    // ANA (CMIC bit 3) stays clear here: every path to a memory-backed
+    // namespace is equally good, so there is nothing to report.
+    assert_eq!(
+        ctrl.cmic & cmic::ANA_REPORTING,
+        0,
+        "ANA must not be advertised without cluster storage"
+    );
 
     let ns = admin.identify(spec::cns::NAMESPACE, 1, 4);
     let ns = IdentifyNamespace::read_from_bytes(&ns).expect("identify namespace 4096 bytes");

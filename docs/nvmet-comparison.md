@@ -171,9 +171,14 @@ that head its identity.
 **Differences/Risks.** Log pages are minimal (zeroed error/SMART/FW);
 RAE handling, SMART data, and multi-page error logs are future work.
 Discovery log windowing (LPO) is implemented; generation-counter
-churn protection is simplistic (static genctr). Unlike nvmet, **ANA is
-not advertised** (CMIC bit 3 clear): ioutgt serves no ANA log page, so
-the host runs plain (non-ANA) multipath — paths are all optimized.
+churn protection is simplistic (static genctr). **ANA** is reported
+(CMIC bit 3, ANA log page 0Ch, ANAGRPID, ANA Change AER) for
+cluster-backed subsystems only, and where nvmet lets configfs assign a
+namespace to any of `NVMET_MAX_ANAGRPS` groups whose states an admin
+sets by hand, ioutgt has two fixed groups — optimized and
+non-optimized — and derives the membership itself from Sheepdog object
+locality (`docs/architecture.md` §7). A subsystem with no cluster storage leaves CMIC bit 3
+clear and the host runs plain (non-ANA) multipath, all paths equal.
 
 ## 5. IO backends
 

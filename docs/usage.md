@@ -283,9 +283,9 @@ from. A target bound to the wildcard address registers
 the local address of a route to the cluster, since `0.0.0.0` is nothing a
 host can connect to.
 
-This is discovery only — the target does not report ANA, and nothing
-coordinates writes between paths beyond the shared VDI lock (see the
-sharing caveat above). If the cluster refuses the registration the target
+Nothing coordinates writes between those paths beyond the shared VDI lock
+(see the sharing caveat above), but the host is told which of them to
+prefer — see ANA below. If the cluster refuses the registration the target
 logs a warning and advertises only itself, which is what every non-cluster
 subsystem does; an unreadable holder list leaves the paths as they were
 rather than flapping them away. A subsystem whose namespaces span two
@@ -297,6 +297,32 @@ costs one cluster round trip at startup plus an in-memory copy of that
 VDI's object map (4 bytes per data object — 1 MiB for a 4 TiB volume at
 the default 4 MiB objects), so a cluster with very many large VDIs is
 better served by naming the VDIs it should export.
+
+#### ANA: which of those paths is the near one
+
+The paths are not equal. A `sheep` serves any object in the cluster, but
+only some of them out of its own store — the rest cost it one more hop to
+the node that has them. So for each namespace the target asks the gateway
+it is connected to whether that volume's inode object lives there, and
+reports the answer to the host as **Asymmetric Namespace Access**:
+*optimized* if it does, *non-optimized* if it does not. A Linux host sends
+IO down the optimized paths and keeps the others in reserve, per namespace,
+with no configuration on either side.
+
+```sh
+nvme list-subsys /dev/nvme0n1     # per-path: "optimized" / "non-optimized"
+nvme ana-log /dev/nvme0           # the log page itself, group per state
+dog vdi object <vdi>              # the cluster's view: which node has it
+```
+
+Any subsystem with a Sheepdog namespace reports ANA; subsystems on local
+storage do not (every path to them is the same path). There are two ANA
+groups — 1 optimized, 2 non-optimized — and a namespace moves between them
+as objects move in the cluster: the same 10 s refresh re-asks, and a change
+raises an ANA Change event so hosts re-read the log page instead of polling
+it. This works with `?nolock` too — the question is about an object, not
+about a lock — and a cluster that will not answer leaves the last known
+states in place rather than flapping the host's path choice.
 
 Validation runs before any thread spawns; duplicate or reserved NSIDs,
 malformed addresses or UUIDs, and ports exporting undefined subsystems

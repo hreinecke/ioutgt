@@ -122,7 +122,7 @@ impl<B: Backend> ConnCtx<B> {
                 aer_wakers: RefCell::new(Vec::new()),
                 // Optional notices enabled until the host programs AEC
                 // (nvmet behaves the same).
-                aec: Cell::new(crate::AEN_CFG_NS_ATTR),
+                aec: Cell::new(crate::AEN_CFG_NS_ATTR | crate::AEN_CFG_ANA_CHANGE),
                 ns_changed: Cell::new(false),
                 closing: Cell::new(false),
             }),
@@ -183,19 +183,26 @@ impl<B: Backend> ConnCtx<B> {
         }
     }
 
-    /// Weak handles for the harness pool: a side-effect-free liveness
-    /// probe and a [`fire_ns_changed`](Self::fire_ns_changed) trigger,
-    /// both holding only a `Weak` on this context. Plain boxed closures
-    /// (not a named type) so the pool needs no NVMe types.
+    /// Weak handles for the harness pool: a side-effect-free liveness probe
+    /// and the two change triggers ([`fire_ns_changed`](Self::fire_ns_changed)
+    /// and [`fire_ana_changed`](Self::fire_ana_changed)), all holding only a
+    /// `Weak` on this context. Plain boxed closures (not a named type) so the
+    /// pool needs no NVMe types.
     #[allow(clippy::type_complexity)]
-    pub fn ns_nudge(self: &Rc<Self>) -> (Box<dyn Fn() -> bool>, Box<dyn Fn()>) {
+    pub fn change_nudge(self: &Rc<Self>) -> (Box<dyn Fn() -> bool>, Box<dyn Fn()>, Box<dyn Fn()>) {
         let alive = Rc::downgrade(self);
-        let fire = Rc::downgrade(self);
+        let ns = Rc::downgrade(self);
+        let ana = Rc::downgrade(self);
         (
             Box::new(move || alive.strong_count() > 0),
             Box::new(move || {
-                if let Some(ctx) = fire.upgrade() {
+                if let Some(ctx) = ns.upgrade() {
                     ctx.fire_ns_changed();
+                }
+            }),
+            Box::new(move || {
+                if let Some(ctx) = ana.upgrade() {
+                    ctx.fire_ana_changed();
                 }
             }),
         )
@@ -208,23 +215,40 @@ impl<B: Backend> ConnCtx<B> {
             return;
         };
         admin.ns_changed.set(true);
-        if admin.aec.get() & crate::AEN_CFG_NS_ATTR == 0 {
-            return;
-        }
         // AER result DW0: type Notice (2) | info NS_ATTR_CHANGED (0) <<8
-        // | Changed-NS log page (0x04) <<16. A single pending NS_ATTR
-        // notice suffices (the host rescans everything on read), so
-        // coalesce rather than letting the queue grow unbounded when no
-        // AER is posted.
-        const NS_ATTR_NOTICE: u32 = 0x0004_0002;
-        let mut events = admin.events.borrow_mut();
-        if !events.contains(&NS_ATTR_NOTICE) {
-            events.push_back(NS_ATTR_NOTICE);
-        }
-        drop(events);
-        for waker in admin.aer_wakers.borrow_mut().drain(..) {
-            waker.wake();
-        }
+        // | Changed-NS log page (0x04) <<16.
+        post_notice(admin, crate::AEN_CFG_NS_ATTR, 0x0004_0002);
+    }
+
+    /// A namespace changed ANA group: complete one parked AER with the ANA
+    /// Change notice, which sends the host back to the ANA log page.
+    pub fn fire_ana_changed(&self) {
+        let Role::Admin(admin) = &self.role else {
+            return;
+        };
+        // AER result DW0: type Notice (2) | info ANA_CHANGE (3) <<8 | ANA log
+        // page (0x0C) <<16.
+        post_notice(admin, crate::AEN_CFG_ANA_CHANGE, 0x000C_0302);
+    }
+}
+
+/// Queue one async-event notice and wake a parked AER, if the host enabled
+/// this event class in AEC.
+///
+/// A single pending notice of a kind suffices — the host re-reads the whole
+/// log page either way — so identical notices coalesce rather than letting
+/// the queue grow unbounded while no AER is posted.
+fn post_notice<B>(admin: &AdminState<B>, aec_bit: u32, notice: u32) {
+    if admin.aec.get() & aec_bit == 0 {
+        return;
+    }
+    let mut events = admin.events.borrow_mut();
+    if !events.contains(&notice) {
+        events.push_back(notice);
+    }
+    drop(events);
+    for waker in admin.aer_wakers.borrow_mut().drain(..) {
+        waker.wake();
     }
 }
 

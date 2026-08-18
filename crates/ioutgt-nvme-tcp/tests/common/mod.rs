@@ -405,13 +405,26 @@ pub fn connect_discovery(client: &mut Client, hostnqn: &str) {
 /// Get Log Page DISCOVERY: returns the payload (data may arrive as
 /// C2HData with SUCCESS elision — no response capsule follows).
 pub fn get_disc_log(client: &mut Client, cid: u16, offset: u64, len: u32) -> Vec<u8> {
+    get_log_page(client, spec::log_page::DISCOVERY, 0, cid, offset, len)
+}
+
+/// Get Log Page `lid` with log-specific parameter `lsp`, returning the
+/// payload — however much of the requested `len` the target sent.
+pub fn get_log_page(
+    client: &mut Client,
+    lid: u8,
+    lsp: u8,
+    cid: u16,
+    offset: u64,
+    len: u32,
+) -> Vec<u8> {
     let mut sqe = spec::Sqe::zeroed();
     sqe.opcode = spec::admin_opcode::GET_LOG_PAGE;
     sqe.flags = spec::CMD_FLAGS_SGL_METABUF;
     sqe.cid.set(cid);
     let numd = len / 4 - 1;
     sqe.cdw10
-        .set(u32::from(spec::log_page::DISCOVERY) | (numd << 16));
+        .set(u32::from(lid) | (u32::from(lsp) << 8) | (numd << 16));
     #[allow(clippy::cast_possible_truncation)]
     sqe.cdw12.set(offset as u32);
     sqe.cdw13.set(u32::try_from(offset >> 32).unwrap());

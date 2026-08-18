@@ -152,6 +152,12 @@ const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
 const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
 const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
+/// `SD_OP_EXIST` — "do *you* store this object?", answered by the gateway we
+/// are connected to out of its own store and never forwarded (`SD_OP_TYPE_LOCAL`
+/// with `.force`, so it is answered even while the cluster is not in a
+/// serviceable state). `dog vdi object` asks every node this to print an
+/// object's locations; we ask only ours, to learn whether we are a local path.
+const SD_OP_EXIST: u8 = 0xBD;
 
 /// `LOCK_TYPE_NORMAL` — the ACL id of a VDI belonging to no ACL, and the
 /// exclusive (single-holder) VDI lock such an open takes. Any non-zero ACL id
@@ -168,6 +174,7 @@ const SD_FLAG_CMD_COW: u16 = 0x02;
 const SD_FLAG_CMD_DIRECT: u16 = 0x08;
 
 const SD_RES_SUCCESS: u32 = 0x00;
+const SD_RES_NO_OBJ: u32 = 0x02;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_NO_VDI: u32 = 0x08;
 const SD_RES_NO_TAG: u32 = 0x0E;
@@ -357,6 +364,17 @@ fn encode_sheep_req(hdr: &mut [u8; SD_HDR_SIZE], opcode: u8, data_length: u32) {
     hdr[0] = SD_SHEEP_PROTO_VER;
     hdr[1] = opcode;
     hdr[12..16].copy_from_slice(&data_length.to_le_bytes());
+}
+
+/// Encode a 48-byte sheep-internal *object* request header: the sheep-internal
+/// version byte over an `obj` body, which is the shape the local object ops
+/// take ([`SD_OP_EXIST`]). The epoch stays zero — `sheep` stamps its own on a
+/// local op before running it.
+fn encode_sheep_obj_req(hdr: &mut [u8; SD_HDR_SIZE], opcode: u8, oid: u64) {
+    hdr.fill(0);
+    hdr[0] = SD_SHEEP_PROTO_VER;
+    hdr[1] = opcode;
+    hdr[16..24].copy_from_slice(&oid.to_le_bytes());
 }
 
 /// A node id's `addr[16]`: an IPv4 address in the last four bytes with the
@@ -1347,6 +1365,58 @@ fn parse_holders(vs: &[u8]) -> Vec<VdiHolder> {
             }
         })
         .collect()
+}
+
+/// Whether the `sheep` we are connected to stores each vid's *inode* object
+/// itself, rather than having to fetch it from another node. One answer per
+/// requested vid, in the order asked.
+///
+/// This is the locality that decides a namespace's ANA state: sheepdog places
+/// every object on `nr_copies` nodes by consistent hash, and a gateway that is
+/// one of them serves reads and writes of it out of its own store, while any
+/// other gateway adds a network hop each way. The inode object stands in for
+/// the volume as a whole — data objects hash independently, so no single node
+/// is local to all of them, but a node local to the inode is on the volume's
+/// hash neighbourhood and is the better path on average, which is exactly the
+/// preference ANA expresses.
+///
+/// `SD_OP_EXIST` is a local op: the gateway answers out of its own object
+/// store and never forwards, so the reply describes *this* node — which is
+/// what makes the question answerable at all. `SD_RES_NO_OBJ` (not local, or
+/// this node holds no objects because it is a gateway-only node) is a normal
+/// answer, not an error.
+///
+/// Blocking; called from the control plane only (startup and the periodic
+/// path refresh).
+pub fn vdi_objects_local(cluster: SocketAddr, vids: &[u32]) -> io::Result<Vec<bool>> {
+    if vids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stream = TcpStream::connect(cluster)?;
+    stream.set_nodelay(true).ok();
+    vids.iter()
+        .map(|&vid| sync_oid_is_local(&mut stream, vid_to_vdi_oid(vid)))
+        .collect()
+}
+
+/// One `EXIST` round trip.
+fn sync_oid_is_local(stream: &mut TcpStream, oid: u64) -> io::Result<bool> {
+    use std::io::Write;
+
+    let mut hdr = [0u8; SD_HDR_SIZE];
+    encode_sheep_obj_req(&mut hdr, SD_OP_EXIST, oid);
+    stream.write_all(&hdr)?;
+
+    let mut resp = [0u8; SD_HDR_SIZE];
+    std::io::Read::read_exact(stream, &mut resp)?;
+    read_payload(stream, &resp, &mut [])?;
+    match resp_result(&resp) {
+        SD_RES_SUCCESS => Ok(true),
+        SD_RES_NO_OBJ => Ok(false),
+        res => Err(io::Error::other(format!(
+            "EXIST({oid:#x}) failed: SD_RES {res:#x}"
+        ))),
+    }
 }
 
 /// Take the cluster lock on the VDI named `vdi` within ACL `acl`, registering

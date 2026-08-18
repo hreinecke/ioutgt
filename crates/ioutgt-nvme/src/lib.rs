@@ -46,3 +46,8 @@ pub const INLINE_DATA_SIZE: u32 = 16 * 1024;
 
 /// AEC bit: namespace-attribute-changed notices.
 pub const AEN_CFG_NS_ATTR: u32 = 1 << 8;
+
+/// AEC bit: asymmetric-namespace-access-change notices. Only meaningful on a
+/// subsystem that reports ANA; the host sets it (`NVME_AEN_CFG_ANA_CHANGE`)
+/// when we advertise it in OAES.
+pub const AEN_CFG_ANA_CHANGE: u32 = 1 << 11;

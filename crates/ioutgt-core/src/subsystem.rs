@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
@@ -25,6 +25,54 @@ pub enum TransportType {
     Rdma,
 }
 
+/// Asymmetric Namespace Access state of a namespace, as reported in the ANA
+/// log page (NVMe base spec, Asymmetric Namespace Access Log).
+///
+/// Only the two states a working path can be in are modelled: a namespace we
+/// cannot serve at all is removed from the table rather than parked in
+/// `Inaccessible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnaState {
+    /// `01h` — this path is a preferred path to the namespace. For a Sheepdog
+    /// namespace: the gateway we talk to stores the VDI object itself.
+    Optimized,
+    /// `02h` — usable, but not preferred; the host uses it only when no
+    /// optimized path is available. For Sheepdog: reaching the object costs
+    /// this gateway another network hop.
+    NonOptimized,
+}
+
+/// ANA group holding the [`AnaState::Optimized`] namespaces.
+pub const ANA_GRPID_OPTIMIZED: u32 = 1;
+/// ANA group holding the [`AnaState::NonOptimized`] namespaces.
+pub const ANA_GRPID_NONOPTIMIZED: u32 = 2;
+/// Every ANA group an ioutgt subsystem has, in ascending group-id order.
+///
+/// Groups are fixed and state-defined rather than allocated per namespace
+/// (nvmet's model): a namespace's state *is* its group, so a locality flip is
+/// a move between the two. Both descriptors are always reported, so
+/// `ANAGRPMAX` = `NANAGRPID` = this length and the host's log-page allocation
+/// never has to grow.
+pub const ANA_GROUPS: [AnaState; 2] = [AnaState::Optimized, AnaState::NonOptimized];
+
+impl AnaState {
+    /// The wire value in an ANA group descriptor's state field.
+    pub fn code(self) -> u8 {
+        match self {
+            AnaState::Optimized => 0x01,
+            AnaState::NonOptimized => 0x02,
+        }
+    }
+
+    /// The ANA group id namespaces in this state belong to.
+    pub fn grpid(self) -> u32 {
+        match self {
+            AnaState::Optimized => ANA_GRPID_OPTIMIZED,
+            AnaState::NonOptimized => ANA_GRPID_NONOPTIMIZED,
+        }
+    }
+}
+
 /// One namespace: an NSID bound to a backend.
 #[allow(missing_docs)]
 pub struct Namespace<B> {
@@ -32,6 +80,38 @@ pub struct Namespace<B> {
     pub backend: Arc<B>,
     /// Namespace UUID (Identify CNS 0x03 descriptor).
     pub uuid: [u8; 16],
+    /// ANA group id, i.e. the namespace's ANA state. Written by the control
+    /// plane as path locality changes, read by Identify Namespace and the ANA
+    /// log page — never on the IO path.
+    ana_grpid: AtomicU32,
+}
+
+impl<B> Namespace<B> {
+    /// Bind `nsid` to `backend`. The namespace starts
+    /// [`AnaState::Optimized`]: until something knows better, this path is as
+    /// good as any (and for a subsystem that never reports ANA, the group is
+    /// simply never looked at).
+    pub fn new(nsid: u32, backend: Arc<B>, uuid: [u8; 16]) -> Self {
+        Namespace {
+            nsid,
+            backend,
+            uuid,
+            ana_grpid: AtomicU32::new(ANA_GRPID_OPTIMIZED),
+        }
+    }
+
+    /// Current ANA state.
+    pub fn ana_state(&self) -> AnaState {
+        match self.ana_grpid.load(Ordering::Relaxed) {
+            ANA_GRPID_NONOPTIMIZED => AnaState::NonOptimized,
+            _ => AnaState::Optimized,
+        }
+    }
+
+    /// Current ANA group id (Identify Namespace `ANAGRPID`).
+    pub fn ana_grpid(&self) -> u32 {
+        self.ana_state().grpid()
+    }
 }
 
 /// Derive a namespace's 16-byte UUID (Identify CNS 03h descriptor) from its
@@ -128,6 +208,8 @@ pub struct Subsystem<B> {
     /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
     pub allowed_hosts: Vec<String>,
     mnan: Option<u32>,
+    ana: bool,
+    ana_chgcnt: AtomicU64,
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
     ports: RwLock<PortList>,
@@ -150,6 +232,8 @@ impl<B: Backend> Subsystem<B> {
             allow_any_host,
             allowed_hosts,
             mnan: None,
+            ana: false,
+            ana_chgcnt: AtomicU64::new(1),
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
             ports: RwLock::new(Arc::new(Vec::new())),
@@ -168,6 +252,46 @@ impl<B: Backend> Subsystem<B> {
     pub fn with_mnan(mut self, mnan: Option<u32>) -> Self {
         self.mnan = mnan;
         self
+    }
+
+    /// Report Asymmetric Namespace Access for this subsystem: CMIC bit 3, the
+    /// Identify Controller ANA fields, per-namespace `ANAGRPID`, the ANA log
+    /// page, and the ANA Change async event.
+    ///
+    /// Enable it where the paths to a namespace are genuinely unequal and we
+    /// can tell which is which — Sheepdog, where a target whose gateway stores
+    /// the VDI object locally is a better path than one that has to hop. A
+    /// subsystem with no such knowledge leaves it off: advertising ANA with
+    /// every namespace optimized tells the host nothing and only adds a log
+    /// page to poll.
+    #[must_use]
+    pub fn with_ana(mut self, ana: bool) -> Self {
+        self.ana = ana;
+        self
+    }
+
+    /// Whether this subsystem reports ANA ([`Subsystem::with_ana`]).
+    pub fn ana(&self) -> bool {
+        self.ana
+    }
+
+    /// ANA change count: bumped whenever a namespace changes ANA group, and
+    /// reported in the log page header and every group descriptor so a host
+    /// can tell a re-read raced a change.
+    pub fn ana_chgcnt(&self) -> u64 {
+        self.ana_chgcnt.load(Ordering::Acquire)
+    }
+
+    /// Move `ns` into the ANA group for `state`, bumping the change count if
+    /// this is a change. Returns whether the state changed — the caller uses
+    /// that to decide whether hosts need an ANA Change notice.
+    pub fn set_ana_state(&self, ns: &Namespace<B>, state: AnaState) -> bool {
+        let prev = ns.ana_grpid.swap(state.grpid(), Ordering::Relaxed);
+        let changed = prev != state.grpid();
+        if changed {
+            self.ana_chgcnt.fetch_add(1, Ordering::Release);
+        }
+        changed
     }
 
     /// The paths this subsystem is reachable by ([`Subsystem::set_ports`]);
