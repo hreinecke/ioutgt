@@ -16,7 +16,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,7 @@ use ioutgt_core::subsystem::{AnaState, Namespace, PortConfig, Subsystem, Subsyst
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// What a connection reports to its queue thread once its dispatch state
 /// exists. Built by the transport's `run_queue` from its per-connection
@@ -318,6 +318,18 @@ static QUIESCE_REQS: Mutex<Vec<QuiesceHandle>> = Mutex::new(Vec::new());
 /// blocking in [`shutdown`] (std).
 type QuiesceHandle = tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::SyncSender<()>>;
 
+/// Set for good the moment [`shutdown`] starts, before anything is torn down.
+/// The control plane reads it to tell "the cluster is faulty" from "we are on
+/// our way out": once this is set, a cluster that stops answering is expected
+/// — often it is the same environment going down with us — and the state a
+/// refresh would have updated is about to be released anyway.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`shutdown`] has begun.
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(Ordering::Relaxed)
+}
+
 /// Read end of the self-pipe [`wait_for_shutdown`] sleeps on, `-1` before the
 /// handler is installed.
 static SHUTDOWN_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -441,6 +453,10 @@ pub fn wait_for_shutdown() -> io::Result<()> {
 ///    it holds outside the process — its VDI registration, which is also what
 ///    advertised this target as a path to the volume.
 ///
+/// [`SHUTTING_DOWN`] is set before either phase, so a cluster that stops
+/// answering while this runs is reported as the expected teardown it is
+/// rather than as a fault.
+///
 /// Doing it the other way round would let an in-flight write land on a VDI
 /// this process no longer holds the lock for. Neither phase can hang: a
 /// target that does not answer in [`TARGET_QUIESCE_BUDGET`] is reported and
@@ -451,6 +467,7 @@ pub fn wait_for_shutdown() -> io::Result<()> {
 /// come back. Belongs immediately before process exit; [`wait_for_shutdown`]
 /// pairs the two.
 pub fn shutdown() -> usize {
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
     quiesce_targets();
     stop_cluster_refresh();
     let ports = std::mem::take(&mut *live_ports());
@@ -1109,6 +1126,19 @@ fn cluster_paths() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterPaths>>> {
 /// well inside the time a host takes to notice, seconds not milliseconds.
 const CLUSTER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Report a cluster that would not answer a control-plane query, at the level
+/// the situation deserves: a warning while the target serves, because it means
+/// the hosts' view of the paths or of ANA is going stale — but only a debug
+/// line once [`shutdown`] has begun, when the cluster (or the connection to it)
+/// going away is part of the teardown and the state is about to be dropped.
+fn cluster_unreachable(subsystem: &str, cluster: SocketAddr, err: &io::Error, what: &str) {
+    if shutting_down() {
+        debug!(subsystem, %cluster, %err, "sheepdog: {what} unavailable during shutdown");
+    } else {
+        warn!(subsystem, %cluster, %err, "sheepdog: {what} unavailable");
+    }
+}
+
 /// Seed `subsystem`'s path list from the holders of the cluster volumes it
 /// just registered for, and arrange for it to be kept up.
 ///
@@ -1164,11 +1194,16 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
     let mut holders = match ioutgt_backend::vdi_holders(paths.cluster, &vids) {
         Ok(holders) => holders,
         Err(err) => {
-            warn!(subsystem = %paths.subsystem.nqn, %err,
-                  "sheepdog: holder list unavailable");
+            cluster_unreachable(&paths.subsystem.nqn, paths.cluster, &err, "holder list");
             return;
         }
     };
+    // Started before [`shutdown`] did, finishing after: a registration retaken
+    // now is one the release walk may already have passed, so it would outlive
+    // the process. The path list is equally moot at this point.
+    if shutting_down() {
+        return;
+    }
     let mut retaken = false;
     for (backend, holders) in paths.namespaces.iter().zip(&holders) {
         if holders.iter().any(|h| h.addr == paths.owner) {
@@ -1297,8 +1332,7 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
     let local = match ioutgt_backend::vdi_objects_local(spec.cluster, &vids) {
         Ok(local) => local,
         Err(err) => {
-            warn!(subsystem = %spec.subsystem.nqn, cluster = %spec.cluster, %err,
-                  "sheepdog: object locality unavailable, ANA states unchanged");
+            cluster_unreachable(&spec.subsystem.nqn, spec.cluster, &err, "object locality");
             return;
         }
     };
@@ -1325,8 +1359,15 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
 /// clusters were visited. Hosts see whatever changed exactly as they would
 /// from the refresh thread: a new discovery log, an ANA Change notice.
 ///
+/// Visits nothing, and so returns zero, once [`shutdown`] has begun: there is
+/// no point re-reading state that is being released, and the refresh thread
+/// takes the zero as its cue to end.
+///
 /// Blocking cluster IO — call it from a plain thread, never a queue thread.
 pub fn refresh_clusters() -> usize {
+    if shutting_down() {
+        return 0;
+    }
     let paths = cluster_paths().clone();
     let ana = cluster_ana().clone();
     for paths in &paths {

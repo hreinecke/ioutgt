@@ -598,8 +598,13 @@ cluster contribute no paths (a warning; the first backend's cluster wins).
 A background thread (`ioutgt-harness`, 10 s) re-reads the holders so a
 target joining or leaving turns into a path appearing or disappearing, and
 re-registers a namespace whose holder list no longer names us; `shutdown()`
-stops that thread before the backends hand their registrations back, so a
-refresh cannot re-take a lock behind a release. Every step is best-effort:
+raises a shutting-down flag as its first act, which ends that thread and
+makes a refresh already in flight give up before it re-registers anything,
+so a refresh cannot re-take a lock behind a release. The same flag decides
+how a cluster that stops answering is reported: a warning while the target
+serves (the hosts' view is going stale), a debug line during shutdown (the
+connection going down is the teardown, not a fault). Every step is
+best-effort:
 an unreadable or empty holder list leaves the previous paths in place rather
 than flapping, and a cluster that will not take the registration costs the
 target its extra entries — it falls back to advertising itself, exactly as a
