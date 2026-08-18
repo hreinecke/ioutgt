@@ -611,6 +611,28 @@ target its extra entries — it falls back to advertising itself, exactly as a
 non-cluster subsystem does (empty port list) — not its ability to serve IO.
 All of it is blocking TCP on the control plane, never on a queue thread.
 
+**Whose cntlids are whose — partitioning by holder slot.** Several targets
+fronting one subsystem raises a second collision, the same one multi-port
+configs have: a cntlid is unique *per subsystem*, so two targets minting
+cntlid 1 for the same NQN hand a multipath host a duplicate it rejects
+(`nvme_validate_cntlid`). The cluster has already answered the question the
+targets would otherwise have to negotiate — the participant array of a VDI
+lock is a fixed 31 slots (`SD_MAX_COPIES`), and `REGISTER_VDI` puts this
+target in one of them, stably: `sheep` leaves a departed participant's slot
+as a hole rather than compacting (`del_participant`), so a slot index is a
+cluster-assigned small integer no other live target holds. The port's cntlid
+range is therefore cut into 31 equal partitions and this target's slot picks
+one (`holder_cntlid_slice`, `ioutgt-harness`), on top of whatever
+per-port slicing already narrowed it. The slot comes from the
+*lowest-vid* registered namespace on the port, so all targets fronting the
+same volume agree on who is who; a port with no cluster registration (no
+Sheepdog namespace, `?nolock`, or a cluster that refused) keeps its full
+range unpartitioned, and so does one whose range is too small to cut into 31
+(a warning). Note the asymmetry with the discovery log's PORTID, which is an
+index into the *sorted, hole-free* path list and so is not the slot: PORTID
+names a path in a list all targets compute identically, the slot names a
+seat in the cluster's array.
+
 **Which path is the good one — ANA.** Those paths are not equal. A `sheep`
 serves any object in the cluster, but only some of them out of its own
 store; the rest it fetches from the node that has them, one hop further.

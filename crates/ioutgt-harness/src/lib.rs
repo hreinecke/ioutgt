@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use ioutgt_backend::AnyBackend;
+use ioutgt_backend::{AnyBackend, VDI_MAX_HOLDERS};
 use ioutgt_control::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
 use ioutgt_control::nvmet::NvmetTarget;
 use ioutgt_control::server::{CtlState, build_backend};
@@ -163,7 +163,10 @@ pub struct TargetConfig {
     /// Allocatable cntlid slice, inclusive. Multi-port configs give
     /// each port process a disjoint slice (see
     /// [`TargetConfig::apply_file`]); single-port targets own the full
-    /// spec range.
+    /// spec range. A target serving cluster storage subdivides whatever
+    /// this leaves it once more, by holder slot, so that the *other*
+    /// targets fronting the same volumes get a slice of their own
+    /// ([`holder_cntlid_slice`]).
     pub cntlid_range: (u16, u16),
     /// Test-only: artificial per-write delay (microseconds) injected into
     /// memory-backed namespaces, emulating a slow real disk so recv-side data
@@ -989,17 +992,36 @@ fn spawn_pinned(
     Ok(())
 }
 
+/// What [`build_port`] hands back: the port itself, plus the two things
+/// opening cluster-backed namespaces reveals along the way.
+struct BuiltPort {
+    /// The served port: subsystems, namespaces, and the transport limits.
+    port: Arc<PortConfig<AnyBackend>>,
+    /// The cluster namespaces whose ANA state wants tracking, one entry per
+    /// (subsystem, cluster).
+    ana_specs: Vec<AnaSpec>,
+    /// Where the cluster filed this target among the holders of its volumes,
+    /// if any of them is cluster storage this target registered for.
+    holder_slot: Option<HolderSlot>,
+}
+
 /// Build the port snapshot from the configured subsystems.
 /// `bound` is the listener's actual local address, so ephemeral ports
 /// (`--listen …:0`) report the real port in discovery log entries and
 /// LIST_CONTROLLER, not the configured 0. `trtype` is the serving fabric.
+///
+/// Opening the namespaces is what registers this target on a Sheepdog cluster,
+/// so this is also where the two things that registration tells us come from:
+/// the ANA specs of the cluster namespaces, and the holder slot the cluster
+/// gave us — the target's share of the subsystem's cntlid space.
 fn build_port(
     config: &TargetConfig,
     bound: SocketAddr,
     trtype: TransportType,
-) -> io::Result<(Arc<PortConfig<AnyBackend>>, Vec<AnaSpec>)> {
+) -> io::Result<BuiltPort> {
     let mut subsystems = BTreeMap::new();
     let mut ana_specs = Vec::new();
+    let mut holder_slot: Option<HolderSlot> = None;
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
         // The Sheepdog namespaces that registered this target as a holder of
@@ -1060,7 +1082,16 @@ fn build_port(
         }));
         // A subsystem holding cluster volumes advertises every target that
         // holds them too, itself included, as a path to it.
-        track_cluster_paths(&subsystem, registered, trtype);
+        let slot = track_cluster_paths(&subsystem, registered, trtype);
+        // One registry serves the whole port, so its cntlid partition comes
+        // from a single slot: the one in the lowest-vid volume, the same
+        // volume every target holding it picks (see [`holder_cntlid_slice`]).
+        // A port whose subsystems hold disjoint volumes has no such common
+        // volume — then this is simply the first-registered one's slot, which
+        // still collides with nobody serving *that* subsystem.
+        if slot.is_some_and(|s| holder_slot.is_none_or(|held| s.vid < held.vid)) {
+            holder_slot = slot;
+        }
         subsystems.insert(spec.nqn.clone(), subsystem);
     }
     let port = Arc::new(PortConfig {
@@ -1077,7 +1108,11 @@ fn build_port(
     // The backends are now open — and a Sheepdog one holds its VDI lock on
     // the cluster. Register the port so [`shutdown`] can hand that back.
     live_ports().push(Arc::clone(&port));
-    Ok((port, ana_specs))
+    Ok(BuiltPort {
+        port,
+        ana_specs,
+        holder_slot,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,17 +1184,18 @@ fn cluster_unreachable(subsystem: &str, cluster: SocketAddr, err: &io::Error, wh
 /// Best-effort by design: a cluster that will not answer costs this target its
 /// multi-path discovery entries, not its ability to serve the namespaces it
 /// already opened.
+///
+/// Returns the holder slot the cluster gave this target, for the caller to
+/// partition its cntlid space with ([`holder_cntlid_slice`]).
 fn track_cluster_paths(
     subsystem: &Arc<Subsystem<AnyBackend>>,
     registered: Vec<Arc<AnyBackend>>,
     trtype: TransportType,
-) {
-    let Some((cluster, owner)) = registered.first().and_then(|b| {
+) -> Option<HolderSlot> {
+    let (cluster, owner) = registered.first().and_then(|b| {
         let sd = b.as_sheepdog()?;
         Some((sd.cluster(), sd.owner()?))
-    }) else {
-        return;
-    };
+    })?;
     // Volumes on a second cluster have their own holder lists, which say
     // nothing about who serves *this* one's; a subsystem spanning clusters
     // advertises the paths of the first and warns about the rest.
@@ -1177,15 +1213,96 @@ fn track_cluster_paths(
         trtype,
         subsystem: Arc::clone(subsystem),
     });
-    refresh_cluster_paths(&paths);
+    let slot = refresh_cluster_paths(&paths);
     cluster_paths().push(paths);
     start_cluster_refresh();
+    slot
+}
+
+/// Where the cluster filed this target among the holders of one volume.
+///
+/// Sheepdog's shared VDI lock is a fixed array of [`VDI_MAX_HOLDERS`]
+/// participant slots, and a holder keeps its slot until it unregisters — the
+/// cluster leaves a hole rather than renumbering the rest. That makes the slot
+/// a small, stable, cluster-assigned identity for "which of the targets
+/// serving this volume am I", which is exactly what is needed to partition an
+/// identifier space no single target can allocate from alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HolderSlot {
+    /// The volume whose participant list the slot is in.
+    vid: u32,
+    /// The slot itself, `0 ..` [`VDI_MAX_HOLDERS`].
+    slot: u16,
+}
+
+/// Narrow this process's cntlid slice to the partition belonging to its
+/// Sheepdog holder slot.
+///
+/// CNTLIDs must be unique per subsystem *across every target serving it*
+/// (Linux rejects a duplicate in `nvme_validate_cntlid`), and the targets
+/// fronting one cluster volume never talk to each other — they only share what
+/// the cluster records. What the cluster records is the participant list, and a
+/// slot in it is held by exactly one target: cut the cntlid range into
+/// [`VDI_MAX_HOLDERS`] equal partitions, take the one matching our slot, and no
+/// two paths to the same subsystem can mint the same cntlid, however many
+/// controllers each of them has. The same reasoning as the per-port slice
+/// [`TargetConfig::apply_file`] hands out, one level down: this subdivides
+/// whatever that left us.
+///
+/// Falls back to the whole slice — the pre-cluster behaviour — when there is
+/// no slot to key on (local storage, `?nolock`, or a cluster that would not
+/// answer) or when the slice is too small to cut, which are also the cases
+/// where nothing else is minting cntlids for the subsystem or where a wrong
+/// answer is worse than an unpartitioned one.
+fn holder_cntlid_slice(range: (u16, u16), holder: Option<HolderSlot>) -> (u16, u16) {
+    let (base, top) = range;
+    let Some(HolderSlot { vid, slot }) = holder else {
+        return range;
+    };
+    let parts = u32::from(VDI_MAX_HOLDERS);
+    let width = (u32::from(top - base) + 1) / parts;
+    if width == 0 || u32::from(slot) >= parts {
+        warn!(
+            slot,
+            vid = format_args!("{vid:x}"),
+            cntlid_min = base,
+            cntlid_max = top,
+            "sheepdog: cntlid range not partitionable; paths may collide"
+        );
+        return range;
+    }
+    let min = u32::from(base) + u32::from(slot) * width;
+    // The last partition keeps the remainder of an uneven cut, so the
+    // boundaries are the same wherever they are computed.
+    let max = if u32::from(slot) + 1 == parts {
+        u32::from(top)
+    } else {
+        min + width - 1
+    };
+    let (min, max) = (
+        u16::try_from(min).expect("min <= top"),
+        u16::try_from(max).expect("max <= top"),
+    );
+    info!(
+        slot,
+        vid = format_args!("{vid:x}"),
+        cntlid_min = min,
+        cntlid_max = max,
+        "sheepdog: cntlid partition from holder slot"
+    );
+    (min, max)
 }
 
 /// Re-read the holders of a subsystem's volumes into its path list,
 /// re-registering any volume this target is no longer listed for (the cluster
 /// dropped us while we were away — a restart, or an eviction and rejoin).
-fn refresh_cluster_paths(paths: &ClusterPaths) {
+///
+/// Returns where the cluster files this target among the volumes' holders,
+/// which the first call — the one from [`track_cluster_paths`], before any
+/// controller exists — turns into this target's cntlid partition
+/// ([`holder_cntlid_slice`]). Later calls, from the refresh thread, have
+/// nowhere to put it: the partition is fixed for the process.
+fn refresh_cluster_paths(paths: &ClusterPaths) -> Option<HolderSlot> {
     let vids: Vec<u32> = paths
         .namespaces
         .iter()
@@ -1195,14 +1312,14 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
         Ok(holders) => holders,
         Err(err) => {
             cluster_unreachable(&paths.subsystem.nqn, paths.cluster, &err, "holder list");
-            return;
+            return None;
         }
     };
     // Started before [`shutdown`] did, finishing after: a registration retaken
     // now is one the release walk may already have passed, so it would outlive
     // the process. The path list is equally moot at this point.
     if shutting_down() {
-        return;
+        return None;
     }
     let mut retaken = false;
     for (backend, holders) in paths.namespaces.iter().zip(&holders) {
@@ -1224,6 +1341,18 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
     if retaken {
         holders = ioutgt_backend::vdi_holders(paths.cluster, &vids).unwrap_or(holders);
     }
+    // Our slot among the holders of the lowest-vid volume this subsystem
+    // registered for. The lowest vid is a choice every target serving the
+    // volume makes the same way, and within one volume the cluster hands out
+    // each slot once — which is what makes the slot usable as a partition id.
+    let slot = vids
+        .iter()
+        .zip(&holders)
+        .min_by_key(|&(vid, _)| *vid)
+        .and_then(|(&vid, holders)| {
+            let index = holders.iter().find(|h| h.addr == paths.owner)?.index;
+            Some(HolderSlot { vid, slot: index })
+        });
     // The union across the subsystem's volumes: a target holding any of them
     // is a path to the subsystem. Sorted so every target computes the same
     // PORTID — the index in this list — for the same peer.
@@ -1233,7 +1362,7 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
     // Nobody holds anything: a cluster mid-restart, most likely. Leave the
     // path list as it was rather than flapping the hosts' view of it.
     if addrs.is_empty() {
-        return;
+        return slot;
     }
     // Every holder is another ioutgt target fronting the same cluster, so it
     // speaks the fabric this one does; the cluster records an address, not a
@@ -1250,6 +1379,7 @@ fn refresh_cluster_paths(paths: &ClusterPaths) {
             })
             .collect(),
     );
+    slot
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,7 +1501,9 @@ pub fn refresh_clusters() -> usize {
     let paths = cluster_paths().clone();
     let ana = cluster_ana().clone();
     for paths in &paths {
-        refresh_cluster_paths(paths);
+        // The holder slot it reports is startup-only: the cntlid partition it
+        // keys is fixed for the process (see [`holder_cntlid_slice`]).
+        let _ = refresh_cluster_paths(paths);
     }
     for ana in &ana {
         refresh_cluster_ana(ana);
@@ -1763,8 +1895,6 @@ async fn control_loop<T: Transport>(
     config: TargetConfig,
     addr_tx: mpsc::Sender<io::Result<SocketAddr>>,
 ) {
-    let registry = Registry::new(config.cntlid_range.0, config.cntlid_range.1);
-
     // The queue-thread pool is spawned lazily on the first connection and
     // torn down after an idle grace period; `senders` is the single source
     // of truth for whether it is up. `None` = down (pre-first-connect or
@@ -1795,13 +1925,23 @@ async fn control_loop<T: Transport>(
             return;
         }
     };
-    let (port, ana_specs) = match build_port(&config, local, T::trtype()) {
+    let BuiltPort {
+        port,
+        ana_specs,
+        holder_slot,
+    } = match build_port(&config, local, T::trtype()) {
         Ok(built) => built,
         Err(err) => {
             let _ = addr_tx.send(Err(err));
             return;
         }
     };
+    // Only now is the cntlid range known: on a cluster it is this target's
+    // partition of the configured one, keyed on the holder slot the volumes
+    // were just registered into. Nothing above allocates a cntlid — the first
+    // Connect is still several awaits away.
+    let (cntlid_min, cntlid_max) = holder_cntlid_slice(config.cntlid_range, holder_slot);
+    let registry = Registry::new(cntlid_min, cntlid_max);
     // Cluster-backed namespaces: seed their ANA state now — before the first
     // host can ask — and keep it current from the refresh thread.
     track_cluster_ana(ana_specs, &senders);
@@ -1894,7 +2034,40 @@ pub fn spawn<T: Transport>(config: TargetConfig) -> io::Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_live_socket;
+    use super::{HolderSlot, VDI_MAX_HOLDERS, holder_cntlid_slice, refuse_live_socket};
+
+    fn slot(slot: u16) -> Option<HolderSlot> {
+        Some(HolderSlot { vid: 0x4712, slot })
+    }
+
+    #[test]
+    fn holder_slots_get_disjoint_cntlid_partitions() {
+        let full = (1, ioutgt_core::registry::CNTLID_MAX);
+        // No cluster storage: the target owns everything it was given.
+        assert_eq!(holder_cntlid_slice(full, None), full);
+
+        // Every slot's partition, end to end: they tile the range without a
+        // gap or an overlap, so no two targets can mint the same cntlid.
+        let slices: Vec<(u16, u16)> = (0..VDI_MAX_HOLDERS)
+            .map(|i| holder_cntlid_slice(full, slot(i)))
+            .collect();
+        assert_eq!(slices[0].0, full.0);
+        assert_eq!(slices[usize::from(VDI_MAX_HOLDERS) - 1].1, full.1);
+        for pair in slices.windows(2) {
+            assert!(pair[0].0 <= pair[0].1, "partition {pair:?} is empty");
+            assert_eq!(pair[1].0, pair[0].1 + 1, "partitions {pair:?} not adjacent");
+        }
+
+        // A slice already narrowed per port is subdivided the same way...
+        let (min, max) = holder_cntlid_slice((1, 1000), slot(1));
+        assert_eq!((min, max), (33, 64));
+        // ...until there is nothing left to cut, when the whole slice is kept
+        // rather than handing out an empty one.
+        assert_eq!(holder_cntlid_slice((1, 20), slot(1)), (1, 20));
+
+        // A slot the cluster cannot have handed out is not trusted either.
+        assert_eq!(holder_cntlid_slice(full, slot(VDI_MAX_HOLDERS)), full);
+    }
 
     #[test]
     fn socket_probe_distinguishes_live_stale_missing() {

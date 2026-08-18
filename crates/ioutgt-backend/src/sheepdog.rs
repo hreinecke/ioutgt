@@ -231,7 +231,14 @@ const NID_OFF_PORT: usize = 16;
 
 // `struct vdi_state` (include/internal_proto.h), the GET_VDI_COPIES payload:
 // one fixed-size record per VDI the cluster knows.
-const SD_MAX_COPIES: usize = 31;
+/// Slots in a VDI's participant list (`SD_MAX_COPIES`, sized `SD_EC_MAX_STRIP
+/// * 2 - 1`): the hard ceiling on how many targets can hold one volume's
+/// shared lock at once, and so on how many paths a cluster subsystem has.
+/// A holder's slot in that fixed array is its identity among them
+/// ([`VdiHolder::index`]).
+pub const VDI_MAX_HOLDERS: u16 = 31;
+
+const SD_MAX_COPIES: usize = VDI_MAX_HOLDERS as usize;
 const SD_VDI_STATE_SIZE: usize = 1432;
 const VS_OFF_VID: usize = 0;
 const VS_OFF_LOCK_STATE: usize = 20;
@@ -1298,9 +1305,12 @@ pub struct VdiHolder {
     /// that is the address its fabric listens on, which is exactly what a
     /// discovery-log entry advertises (`traddr` + `trsvcid`).
     pub addr: SocketAddr,
-    /// The holder's slot in the VDI's participant list: unique among the
-    /// holders of *this* volume, and stable while it stays registered
-    /// (`sheep` compacts the list when one leaves).
+    /// The holder's slot in the VDI's participant list (`0 ..
+    /// `[`VDI_MAX_HOLDERS`]): unique among the holders of *this* volume, and
+    /// stable for as long as it stays registered — `sheep` clears a departing
+    /// holder's slot and hands the hole to the next joiner rather than
+    /// compacting the array (`del_participant`), so a slot is a name the whole
+    /// cluster agrees on, not just a position in a list.
     pub index: u16,
     /// Registrations this holder currently has. One per open, so normally
     /// one: `sheep` refcounts repeats of one owner rather than listing it
@@ -1344,7 +1354,17 @@ fn parse_holders(vs: &[u8]) -> Vec<VdiHolder> {
     }
     let count = (read_u32(vs, VS_OFF_NR_PARTICIPANTS) as usize).min(SD_MAX_COPIES);
     (0..count)
-        .map(|i| {
+        .filter_map(|i| {
+            // participants_state packs the shared-lock state in the low byte
+            // and the owner's registration count above it; a `sheep` predating
+            // the count reports zero there, which is the one registration it
+            // means. An all-zero word is neither: the states start at 1, so it
+            // is a slot a holder left behind — nr_participants spans those
+            // holes, and reporting one would advertise a path to 0.0.0.0.
+            let state = read_u32(vs, VS_OFF_PARTICIPANTS_STATE + i * 4);
+            if state == 0 {
+                return None;
+            }
             let nid = VS_OFF_PARTICIPANTS + i * SD_NODE_ID_SIZE;
             let addr: [u8; 16] = vs[nid + NID_OFF_ADDR..nid + NID_OFF_ADDR + 16]
                 .try_into()
@@ -1354,15 +1374,11 @@ fn parse_holders(vs: &[u8]) -> Vec<VdiHolder> {
                     .try_into()
                     .expect("2 bytes"),
             );
-            // participants_state packs the shared-lock state in the low byte
-            // and the owner's registration count above it; a `sheep` predating
-            // the count reports zero, which is the one registration it means.
-            let state = read_u32(vs, VS_OFF_PARTICIPANTS_STATE + i * 4);
-            VdiHolder {
+            Some(VdiHolder {
                 addr: SocketAddr::new(decode_node_addr(&addr), port),
                 index: u16::try_from(i).expect("at most SD_MAX_COPIES"),
                 registrations: (state >> 8).max(1),
-            }
+            })
         })
         .collect()
 }
@@ -2071,10 +2087,47 @@ mod tests {
         }
 
         // nr_participants is a wire value: never index past the array with it.
-        let mut vs = vdi_state_record(0x42, LOCK_STATE_SHARED, &[("10.0.0.1:14420", 1)]);
+        let full = vec![("10.0.0.1:14420", 1); SD_MAX_COPIES];
+        let mut vs = vdi_state_record(0x42, LOCK_STATE_SHARED, &full);
         vs[VS_OFF_NR_PARTICIPANTS..VS_OFF_NR_PARTICIPANTS + 4]
             .copy_from_slice(&999u32.to_le_bytes());
         assert_eq!(parse_holders(&vs).len(), SD_MAX_COPIES);
+    }
+
+    #[test]
+    fn a_departed_holder_leaves_a_hole_not_a_path() {
+        // `sheep` clears the slot of a holder that unregistered and keeps
+        // nr_participants covering it (`del_participant`), so slot 1 here is a
+        // hole: no holder, and — crucially for anything keyed on the slot —
+        // no renumbering of the holder above it.
+        let mut vs = vdi_state_record(
+            0x42,
+            LOCK_STATE_SHARED,
+            &[
+                ("10.0.0.1:14420", 1),
+                ("10.0.0.2:14420", 1),
+                ("10.0.0.3:14420", 1),
+            ],
+        );
+        let hole = VS_OFF_PARTICIPANTS_STATE + 4;
+        vs[hole..hole + 4].copy_from_slice(&0u32.to_le_bytes());
+        let nid = VS_OFF_PARTICIPANTS + SD_NODE_ID_SIZE;
+        vs[nid..nid + SD_NODE_ID_SIZE].fill(0);
+        assert_eq!(
+            parse_holders(&vs),
+            vec![
+                VdiHolder {
+                    addr: "10.0.0.1:14420".parse().unwrap(),
+                    index: 0,
+                    registrations: 1,
+                },
+                VdiHolder {
+                    addr: "10.0.0.3:14420".parse().unwrap(),
+                    index: 2,
+                    registrations: 1,
+                },
+            ]
+        );
     }
 
     #[test]

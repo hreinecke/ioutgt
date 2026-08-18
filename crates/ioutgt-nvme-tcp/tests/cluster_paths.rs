@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use common::{Client, ascii, connect_discovery, get_disc_log};
+use common::{Client, ascii, connect_cqe, connect_discovery, get_disc_log};
 use ioutgt_control::config::BackendConfig;
 use ioutgt_nvme::fabrics;
 
@@ -52,15 +52,17 @@ const VOL_VID: u32 = 0x0000_4712;
 const VOL_SIZE: u64 = 16 << 20;
 const VOL_SHIFT: u8 = 22;
 
-/// Another target already serving the volume when this one starts: the peer
-/// whose path must show up in our discovery log, and must survive our
+/// Two other targets already serving the volume when this one starts: the
+/// peers whose paths must show up in our discovery log, and must survive our
 /// shutdown.
 const PEER: &str = "10.9.8.7:4420";
+const PEER2: &str = "10.9.8.9:4420";
 
-/// The fake cluster's whole state: who holds the shared lock on [`VOL_VID`],
-/// with each holder's registration count (`sheep` refcounts repeats of one
-/// owner into a single participant entry).
-type Participants = Arc<Mutex<Vec<(SocketAddr, u32)>>>;
+/// The fake cluster's whole state: the shared lock on [`VOL_VID`] as `sheep`
+/// keeps it — a fixed array of participant slots, each either free or a holder
+/// with its registration count (repeats from one owner refcount into a single
+/// slot rather than taking a second).
+type Participants = Arc<Mutex<Vec<Option<(SocketAddr, u32)>>>>;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
@@ -98,16 +100,21 @@ fn inode(vid: u32) -> Vec<u8> {
 }
 
 /// The `GET_VDI_COPIES` payload: one `vdi_state` for the volume, carrying its
-/// participant list.
-fn vdi_states(list: &[(SocketAddr, u32)]) -> Vec<u8> {
+/// participant slots. A free slot goes out as an all-zero state word — what
+/// `sheep` leaves behind when a holder unregisters, holes included.
+fn vdi_states(slots: &[Option<(SocketAddr, u32)>]) -> Vec<u8> {
     let mut vs = vec![0u8; VDI_STATE];
     vs[0..4].copy_from_slice(&VOL_VID.to_le_bytes());
-    if list.is_empty() {
+    if slots.iter().all(Option::is_none) {
         return vs; // lock_state stays 0: nobody holds it
     }
     vs[20..24].copy_from_slice(&LOCK_STATE_SHARED.to_le_bytes());
-    vs[64..68].copy_from_slice(&(list.len() as u32).to_le_bytes());
-    for (i, (owner, count)) in list.iter().enumerate() {
+    vs[64..68].copy_from_slice(&(slots.len() as u32).to_le_bytes());
+    for (i, (owner, count)) in slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| Some((i, slot.as_ref()?)))
+    {
         // participants_state[i]: SHARED_LOCK_STATE_SHARED, count above it.
         vs[68 + i * 4..72 + i * 4].copy_from_slice(&(2u32 | (count << 8)).to_le_bytes());
         let nid = 192 + i * 40;
@@ -192,12 +199,20 @@ fn serve_conn(mut sock: TcpStream, holders: Participants) -> std::io::Result<()>
                     Err(res) => res,
                     Ok(_) => {
                         // add_participant: a repeat from one owner bumps its
-                        // count rather than taking a second slot.
+                        // count rather than taking a second slot; a new one
+                        // takes the lowest free slot, appending only when the
+                        // array has no hole to fill.
                         let owner = req_owner(&hdr);
-                        let mut list = holders.lock().unwrap();
-                        match list.iter_mut().find(|(addr, _)| *addr == owner) {
-                            Some(entry) => entry.1 += 1,
-                            None => list.push((owner, 1)),
+                        let mut slots = holders.lock().unwrap();
+                        let mine = slots
+                            .iter()
+                            .position(|s| s.is_some_and(|(addr, _)| addr == owner));
+                        match mine {
+                            Some(i) => slots[i].as_mut().unwrap().1 += 1,
+                            None => match slots.iter().position(Option::is_none) {
+                                Some(free) => slots[free] = Some((owner, 1)),
+                                None => slots.push(Some((owner, 1))),
+                            },
                         }
                         0
                     }
@@ -206,18 +221,27 @@ fn serve_conn(mut sock: TcpStream, holders: Participants) -> std::io::Result<()>
             }
             SD_OP_UNREGISTER_VDI => {
                 let owner = req_owner(&hdr);
-                let mut list = holders.lock().unwrap();
-                let result = match list.iter().position(|(addr, _)| *addr == owner) {
+                let mut slots = holders.lock().unwrap();
+                let mine = slots
+                    .iter()
+                    .position(|s| s.is_some_and(|(addr, _)| addr == owner));
+                let result = match mine {
                     Some(i) => {
-                        list[i].1 -= 1;
-                        if list[i].1 == 0 {
-                            list.remove(i); // the cluster compacts the list
+                        let count = &mut slots[i].as_mut().unwrap().1;
+                        *count -= 1;
+                        if *count == 0 {
+                            // del_participant: the slot is cleared, not
+                            // removed — the holders above it keep theirs.
+                            slots[i] = None;
+                            while slots.last().is_some_and(Option::is_none) {
+                                slots.pop();
+                            }
                         }
                         0
                     }
                     None => SD_RES_VDI_NOT_LOCKED,
                 };
-                drop(list);
+                drop(slots);
                 sock.write_all(&resp(opcode, id, result, 0))?;
             }
             SD_OP_GET_VDI_COPIES => {
@@ -257,8 +281,10 @@ fn spawn_fake_sheep(holders: Participants) -> SocketAddr {
 #[test]
 fn a_cluster_namespace_registers_and_advertises_every_holder() {
     let peer: SocketAddr = PEER.parse().unwrap();
-    // The cluster already has one target serving the volume when we start.
-    let holders: Participants = Arc::new(Mutex::new(vec![(peer, 1)]));
+    let peer2: SocketAddr = PEER2.parse().unwrap();
+    // Two other targets already serve the volume when we start, and a third
+    // one left: slot 1 is the hole it left behind, which we take.
+    let holders: Participants = Arc::new(Mutex::new(vec![Some((peer, 1)), None, Some((peer2, 1))]));
     let cluster = spawn_fake_sheep(Arc::clone(&holders));
 
     let mut config = ioutgt_nvme_tcp::TargetConfig::single_memory(ACL_NQN, 16);
@@ -274,10 +300,11 @@ fn a_cluster_namespace_registers_and_advertises_every_holder() {
     let addr = ioutgt_nvme_tcp::spawn_target(config).expect("target start");
 
     // Opening the namespace registered this target as a holder of the volume,
-    // under the address it listens on — one registration per open.
+    // under the address it listens on — one registration per open, into the
+    // free slot rather than after the holders already there.
     assert_eq!(
         *holders.lock().unwrap(),
-        vec![(peer, 1), (addr, 1)],
+        vec![Some((peer, 1)), Some((addr, 1)), Some((peer2, 1))],
         "the target joined the volume's holders"
     );
 
@@ -288,10 +315,10 @@ fn a_cluster_namespace_registers_and_advertises_every_holder() {
     client.enable_controller(2);
     let header = get_disc_log(&mut client, 3, 0, 16);
     let numrec = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    assert_eq!(numrec, 2, "one entry per holder of the volume");
+    assert_eq!(numrec, 3, "one entry per holder of the volume");
 
-    let log = get_disc_log(&mut client, 4, 0, 3072);
-    let paths: Vec<_> = (1..=2)
+    let log = get_disc_log(&mut client, 4, 0, 4096);
+    let paths: Vec<_> = (1..=3)
         .map(|i| {
             let entry = &log[1024 * i..1024 * (i + 1)];
             assert_eq!(entry[0], fabrics::trtype::TCP, "entry {i} trtype");
@@ -313,19 +340,35 @@ fn a_cluster_namespace_registers_and_advertises_every_holder() {
         paths,
         vec![
             // PORTID is the holder's index in the address-sorted holder list,
-            // which every target serving the volume computes the same way.
+            // which every target serving the volume computes the same way —
+            // not its participant slot: ours is 1, and we are advertised last.
             (peer.ip().to_string(), peer.port().to_string(), 0),
-            (addr.ip().to_string(), addr.port().to_string(), 1),
+            (peer2.ip().to_string(), peer2.port().to_string(), 1),
+            (addr.ip().to_string(), addr.port().to_string(), 2),
         ]
     );
     drop(client);
 
-    // Shutdown hands the registration back, so the peer's discovery log stops
-    // advertising a target that is no longer there.
+    // Every controller this target mints comes out of the cntlid partition its
+    // participant slot owns, so the peers — allocating from theirs, with no
+    // way to ask us — cannot hand the same host the same cntlid for this
+    // subsystem.
+    let width =
+        u32::from(ioutgt_core::registry::CNTLID_MAX) / u32::from(ioutgt_backend::VDI_MAX_HOLDERS);
+    let ours = (1 + width)..=(width + width);
+    let cntlid = connect_cqe(addr, ACL_NQN).result.get() & 0xFFFF;
+    assert!(
+        ours.contains(&cntlid),
+        "cntlid {cntlid} outside slot 1's partition {ours:?}"
+    );
+
+    // Shutdown hands the registration back, so the peers' discovery logs stop
+    // advertising a target that is no longer there — and our slot goes back to
+    // being a hole for the next target to fill.
     assert_eq!(ioutgt_harness::shutdown(), 1, "one namespace released");
     assert_eq!(
         *holders.lock().unwrap(),
-        vec![(peer, 1)],
-        "only the peer still serves the volume"
+        vec![Some((peer, 1)), None, Some((peer2, 1))],
+        "only the peers still serve the volume"
     );
 }

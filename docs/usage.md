@@ -291,6 +291,17 @@ subsystem does; an unreadable holder list leaves the paths as they were
 rather than flapping them away. A subsystem whose namespaces span two
 clusters takes its paths from the first one and warns about the rest.
 
+The registration doubles as a name tag. Controller IDs are unique per
+subsystem, so targets fronting the same ACL must not mint the same one — a
+Linux host rejects the duplicate. The VDI lock's participant array has a
+fixed 31 slots and the cluster keeps a target in the slot it was given
+(a departing target leaves a hole, it does not shift the others), so each
+target takes the 1/31 of the cntlid range its slot points at, no
+target-to-target negotiation needed. It is not the same number as PORTID,
+which counts sorted paths. Targets that register nothing — no `sheepdog`
+namespace, or all of them opened `?nolock` — keep the whole range, as does
+a single-target setup, so nothing changes for them.
+
 The mapping is a startup snapshot: VDIs created afterwards need a restart,
 or an `ADD_NAMESPACE` control request naming the new VDI. Each namespace
 costs one cluster round trip at startup plus an in-memory copy of that
