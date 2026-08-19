@@ -68,6 +68,18 @@
 //! the caller's buffer, the same cancellation envelope as `FileBackend`'s
 //! vectored IO (memory outlives the op until queue-teardown drain).
 //!
+//! Everything else the backend says to the cluster — the lookups and inode
+//! read at [`SheepdogBackend::open`], the VDI registration and its release,
+//! the enumerations ([`list_vdis`], [`list_acls`], [`vdi_holders`],
+//! [`vdi_objects_local`]) — goes over the ring too, on a connection of its own
+//! ([`ctl`]). Those callers are synchronous, may hold no scheduler at all (the
+//! ACL refresh thread) or sit inside someone else's runtime (the control
+//! server), so a control connection carries its own
+//! [`BlockingRing`](ioutgt_uring::BlockingRing): one
+//! request in flight, owned buffers, and the calling thread parked in
+//! `io_uring_enter` until the answer lands. Nothing in this backend touches a
+//! socket any other way.
+//!
 //! # VDI locking (and who serves a volume)
 //!
 //! Opening a writable VDI takes the cluster's VDI lock, and the ACL id the
@@ -125,13 +137,16 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ioutgt_core::buf::AlignedBuf;
 use ioutgt_core::{Backend, BackendError, LbaRange};
 use ioutgt_uring::ops;
+
+use ctl::Conn;
 
 // ---------------------------------------------------------------------------
 // Wire constants (include/sheepdog_proto.h)
@@ -442,10 +457,41 @@ fn io_to_backend(err: &io::Error) -> BackendError {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread multiplexed connection (data path)
+// Connections: the per-thread multiplexed one (data path), the one-shot
+// blocking one (control plane)
 // ---------------------------------------------------------------------------
 
+mod ctl;
 mod mux;
+
+/// Create a stream socket suitable for `IORING_OP_CONNECT`, with
+/// `TCP_NODELAY` set (requests are small and latency-bound). Shared by both
+/// connection kinds.
+fn new_stream_socket(addr: &SocketAddr) -> io::Result<OwnedFd> {
+    let domain = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    // SAFETY: plain socket(2) with constant args; the returned fd is owned.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh fd, exclusively owned.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let one: libc::c_int = 1;
+    // SAFETY: valid fd; `one` outlives the call; length matches its type.
+    unsafe {
+        libc::setsockopt(
+            owned.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            std::ptr::from_ref(&one).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    Ok(owned)
+}
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -479,22 +525,29 @@ pub struct SheepdogBackend {
     /// `data_vdi_id[]`: object index → owning vid (`0` hole, [`VID_INFLIGHT`]
     /// during a create). Lock-free reads; only first-touch writes contend.
     data_map: Box<[AtomicU32]>,
-    /// The connection this VDI's cluster lock was taken on, parked here for
-    /// the backend's lifetime and used once more to release the lock on drop
-    /// or at [`SheepdogBackend::release_lock`]. The registration itself lives
-    /// in the cluster's VDI state rather than on this connection; keeping it
-    /// is what makes the release one warm round trip, and its presence is
-    /// this backend's "still registered" flag. `None` when locking is off,
-    /// the VDI is a read-only snapshot, or the lock has already gone back.
-    /// Control-plane state only (open, shutdown, drop) — never the IO path,
-    /// hence a plain `Mutex`.
-    lock_conn: Mutex<Option<TcpStream>>,
+    /// The socket this VDI's cluster lock was taken on, parked here for the
+    /// backend's lifetime and used once more to release the lock on drop or
+    /// at [`SheepdogBackend::release_lock`]. The registration itself lives in
+    /// the cluster's VDI state rather than on this connection; keeping it is
+    /// what makes the release one warm round trip, and its presence is this
+    /// backend's "still registered" flag. `None` when locking is off, the VDI
+    /// is a read-only snapshot, or the lock has already gone back.
+    ///
+    /// A bare fd rather than a [`Conn`]: the ring a control request runs on
+    /// belongs to the thread that makes it, and a backend is shared across
+    /// threads, so the ring is built around this fd again at release time
+    /// ([`Conn::adopt`]) wherever that happens to be. Control-plane state
+    /// only (open, shutdown, drop) — never the IO path, hence a plain
+    /// `Mutex`.
+    lock_conn: Mutex<Option<OwnedFd>>,
 }
 
 impl SheepdogBackend {
     /// Look up `vdi` (optionally at snapshot `tag`) on the cluster at `addr`,
-    /// read its inode, and build the backend. Performs a small synchronous
-    /// handshake (blocking `TcpStream`) once at startup — off the io_uring path.
+    /// read its inode, and build the backend. A small handshake over a
+    /// control connection of its own once at startup: on the ring,
+    /// like everything else that talks to the cluster, but with the calling
+    /// thread blocked across each round trip.
     ///
     /// `acl` names the ACL object the VDI belongs to; every lookup and lock
     /// runs under it, so it must match the VDI's inode `acl_id` or the cluster
@@ -525,40 +578,39 @@ impl SheepdogBackend {
                 "invalid VDI name",
             ));
         }
-        let mut stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true).ok();
+        let conn = Conn::connect(addr)?;
 
         let acl = match acl {
-            Some(name) => sync_lookup_acl(&mut stream, name)?,
+            Some(name) => lookup_acl(&conn, name)?,
             None => SD_ACL_NONE,
         };
-        let vid = sync_lookup_vdi(&mut stream, vdi, tag, acl)?;
-        let mut backend = Self::with_inode(addr, vdi, vid, acl, &mut stream)?;
+        let vid = lookup_vdi(&conn, vdi, tag, acl)?;
+        let mut backend = Self::with_inode(addr, vdi, vid, acl, &conn)?;
 
         // A frozen snapshot serves nobody's writes, so it needn't keep anyone
         // out — and the cluster would not record a useful holder for it.
         if let Some(fabric) = lock.filter(|_| !backend.read_only) {
             let owner = advertised_addr(fabric, addr)?;
-            sync_register_vdi(&mut stream, vdi, owner, acl)?;
+            register_vdi(&conn, vdi, owner, acl)?;
             backend.owner = Some(owner);
-            backend.lock_conn = Mutex::new(Some(stream));
+            backend.lock_conn = Mutex::new(Some(conn.into_fd()));
         }
         Ok(backend)
     }
 
-    /// Read `vid`'s inode over `stream` and assemble the (unregistered)
+    /// Read `vid`'s inode over `conn` and assemble the (unregistered)
     /// backend.
     fn with_inode(
         addr: SocketAddr,
         name: &str,
         vid: u32,
         acl: u32,
-        stream: &mut TcpStream,
+        conn: &Conn,
     ) -> io::Result<SheepdogBackend> {
         // Inode metadata, then the data_vdi_id[] slice sized to the volume.
         let inode_oid = vid_to_vdi_oid(vid);
         let mut header = vec![0u8; SD_INODE_META_SIZE];
-        sync_read_obj(stream, inode_oid, 0, &mut header)?;
+        read_obj(conn, inode_oid, 0, &mut header)?;
 
         let snap_ctime = read_u64(&header, INO_OFF_SNAP_CTIME);
         let vdi_size = read_u64(&header, INO_OFF_VDI_SIZE);
@@ -583,7 +635,7 @@ impl SheepdogBackend {
 
         let mut map_bytes = vec![0u8; nr_objects as usize * 4];
         if !map_bytes.is_empty() {
-            sync_read_obj(stream, inode_oid, SD_INODE_HEADER_SIZE, &mut map_bytes)?;
+            read_obj(conn, inode_oid, SD_INODE_HEADER_SIZE, &mut map_bytes)?;
         }
         let data_map: Box<[AtomicU32]> = (0..nr_objects as usize)
             .map(|i| AtomicU32::new(read_u32(&map_bytes, i * 4)))
@@ -643,15 +695,24 @@ impl SheepdogBackend {
     pub fn release_lock(&self) {
         // A poisoned lock still holds a usable connection: a shutdown path
         // has nowhere better to go than to try the release anyway.
-        let conn = self
+        let fd = self
             .lock_conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let (Some(mut stream), Some(owner)) = (conn, self.owner) {
-            let _ = stream.set_write_timeout(Some(LOCK_RELEASE_TIMEOUT));
-            let _ = stream.set_read_timeout(Some(LOCK_RELEASE_TIMEOUT));
-            release_registration(&mut stream, self.vid, owner, self.acl);
+        let (Some(fd), Some(owner)) = (fd, self.owner) else {
+            return;
+        };
+        match Conn::adopt(fd, LOCK_RELEASE_TIMEOUT) {
+            Ok(conn) => release_registration(&conn, self.vid, owner, self.acl),
+            // No ring on this thread and none to be had: nothing can be sent,
+            // and the cluster is left to reclaim the registration.
+            Err(err) => tracing::warn!(
+                vid = format_args!("{:x}", self.vid),
+                %owner,
+                %err,
+                "sheepdog: VDI registration not released"
+            ),
         }
     }
 
@@ -683,9 +744,8 @@ impl SheepdogBackend {
         let (Some(owner), true) = (self.owner, conn.is_some()) else {
             return Ok(());
         };
-        let mut stream = TcpStream::connect(self.addr)?;
-        stream.set_nodelay(true).ok();
-        let vid = sync_lookup_vdi(&mut stream, &self.name, None, self.acl)?;
+        let fresh = Conn::connect(self.addr)?;
+        let vid = lookup_vdi(&fresh, &self.name, None, self.acl)?;
         if vid != self.vid {
             return Err(io::Error::new(
                 io::ErrorKind::StaleNetworkFileHandle,
@@ -695,10 +755,10 @@ impl SheepdogBackend {
                 ),
             ));
         }
-        sync_register_vdi(&mut stream, &self.name, owner, self.acl)?;
+        register_vdi(&fresh, &self.name, owner, self.acl)?;
         // The connection the open left behind is dead if the cluster restarted
         // under us; the release goes over this one instead.
-        *conn = Some(stream);
+        *conn = Some(fresh.into_fd());
         Ok(())
     }
 
@@ -1011,10 +1071,8 @@ struct TableEntry {
 /// belong to in [`VdiInfo::acl`], which [`SheepdogBackend::open`] needs to
 /// reach them.
 pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_nodelay(true).ok();
-
-    let mut vdis: Vec<VdiInfo> = scan_vdi_table(&mut stream)?
+    let conn = Conn::connect(addr)?;
+    let mut vdis: Vec<VdiInfo> = scan_vdi_table(&conn)?
         .into_iter()
         .filter(|entry| !entry.is_acl)
         .map(|entry| entry.info)
@@ -1044,13 +1102,12 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
 /// not an error. Volumes belonging to no ACL appear in no entry; use
 /// [`list_vdis`] for those.
 pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_nodelay(true).ok();
-    let entries = scan_vdi_table(&mut stream)?;
+    let conn = Conn::connect(addr)?;
+    let entries = scan_vdi_table(&conn)?;
 
     let mut acls = Vec::new();
     for entry in entries.iter().filter(|entry| entry.is_acl) {
-        let members = sync_read_acl_members(&mut stream, entry.info.vid, entry.max_data_id_nr)?;
+        let members = read_acl_members(&conn, entry.info.vid, entry.max_data_id_nr)?;
         let mut vdis: Vec<VdiInfo> = Vec::new();
         for vid in members.iter().copied().filter(|&vid| vid != 0) {
             match entries.iter().find(|e| e.info.vid == vid && !e.is_acl) {
@@ -1113,22 +1170,13 @@ pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
 /// starts at [`SD_INODE_HEADER_SIZE`] in the inode object. Zero entries are
 /// holes and stay in the returned vector, so its length is the `nn` an ACL
 /// reports. A count past the array's end is clamped rather than trusted.
-fn sync_read_acl_members(
-    stream: &mut TcpStream,
-    vid: u32,
-    max_data_id_nr: u32,
-) -> io::Result<Vec<u32>> {
+fn read_acl_members(conn: &Conn, vid: u32, max_data_id_nr: u32) -> io::Result<Vec<u32>> {
     let count = u64::from(max_data_id_nr).min(SD_INODE_DATA_INDEX) as usize;
     if count == 0 {
         return Ok(Vec::new());
     }
     let mut bytes = vec![0u8; count * 4];
-    sync_read_obj(
-        stream,
-        vid_to_vdi_oid(vid),
-        SD_INODE_HEADER_SIZE,
-        &mut bytes,
-    )?;
+    read_obj(conn, vid_to_vdi_oid(vid), SD_INODE_HEADER_SIZE, &mut bytes)?;
     Ok((0..count).map(|i| read_u32(&bytes, i * 4)).collect())
 }
 
@@ -1171,9 +1219,8 @@ pub struct VdiHolder {
 /// plane only: at startup and from the refresh that keeps a subsystem's
 /// advertised paths current.
 pub fn vdi_holders(cluster: SocketAddr, vids: &[u32]) -> io::Result<Vec<Vec<VdiHolder>>> {
-    let mut stream = TcpStream::connect(cluster)?;
-    stream.set_nodelay(true).ok();
-    let states = sync_get_vdi_states(&mut stream)?;
+    let conn = Conn::connect(cluster)?;
+    let states = get_vdi_states(&conn)?;
     Ok(vids
         .iter()
         .map(|&vid| {
@@ -1247,25 +1294,17 @@ pub fn vdi_objects_local(cluster: SocketAddr, vids: &[u32]) -> io::Result<Vec<bo
     if vids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stream = TcpStream::connect(cluster)?;
-    stream.set_nodelay(true).ok();
+    let conn = Conn::connect(cluster)?;
     vids.iter()
-        .map(|&vid| sync_oid_is_local(&mut stream, vid_to_vdi_oid(vid)))
+        .map(|&vid| oid_is_local(&conn, vid_to_vdi_oid(vid)))
         .collect()
 }
 
 /// One `EXIST` round trip.
-fn sync_oid_is_local(stream: &mut TcpStream, oid: u64) -> io::Result<bool> {
-    use std::io::Write;
-
+fn oid_is_local(conn: &Conn, oid: u64) -> io::Result<bool> {
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_sheep_obj_req(&mut hdr, SD_OP_EXIST, oid);
-    stream.write_all(&hdr)?;
-
-    let mut resp = [0u8; SD_HDR_SIZE];
-    std::io::Read::read_exact(stream, &mut resp)?;
-    read_payload(stream, &resp, &mut [])?;
-    match resp_result(&resp) {
+    match conn.request_discard(&hdr, &[])?.result() {
         SD_RES_SUCCESS => Ok(true),
         SD_RES_NO_OBJ => Ok(false),
         res => Err(io::Error::other(format!(
@@ -1281,14 +1320,7 @@ fn sync_oid_is_local(stream: &mut TcpStream, oid: u64) -> io::Result<bool> {
 /// `acl` is both the scope the name resolves in and the lock's kind — a real
 /// ACL id joins the volume's participant list, [`SD_ACL_NONE`] claims a volume
 /// that is in no ACL exclusively.
-fn sync_register_vdi(
-    stream: &mut TcpStream,
-    vdi: &str,
-    owner: SocketAddr,
-    acl: u32,
-) -> io::Result<()> {
-    use std::io::{Read, Write};
-
+fn register_vdi(conn: &Conn, vdi: &str, owner: SocketAddr, acl: u32) -> io::Result<()> {
     if vdi.is_empty() || vdi.len() >= SD_MAX_VDI_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1308,16 +1340,7 @@ fn sync_register_vdi(
         owner,
         acl,
     );
-    stream.write_all(&hdr)?;
-    stream.write_all(&payload)?;
-
-    let mut resp = [0u8; SD_HDR_SIZE];
-    stream.read_exact(&mut resp)?;
-    let resp_len = resp_data_length(&resp) as u64;
-    if resp_len > 0 {
-        io::copy(&mut stream.take(resp_len), &mut io::sink())?;
-    }
-    match resp_result(&resp) {
+    match conn.request_discard(&hdr, &payload)?.result() {
         SD_RES_SUCCESS => Ok(()),
         SD_RES_NO_VDI => Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1346,25 +1369,13 @@ fn sync_register_vdi(
     }
 }
 
-/// One `UNREGISTER_VDI` round trip — the [`sync_register_vdi`] inverse, naming
-/// the same owner and ACL back. Reported rather than propagated: every caller
-/// is on a teardown path with nowhere to return an error to.
-fn release_registration(stream: &mut TcpStream, vid: u32, owner: SocketAddr, acl: u32) {
-    use std::io::{Read, Write};
-
+/// One `UNREGISTER_VDI` round trip — the [`register_vdi`] inverse, naming the
+/// same owner and ACL back. Reported rather than propagated: every caller is
+/// on a teardown path with nowhere to return an error to.
+fn release_registration(conn: &Conn, vid: u32, owner: SocketAddr, acl: u32) {
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_vdi_lock_req(&mut hdr, SD_OP_UNREGISTER_VDI, 0, 0, vid, owner, acl);
-    let result = (|| -> io::Result<u32> {
-        stream.write_all(&hdr)?;
-        let mut resp = [0u8; SD_HDR_SIZE];
-        stream.read_exact(&mut resp)?;
-        let resp_len = resp_data_length(&resp) as u64;
-        if resp_len > 0 {
-            io::copy(&mut stream.take(resp_len), &mut io::sink())?;
-        }
-        Ok(resp_result(&resp))
-    })();
-    match result {
+    match conn.request_discard(&hdr, &[]).map(|resp| resp.result()) {
         // NOT_LOCKED: the cluster dropped this holder on its own (the node
         // left the cluster's view and came back). The postcondition holds.
         Ok(SD_RES_SUCCESS | SD_RES_VDI_NOT_LOCKED) => {}
@@ -1390,20 +1401,15 @@ fn release_registration(stream: &mut TcpStream, vid: u32, owner: SocketAddr, acl
 ///
 /// The returned bytes are a whole number of `vdi_state` records; a reply that
 /// is not is a protocol violation rather than something to parse half of.
-fn sync_get_vdi_states(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    use std::io::Write;
-
+fn get_vdi_states(conn: &Conn) -> io::Result<Vec<u8>> {
     let mut records = SD_VDI_STATE_BATCH;
     loop {
         let mut buf = vec![0u8; records * SD_VDI_STATE_SIZE];
         let mut hdr = [0u8; SD_HDR_SIZE];
         encode_sheep_req(&mut hdr, SD_OP_GET_VDI_COPIES, buf.len() as u32);
-        stream.write_all(&hdr)?;
-
-        let mut resp = [0u8; SD_HDR_SIZE];
-        std::io::Read::read_exact(stream, &mut resp)?;
-        let len = read_payload(stream, &resp, &mut buf)?;
-        match resp_result(&resp) {
+        let resp = conn.request(&hdr, &[], &mut buf)?;
+        let len = resp.len;
+        match resp.result() {
             SD_RES_SUCCESS => {
                 if len % SD_VDI_STATE_SIZE != 0 {
                     return Err(io::Error::new(
@@ -1432,13 +1438,13 @@ fn sync_get_vdi_states(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// Walk the cluster's VDI bitmap (`READ_VDIS`, one bit per vid) and read each
 /// live vid's inode metadata.
 ///
-/// Blocking and off the io_uring path, like [`SheepdogBackend::open`]: a
-/// target calls it once at startup to map the cluster onto subsystems and
-/// namespaces. Vids that vanish between the bitmap snapshot and the inode
-/// read (a concurrent `dog vdi delete`), and unnamed or zero-sized inodes,
-/// are skipped rather than failing the whole enumeration.
-fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
-    let bitmap = sync_read_vdi_bitmap(stream)?;
+/// Blocking, like [`SheepdogBackend::open`]: a target calls it once at
+/// startup to map the cluster onto subsystems and namespaces. Vids that
+/// vanish between the bitmap snapshot and the inode read (a concurrent `dog
+/// vdi delete`), and unnamed or zero-sized inodes, are skipped rather than
+/// failing the whole enumeration.
+fn scan_vdi_table(conn: &Conn) -> io::Result<Vec<TableEntry>> {
+    let bitmap = read_vdi_bitmap(conn)?;
 
     let mut entries = Vec::new();
     let mut inode = vec![0u8; SD_INODE_META_SIZE];
@@ -1452,7 +1458,7 @@ fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
             if bits & (1 << bit) == 0 || vid == 0 {
                 continue;
             }
-            if sync_try_read_obj(stream, vid_to_vdi_oid(vid), 0, &mut inode)? != SD_RES_SUCCESS {
+            if try_read_obj(conn, vid_to_vdi_oid(vid), 0, &mut inode)? != SD_RES_SUCCESS {
                 continue;
             }
             let name = read_cstr(&inode[INO_OFF_NAME..INO_OFF_NAME + SD_MAX_VDI_LEN]);
@@ -1479,7 +1485,8 @@ fn scan_vdi_table(stream: &mut TcpStream) -> io::Result<Vec<TableEntry>> {
 }
 
 // ---------------------------------------------------------------------------
-// Synchronous startup helpers (blocking TcpStream, off the io_uring path)
+// Control-plane helpers (one round trip at a time on a [`ctl::Conn`], with
+// the calling thread blocked across it)
 // ---------------------------------------------------------------------------
 
 fn read_u32(buf: &[u8], off: usize) -> u32 {
@@ -1512,16 +1519,16 @@ fn read_cstr(field: &[u8]) -> String {
 /// `SD_VDI_FLAG_ACL` check then keeps an ordinary VDI that happens to share
 /// the name from being mistaken for an access-control scope (the same guard
 /// `dog acl` applies).
-fn sync_lookup_acl(stream: &mut TcpStream, acl: &str) -> io::Result<u32> {
+fn lookup_acl(conn: &Conn, acl: &str) -> io::Result<u32> {
     if acl.is_empty() || acl.len() >= SD_MAX_VDI_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid ACL name",
         ));
     }
-    let vid = sync_lookup_vdi(stream, acl, None, SD_ACL_NONE)?;
+    let vid = lookup_vdi(conn, acl, None, SD_ACL_NONE)?;
     let mut meta = vec![0u8; SD_INODE_META_SIZE];
-    sync_read_obj(stream, vid_to_vdi_oid(vid), 0, &mut meta)?;
+    read_obj(conn, vid_to_vdi_oid(vid), 0, &mut meta)?;
     if read_u32(&meta, INO_OFF_VDI_FLAGS) & SD_VDI_FLAG_ACL == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1534,14 +1541,7 @@ fn sync_lookup_acl(stream: &mut TcpStream, acl: &str) -> io::Result<u32> {
 /// Look up a VDI by name (and optional snapshot tag) within ACL `acl` → its
 /// vid. `sheep` matches the name only against inodes whose `acl_id` is `acl`,
 /// so the scope is part of the question (see the module docs).
-fn sync_lookup_vdi(
-    stream: &mut TcpStream,
-    vdi: &str,
-    tag: Option<&str>,
-    acl: u32,
-) -> io::Result<u32> {
-    use std::io::{Read, Write};
-
+fn lookup_vdi(conn: &Conn, vdi: &str, tag: Option<&str>, acl: u32) -> io::Result<u32> {
     let mut payload = vec![0u8; SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
     payload[..vdi.len()].copy_from_slice(vdi.as_bytes());
     if let Some(tag) = tag {
@@ -1561,18 +1561,9 @@ fn sync_lookup_vdi(
         0,
         acl,
     );
-    stream.write_all(&hdr)?;
-    stream.write_all(&payload)?;
-
-    let mut resp = [0u8; SD_HDR_SIZE];
-    stream.read_exact(&mut resp)?;
-    // Drain any response payload to keep the stream framed.
-    let resp_len = resp_data_length(&resp) as usize;
-    if resp_len > 0 {
-        io::copy(&mut stream.take(resp_len as u64), &mut io::sink())?;
-    }
-    match resp_result(&resp) {
-        SD_RES_SUCCESS => Ok(read_u32(&resp, 24)), // vdi_id at byte 24
+    let resp = conn.request_discard(&hdr, &payload)?;
+    match resp.result() {
+        SD_RES_SUCCESS => Ok(read_u32(&resp.hdr, 24)), // vdi_id at byte 24
         SD_RES_NO_VDI => Err(io::Error::new(io::ErrorKind::NotFound, "no such VDI")),
         SD_RES_NO_TAG => Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1615,11 +1606,9 @@ fn advertised_addr(fabric: SocketAddr, cluster: SocketAddr) -> io::Result<Socket
     Ok(SocketAddr::new(probe.local_addr()?.ip(), fabric.port()))
 }
 
-/// Synchronously read the cluster's VDI bitmap (one bit per vid, LSB-first
-/// within each byte — the kernel `test_bit` layout the `sheep` gateway uses).
-fn sync_read_vdi_bitmap(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Write};
-
+/// Read the cluster's VDI bitmap (one bit per vid, LSB-first within each
+/// byte — the kernel `test_bit` layout the `sheep` gateway uses).
+fn read_vdi_bitmap(conn: &Conn) -> io::Result<Vec<u8>> {
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_vdi_req(
         &mut hdr,
@@ -1630,14 +1619,8 @@ fn sync_read_vdi_bitmap(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
         0,
         0,
     );
-    stream.write_all(&hdr)?;
-
-    let mut resp = [0u8; SD_HDR_SIZE];
-    stream.read_exact(&mut resp)?;
-    let result = resp_result(&resp);
     let mut bitmap = vec![0u8; SD_VDI_BITMAP_SIZE];
-    let resp_len = read_payload(stream, &resp, &mut bitmap)?;
-    bitmap[resp_len..].fill(0);
+    let result = conn.request(&hdr, &[], &mut bitmap)?.result();
     if result != SD_RES_SUCCESS {
         return Err(io::Error::other(format!(
             "READ_VDIS failed: SD_RES {result:#x}"
@@ -1646,11 +1629,11 @@ fn sync_read_vdi_bitmap(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(bitmap)
 }
 
-/// Synchronously read `dst.len()` bytes of object `oid` at `offset`,
-/// zero-filling any trailing bytes the server trims. A non-success
-/// `SD_RES_*` is an error; see [`sync_try_read_obj`] to inspect it.
-fn sync_read_obj(stream: &mut TcpStream, oid: u64, offset: u64, dst: &mut [u8]) -> io::Result<()> {
-    match sync_try_read_obj(stream, oid, offset, dst)? {
+/// Read `dst.len()` bytes of object `oid` at `offset`, zero-filling any
+/// trailing bytes the server trims. A non-success `SD_RES_*` is an error; see
+/// [`try_read_obj`] to inspect it.
+fn read_obj(conn: &Conn, oid: u64, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+    match try_read_obj(conn, oid, offset, dst)? {
         SD_RES_SUCCESS => Ok(()),
         result => Err(io::Error::other(format!(
             "READ_OBJ failed: SD_RES {result:#x}"
@@ -1658,16 +1641,9 @@ fn sync_read_obj(stream: &mut TcpStream, oid: u64, offset: u64, dst: &mut [u8]) 
     }
 }
 
-/// [`sync_read_obj`] returning the raw `SD_RES_*` result, for callers that
+/// [`read_obj`] returning the raw `SD_RES_*` result, for callers that
 /// tolerate a failed object (e.g. an inode deleted under an enumeration).
-fn sync_try_read_obj(
-    stream: &mut TcpStream,
-    oid: u64,
-    offset: u64,
-    dst: &mut [u8],
-) -> io::Result<u32> {
-    use std::io::Write;
-
+fn try_read_obj(conn: &Conn, oid: u64, offset: u64, dst: &mut [u8]) -> io::Result<u32> {
     let mut hdr = [0u8; SD_HDR_SIZE];
     encode_obj_req(
         &mut hdr,
@@ -1680,37 +1656,7 @@ fn sync_try_read_obj(
         0,
         offset,
     );
-    stream.write_all(&hdr)?;
-
-    let mut resp = [0u8; SD_HDR_SIZE];
-    std::io::Read::read_exact(stream, &mut resp)?;
-    let resp_len = read_payload(stream, &resp, dst)?;
-    dst[resp_len..].fill(0);
-    Ok(resp_result(&resp))
-}
-
-/// Read a response's payload into `dst`, returning its length. Keeps the
-/// stream framed for the next request: an over-long payload (more than was
-/// asked for) is a protocol violation, not something to leave unread.
-fn read_payload(
-    stream: &mut TcpStream,
-    resp: &[u8; SD_HDR_SIZE],
-    dst: &mut [u8],
-) -> io::Result<usize> {
-    let resp_len = resp_data_length(resp) as usize;
-    if resp_len > dst.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "response payload {resp_len} exceeds the {} requested",
-                dst.len()
-            ),
-        ));
-    }
-    if resp_len > 0 {
-        std::io::Read::read_exact(stream, &mut dst[..resp_len])?;
-    }
-    Ok(resp_len)
+    Ok(conn.request(&hdr, &[], dst)?.result())
 }
 
 #[cfg(test)]

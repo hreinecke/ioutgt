@@ -323,6 +323,16 @@ reactor owns the ring:
   terminal CQE arrives. This is stress-tested (drop-at-random-poll, ASAN
   soak) before anything is built on top.
 
+**Off the scheduler** (`BlockingRing`): a synchronous caller with no runtime
+under it — the Sheepdog backend's control plane, whose signatures are
+synchronous and whose threads may be a plain `std::thread` or someone else's
+Tokio worker — still reaches the same ops. `BlockingRing` polls one future
+with a flag-setting waker and, between polls, parks the whole calling thread
+in the same `Reactor::park` the runtime's hook uses. A thread that already
+has a reactor has it *adopted* (config ignored, ring outlives the handle);
+a thread with none gets a private ring, uninstalled at drop. It panics rather
+than spinning if the future is pending with nothing in flight on the reactor.
+
 Rejected alternatives: **tokio-uring** (no multishot recv / provided-buffer
 rings / SEND_ZC notification control; owned-buffer model conflicts with
 preallocated slots; maintenance mode) and a **fully custom executor**
@@ -540,6 +550,18 @@ thread arms no op. Any IO error, EOF, or cancellation mid-send poisons the
 connection: all its waiters fail with `EIO` (the host retries; a shared
 connection means a wider blast radius than the per-command connections this
 replaced) and the next request dials a fresh one.
+
+The backend's **control plane** — the lookups and inode read at open, the VDI
+registration and its release, and the cluster enumerations (`list_vdis`,
+`list_acls`, `vdi_holders`, `vdi_objects_local`) — runs on the ring too, but
+over its own one-shot connections (`sheepdog::ctl`), not the multiplexed one.
+Its callers are synchronous and hold no scheduler (the CLI, the ACL refresh
+thread) or sit inside the control server's runtime, so each connection carries
+a `BlockingRing` (§4): one request in flight at a time, `id` left zero, owned
+buffers so an abandoned request (the 2 s lock-release deadline) leaves nothing
+the kernel could still write into, and the calling thread parked in
+`io_uring_enter` until the answer lands. No socket in this backend is touched
+any other way.
 
 Access control on the cluster side is the **ACL object**: a VDI carrying
 `SD_VDI_FLAG_ACL`, named back by the volumes it grants access to (their

@@ -14,6 +14,10 @@
 //! on the thread that created it. The only cross-thread entry point is the
 //! [`mailbox`] doorbell.
 //!
+//! A thread with no scheduler — a control-plane caller whose signature is
+//! synchronous — gets at the same ops through [`BlockingRing`], which drives
+//! one future by parking the whole thread in the ring.
+//!
 //! # Cancellation contract
 //!
 //! Owned-buffer ops ([`ops::read_at`], [`ops::recv`], ...) are safe to drop
@@ -24,6 +28,7 @@
 //!
 //! See `docs/architecture.md` ("Reactor") for the full design.
 
+mod blocking;
 pub mod bufring;
 mod cqe;
 pub mod mailbox;
@@ -34,6 +39,7 @@ mod reactor;
 mod runtime;
 pub mod sendbatch;
 
+pub use blocking::BlockingRing;
 pub use bufring::{BufRing, RecvChunk};
 pub use cqe::CqeResult;
 pub use ops::BackendFd;

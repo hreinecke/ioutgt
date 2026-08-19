@@ -2,8 +2,9 @@
 //!
 //! A tiny `TcpListener`-backed server speaks the real 48-byte Sheepdog wire
 //! protocol against an in-memory object store, letting the backend exercise its
-//! full path (blocking VDI lookup + inode read at open, then io_uring
-//! object read/write/allocate/CoW on a real `QueueRuntime`) with no cluster.
+//! full path (the control plane's VDI lookup + inode read at open, then
+//! io_uring object read/write/allocate/CoW on a real `QueueRuntime`) with no
+//! cluster.
 //! The same fake serves the cluster-wide VDI bitmap and models the cluster's
 //! ACL scoping — a lookup only sees names whose inode `acl_id` matches the ACL
 //! it carries — covering `ioutgt_backend::list_vdis` and
@@ -1260,7 +1261,7 @@ fn one_connection_carries_concurrent_requests_answered_out_of_order() {
     let addr = spawn_counting_sheep(Arc::clone(&store), Arc::clone(&conns));
     let rt = QueueRuntime::new(RingConfig::default()).unwrap();
     let be = Rc::new(SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap());
-    // The open's own lookups went over blocking control-plane connections.
+    // The open's own lookups went over one-shot control-plane connections.
     let before = conns.load(Ordering::SeqCst);
 
     let obj = 64 * 1024 / 512; // LBAs per object
