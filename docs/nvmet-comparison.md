@@ -115,7 +115,9 @@ noted above — accepted deliberately for the batching win
 validates subsysnqn/hostnqn ACLs, installs queues with sqsize
 validation against MQES; property get/set implement the register
 surface (CAP/VS/CC/CSTS) with the enable/shutdown state machine;
-keep-alive is a delayed work item firing fatal error on expiry.
+keep-alive is a delayed work item firing fatal error on expiry, with
+traffic-based keep-alive (`CTRATT.TBKAS`) letting any command on any
+queue stand in for a Keep Alive (`sq->ctrl->reset_tbkas`).
 
 **ioutgt.** The control thread performs the ICReq handshake and reads
 the first (Connect) capsule on plain Tokio sockets — the qid decides
@@ -125,7 +127,13 @@ command. Controllers live and die with their admin-queue connection;
 a mutex-guarded registry (control-plane rate only) maps cntlid →
 identity for IO-queue Connect validation. Register state machine and
 CAP values mirror nvmet (MQES 0-based, CQR, TO=15s). Keep-alive is a
-ring-timer watchdog that closes the socket past 2×KATO+grace.
+ring-timer watchdog that closes the socket past 2×KATO+grace. TBKAS
+works the same way as nvmet's but arrives by a different route: the
+controller's queues sit on different threads, so an IO queue publishes
+"I saw traffic" into a shared flag once per keep-alive tick (never per
+command) and the admin queue's watchdog consumes it. Only the TCP
+transport publishes, so only it advertises the bit; RDMA still relies on
+Keep Alive commands.
 
 **Differences.** nvmet routes raw connections to whatever CPU the
 socket callback lands on and learns the qid later; ioutgt pays one

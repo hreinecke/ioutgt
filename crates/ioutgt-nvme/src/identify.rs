@@ -96,6 +96,19 @@ pub mod oncs {
     pub const WRITE_ZEROES: u16 = 1 << 3;
 }
 
+/// CTRATT bits (Identify Controller: controller attributes).
+pub mod ctratt {
+    /// Traffic Based Keep Alive Support: the controller treats command
+    /// traffic on any queue as a keep-alive, so a host with IO in flight
+    /// need not send Keep Alive commands at all. A Linux host that sees
+    /// this bit halves its keep-alive period and then skips the command
+    /// whenever it saw a completion in the last interval
+    /// (`nvme_keep_alive_work`, `NVME_CTRL_ATTR_TBKAS`) — so a target must
+    /// not claim it unless every queue really does feed its keep-alive
+    /// watchdog.
+    pub const TBKAS: u32 = 1 << 6;
+}
+
 /// CMIC bits (Identify Controller: multi-path I/O & namespace sharing).
 pub mod cmic {
     /// The NVM subsystem may contain two or more controllers. Setting it

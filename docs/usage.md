@@ -167,8 +167,9 @@ same in totals and rate mode. The SQE split shows the op mix:
 gather keeps `send` far below the response count), `read`/`write` are
 the backend storage ops (one ring op per command on the file/bdev
 backend — `0` for memory/null, which serve in-CPU); the remainder
-`sqes − send − recv − read − write` is keep-alive timers + the mailbox
-doorbell. Rates are computed client-side from the monotonic counters,
+`sqes − send − recv − read − write` is keep-alive timers (the admin
+watchdog and each IO connection's traffic beacon, one op per keep-alive
+tick) + the mailbox doorbell. Rates are computed client-side from the monotonic counters,
 so a target restart
 between samples shows zeros, never garbage.
 

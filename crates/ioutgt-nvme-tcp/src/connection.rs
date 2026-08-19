@@ -126,8 +126,9 @@ pub async fn run_queue<B: Backend>(conn: QueueConn<B>, on_ctx: impl FnOnce(&Rc<C
     on_ctx(&ctx);
 
     let mut tasks = spawn_slot_tasks(&queue, &ctx);
-    if let Role::Admin(_) = &ctx.role {
-        tasks.push(spawn_keepalive_watchdog(Rc::clone(&ctx), fd));
+    match &ctx.role {
+        Role::Admin(_) => tasks.push(spawn_keepalive_watchdog(Rc::clone(&ctx), fd)),
+        Role::Io(_) => tasks.push(spawn_traffic_beacon(Rc::clone(&ctx), Rc::clone(&queue))),
     }
     let send_task = spawn_send_task(
         Rc::clone(&queue),
@@ -191,18 +192,22 @@ fn spawn_slot_tasks<B: Backend>(
 
 /// Keep-alive watchdog (admin queues): close the socket when the host
 /// goes silent past KATO + grace, which unwinds the whole connection.
+/// "Silent" counts traffic on the controller's IO queues too — see
+/// [`spawn_traffic_beacon`] and `AdminState::keepalive_expired`.
 fn spawn_keepalive_watchdog<B: Backend>(ctx: Rc<ConnCtx<B>>, fd: i32) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
-            let Ok(sleep) = ops::sleep(Duration::from_secs(5)) else {
+            let Role::Admin(admin) = &ctx.role else {
+                return;
+            };
+            // Re-read the KATO every round: it is 0 until this queue's
+            // Connect executes, and the tick follows it from then on.
+            let Ok(sleep) = ops::sleep(dispatch::keepalive_tick(admin.kato_ms.get())) else {
                 return;
             };
             if sleep.await.is_err() {
                 return;
             }
-            let Role::Admin(admin) = &ctx.role else {
-                return;
-            };
             if let Some(silent) = admin.keepalive_expired() {
                 info!(
                     cntlid = admin.cntlid.get(),
@@ -213,6 +218,55 @@ fn spawn_keepalive_watchdog<B: Backend>(ctx: Rc<ConnCtx<B>>, fd: i32) -> JoinHan
                 // shutdown only signals, never frees.
                 unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
                 return;
+            }
+        }
+    })
+}
+
+/// Traffic beacon (IO queues): the publishing half of traffic-based
+/// keep-alive (`CTRATT.TBKAS`).
+///
+/// A controller's IO queues run on other threads than its admin queue, so
+/// they cannot touch its keep-alive deadline — and writing the shared flag
+/// per command would bounce its cacheline between the two threads. Instead
+/// [`NvmeTcpQueue::submit`] marks a thread-local `Cell`, and this task
+/// forwards the mark once per keep-alive tick into the controller's shared
+/// [`TrafficFlag`](ioutgt_core::registry::TrafficFlag): one relaxed store
+/// per tick per busy queue, and the admin watchdog takes it as "the host is
+/// alive". That is what lets a host with IO in flight stop sending Keep
+/// Alive commands, exactly as nvmet's `reset_tbkas` does.
+fn spawn_traffic_beacon<B: Backend>(
+    ctx: Rc<ConnCtx<B>>,
+    queue: Rc<NvmeTcpQueue>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        let Role::Io(io) = &ctx.role else {
+            return;
+        };
+        loop {
+            // Before Connect neither the KATO nor the flag is known: poll
+            // at the floor so a short-KATO controller is covered from its
+            // very first command.
+            let tick = if io.cntlid.get() == 0 {
+                dispatch::KEEPALIVE_TICK_MIN
+            } else {
+                dispatch::keepalive_tick(io.kato_ms.get())
+            };
+            let Ok(sleep) = ops::sleep(tick) else {
+                return;
+            };
+            if sleep.await.is_err() {
+                return;
+            }
+            let Some(traffic) = io.traffic.get() else {
+                // Connected with KATO 0: no watchdog to feed, ever.
+                if io.cntlid.get() != 0 {
+                    return;
+                }
+                continue;
+            };
+            if queue.take_traffic() {
+                traffic.set();
             }
         }
     })
