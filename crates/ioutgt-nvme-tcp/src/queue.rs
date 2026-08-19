@@ -5,6 +5,7 @@
 //! types owned here (an NVMe/RDMA transport has no R2T; an NBD
 //! transport has no CQE — the work type is transport property).
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use ioutgt_core::queue::QueueCore;
@@ -44,6 +45,9 @@ pub struct NvmeTcpQueue {
     pub nvme: Rc<QueueCore<Sqe>>,
     /// This transport's send list.
     pub send: SendList<SendWork>,
+    /// A command was submitted since the traffic beacon last looked
+    /// ([`submit`](Self::submit) / [`take_traffic`](Self::take_traffic)).
+    traffic: Cell<bool>,
 }
 
 impl std::ops::Deref for NvmeTcpQueue {
@@ -61,7 +65,26 @@ impl NvmeTcpQueue {
         Rc::new(NvmeTcpQueue {
             nvme: QueueCore::new(qid, sqsize, pool_bytes, sqhd_disabled, Sqe::zeroed()),
             send: SendList::new(sqsize),
+            traffic: Cell::new(false),
         })
+    }
+
+    /// Deliver a fully received command to its slot task (recv path),
+    /// noting the traffic on the way through.
+    ///
+    /// Shadows [`SlotArray::submit`][ioutgt_core::slotq::SlotArray::submit],
+    /// which this forwards to: every command on this connection passes
+    /// here, which makes it the one place the traffic-based keep-alive
+    /// beacon needs — a thread-local `Cell` store of a constant, the same
+    /// point nvmet sets `reset_tbkas` from (`nvmet_req_init`).
+    pub fn submit(&self, tag: u16, cmd: Sqe) {
+        self.traffic.set(true);
+        self.nvme.submit(tag, cmd);
+    }
+
+    /// Consume the "commands were submitted" mark (traffic beacon).
+    pub fn take_traffic(&self) -> bool {
+        self.traffic.replace(false)
     }
 
     /// Queue a completion for the send path (slot task side).

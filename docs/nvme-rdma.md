@@ -244,10 +244,13 @@ host disconnect produces no flushed completions. Teardown signals:
   data path, and this is a second cross-thread wake channel).
 - **Abrupt (host vanishes, no DREQ)**: nothing on the QP or CM
   notices, so the backstop's keep-alive watchdog (every 2nd tick,
-  ≈ 2 s) covers it: an admin queue silent past KATO×2 + 5 s tears down
-  and removes its controller from the registry; IO queues whose
-  controller has left the registry follow — a dead host's QPs, permits
-  and slots all recycle.
+  ≈ 2 s) covers it: an admin queue silent past KATO×2 + one keep-alive
+  tick tears down and removes its controller from the registry; IO
+  queues whose controller has left the registry follow — a dead host's QPs, permits
+  and slots all recycle. "Silent" here means the admin queue alone: this
+  transport does not publish IO-queue traffic to the watchdog, so (unlike
+  TCP) it does not advertise `CTRATT.TBKAS` and its hosts keep sending
+  Keep Alive commands.
 
 `RdmaQueue::drop` drains the comp channel before destroying the CQ
 (`ibv_destroy_cq` hangs on unacked events); field order in the struct

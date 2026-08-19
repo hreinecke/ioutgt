@@ -42,6 +42,7 @@ run_queue(QueueConn)
   │                                  → complete() }    "task per tag"
   ├─ send task                StreamSender loop (stream-sender.md)
   ├─ keep-alive watchdog      admin queue only
+  ├─ traffic beacon           io queues only (TBKAS)
   └─ recv_loop                runs as the task body
 ```
 
@@ -301,9 +302,23 @@ mode vs classic mode); the two never mix on one connection.
 
 ## Lifecycle hardening
 
-- **Keep-alive watchdog** (admin queues only): polls every 5 s; a host
-  silent past KATO×2 + 5 s gets `shutdown(fd)`, unwinding the whole
-  connection through recv EOF (KATO 0 disables).
+- **Keep-alive watchdog** (admin queues only): polls every
+  `keepalive_tick` = KATO/2 clamped to 250 ms..5 s; a host silent past
+  KATO×2 + one tick gets `shutdown(fd)`, unwinding the whole connection
+  through recv EOF (KATO 0 disables).
+- **Traffic-based keep-alive** (`CTRATT.TBKAS`, advertised by this
+  transport): "silent" means the whole controller, not just its admin
+  queue. `NvmeTcpQueue::submit` marks a thread-local `Cell` for every
+  command it takes, and each IO connection runs a *traffic beacon* task
+  on the same tick that forwards the mark into the controller's shared
+  `TrafficFlag` (`ioutgt-core` registry) — one relaxed store per tick
+  per busy queue instead of a contended cacheline per command, and the
+  only path by which an IO thread reaches its admin queue's deadline.
+  The watchdog takes the flag and treats it as having been heard from,
+  so a host with IO in flight stops sending Keep Alive commands
+  altogether (`nvme_keep_alive_work` skips them once it sees the bit).
+  An IO queue's teardown sets the flag too, granting one more period,
+  as `nvmet_sq_destroy()` does.
 - **Send-task death self-heals**: if the send loop ends, the spawner
   shuts the socket down so the recv loop sees EOF immediately instead
   of waiting for the host IO timeout.

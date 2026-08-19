@@ -458,7 +458,10 @@ Port ──┬── Subsystem (NQN) ──┬── Namespace (nsid → Backend
 
 Controller (cntlid) ── created by fabrics Connect on the admin queue
   ├── CC/CSTS register state machine (enable → ready, shutdown)
-  ├── Keep-alive timer (KAS granularity 10 s; teardown on expiry)
+  ├── Keep-alive timer (KAS granularity 10 s; teardown on expiry).
+  │   Traffic-based (CTRATT.TBKAS on TCP): every queue publishes its
+  │   command traffic into one shared flag, so IO alone keeps the
+  │   controller alive and a busy host sends no Keep Alive commands
   ├── AER pool (4 outstanding; NS_CHANGED on namespace add/remove,
   │   ANA_CHANGE when a cluster namespace changes path locality)
   └── queues: admin (qid 0) + up to N IO queues (clamped to thread count

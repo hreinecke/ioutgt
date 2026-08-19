@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
     IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
-    nmic, oncs, u128_le,
+    ctratt, nmic, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
@@ -212,6 +212,16 @@ fn build_id_ctrl<B: Backend>(
     }
     id.oaes.set(oaes);
     id.kas.set(KAS_UNITS);
+    // TBKAS: IO traffic keeps the controller alive, so a busy host stops
+    // sending Keep Alive commands entirely. Only claim it where every queue
+    // publishes its traffic to the admin queue's watchdog — TCP does (the
+    // per-queue traffic beacon in ioutgt-nvme-tcp), RDMA does not yet, and
+    // claiming it there would tear down a controller whose admin queue is
+    // idle while its IO queues are busy. Discovery controllers have no IO
+    // queues and follow nvmet, which leaves their CTRATT at zero.
+    if !discovery && matches!(ctx.port.trtype, TransportType::Tcp) {
+        id.ctratt.set(ctratt::TBKAS);
+    }
     id.sqes = 0x66;
     id.cqes = 0x44;
     // Advertise the configured IO queue-depth ceiling, not the admin

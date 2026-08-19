@@ -265,8 +265,9 @@ fn cc_enable_before_connect_rejected() {
 fn kato_expiry_closes_connection() {
     let addr = start_target();
     let mut admin = Client::handshake(addr, false, false);
-    // Connect with KATO = 1s, then go silent: watchdog (5s tick) must
-    // close us within 2*kato + 5s grace + one tick ≈ ≤ 13s.
+    // Connect with KATO = 1s, then go silent: the watchdog polls every
+    // kato/2 = 500ms and expires the controller at 2*kato + one tick =
+    // 2.5s, so we must be closed in ~3s.
     let cntlid = admin.connect_with_kato(0, 32, 0xFFFF, 1, 1_000);
     assert!(cntlid >= 1);
     let start = Instant::now();

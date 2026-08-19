@@ -3,7 +3,37 @@
 //! (thread, CPUs, peer). Control-plane rate only (Connect / teardown).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Traffic-based keep-alive liveness bit, shared by every queue of one
+/// controller (Identify Controller `CTRATT.TBKAS`).
+///
+/// A controller's queues live on different threads, so an IO queue cannot
+/// touch its admin queue's keep-alive deadline directly — this flag is the
+/// one place they meet. Queues [`set`](Self::set) it when they have seen
+/// command traffic; the admin queue's watchdog [`take`](Self::take)s it and
+/// treats a set flag as "the host is alive", exactly as nvmet's
+/// `reset_tbkas` does.
+///
+/// Deliberately a flag and not a counter or a timestamp: it is written off
+/// the IO path (a queue publishes at most once per keep-alive tick, never
+/// per command), and "was there traffic since the last check" is all the
+/// watchdog asks.
+#[derive(Debug, Default)]
+pub struct TrafficFlag(AtomicBool);
+
+impl TrafficFlag {
+    /// Record that this controller's host has been heard from.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Consume the flag: whether traffic was recorded since the last take.
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
 
 /// One installed queue's identity (recorded at Connect time, on the
 /// owning queue thread).
@@ -44,6 +74,11 @@ pub struct ControllerEntry {
     /// log pages, no storage). Decided by the protocol layer at
     /// [`Registry::allocate`] time.
     pub discovery: bool,
+    /// Traffic-based keep-alive liveness, shared by every queue of this
+    /// controller: an IO queue sets it, the admin queue's keep-alive
+    /// watchdog takes it. Cloned along with the entry, so an IO queue gets
+    /// the flag straight out of [`Registry::install_io_queue`].
+    pub traffic: Arc<TrafficFlag>,
 }
 
 /// Cross-thread controller registry. Control-plane rate only (Connect /
@@ -119,6 +154,7 @@ impl Registry {
                         kato_ms,
                         queues: vec![admin_queue.clone()],
                         discovery,
+                        traffic: Arc::new(TrafficFlag::default()),
                     });
                     true
                 }
@@ -169,6 +205,18 @@ impl Registry {
             .expect("registry poisoned")
             .controllers
             .remove(&cntlid)
+    }
+
+    /// This controller's traffic-based keep-alive flag (the admin queue
+    /// picks it up right after [`allocate`](Self::allocate); IO queues get
+    /// it from their [`install_io_queue`](Self::install_io_queue) entry).
+    pub fn traffic(&self, cntlid: u16) -> Option<Arc<TrafficFlag>> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .controllers
+            .get(&cntlid)
+            .map(|entry| Arc::clone(&entry.traffic))
     }
 
     /// Whether a controller is still live (IO-queue liveness watchdogs poll
@@ -340,6 +388,29 @@ mod tests {
         assert!(snap[0].queues.iter().all(|q| q.cpus == "0-3"));
         assert!(!snap[0].queues[0].cpus.is_empty());
         assert!(!snap[0].discovery);
+    }
+
+    #[test]
+    fn traffic_flag_shared_by_all_queues() {
+        let registry = Registry::new(1, super::CNTLID_MAX);
+        let a = registry
+            .allocate("nqn.test", "nqn.host", 4, 5000, qi(0), false)
+            .unwrap();
+        let admin = registry.traffic(a).unwrap();
+        // The IO queue's entry carries the very same flag, which is the
+        // whole point: setting it there is visible to the admin watchdog.
+        let io = registry.install_io_queue(a, "nqn.host", qi(1)).unwrap();
+        assert!(!admin.take());
+        io.traffic.set();
+        assert!(admin.take(), "io traffic visible to the admin queue");
+        assert!(!admin.take(), "take consumes the flag");
+        // Each controller gets its own flag.
+        let b = registry
+            .allocate("nqn.test", "nqn.host", 4, 5000, qi(0), false)
+            .unwrap();
+        registry.traffic(b).unwrap().set();
+        assert!(!admin.take());
+        assert!(registry.traffic(0xBEEF).is_none());
     }
 
     #[test]

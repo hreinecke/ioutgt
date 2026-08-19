@@ -133,6 +133,11 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
             admin.cntlid.set(cntlid);
             ctx.queue.stats.cntlid.set(cntlid);
             admin.kato_ms.set(kato);
+            // Traffic-based keep-alive: pick up the flag the controller's
+            // IO queues will publish into.
+            if let Some(traffic) = ctx.registry.traffic(cntlid) {
+                let _ = admin.traffic.set(traffic);
+            }
             info!(cntlid, subsysnqn, hostnqn, kato, "controller created");
             Outcome::status(ctx.cqe(u32::from(cntlid), cid, status::SUCCESS))
         }
@@ -153,6 +158,13 @@ fn connect<B: Backend>(ctx: &Rc<ConnCtx<B>>, sqe: &Sqe) -> Outcome {
                 Ok(entry) => {
                     io.cntlid.set(cntlid);
                     ctx.queue.stats.cntlid.set(cntlid);
+                    // Traffic-based keep-alive: only worth publishing when
+                    // the controller actually runs a keep-alive timer. A
+                    // KATO of 0 leaves the flag (and the beacon) unset.
+                    io.kato_ms.set(entry.kato_ms);
+                    if entry.kato_ms != 0 {
+                        let _ = io.traffic.set(Arc::clone(&entry.traffic));
+                    }
                     if !entry.discovery
                         && let Some(subsys) = ctx.port.subsystem(&entry.subsys_nqn)
                     {
