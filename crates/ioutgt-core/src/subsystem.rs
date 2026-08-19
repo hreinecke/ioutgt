@@ -114,6 +114,17 @@ impl<B> Namespace<B> {
     }
 }
 
+impl<B: Backend> Namespace<B> {
+    /// Capacity in bytes (Identify Namespace `NVMCAP`).
+    ///
+    /// 128-bit because the NVMe field is: a byte count in `u64` overflows
+    /// long before the spec's does, and summing namespaces
+    /// ([`Subsystem::total_capacity`]) only brings that closer.
+    pub fn capacity(&self) -> u128 {
+        u128::from(self.backend.nr_blocks()) << self.backend.block_shift()
+    }
+}
+
 /// Derive a namespace's 16-byte UUID (Identify CNS 03h descriptor) from its
 /// owning subsystem NQN and its NSID.
 ///
@@ -371,6 +382,13 @@ impl<B: Backend> Subsystem<B> {
     /// storage supplies no count, meaning "no more than `NN`".
     pub fn mnan(&self) -> u32 {
         self.mnan.unwrap_or(0)
+    }
+
+    /// Bytes of NVM the subsystem holds (Identify Controller `TNVMCAP`): the
+    /// sum of every attached namespace's [`Namespace::capacity`]. Read from
+    /// the current snapshot, so an add or remove moves it.
+    pub fn total_capacity(&self) -> u128 {
+        self.snapshot().values().map(|ns| ns.capacity()).sum()
     }
 }
 

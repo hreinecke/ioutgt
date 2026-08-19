@@ -160,7 +160,14 @@ complete one with the NS_ATTR notice; teardown fails parked AERs
 (`ConnCtx::close`, the analog of `nvmet_async_events_failall`) — the
 omission of which was a 389 KB-per-disconnect leak caught by the M8
 RSS gate. Changed-NS log reports the 0xFFFFFFFF sentinel and clears
-on read (RAE is not yet honored). Like nvmet, it advertises multi-path
+on read (RAE is not yet honored). Two capacity fields go beyond nvmet, which
+leaves both zero: Identify Controller **TNVMCAP**, the subsystem's total
+NVM capacity in bytes (the sum of the attached backends; UNVMCAP stays 0,
+nothing is unallocated), and Identify Namespace **NVMCAP**, one
+namespace's share of it. The Linux host never reads either — nothing in
+`drivers/nvme` touches the fields — but `nvme id-ctrl`/`id-ns` and
+management tooling report them, and a subsystem whose size is a
+cluster-side fact is worth stating. Like nvmet, it advertises multi-path
 capability — Identify Controller **CMIC** multi-controller (bit 1) and
 Identify Namespace **NMIC** shared (bit 0) — so the host's NVMe-multipath
 layer (`nvme_mpath_alloc_disk`, gated on `CMIC_MULTI_CTRL`) folds each

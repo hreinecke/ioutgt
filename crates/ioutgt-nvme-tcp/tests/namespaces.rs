@@ -100,23 +100,38 @@ fn static_multi_namespace_isolation_and_identify() {
     let ctrl = IdentifyController::read_from_bytes(&ctrl).expect("identify controller");
     assert_eq!(ctrl.nn.get(), 3, "NN reports the highest NSID");
     assert_eq!(ctrl.mnan.get(), 0, "no storage-supplied count: MNAN is 0");
+    // TNVMCAP sums every backend: 8 + 16 + 8 MiB. Nothing is held back, so
+    // UNVMCAP is 0.
+    assert_eq!(
+        u128::from_le_bytes(ctrl.tnvmcap),
+        32 << 20,
+        "TNVMCAP is the sum of the three backends"
+    );
+    assert_eq!(u128::from_le_bytes(ctrl.unvmcap), 0, "nothing unallocated");
 
     // Identify Namespace reports each backend's own size (512-byte blocks,
     // as the config path builds them): 8 MiB → 16384 blocks, 16 MiB → 32768.
-    let nsze = |c: &mut Client, nsid: u32, cid: u16| -> u64 {
+    let id_ns = |c: &mut Client, nsid: u32, cid: u16| -> IdentifyNamespace {
         let ns = c.identify(spec::cns::NAMESPACE, nsid, cid);
-        IdentifyNamespace::read_from_bytes(&ns)
-            .expect("identify namespace")
-            .nsze
-            .get()
+        IdentifyNamespace::read_from_bytes(&ns).expect("identify namespace")
     };
-    let n1 = nsze(&mut admin, 1, 5);
-    let n2 = nsze(&mut admin, 2, 6);
-    let n3 = nsze(&mut admin, 3, 7);
+    let id1 = id_ns(&mut admin, 1, 5);
+    let id2 = id_ns(&mut admin, 2, 6);
+    let id3 = id_ns(&mut admin, 3, 7);
+    let (n1, n2, n3) = (id1.nsze.get(), id2.nsze.get(), id3.nsze.get());
     assert_eq!(n1, 16384, "nsid 1 = 8 MiB / 512");
     assert_eq!(n2, 32768, "nsid 2 = 16 MiB / 512");
     assert_eq!(n2, 2 * n1, "each namespace is sized independently");
     assert_eq!(n3, n1, "nsid 3 = 8 MiB null, same block count");
+    // NVMCAP restates that in bytes, and the three of them sum to TNVMCAP.
+    let cap = |id: &IdentifyNamespace| u128::from_le_bytes(id.nvmcap);
+    assert_eq!(cap(&id1), 8 << 20, "nsid 1 NVMCAP = 8 MiB");
+    assert_eq!(cap(&id2), 16 << 20, "nsid 2 NVMCAP = 16 MiB");
+    assert_eq!(
+        cap(&id1) + cap(&id2) + cap(&id3),
+        u128::from_le_bytes(ctrl.tnvmcap),
+        "the namespaces' NVMCAP sums to the controller's TNVMCAP"
+    );
 
     let mut io = Client::handshake(addr, false, false);
     io.connect(1, 32, cntlid, 1);

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
     IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
-    nmic, oncs,
+    nmic, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
@@ -255,6 +255,12 @@ fn build_id_ctrl<B: Backend>(
             mnan = mnan.clamp(count.clamp(1, nn), nn);
         }
         id.mnan.set(mnan);
+        // TNVMCAP: bytes of NVM in the subsystem, which for us is exactly the
+        // sum of the attached backends — there is no spare pool a namespace
+        // could grow into, so UNVMCAP stays 0. Both fields move with the
+        // namespace table: a hot-add grows TNVMCAP on the next Identify.
+        id.tnvmcap = u128_le(subsys.as_ref().map_or(0, |s| s.total_capacity()));
+        id.unvmcap = u128_le(0);
         id.oncs.set(oncs::DSM | oncs::WRITE_ZEROES);
         // IOCCSZ: (64B SQE + in-capsule data) / 16; IORCSZ: one CQE. RDMA
         // advertises one page of in-capsule data (nvmet parity): small write
@@ -285,6 +291,10 @@ fn build_id_ns<B: Backend>(subsys: &Subsystem<B>, ns: &Namespace<B>) -> Box<Iden
     id.nsze.set(blocks);
     id.ncap.set(blocks);
     id.nuse.set(blocks);
+    // NVMCAP: the same capacity NSZE states, but in bytes — the namespace's
+    // share of the subsystem's TNVMCAP. Nothing here is thin-provisioned, so
+    // allocated and total are one number.
+    id.nvmcap = u128_le(ns.capacity());
     id.nlbaf = 0;
     id.flbas = 0;
     // Shared namespace: it may be attached to multiple controllers at once

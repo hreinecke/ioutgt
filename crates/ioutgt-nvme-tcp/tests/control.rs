@@ -9,8 +9,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 use common::{Client, NQN, pattern, rw_sqe};
+use ioutgt_nvme::identify::IdentifyController;
 use ioutgt_nvme::pdu::PduKind;
 use ioutgt_nvme::{spec, status};
+use zerocopy::FromBytes;
 
 fn ctl(socket: &std::path::Path, request: &str) -> serde_json::Value {
     let mut stream = UnixStream::connect(socket).expect("control socket");
@@ -27,6 +29,13 @@ fn active_nsids(payload: &[u8]) -> Vec<u32> {
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .take_while(|&n| n != 0)
         .collect()
+}
+
+/// Identify Controller TNVMCAP, in bytes.
+fn tnvmcap(admin: &mut Client, cid: u16) -> u128 {
+    let ctrl = admin.identify(spec::cns::CONTROLLER, 0, cid);
+    let ctrl = IdentifyController::read_from_bytes(&ctrl).expect("identify controller");
+    u128::from_le_bytes(ctrl.tnvmcap)
 }
 
 #[test]
@@ -49,6 +58,7 @@ fn runtime_namespace_add_remove_with_aer() {
     // Baseline inventory: nsid 1 only.
     let list = admin.identify(spec::cns::ACTIVE_NS_LIST, 0, 2);
     assert_eq!(active_nsids(&list), vec![1]);
+    assert_eq!(tnvmcap(&mut admin, 20), 16 << 20, "baseline: one 16 MiB ns");
 
     // Hot-add nsid 2 over the control socket.
     let resp = ctl(
@@ -80,9 +90,10 @@ fn runtime_namespace_add_remove_with_aer() {
         "changed-ns sentinel"
     );
 
-    // Inventory now lists both.
+    // Inventory now lists both, and TNVMCAP has grown by the new backend.
     let list = admin.identify(spec::cns::ACTIVE_NS_LIST, 0, 11);
     assert_eq!(active_nsids(&list), vec![1, 2]);
+    assert_eq!(tnvmcap(&mut admin, 21), 24 << 20, "hot-add grows TNVMCAP");
 
     // IO on the hot-added namespace.
     let mut io = Client::handshake(addr, false, false);
@@ -113,6 +124,7 @@ fn runtime_namespace_add_remove_with_aer() {
 
     let list = admin.identify(spec::cns::ACTIVE_NS_LIST, 0, 13);
     assert_eq!(active_nsids(&list), vec![1]);
+    assert_eq!(tnvmcap(&mut admin, 22), 16 << 20, "removal shrinks TNVMCAP");
 
     let mut sqe = rw_sqe(spec::io_opcode::READ, 5, 0, 7, 4096, true);
     sqe.nsid.set(2);
@@ -127,10 +139,19 @@ fn runtime_namespace_add_remove_with_aer() {
     // Control queries.
     let resp = ctl(&socket, r#"{"op":"LIST_NAMESPACE"}"#);
     assert_eq!(resp["ok"], true);
-    assert_eq!(resp["data"]["namespaces"].as_array().unwrap().len(), 1);
+    let listed = resp["data"]["namespaces"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    // The same capacity Identify reports as NVMCAP, in bytes.
+    assert_eq!(listed[0]["capacity"], 16 << 20, "{resp}");
     let resp = ctl(&socket, r#"{"op":"GET_STATS"}"#);
     assert_eq!(resp["ok"], true);
     assert_eq!(resp["data"]["controllers"], 1);
+    // ...and per subsystem, the TNVMCAP total.
+    assert_eq!(
+        resp["data"]["subsystems"][0]["capacity"],
+        16 << 20,
+        "{resp}"
+    );
     // Every queue thread (admin + io) reports its ring counters.
     let threads = resp["data"]["threads"].as_array().expect("threads array");
     assert!(!threads.is_empty(), "{resp}");
@@ -174,7 +195,13 @@ fn list_controller_reports_queues_and_namespaces() {
     let subsystems = ports[0]["subsystems"].as_array().unwrap();
     assert_eq!(subsystems.len(), 1);
     assert_eq!(subsystems[0]["nqn"], NQN);
+    assert_eq!(subsystems[0]["capacity"], 16 << 20, "{resp}");
     assert_eq!(subsystems[0]["namespaces"][0]["nsid"], 1);
+    assert_eq!(
+        subsystems[0]["namespaces"][0]["capacity"],
+        16 << 20,
+        "{resp}"
+    );
 
     // Admin connect (Client::connect uses kato 60s on qid 0) + one IO queue.
     let mut admin = Client::handshake(addr, false, false);

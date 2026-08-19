@@ -45,7 +45,19 @@ pub struct IdentifyController {
     pub apsta: u8,
     pub wctemp: U16,
     pub cctemp: U16,
-    pub rsvd270: [u8; 50],
+    pub mtfa: U16,
+    pub hmpre: U32,
+    pub hmmin: U32,
+    /// Total NVM Capacity: bytes of NVM the subsystem holds, as a 128-bit
+    /// little-endian integer ([`u128_le`]).
+    pub tnvmcap: [u8; 16],
+    /// Unallocated NVM Capacity: bytes of NVM not allocated to any
+    /// namespace, same encoding as [`Self::tnvmcap`].
+    pub unvmcap: [u8; 16],
+    pub rpmbs: U32,
+    pub edstt: U16,
+    pub dsto: u8,
+    pub fwug: u8,
     /// Keep-alive support granularity in 100ms units.
     pub kas: U16,
     pub rsvd322: [u8; 20],
@@ -98,6 +110,12 @@ impl IdentifyController {
     pub fn zeroed() -> Self {
         Self::new_zeroed()
     }
+}
+
+/// Encode a 128-bit capacity field (`TNVMCAP`, `UNVMCAP`, `NVMCAP`), which
+/// the spec defines as a little-endian 16-byte integer of *bytes*.
+pub fn u128_le(bytes: u128) -> [u8; 16] {
+    bytes.to_le_bytes()
 }
 
 /// ONCS bits.
@@ -196,6 +214,8 @@ pub struct IdentifyNamespace {
     pub nabo: U16,
     pub nabspf: U16,
     pub noiob: U16,
+    /// NVM Capacity: bytes of NVM allocated to this namespace, same 128-bit
+    /// little-endian encoding as [`IdentifyController::tnvmcap`] ([`u128_le`]).
     pub nvmcap: [u8; 16],
     pub npwg: U16,
     pub npwa: U16,
@@ -227,6 +247,8 @@ const _: () = {
     assert!(size_of::<LbaFormat>() == 4);
     // Spot-check critical offsets against the spec.
     assert!(core::mem::offset_of!(IdentifyController, cntlid) == 78);
+    assert!(core::mem::offset_of!(IdentifyController, tnvmcap) == 280);
+    assert!(core::mem::offset_of!(IdentifyController, unvmcap) == 296);
     assert!(core::mem::offset_of!(IdentifyController, kas) == 320);
     assert!(core::mem::offset_of!(IdentifyController, anatt) == 342);
     assert!(core::mem::offset_of!(IdentifyController, anacap) == 343);

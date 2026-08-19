@@ -483,6 +483,13 @@ Namespace table — versioned for runtime add/remove:
 - Changes fire the NS_ATTR async event (note: Identify must advertise
   OAES.NS_ATTR or Linux hosts never enable the notice).
 
+- Capacity in bytes comes off the same snapshot: `Namespace::capacity`
+  (Identify Namespace `NVMCAP`) and its sum `Subsystem::total_capacity`
+  (Identify Controller `TNVMCAP`), both recomputed per Identify, so an add
+  or remove moves them. `UNVMCAP` is 0 — there is no spare pool behind the
+  namespaces, every byte is allocated. The control plane reports the same
+  two numbers as `capacity` on its namespace and subsystem bodies.
+
 Admin command surface (interop-minimal, values per nvmet): Identify CNS
 0x00/0x01/0x02/0x03, Get/Set Features (NUM_QUEUES, KATO, async event
 config), Keep Alive, AER, Get Log Page (error/SMART/firmware/discovery/ANA),

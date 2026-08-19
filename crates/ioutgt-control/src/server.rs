@@ -222,7 +222,17 @@ fn ns_json(ns: &Namespace<AnyBackend>) -> serde_json::Value {
         "nsid": ns.nsid,
         "blocks": ns.backend.nr_blocks(),
         "block_shift": ns.backend.block_shift(),
+        "capacity": bytes_json(ns.capacity()),
     })
+}
+
+/// An NVMe capacity (`NVMCAP` / `TNVMCAP`) as a JSON byte count.
+///
+/// The NVMe fields are 128-bit and JSON integers are not, so saturate: a
+/// backend within reach of 16 EiB does not exist, and the alternative — a
+/// string, or a high/low pair — would make every consumer parse it.
+fn bytes_json(bytes: u128) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 async fn handle(state: &CtlState, request: Request) -> Response {
@@ -293,6 +303,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                     json!({
                         "nqn": subsys.nqn,
                         "namespaces": subsys.snapshot().len(),
+                        "capacity": bytes_json(subsys.total_capacity()),
                     })
                 })
                 .collect();
@@ -383,7 +394,11 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 .map(|subsys| {
                     let namespaces: Vec<_> =
                         subsys.snapshot().values().map(|ns| ns_json(ns)).collect();
-                    json!({ "nqn": subsys.nqn, "namespaces": namespaces })
+                    json!({
+                        "nqn": subsys.nqn,
+                        "capacity": bytes_json(subsys.total_capacity()),
+                        "namespaces": namespaces,
+                    })
                 })
                 .collect();
             // An array from day one: multi-port is on the roadmap and

@@ -423,6 +423,16 @@ fn render_cpu_group(group: &str, active: &str) -> String {
         .join(",")
 }
 
+/// A byte count in whole GiB where it divides evenly, else MiB.
+fn human_size(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes > 0 && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        format!("{} MiB", bytes >> 20)
+    }
+}
+
 /// One block per controller; NQNs are too long for fixed columns.
 fn render_ctrl_list(data: &serde_json::Value) -> String {
     use std::fmt::Write;
@@ -438,22 +448,22 @@ fn render_ctrl_list(data: &serde_json::Value) -> String {
             port["trsvcid"].as_str().unwrap_or("?")
         );
         for subsys in port["subsystems"].as_array().into_iter().flatten() {
-            let _ = writeln!(out, "  subsystem {}", subsys["nqn"].as_str().unwrap_or("?"));
+            // The subsystem's total is TNVMCAP, each namespace's is NVMCAP —
+            // the same numbers Identify reports, so the two views agree.
+            let _ = writeln!(
+                out,
+                "  subsystem {} ({})",
+                subsys["nqn"].as_str().unwrap_or("?"),
+                human_size(subsys["capacity"].as_u64().unwrap_or(0))
+            );
             for ns in subsys["namespaces"].as_array().into_iter().flatten() {
-                let blocks = ns["blocks"].as_u64().unwrap_or(0);
                 let shift = u32::try_from(ns["block_shift"].as_u64().unwrap_or(0).min(63))
                     .expect("bounded by min(63)");
-                let bytes = blocks << shift;
-                const GIB: u64 = 1 << 30;
-                let size = if bytes > 0 && bytes % GIB == 0 {
-                    format!("{} GiB", bytes / GIB)
-                } else {
-                    format!("{} MiB", bytes >> 20)
-                };
                 let _ = writeln!(
                     out,
-                    "    ns {}: {size} ({}B blocks)",
+                    "    ns {}: {} ({}B blocks)",
                     ns["nsid"],
+                    human_size(ns["capacity"].as_u64().unwrap_or(0)),
                     1u64 << shift
                 );
             }
@@ -526,13 +536,16 @@ mod tests {
             "trsvcid": "14420",
             "subsystems": [{
                 "nqn": "nqn.2026-06.io.ioutgt:test",
-                "namespaces": [{"nsid": 1, "blocks": 131072, "block_shift": 9}],
+                "capacity": 64 << 20,
+                "namespaces": [
+                    {"nsid": 1, "blocks": 131072, "block_shift": 9, "capacity": 64 << 20},
+                ],
             }],
         })
     }
 
     const PORT_HEADER: &str = "port 0.0.0.0:14420\n\
-         \x20 subsystem nqn.2026-06.io.ioutgt:test\n\
+         \x20 subsystem nqn.2026-06.io.ioutgt:test (64 MiB)\n\
          \x20   ns 1: 64 MiB (512B blocks)\n";
 
     #[test]
@@ -560,7 +573,9 @@ mod tests {
                     {"qid": 0, "depth": 32, "tid": 100, "cpus": "*"},
                     {"qid": 1, "depth": 64, "tid": 101, "cpus": "3"},
                 ],
-                "namespaces": [{"nsid": 1, "blocks": 32768, "block_shift": 9}],
+                "namespaces": [
+                    {"nsid": 1, "blocks": 32768, "block_shift": 9, "capacity": 16 << 20},
+                ],
             }],
         });
         let out = super::render_ctrl_list(&data);
@@ -592,8 +607,11 @@ mod tests {
                 "traddr": "::", "trsvcid": "14420",
                 "subsystems": [{
                     "nqn": "nqn.x",
+                    "capacity": 2u64 << 30,
                     // 2 GiB in 4096B blocks.
-                    "namespaces": [{"nsid": 7, "blocks": 524288, "block_shift": 12}],
+                    "namespaces": [
+                        {"nsid": 7, "blocks": 524288, "block_shift": 12, "capacity": 2u64 << 30},
+                    ],
                 }],
             }],
             "controllers": [],

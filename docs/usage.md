@@ -371,6 +371,15 @@ pid and the namespaces visible through the controller. The response also carries
 discoverable inventory (listen address, subsystems, namespaces), which
 `ioutgt list` prints before the controller list — so an idle target
 shows what hosts would discover rather than only `no controllers`.
+
+Every namespace body — in `LIST_NAMESPACE` and in both namespace lists
+of `LIST_CONTROLLER` — carries `capacity`, its size in bytes, which is
+what Identify Namespace reports as **NVMCAP**; each subsystem carries the
+sum of its namespaces', which is Identify Controller **TNVMCAP**
+(`GET_STATS` reports the subsystem total too). `blocks` and `block_shift`
+are the same number factored into the geometry a host sees. The NVMe
+fields are 128-bit and JSON integers are not, so `capacity` saturates at
+`u64::MAX` — 16 EiB, which no backend approaches.
 (`list-ctrl` remains as an alias for `list`.)
 
 ## Counters: `ioutgt stat`
