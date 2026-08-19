@@ -703,15 +703,17 @@ mod tests {
             .open(&path)
             .unwrap();
         let fd = file.as_raw_fd();
+        const N: usize = 8192;
 
         let rt = QueueRuntime::new(RingConfig::default()).unwrap();
-        rt.block_on(async move {
+        // False when the ring could not be registered: the write never
+        // happened, so there is nothing on disk to check below either.
+        let wrote = rt.block_on(async move {
             let ring = BufRing::new(21, 256 * 1024).unwrap();
             let Some(idx) = ring.buf_index(0) else {
                 eprintln!("kernel lacks fixed buffers; skipping");
-                return;
+                return false;
             };
-            const N: usize = 8192;
             let base = ring.buf(0);
             // SAFETY: base..base+N is within sub-buffer 0 (buf_size ≥ 1 page).
             unsafe { std::slice::from_raw_parts_mut(base, N).fill(0x5A) };
@@ -732,14 +734,18 @@ mod tests {
                 .unwrap()
                 .await
                 .unwrap();
+            true
         });
+        if !wrote {
+            return;
+        }
 
         let mut back = Vec::new();
         std::fs::File::open(&path)
             .unwrap()
             .read_to_end(&mut back)
             .unwrap();
-        assert_eq!(back.len(), 8192);
+        assert_eq!(back.len(), N);
         assert!(
             back.iter().all(|&b| b == 0x5A),
             "WRITE_FIXED from ring sub-buffer corrupted the data"
