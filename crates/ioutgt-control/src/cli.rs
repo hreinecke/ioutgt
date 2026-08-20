@@ -6,7 +6,9 @@
 //! a `sheepdog:` spec naming one VDI. A `sheepdog:` spec naming no VDI maps
 //! the **whole cluster**: one subsystem per ACL object, named by the ACL, and
 //! one namespace per VDI in it, each under the cluster's shared VDI lock
-//! unless the spec ends in `?nolock`. The config-file path
+//! unless the spec ends in `?nolock`, and each admitting only the hostnqns
+//! the ACL lists as members — for as long as it lists them, since the target
+//! keeps re-reading that list. The config-file path
 //! ([`crate::nvmet`]) is unaffected: it always spells the model out.
 
 use std::net::SocketAddr;
@@ -15,7 +17,7 @@ use ioutgt_backend::{AclInfo, list_acls};
 use tracing::{info, warn};
 
 use crate::config::{
-    BackendConfig, NamespaceConfig, SubsystemConfig, default_model, default_serial,
+    BackendConfig, NamespaceConfig, SheepdogAcl, SubsystemConfig, default_model, default_serial,
 };
 
 /// A parsed `sheepdog:` spec: one named VDI, or a whole cluster.
@@ -57,6 +59,9 @@ pub fn subsystems(spec: &str, mem_size_mb: u64, nqn: &str) -> Result<Vec<Subsyst
         model: default_model(),
         allow_any_host: true,
         allowed_hosts: vec![],
+        // Not a cluster ACL's subsystem, even for a single VDI addressed
+        // through one: nothing re-reads its host list.
+        sheepdog_acl: None,
         mnan: None,
         namespaces: vec![NamespaceConfig {
             nsid: 1,
@@ -71,7 +76,8 @@ pub fn subsystems(spec: &str, mem_size_mb: u64, nqn: &str) -> Result<Vec<Subsyst
 ///
 /// An ACL object *is* the cluster's notion of "which volumes belong
 /// together, reachable by whom", which is what a subsystem is on the NVMe
-/// side — so the ACL's name becomes the subsystem NQN verbatim, and hosts
+/// side — so the ACL's name becomes the subsystem NQN verbatim, its member
+/// names become the hostnqns that subsystem admits, and hosts
 /// find every one of them in the discovery log this port serves. Volumes
 /// belonging to no ACL are exported by no subsystem: they are unreachable
 /// through this target by construction, since the cluster will not even
@@ -113,7 +119,7 @@ fn cluster_subsystems(addr: &str, lock: bool) -> Result<Vec<SubsystemConfig>, St
 
     let subsystems: Vec<SubsystemConfig> = acls
         .iter()
-        .map(|acl| acl_subsystem(addr, acl, lock))
+        .map(|acl| acl_subsystem(addr, sockaddr, acl, lock))
         .collect();
     let exported: usize = subsystems.iter().map(|s| s.namespaces.len()).sum();
     if exported == 0 {
@@ -132,8 +138,24 @@ fn cluster_subsystems(addr: &str, lock: bool) -> Result<Vec<SubsystemConfig>, St
 }
 
 /// One ACL object as a subsystem: its name as the NQN, its writable VDIs as
-/// namespaces.
-fn acl_subsystem(addr: &str, acl: &AclInfo, lock: bool) -> SubsystemConfig {
+/// namespaces, its member names as the hostnqns allowed to connect.
+///
+/// The cluster's ACL is the access-control scope on both sides, so the host
+/// list is the cluster's too: the names `dog acl add member <acl> <hostnqn>`
+/// wrote into the ACL inode become the subsystem's `allowed_hosts`, and
+/// nothing else may connect (Connect answers CONNECT_INVALID_HOST).
+///
+/// An ACL with no members is an ACL that expresses no opinion about hosts,
+/// not one that refuses them all: its subsystem takes `allow_any_host`, as a
+/// group unconstrained on the cluster side is unconstrained here. Access
+/// control starts with the first `dog acl add member`, which is also when the
+/// subsystem stops admitting everyone.
+///
+/// This is only the first reading of that list: the ACL object is recorded in
+/// [`SubsystemConfig::sheepdog_acl`], and the target's refresh thread re-reads
+/// it every few seconds, so an administrator's `dog acl add member` /
+/// `remove member` reaches a running target without a restart.
+fn acl_subsystem(addr: &str, cluster: SocketAddr, acl: &AclInfo, lock: bool) -> SubsystemConfig {
     if !acl.name.starts_with("nqn.") {
         warn!(
             acl = %acl.name,
@@ -177,6 +199,16 @@ fn acl_subsystem(addr: &str, acl: &AclInfo, lock: bool) -> SubsystemConfig {
         warn!(acl = %acl.name, snapshots,
               "sheepdog: ACL holds no writable VDI; its subsystem is empty");
     }
+    if acl.hosts.is_empty() {
+        info!(
+            acl = %acl.name,
+            "sheepdog: ACL has no members; its subsystem admits any host until one \
+             is added with `dog acl add member <acl> <hostnqn>`"
+        );
+    } else {
+        info!(acl = %acl.name, hosts = ?acl.hosts, "sheepdog ACL members admitted");
+    }
+    let hosts = acl.host_acl();
     SubsystemConfig {
         nqn: acl.name.clone(),
         // The ACL's vid is its cluster-wide identity and outlives any target,
@@ -184,8 +216,16 @@ fn acl_subsystem(addr: &str, acl: &AclInfo, lock: bool) -> SubsystemConfig {
         // group — as two paths to one subsystem must.
         serial: format!("SHEEPDOG{:06X}", acl.vid),
         model: default_model(),
-        allow_any_host: true,
-        allowed_hosts: vec![],
+        // The cluster's ACL *is* the host ACL: once it names members, only
+        // they may connect. An empty member list names nobody to keep out
+        // either, so it leaves the subsystem open rather than sealed.
+        allow_any_host: hosts.allow_any_host,
+        allowed_hosts: hosts.hosts,
+        // ...and the ACL object it was read from, for the refresh to re-read.
+        sheepdog_acl: Some(SheepdogAcl {
+            cluster,
+            vid: acl.vid,
+        }),
         // The cluster's own count of the volumes in this ACL
         // (`max_data_id_nr`), rather than one derived from the namespaces
         // this target managed to build out of them. NN cannot carry it: with

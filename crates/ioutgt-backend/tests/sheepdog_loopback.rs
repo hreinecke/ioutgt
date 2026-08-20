@@ -59,6 +59,9 @@ const SD_FLAG_CMD_COW: u16 = 0x02;
 const VDI_BIT: u64 = 1 << 63;
 const SD_INODE_HEADER_SIZE: u64 = 4664;
 const SD_MAX_VDI_LEN: usize = 256;
+/// `offsetof(struct sd_inode_header, metadata)` — an ACL object's member-name
+/// table.
+const INO_OFF_METADATA: usize = 600;
 const SD_NR_VDIS: u32 = 1 << 24;
 const HDR: usize = 48;
 
@@ -104,6 +107,10 @@ struct Vdi {
     /// field wrote it.
     no_uuid: bool,
     data_vdi_id: Vec<u32>,
+    /// An ACL object's member names (`dog acl add member`), one per
+    /// fixed-width slot of the inode header's `metadata[]`; an empty string is
+    /// the hole `dog acl remove member` leaves.
+    members: Vec<String>,
 }
 
 impl Vdi {
@@ -120,6 +127,7 @@ impl Vdi {
             vdi_flags: 0,
             no_uuid: false,
             data_vdi_id: vec![0u32; nr_objects],
+            members: Vec::new(),
         }
     }
 
@@ -163,6 +171,13 @@ impl Vdi {
         self
     }
 
+    /// The ACL's member names (`dog acl add member`), in slot order — an
+    /// empty one being the hole a `dog acl remove member` left behind.
+    fn members(mut self, members: &[&str]) -> Vdi {
+        self.members = members.iter().map(|m| (*m).to_string()).collect();
+        self
+    }
+
     fn object_size(&self) -> usize {
         1usize << self.block_size_shift
     }
@@ -184,6 +199,11 @@ impl Vdi {
             b[576..592].copy_from_slice(&uuid);
         }
         b[592..596].copy_from_slice(&self.vdi_flags.to_le_bytes());
+        // metadata[]: the ACL's member names, one per SD_MAX_VDI_LEN slot.
+        for (i, member) in self.members.iter().enumerate() {
+            let o = INO_OFF_METADATA + i * SD_MAX_VDI_LEN;
+            b[o..o + member.len()].copy_from_slice(member.as_bytes());
+        }
         for (i, v) in self.data_vdi_id.iter().enumerate() {
             let o = SD_INODE_HEADER_SIZE as usize + i * 4;
             b[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -608,6 +628,9 @@ fn spawn_counting_sheep(store: Arc<Mutex<Store>>, conns: Arc<AtomicUsize>) -> So
 const TEST_VID: u32 = 0x00ab_cdef;
 const ACL_VID: u32 = 0x0000_4711;
 const ACL_NQN: &str = "nqn.2026-06.io.ioutgt:grp";
+/// The hostnqns `dog acl add member` put on that ACL: the hosts it admits.
+const HOST_A: &str = "nqn.2014-08.org.nvmexpress:uuid:host-a";
+const HOST_B: &str = "nqn.2014-08.org.nvmexpress:uuid:host-b";
 
 fn fresh_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
     let mut vdis = BTreeMap::new();
@@ -930,10 +953,14 @@ fn enumeration_store() -> Arc<Mutex<Store>> {
         st.vdis.insert(0x00_0012, Vdi::new("", 1 << 20, 22));
         st.vdis.insert(0x00_0013, Vdi::new("empty", 0, 22));
         // An ACL object and its two members — with the hole a third, since
-        // removed, member left in the array — plus an empty second ACL.
+        // removed, member left in the array — plus an empty second ACL. Two
+        // hosts are members of the first (again around a hole), none of the
+        // second.
         st.vdis.insert(
             ACL_VID,
-            Vdi::new(ACL_NQN, 1 << 22, 22).acl_object(&[0x00_0020, 0, 0x00_0021]),
+            Vdi::new(ACL_NQN, 1 << 22, 22)
+                .acl_object(&[0x00_0020, 0, 0x00_0021])
+                .members(&[HOST_A, "", HOST_B]),
         );
         st.vdis
             .insert(0x00_0020, Vdi::new("shared", 8 << 20, 22).in_acl(ACL_VID));
@@ -1009,7 +1036,8 @@ fn cluster_enumeration_lists_every_vdi() {
 }
 
 /// `list_acls` is what maps a cluster onto subsystems: every ACL object, named
-/// as the cluster names it, holding the VDIs its own `data_vdi_id[]` lists.
+/// as the cluster names it, holding the VDIs its own `data_vdi_id[]` lists and
+/// the member names its own `metadata[]` lists.
 #[test]
 fn acl_enumeration_follows_the_acls_member_array() {
     let store = enumeration_store();
@@ -1060,6 +1088,15 @@ fn acl_enumeration_follows_the_acls_member_array() {
             ),
             ("nqn.2026-06.io.ioutgt:idle", 0x30, 0, vec![]),
         ]
+    );
+
+    // The host side of the ACL: the names `dog acl add member` wrote, in slot
+    // order and without the hole a removal left. An ACL nobody was added to
+    // lists none — and so admits none.
+    let hosts: Vec<_> = acls.iter().map(|acl| acl.hosts.clone()).collect();
+    assert_eq!(
+        hosts,
+        vec![vec![HOST_A.to_string(), HOST_B.to_string()], vec![]]
     );
 }
 

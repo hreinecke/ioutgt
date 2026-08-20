@@ -21,12 +21,18 @@ const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_NR_VDIS: u32 = 1 << 24;
 const SD_MAX_VDI_LEN: usize = 256;
 const SD_INODE_HEADER_SIZE: usize = 4664;
+/// `offsetof(struct sd_inode_header, metadata)` — an ACL object's member-name
+/// table.
+const INO_OFF_METADATA: usize = 600;
 const SD_VDI_FLAG_ACL: u32 = 0x01;
 
 const ACL_A: u32 = 0x10;
 const ACL_B: u32 = 0x11;
 const NQN_A: &str = "nqn.2026-06.io.ioutgt:grp-a";
 const NQN_B: &str = "nqn.2026-06.io.ioutgt:grp-b";
+/// The hostnqns `dog acl add member` put on ACL A: the hosts it admits.
+const HOST_A: &str = "nqn.2014-08.org.nvmexpress:uuid:host-a";
+const HOST_B: &str = "nqn.2014-08.org.nvmexpress:uuid:host-b";
 
 /// One inode of the fake cluster: (vid, name, size, snapshot, acl_id, is_acl).
 struct Inode {
@@ -39,10 +45,14 @@ struct Inode {
     /// The inode carries a `uuid[16]`; false for one written by a `sheep`
     /// predating the field (all-zero, i.e. no identity of its own).
     has_uuid: bool,
-    /// An ACL object's `data_vdi_id[]`: the member vids `dog acl add` wrote,
-    /// `0` being a hole left by `dog acl remove`. Empty for a volume — its own
-    /// object map is of no interest to the enumeration.
+    /// An ACL object's `data_vdi_id[]`: the member vids `dog acl add vdi`
+    /// wrote, `0` being a hole left by `dog acl remove vdi`. Empty for a
+    /// volume — its own object map is of no interest to the enumeration.
     members: &'static [u32],
+    /// An ACL object's `metadata[]`: the member names `dog acl add member`
+    /// wrote, `""` being the hole a `dog acl remove member` left. These are
+    /// the hostnqns the ACL's subsystem admits.
+    hosts: &'static [&'static str],
 }
 
 /// A volume in ACL `acl_id`.
@@ -56,6 +66,7 @@ const fn vol(vid: u32, name: &'static str, size: u64, snapshot: bool, acl_id: u3
         is_acl: false,
         has_uuid: true,
         members: &[],
+        hosts: &[],
     }
 }
 
@@ -68,8 +79,13 @@ const fn legacy_vol(vid: u32, name: &'static str, size: u64, acl_id: u32) -> Ino
 }
 
 /// An ACL object (`dog acl create`), which belongs to no ACL itself, listing
-/// `members` in its `data_vdi_id[]`.
-const fn acl(vid: u32, name: &'static str, members: &'static [u32]) -> Inode {
+/// `members` in its `data_vdi_id[]` and `hosts` in its `metadata[]`.
+const fn acl(
+    vid: u32,
+    name: &'static str,
+    members: &'static [u32],
+    hosts: &'static [&'static str],
+) -> Inode {
     Inode {
         vid,
         name,
@@ -79,6 +95,7 @@ const fn acl(vid: u32, name: &'static str, members: &'static [u32]) -> Inode {
         is_acl: true,
         has_uuid: true,
         members,
+        hosts,
     }
 }
 
@@ -92,9 +109,10 @@ const CLUSTER: &[Inode] = &[
     legacy_vol(0x25, "vol-d", 8 << 20, ACL_B), // no inode uuid to export
     vol(0x24, "loose", 8 << 20, false, 0),     // in no ACL: exported by nobody
     // ACL A lists its three VDIs (two heads and a snapshot); ACL B lists its
-    // two, plus the hole a since-removed third left behind.
-    acl(ACL_A, NQN_A, &[0x20, 0x21, 0x22]),
-    acl(ACL_B, NQN_B, &[0x23, 0, 0x25]),
+    // two, plus the hole a since-removed third left behind. A admits two
+    // hosts (around the hole a removed one left), B none at all.
+    acl(ACL_A, NQN_A, &[0x20, 0x21, 0x22], &[HOST_A, "", HOST_B]),
+    acl(ACL_B, NQN_B, &[0x23, 0, 0x25], &[]),
 ];
 
 /// The `uuid[16]` the fake cluster generated for `vid` when the VDI was
@@ -123,6 +141,11 @@ fn inode_bytes(inode: &Inode) -> Vec<u8> {
     }
     let flags = if inode.is_acl { SD_VDI_FLAG_ACL } else { 0 };
     b[592..596].copy_from_slice(&flags.to_le_bytes());
+    // metadata[]: the ACL's member names, one per SD_MAX_VDI_LEN slot.
+    for (i, host) in inode.hosts.iter().enumerate() {
+        let o = INO_OFF_METADATA + i * SD_MAX_VDI_LEN;
+        b[o..o + host.len()].copy_from_slice(host.as_bytes());
+    }
     for (i, vid) in inode.members.iter().enumerate() {
         let o = SD_INODE_HEADER_SIZE + i * 4;
         b[o..o + 4].copy_from_slice(&vid.to_le_bytes());
@@ -239,6 +262,27 @@ fn cluster_spec_expands_to_one_subsystem_per_acl() {
                 vec![(0x23, "vol-c".to_string()), (0x25, "vol-d".to_string())]
             ),
         ]
+    );
+
+    // The ACL is the host ACL too: only the members `dog acl add member` put
+    // on it may connect, in the order the slots hold them and without the hole
+    // a removal left. An ACL nobody was added to (B) constrains nobody, so its
+    // subsystem stays open to any host.
+    assert!(!subsystems[0].allow_any_host);
+    assert_eq!(subsystems[0].allowed_hosts, [HOST_A, HOST_B]);
+    assert!(subsystems[1].allow_any_host);
+    assert!(subsystems[1].allowed_hosts.is_empty());
+
+    // ...and the ACL object each list was read from comes along, so the
+    // target's refresh can re-read it: membership is the administrator's to
+    // change while the target runs.
+    assert_eq!(
+        subsystems
+            .iter()
+            .map(|s| s.sheepdog_acl.expect("cluster mode records the ACL"))
+            .map(|acl| (acl.cluster, acl.vid))
+            .collect::<Vec<_>>(),
+        vec![(addr, ACL_A), (addr, ACL_B)]
     );
 
     // One serial per ACL: the group's cluster-wide identity, not the target's.

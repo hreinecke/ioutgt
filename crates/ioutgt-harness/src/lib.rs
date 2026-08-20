@@ -21,14 +21,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ioutgt_backend::{AnyBackend, VDI_MAX_HOLDERS};
-use ioutgt_control::config::{BackendConfig, NamespaceConfig, SubsystemConfig};
+use ioutgt_control::config::{BackendConfig, NamespaceConfig, SheepdogAcl, SubsystemConfig};
 use ioutgt_control::nvmet::NvmetTarget;
 use ioutgt_control::server::{CtlState, build_backend};
 use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
 pub use ioutgt_core::subsystem::TransportType;
-use ioutgt_core::subsystem::{AnaState, Namespace, PortConfig, Subsystem, SubsystemPort};
+use ioutgt_core::subsystem::{AnaState, HostAcl, Namespace, PortConfig, Subsystem, SubsystemPort};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -198,6 +198,7 @@ impl TargetConfig {
                 model: "ioutgt".into(),
                 allow_any_host: true,
                 allowed_hosts: vec![],
+                sheepdog_acl: None,
                 mnan: None,
                 namespaces: vec![NamespaceConfig {
                     nsid: 1,
@@ -1064,8 +1065,10 @@ fn build_port(
             spec.nqn.clone(),
             spec.serial.clone(),
             spec.model.clone(),
-            spec.allow_any_host,
-            spec.allowed_hosts.clone(),
+            HostAcl {
+                allow_any_host: spec.allow_any_host,
+                hosts: spec.allowed_hosts.clone(),
+            },
             namespaces,
         )
         // Where the storage carries its own namespace count (a Sheepdog ACL
@@ -1080,6 +1083,10 @@ fn build_port(
             subsystem: Arc::clone(&subsystem),
             namespaces,
         }));
+        // A subsystem that *is* a cluster ACL object gets its host list from
+        // that object, and keeps getting it: the members may change under a
+        // running target.
+        track_cluster_hosts(&subsystem, spec.sheepdog_acl);
         // A subsystem holding cluster volumes advertises every target that
         // holds them too, itself included, as a path to it.
         let slot = track_cluster_paths(&subsystem, registered, trtype);
@@ -1155,10 +1162,11 @@ fn cluster_paths() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterPaths>>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// How often the refresh thread re-reads the holder lists and object
-/// locality. Both are cold paths — a target joining or leaving is rare, and a
-/// volume's objects move only on a cluster rebalance — so this only has to be
-/// well inside the time a host takes to notice, seconds not milliseconds.
+/// How often the refresh thread re-reads the holder lists, object locality
+/// and ACL membership. All three are cold paths — a target joining or leaving
+/// is rare, a volume's objects move only on a cluster rebalance, and a `dog
+/// acl add member` is an administrator typing — so this only has to be well
+/// inside the time a host takes to notice, seconds not milliseconds.
 const CLUSTER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Report a cluster that would not answer a control-plane query, at the level
@@ -1484,10 +1492,90 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
     }
 }
 
-/// Re-derive every tracked cluster's path list and ANA state now instead of
-/// waiting for the next [`CLUSTER_REFRESH_INTERVAL`] tick, and return how many
-/// clusters were visited. Hosts see whatever changed exactly as they would
-/// from the refresh thread: a new discovery log, an ANA Change notice.
+// ---------------------------------------------------------------------------
+// Cluster host ACLs: who the cluster says may connect
+// ---------------------------------------------------------------------------
+
+/// One subsystem whose host ACL is a cluster ACL object's member list.
+///
+/// Whole-cluster mode builds a subsystem out of each ACL object, so the two
+/// access-control scopes coincide: the names `dog acl add member` writes into
+/// the ACL inode are the hostnqns the subsystem admits
+/// ([`ioutgt_backend::acl_hosts`]). The administrator edits that list on the
+/// cluster, not here — so this target re-reads it rather than treating what it
+/// saw at startup as final.
+struct ClusterHosts {
+    /// The cluster gateway the ACL object is read from.
+    cluster: SocketAddr,
+    /// The ACL object's own vid.
+    vid: u32,
+    /// The subsystem the ACL became, whose host list this keeps current.
+    subsystem: Arc<Subsystem<AnyBackend>>,
+}
+
+/// Every subsystem whose host ACL comes off a cluster. Same lifetime rule as
+/// [`CLUSTER_PATHS`]: appended at startup, drained once by [`shutdown`].
+static CLUSTER_HOSTS: Mutex<Vec<Arc<ClusterHosts>>> = Mutex::new(Vec::new());
+
+/// [`CLUSTER_HOSTS`], recovered from poisoning (see [`live_ports`]).
+fn cluster_hosts() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterHosts>>> {
+    CLUSTER_HOSTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Keep `subsystem`'s host ACL up with the cluster ACL object it came from,
+/// for a subsystem that came from one at all (`acl`; see
+/// [`SubsystemConfig::sheepdog_acl`]).
+///
+/// No read here, unlike [`track_cluster_paths`]: the config already carries
+/// the members as they were when it enumerated the cluster, and the subsystem
+/// was built with them. The first re-read is the refresh thread's.
+fn track_cluster_hosts(subsystem: &Arc<Subsystem<AnyBackend>>, acl: Option<SheepdogAcl>) {
+    let Some(acl) = acl else { return };
+    cluster_hosts().push(Arc::new(ClusterHosts {
+        cluster: acl.cluster,
+        vid: acl.vid,
+        subsystem: Arc::clone(subsystem),
+    }));
+    start_cluster_refresh();
+}
+
+/// Re-read one ACL object's member names into its subsystem's host ACL.
+///
+/// Best-effort, like the path and ANA refreshes: a cluster that will not
+/// answer leaves the host list as it was — the last membership the cluster
+/// did state, which is a better answer than either locking everyone out or
+/// letting everyone in because a gateway was briefly down.
+///
+/// A host dropped from the ACL keeps the controllers it already has (see
+/// [`Subsystem::set_host_acl`]); what changes is who may Connect next.
+fn refresh_cluster_hosts(hosts: &ClusterHosts) {
+    let acl = match ioutgt_backend::acl_hosts(hosts.cluster, hosts.vid) {
+        Ok(acl) => acl,
+        Err(err) => {
+            cluster_unreachable(&hosts.subsystem.nqn, hosts.cluster, &err, "ACL member list");
+            return;
+        }
+    };
+    if !hosts.subsystem.set_host_acl(acl) {
+        return;
+    }
+    let acl = hosts.subsystem.host_acl();
+    if acl.allow_any_host {
+        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
+              "sheepdog: ACL has no members left; the subsystem admits any host again");
+    } else {
+        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
+              hosts = ?acl.hosts, "sheepdog: ACL members changed");
+    }
+}
+
+/// Re-derive every tracked cluster's path list, ANA state and host ACL now
+/// instead of waiting for the next [`CLUSTER_REFRESH_INTERVAL`] tick, and
+/// return how many clusters were visited. Hosts see whatever changed exactly
+/// as they would from the refresh thread: a new discovery log, an ANA Change
+/// notice, a Connect the subsystem now takes (or no longer does).
 ///
 /// Visits nothing, and so returns zero, once [`shutdown`] has begun: there is
 /// no point re-reading state that is being released, and the refresh thread
@@ -1500,6 +1588,7 @@ pub fn refresh_clusters() -> usize {
     }
     let paths = cluster_paths().clone();
     let ana = cluster_ana().clone();
+    let hosts = cluster_hosts().clone();
     for paths in &paths {
         // The holder slot it reports is startup-only: the cntlid partition it
         // keys is fixed for the process (see [`holder_cntlid_slice`]).
@@ -1508,11 +1597,14 @@ pub fn refresh_clusters() -> usize {
     for ana in &ana {
         refresh_cluster_ana(ana);
     }
-    paths.len() + ana.len()
+    for hosts in &hosts {
+        refresh_cluster_hosts(hosts);
+    }
+    paths.len() + ana.len() + hosts.len()
 }
 
-/// Start the one thread that keeps every cluster path list and ANA state
-/// current, if it is not running already.
+/// Start the one thread that keeps every cluster path list, ANA state and
+/// host ACL current, if it is not running already.
 ///
 /// A plain OS thread rather than anything on a queue thread: the refresh is
 /// blocking cluster IO, and a queue thread must never block. It ends when
@@ -1534,16 +1626,20 @@ fn start_cluster_refresh() {
             }
         });
     if let Err(err) = spawned {
-        warn!(%err, "sheepdog: cluster path lists and ANA states will not be refreshed");
+        warn!(
+            %err,
+            "sheepdog: cluster path lists, ANA states and ACL membership will not be refreshed"
+        );
     }
 }
 
-/// Stop tracking cluster paths and ANA, on the way into [`shutdown`]'s release
-/// phase. Ends the refresh thread, so nothing re-registers a volume behind the
-/// backend that is about to hand it back.
+/// Stop tracking cluster paths, ANA and host ACLs, on the way into
+/// [`shutdown`]'s release phase. Ends the refresh thread, so nothing
+/// re-registers a volume behind the backend that is about to hand it back.
 fn stop_cluster_refresh() {
     cluster_paths().clear();
     cluster_ana().clear();
+    cluster_hosts().clear();
 }
 
 /// The live mailbox senders for a spawned queue-thread pool: the admin

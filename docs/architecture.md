@@ -601,13 +601,29 @@ A cluster can also be exported wholesale, and the ACL is what the target
 model hangs off: `list_acls` reads the cluster VDI bitmap (`READ_VDIS`)
 plus each vid's inode at startup, then takes each ACL object's membership
 from its *own* inode — the vids in `data_vdi_id[0..max_data_id_nr]`, the
-list `dog acl add`/`remove` maintain, zeroes being holes — and
+list `dog acl add vdi`/`remove vdi` maintain, zeroes being holes — and
 `ioutgt_control::cli` turns that into **one subsystem per ACL object — NQN
 = the ACL's name verbatim — holding one namespace per writable member**. A
 listed vid the members' side contradicts (no such volume, or an inode
-naming another ACL, as a half-completed `dog acl add` leaves) is skipped
-with a warning, as is a volume naming an ACL that does not list it: the
-cluster resolves neither under that ACL. Each namespace takes its VDI's bitmap position (its vid) as its NSID
+naming another ACL, as a half-completed `dog acl add vdi` leaves) is
+skipped with a warning, as is a volume naming an ACL that does not list it:
+the cluster resolves neither under that ACL. The same inode's `metadata[]`
+holds the ACL's other list — its *member names* (`dog acl add member`),
+fixed-width slots with zeroed holes, read by `read_acl_hosts` into
+`AclInfo::hosts` — and those become the subsystem's `allowed_hosts` with
+`allow_any_host` off: the cluster's ACL is the host ACL, and a Connect from
+a hostnqn it does not list is refused (`CONNECT_INVALID_HOST`,
+`Subsystem::admits`). An ACL with no members names nobody to keep out, so
+that subsystem keeps `allow_any_host`. Membership is the administrator's to
+change while the target runs: `SubsystemConfig::sheepdog_acl` records which
+ACL object (cluster address + vid) a subsystem came from, and the 10 s refresh
+thread re-reads its member names (`acl_hosts` → `Subsystem::set_host_acl`,
+alongside the holder lists and object locality it already re-reads), so a `dog
+acl add member` takes effect within a tick. It decides the *next* Connect: a
+host dropped from the ACL keeps the controllers it already has, as unlinking a
+host in nvmet's configfs does. Only cluster mode tracks this — under `%ACL` the
+ACL is a lookup scope, not the subsystem, and the host list stays the config
+file's. Each namespace takes its VDI's bitmap position (its vid) as its NSID
 so the map is a pure function of the cluster — sparse, large NSIDs in
 exchange for a numbering no other VDI's creation can disturb — and reports
 the VDI's inode `uuid[16]`, the cluster's own identity for the volume, as

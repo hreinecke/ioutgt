@@ -205,6 +205,42 @@ pub struct SubsystemPort {
 /// Immutable path-list snapshot.
 pub type PortList = Arc<Vec<SubsystemPort>>;
 
+/// Who may connect to a subsystem, in nvmet's terms: any host at all, or the
+/// hostnqns on a list.
+///
+/// Kept as one value because the two halves only mean anything together —
+/// `allow_any_host` is exactly "ignore `hosts`" — and because a control plane
+/// that re-reads the ACL from somewhere else (a Sheepdog ACL object's member
+/// names) must be able to swap both at once, with no instant in which a
+/// subsystem is open but list-less or closed but not yet populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostAcl {
+    /// Accept any hostnqn, ignoring `hosts`.
+    pub allow_any_host: bool,
+    /// Hostnqns admitted when `allow_any_host` is off.
+    pub hosts: Vec<String>,
+}
+
+impl HostAcl {
+    /// The ACL that admits everybody — a subsystem nobody has restricted.
+    #[must_use]
+    pub fn any() -> HostAcl {
+        HostAcl {
+            allow_any_host: true,
+            hosts: Vec::new(),
+        }
+    }
+
+    /// The ACL admitting exactly `hosts`.
+    #[must_use]
+    pub fn listed(hosts: Vec<String>) -> HostAcl {
+        HostAcl {
+            allow_any_host: false,
+            hosts,
+        }
+    }
+}
+
 /// An NVM subsystem. Identity is immutable; the namespace table is
 /// versioned (see module docs).
 pub struct Subsystem<B> {
@@ -214,10 +250,7 @@ pub struct Subsystem<B> {
     pub serial: String,
     /// Model number (`mn`, ≤ 40 ASCII chars).
     pub model: String,
-    /// Accept any hostnqn, ignoring `allowed_hosts`.
-    pub allow_any_host: bool,
-    /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
-    pub allowed_hosts: Vec<String>,
+    hosts: RwLock<Arc<HostAcl>>,
     mnan: Option<u32>,
     ana: bool,
     ana_chgcnt: AtomicU64,
@@ -227,21 +260,19 @@ pub struct Subsystem<B> {
 }
 
 impl<B: Backend> Subsystem<B> {
-    /// Build with an initial namespace table.
+    /// Build with an initial namespace table and host ACL.
     pub fn new(
         nqn: String,
         serial: String,
         model: String,
-        allow_any_host: bool,
-        allowed_hosts: Vec<String>,
+        hosts: HostAcl,
         namespaces: BTreeMap<u32, Arc<Namespace<B>>>,
     ) -> Self {
         Subsystem {
             nqn,
             serial,
             model,
-            allow_any_host,
-            allowed_hosts,
+            hosts: RwLock::new(Arc::new(hosts)),
             mnan: None,
             ana: false,
             ana_chgcnt: AtomicU64::new(1),
@@ -329,10 +360,37 @@ impl<B: Backend> Subsystem<B> {
         self
     }
 
-    /// Host admission (nvmet semantics): any host, or membership in
-    /// `allowed_hosts`.
+    /// The host ACL in force ([`Subsystem::set_host_acl`]).
+    pub fn host_acl(&self) -> Arc<HostAcl> {
+        Arc::clone(&self.hosts.read().expect("host acl poisoned"))
+    }
+
+    /// Replace the host ACL, as the control plane learns it — for a Sheepdog
+    /// cluster subsystem, each refresh of its ACL object's member names.
+    /// Returns whether this changed anything, which the caller uses to decide
+    /// whether the change is worth reporting.
+    ///
+    /// Takes effect on the next Connect, not on the connections already up:
+    /// admission is decided once, when a controller is created, so a host
+    /// dropped from the ACL keeps the controller it has until it goes away.
+    /// That is nvmet's behaviour too — unlinking a host from a subsystem's
+    /// `allowed_hosts` leaves its live controllers alone.
+    ///
+    /// Cold path, like [`Subsystem::set_ports`]: only Connect reads this.
+    pub fn set_host_acl(&self, hosts: HostAcl) -> bool {
+        let mut guard = self.hosts.write().expect("host acl poisoned");
+        if **guard == hosts {
+            return false;
+        }
+        *guard = Arc::new(hosts);
+        true
+    }
+
+    /// Host admission (nvmet semantics): any host, or membership in the ACL's
+    /// host list.
     pub fn admits(&self, hostnqn: &str) -> bool {
-        self.allow_any_host || self.allowed_hosts.iter().any(|h| h == hostnqn)
+        let acl = self.host_acl();
+        acl.allow_any_host || acl.hosts.iter().any(|h| h == hostnqn)
     }
 
     /// Current table snapshot (control plane and admin/cold paths).

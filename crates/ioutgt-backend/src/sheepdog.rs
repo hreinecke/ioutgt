@@ -46,14 +46,27 @@
 //! and vice versa. ACL id `0` is both "belongs to no ACL" and, for the lock
 //! ops, `LOCK_TYPE_NORMAL`.
 //!
-//! The membership list itself lives in the ACL object's inode: `dog acl add`
-//! writes the member's vid into the ACL's `data_vdi_id[]` array — the same
-//! array an ordinary VDI uses as its object map — and sizes it with the header
-//! field `max_data_id_nr`. `dog acl remove` clears an entry in place, so the
-//! array is sparse: a zero is a hole, not the end of the list. [`list_acls`]
-//! walks `data_vdi_id[0..max_data_id_nr]` and hands both the members and the
-//! slot count up, the latter for a target to report as Identify Controller
-//! `nn` (each member's vid *is* its NSID).
+//! The membership list itself lives in the ACL object's inode: `dog acl add
+//! vdi` writes the member's vid into the ACL's `data_vdi_id[]` array — the
+//! same array an ordinary VDI uses as its object map — and sizes it with the
+//! header field `max_data_id_nr`. `dog acl remove vdi` clears an entry in
+//! place, so the array is sparse: a zero is a hole, not the end of the list.
+//! [`list_acls`] walks `data_vdi_id[0..max_data_id_nr]` and hands both the
+//! members and the slot count up, the latter for a target to report as
+//! Identify Controller `nn` (each member's vid *is* its NSID).
+//!
+//! An ACL has a second list beside the volumes: its *members*, the names `dog
+//! acl add member` / `dog acl remove member` keep in the inode header's
+//! `metadata[]` area as fixed-width NUL-padded slots (a removal zeroes a slot
+//! in place, so an empty slot is a hole here too). That list is the host side
+//! of the ACL — for an NVMe target, the hostnqns the ACL grants access to —
+//! and [`list_acls`] reports it as [`AclInfo::hosts`], which whole-cluster
+//! mode turns into the subsystem's host ACL ([`AclInfo::host_acl`]): a host
+//! that is not a member of the ACL cannot connect to the subsystem the ACL
+//! becomes. An empty list names nobody to keep out either, and leaves the
+//! subsystem open to any host. Membership is not frozen at startup — the
+//! target's refresh thread re-reads it with [`acl_hosts`], so a `dog acl add
+//! member` reaches the running target.
 //!
 //! # Fit with the engine
 //!
@@ -143,6 +156,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ioutgt_core::buf::AlignedBuf;
+use ioutgt_core::subsystem::HostAcl;
 use ioutgt_core::{Backend, BackendError, LbaRange};
 use ioutgt_uring::ops;
 
@@ -231,9 +245,20 @@ const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
 const INO_OFF_ACL_ID: usize = 572;
 const INO_OFF_UUID: usize = 576;
 const INO_OFF_VDI_FLAGS: usize = 592;
+const INO_OFF_METADATA: usize = 600;
 
 /// Bytes of the inode's `uuid[16]`.
 const SD_UUID_LEN: usize = 16;
+
+/// Bytes of the inode header's `metadata[]` area (`SD_INODE_META_INDEX * 4`),
+/// which on an ACL object holds the member-name table.
+const SD_INODE_METADATA_SIZE: usize = (1024 - 8) * 4;
+
+/// Member names an ACL object's `metadata[]` can hold: fixed-width
+/// [`SD_MAX_VDI_LEN`] slots, and only the ones wholly inside the area — `dog
+/// acl add member` fills a slot only if `(i + 1) * SD_MAX_VDI_LEN` fits, so
+/// the 224-byte remainder at the end is never a member.
+const SD_ACL_MAX_MEMBERS: usize = SD_INODE_METADATA_SIZE / SD_MAX_VDI_LEN;
 
 // `struct node_id` (include/internal_proto.h): addr[16], port, io_addr[16],
 // io_port, pad[4]. A node's address is 16 bytes whatever its family — an IPv4
@@ -1052,6 +1077,52 @@ pub struct AclInfo {
     pub max_data_id_nr: u32,
     /// The ACL's member VDIs, sorted by (name, tag), snapshots included.
     pub vdis: Vec<VdiInfo>,
+    /// The ACL's member *names* (`dog acl add member`), in slot order: the
+    /// hostnqns allowed to connect to the subsystem this ACL becomes. Empty
+    /// for an ACL nobody has been added to, which constrains no host.
+    pub hosts: Vec<String>,
+}
+
+impl AclInfo {
+    /// The host ACL this ACL object's member list expresses
+    /// ([`AclInfo::hosts`]).
+    #[must_use]
+    pub fn host_acl(&self) -> HostAcl {
+        host_acl(self.hosts.clone())
+    }
+}
+
+/// Turn an ACL object's member names into a subsystem host ACL — the one
+/// place that decides what a member list *means*, so the startup snapshot and
+/// the refresh ([`acl_hosts`]) can never drift apart.
+///
+/// The members are the hostnqns admitted and nobody else may connect. No
+/// members at all is not a closed door but no door: an ACL nobody has been
+/// added to expresses no opinion about hosts, so its subsystem admits any of
+/// them, and access control begins with the first `dog acl add member`.
+fn host_acl(hosts: Vec<String>) -> HostAcl {
+    if hosts.is_empty() {
+        HostAcl::any()
+    } else {
+        HostAcl::listed(hosts)
+    }
+}
+
+/// Re-read one ACL object's host ACL: the member names in its inode, as the
+/// cluster holds them *now*.
+///
+/// The targeted form of what [`list_acls`] reads for every ACL at startup —
+/// one lookup-free `READ_OBJ` on a control connection of its own — for the
+/// refresh thread to keep a running subsystem's [`Subsystem::set_host_acl`]
+/// current. `vid` is the ACL object's own vid ([`AclInfo::vid`]), which is
+/// stable for its life; an ACL deleted and recreated under the same name gets
+/// a new one, and this keeps reading the old object until the target restarts.
+///
+/// Blocking cluster IO, like the other control-plane enumerations: never call
+/// it from a queue thread.
+pub fn acl_hosts(cluster: SocketAddr, vid: u32) -> io::Result<HostAcl> {
+    let conn = Conn::connect(cluster)?;
+    Ok(host_acl(read_acl_hosts(&conn, vid)?))
 }
 
 /// One live entry of the cluster's VDI table, as [`scan_vdi_table`] reads it.
@@ -1081,18 +1152,23 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
     Ok(vdis)
 }
 
-/// Enumerate the cluster's ACL objects, each with its member VDIs, sorted by
-/// ACL name.
+/// Enumerate the cluster's ACL objects, each with its member VDIs and its
+/// member names, sorted by ACL name.
 ///
 /// Membership comes from the ACL object's own inode: the vids in
-/// `data_vdi_id[0..max_data_id_nr]`, which is the list `dog acl add`/`remove`
-/// maintain and `dog acl info` prints. Zero entries are holes left by a
-/// removal, not the end of the list. Each vid is then resolved against the
-/// VDI table this scan already read, for the member's name, size and identity.
+/// `data_vdi_id[0..max_data_id_nr]`, which is the list `dog acl add
+/// vdi`/`remove vdi` maintain and `dog acl info` prints. Zero entries are
+/// holes left by a removal, not the end of the list. Each vid is then resolved
+/// against the VDI table this scan already read, for the member's name, size
+/// and identity.
+///
+/// The member *names* ([`AclInfo::hosts`], `dog acl add member`) come from the
+/// same inode's `metadata[]` table — the host side of the ACL, read by
+/// [`read_acl_hosts`].
 ///
 /// A listed vid that is not a volume on the cluster, or whose inode names some
-/// other ACL, is dropped with a warning — `dog acl add` writes the array entry
-/// before the member's `acl_id`, so a half-completed add leaves exactly that,
+/// other ACL, is dropped with a warning — `dog acl add vdi` writes the array
+/// entry before the member's `acl_id`, so a half-completed add leaves that,
 /// and the cluster would refuse to resolve the name under this ACL anyway. A
 /// volume whose `acl_id` names this ACL but that the array does not list is
 /// dropped the same way: the ACL's list is what `dog` shows and what an
@@ -1149,6 +1225,7 @@ pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
             vid: entry.info.vid,
             max_data_id_nr: entry.max_data_id_nr,
             vdis,
+            hosts: read_acl_hosts(&conn, entry.info.vid)?,
         });
     }
     for entry in entries.iter().filter(|e| {
@@ -1178,6 +1255,36 @@ fn read_acl_members(conn: &Conn, vid: u32, max_data_id_nr: u32) -> io::Result<Ve
     let mut bytes = vec![0u8; count * 4];
     read_obj(conn, vid_to_vdi_oid(vid), SD_INODE_HEADER_SIZE, &mut bytes)?;
     Ok((0..count).map(|i| read_u32(&bytes, i * 4)).collect())
+}
+
+/// Read an ACL object's member *names* — the list `dog acl add member` /
+/// `dog acl remove member` maintain and `dog acl info` prints as `member …`.
+///
+/// They live in the ACL inode header's `metadata[]` area
+/// ([`INO_OFF_METADATA`]) as [`SD_ACL_MAX_MEMBERS`] fixed-width, NUL-padded
+/// [`SD_MAX_VDI_LEN`] slots. A removal zeroes a slot in place, so an empty one
+/// is a hole rather than the end of the list; the holes are dropped here and
+/// the surviving names returned in slot order.
+///
+/// One extra `READ_OBJ` per ACL object, on the enumeration's own connection:
+/// the caller turns the names into the subsystem's host ACL ([`host_acl`]), so
+/// this is what decides who may connect to the group. Like everything else
+/// `list_acls` reads, it is the state at enumeration time; [`acl_hosts`] is
+/// the same read on its own, which is how the refresh thread keeps a running
+/// target's host ACL up with `dog acl add member`.
+fn read_acl_hosts(conn: &Conn, vid: u32) -> io::Result<Vec<String>> {
+    let mut bytes = vec![0u8; SD_ACL_MAX_MEMBERS * SD_MAX_VDI_LEN];
+    read_obj(
+        conn,
+        vid_to_vdi_oid(vid),
+        INO_OFF_METADATA as u64,
+        &mut bytes,
+    )?;
+    Ok(bytes
+        .chunks_exact(SD_MAX_VDI_LEN)
+        .map(read_cstr)
+        .filter(|host| !host.is_empty())
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

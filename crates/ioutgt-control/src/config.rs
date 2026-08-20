@@ -4,6 +4,7 @@
 
 #![allow(missing_docs)] // schema: field names are the documented format
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -17,12 +18,30 @@ pub struct SubsystemConfig {
     pub allow_any_host: bool,
     /// Hostnqns admitted when `allow_any_host` is off (nvmet-style ACL).
     pub allowed_hosts: Vec<String>,
+    /// The Sheepdog ACL object this subsystem *is* the export of, when it came
+    /// from whole-cluster mode. The two host lists are then the same list —
+    /// the ACL's members are `allowed_hosts` — so the target keeps re-reading
+    /// it and applying what changed. `None` everywhere else, including a
+    /// single VDI addressed through an ACL (`%ACL`): there the ACL is only a
+    /// lookup scope, and the host list is the config file's own.
+    pub sheepdog_acl: Option<SheepdogAcl>,
     /// Identify Controller `MNAN` (Maximum Number of Allocated Namespaces)
     /// to report; `None` leaves it zero, the spec's "no more than `NN`". Set
     /// where the storage carries its own namespace count — a Sheepdog ACL
     /// object's `max_data_id_nr`.
     pub mnan: Option<u32>,
     pub namespaces: Vec<NamespaceConfig>,
+}
+
+/// Where to find the ACL object behind a whole-cluster subsystem, for the
+/// refresh that keeps its host list current. Resolved at parse time, so the
+/// refresh never has to re-resolve a name that may have moved on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheepdogAcl {
+    /// Cluster gateway the ACL object is read from.
+    pub cluster: SocketAddr,
+    /// The ACL object's own vid — its cluster-wide identity.
+    pub vid: u32,
 }
 
 pub(crate) fn default_serial() -> String {
@@ -139,6 +158,7 @@ mod tests {
             model: default_model(),
             allow_any_host: true,
             allowed_hosts: vec![],
+            sheepdog_acl: None,
             mnan: None,
             namespaces,
         }

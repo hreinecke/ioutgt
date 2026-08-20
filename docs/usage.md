@@ -122,23 +122,56 @@ So a VDI in an ACL needs `%ACL` on the spec (`"acl": "<name>"` through the
 control API); a VDI in no ACL needs it left off. An ACL name that turns out
 to be an ordinary VDI is refused rather than used as a scope.
 
-The membership list lives in the ACL object's own inode: `dog acl add`
+The volume list lives in the ACL object's own inode: `dog acl add vdi`
 writes the member's vid into the ACL's `data_vdi_id[]` array — the array an
 ordinary VDI uses as its object map — and counts the slots in use in
-`max_data_id_nr`; `dog acl remove` clears an entry in place, leaving a hole.
-That list, the one `dog acl info` prints, is what whole-cluster mode reads.
-A VDI that names the ACL but is not in its list, or a listed vid whose own
-inode names some other ACL (what a half-completed `dog acl add` leaves
-behind), is not a member: it is skipped with a warning, since the cluster
-would refuse to resolve it under this ACL anyway.
+`max_data_id_nr`; `dog acl remove vdi` clears an entry in place, leaving a
+hole. That list, the one `dog acl info` prints, is what whole-cluster mode
+reads. A VDI that names the ACL but is not in its list, or a listed vid
+whose own inode names some other ACL (what a half-completed `dog acl add
+vdi` leaves behind), is not a member: it is skipped with a warning, since
+the cluster would refuse to resolve it under this ACL anyway.
+
+The *hosts* an ACL grants access to are its **members**, the second list in
+the same inode (`dog acl add member <acl> <name>`, printed as `member …` by
+`dog acl info`, cleared in place by `dog acl remove member`). For an NVMe
+target a member name is a **hostnqn**, and whole-cluster mode enforces it:
+the ACL's member list becomes the subsystem's host ACL, so only a host
+whose `hostnqn` the cluster lists may connect; every other Connect is
+answered with `CONNECT_INVALID_HOST`, which `nvme connect` reports as a
+failed connect. Membership is the cluster's to change while the target runs:
+the target re-reads each ACL's member list every 10 seconds, so an `add
+member` / `remove member` reaches it without a restart. It decides who may
+connect **next** — a host removed from the ACL keeps the connection it
+already has until it disconnects (`nvme disconnect`), which is how nvmet
+behaves too. While the cluster is unreachable the last membership it did
+report stays in force.
+
+```sh
+dog acl add member nqn.2026-06.io.ioutgt:group-a \
+    "$(cat /etc/nvme/hostnqn)"      # on the initiator: the hostnqn to admit
+dog acl info nqn.2026-06.io.ioutgt:group-a -v
+```
+
+An ACL with **no** members constrains nothing: its subsystem admits any
+host, as it did before there was a host ACL at all. Access control begins
+with the first `dog acl add member` — from then on that ACL's subsystem
+admits its members and nobody else — and ends again if the last member is
+removed, both within a refresh tick.
 
 Because an ACL is exactly "which volumes belong together, reachable by
 whom", **whole-cluster mode maps one ACL object to one NVM subsystem**
-(below), naming the subsystem after the ACL. Name ACLs accordingly: the
+(below), naming the subsystem after the ACL and admitting the ACL's
+members. Name ACLs accordingly: the
 subsystem NQN is the ACL name verbatim, so `dog acl create
 nqn.2026-06.io.ioutgt:group-a` is the useful spelling. A target warns about
 an ACL whose name is not an NQN — it will export it, but hosts will not
 connect to it.
+
+Single-VDI mode (`%ACL`) uses the ACL only as the cluster-side lookup and
+lock scope: that subsystem is the flag-named one, and its host ACL comes
+from the config file's `allowed_hosts` / `allow_any_host` as for any other
+backend.
 
 #### VDI locking
 
@@ -212,6 +245,8 @@ The subsystem NQN is the ACL object's name verbatim, so hosts see the
 cluster's own grouping, and `nvme discover` against this target enumerates
 the cluster's ACLs — one record per *path* to each (see below).
 `--subsys-nqn` is ignored in this mode; the cluster names the subsystems.
+Each subsystem admits exactly the hostnqns the ACL lists as members
+(above), so which hosts may connect is the cluster's call too.
 Volumes in no ACL are exported by nobody (the cluster would not resolve
 their names under one anyway); name such a volume explicitly to serve it.
 A cluster with no ACL objects fails startup rather than serving nothing:
