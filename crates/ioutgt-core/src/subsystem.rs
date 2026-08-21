@@ -257,6 +257,7 @@ pub struct Subsystem<B> {
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
     ports: RwLock<PortList>,
+    disc_genctr: AtomicU64,
 }
 
 impl<B: Backend> Subsystem<B> {
@@ -279,6 +280,7 @@ impl<B: Backend> Subsystem<B> {
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
             ports: RwLock::new(Arc::new(Vec::new())),
+            disc_genctr: AtomicU64::new(1),
         }
     }
 
@@ -345,12 +347,24 @@ impl<B: Backend> Subsystem<B> {
 
     /// Replace the path list, as the control plane learns it — for Sheepdog,
     /// each refresh of the holders registered on the subsystem's cluster ACL.
+    /// Returns whether this changed anything, which the caller turns into a
+    /// discovery-log generation bump and a Discovery Log Page Change notice.
+    ///
+    /// The bump is the caller's, not this method's: seeding the list at startup
+    /// is a change too, and there the counter should still read as the version
+    /// the storage itself states ([`Subsystem::observe_disc_genctr`]) rather
+    /// than one past it.
     ///
     /// Cold path: discovery reads a snapshot per Get Log Page, and IO never
     /// looks at all, so the list needs no generation dance like the namespace
     /// table's.
-    pub fn set_ports(&self, ports: Vec<SubsystemPort>) {
-        *self.ports.write().expect("port list poisoned") = Arc::new(ports);
+    pub fn set_ports(&self, ports: Vec<SubsystemPort>) -> bool {
+        let mut guard = self.ports.write().expect("port list poisoned");
+        if **guard == ports {
+            return false;
+        }
+        *guard = Arc::new(ports);
+        true
     }
 
     /// Builder form of [`Subsystem::set_ports`], for a list known at startup.
@@ -358,6 +372,39 @@ impl<B: Backend> Subsystem<B> {
     pub fn with_ports(self, ports: Vec<SubsystemPort>) -> Self {
         self.set_ports(ports);
         self
+    }
+
+    /// This subsystem's share of the discovery log's `GENCTR`: a counter a host
+    /// re-reads the log on a change of, and compares across a multi-part read
+    /// to tell that one raced a change.
+    ///
+    /// Monotonic, and moved by both of the things that can change what a
+    /// discovery entry for this subsystem says: the version the storage keeps
+    /// itself ([`Subsystem::observe_disc_genctr`] — a Sheepdog ACL object's
+    /// inode `vdi_epoch`) and the path list this target discovers on its own
+    /// ([`Subsystem::bump_disc_genctr`], from `set_ports`).
+    pub fn disc_genctr(&self) -> u64 {
+        self.disc_genctr.load(Ordering::Acquire)
+    }
+
+    /// Take up a generation the storage states for itself, keeping the counter
+    /// monotonic: a Sheepdog ACL object's `vdi_epoch`, which the cluster bumps
+    /// when the ACL's volume membership changes. Returns whether the counter
+    /// moved.
+    ///
+    /// Monotonic rather than authoritative because it shares the counter with
+    /// the local bumps below, and every target must be free to advance it
+    /// without the cluster's help: an epoch that has fallen behind the local
+    /// count is not applied. Hosts only need `GENCTR` to *change* when the log
+    /// does, never to mean anything in particular.
+    pub fn observe_disc_genctr(&self, epoch: u64) -> bool {
+        self.disc_genctr.fetch_max(epoch, Ordering::Release) < epoch
+    }
+
+    /// Note a discovery-log change only this target can see — a peer joining or
+    /// leaving the subsystem's path list.
+    pub fn bump_disc_genctr(&self) {
+        self.disc_genctr.fetch_add(1, Ordering::Release);
     }
 
     /// The host ACL in force ([`Subsystem::set_host_acl`]).

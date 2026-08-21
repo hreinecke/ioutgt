@@ -471,12 +471,16 @@ impl Client {
         sqe.dptr.sgl_type = spec::sgl::TYPE_TRANSPORT_DATA_BLOCK;
         self.send_capsule(&sqe, &[]);
         let (decoded, payload) = self.recv_pdu();
-        assert!(
-            matches!(decoded.kind, PduKind::C2HData { .. }),
-            "identify expects data"
-        );
-        let cqe = self.recv_response();
-        assert_eq!(cqe.status.get() >> 1, status::SUCCESS, "identify cns {cns}");
+        // As for a log page: with SQ flow control disabled the target elides
+        // the response capsule into the last C2HData, so there is nothing
+        // further to read.
+        let PduKind::C2HData { success, .. } = decoded.kind else {
+            panic!("identify expects data, got {:?}", decoded.kind);
+        };
+        if !success {
+            let cqe = self.recv_response();
+            assert_eq!(cqe.status.get() >> 1, status::SUCCESS, "identify cns {cns}");
+        }
         payload
     }
 

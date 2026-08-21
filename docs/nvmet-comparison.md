@@ -185,8 +185,14 @@ that head its identity.
 
 **Differences/Risks.** Log pages are minimal (zeroed error/SMART/FW);
 RAE handling, SMART data, and multi-page error logs are future work.
-Discovery log windowing (LPO) is implemented; generation-counter
-churn protection is simplistic (static genctr). **ANA** is reported
+Discovery log windowing (LPO) is implemented, and so is the pair nvmet
+uses to keep a host's copy honest: the header **GENCTR** and the
+**Discovery Log Page Change** notice (OAES/AEC bit 31, which a discovery
+controller advertises *instead of* NS_ATTR, as `NVMET_DISC_AEN_CFG_OPTIONAL`
+does). Where nvmet's `nvmet_genctr` is one global counter bumped by every
+configfs write, ioutgt's is per subsystem and cluster-derived: the ACL
+object's `vdi_epoch` maxed with a local bump each time the path list
+actually changes (`docs/architecture.md` §7). **ANA** is reported
 (CMIC bit 3, ANA log page 0Ch, ANAGRPID, ANA Change AER) for
 cluster-backed subsystems only, and where nvmet lets configfs assign a
 namespace to any of `NVMET_MAX_ANAGRPS` groups whose states an admin

@@ -6,29 +6,14 @@ services:
   target0:
     image: ioutgt
     hostname: ${TARGET0_NAME}
-    mac_address: ${TARGET0_MAC}
-    networks:
-      etcd-br:
-        ipv4_address: ${TARGET0_IP}
-      target-br:
+    network_mode: service:sheepdog-etcd-sheep0-1
     ports:
       - "127.0.0.1:4420:4420"
     command: /usr/sbin/ioutgt-nvme-tcp --io-threads 4 --listen 127.0.0.1:4420 --backend sheepdog:${SHEEP0_IP}:7000
   target1:
     image: ioutgt
     hostname: ${TARGET1_NAME}
-    mac_address: ${TARGET1_MAC}
-    networks:
-      etcd-br:
-        ipv4_address: ${TARGET1_IP}
-      target-br:
+    network_mode: service:sheepdog-etcd-sheep1-1
     ports:
       - "127.0.0.1:4421:4420"
     command: /usr/sbin/ioutgt-nvme-tcp --io-threads 4 --listen 127.0.0.1:4420 --backend sheepdog:${SHEEP1_IP}:7000
-
-networks:
-  etcd-br:
-    external: true
-    name: "etcd-internal"
-  target-br:
-    driver: bridge

@@ -179,7 +179,9 @@ impl<B: Backend> ConnCtx<B> {
                 aer_wakers: RefCell::new(Vec::new()),
                 // Optional notices enabled until the host programs AEC
                 // (nvmet behaves the same).
-                aec: Cell::new(crate::AEN_CFG_NS_ATTR | crate::AEN_CFG_ANA_CHANGE),
+                aec: Cell::new(
+                    crate::AEN_CFG_NS_ATTR | crate::AEN_CFG_ANA_CHANGE | crate::AEN_CFG_DISC_CHANGE,
+                ),
                 ns_changed: Cell::new(false),
                 closing: Cell::new(false),
             }),
@@ -256,15 +258,25 @@ impl<B: Backend> ConnCtx<B> {
     }
 
     /// Weak handles for the harness pool: a side-effect-free liveness probe
-    /// and the two change triggers ([`fire_ns_changed`](Self::fire_ns_changed)
-    /// and [`fire_ana_changed`](Self::fire_ana_changed)), all holding only a
+    /// and the three change triggers
+    /// ([`fire_ns_changed`](Self::fire_ns_changed),
+    /// [`fire_ana_changed`](Self::fire_ana_changed) and
+    /// [`fire_disc_changed`](Self::fire_disc_changed)), all holding only a
     /// `Weak` on this context. Plain boxed closures (not a named type) so the
     /// pool needs no NVMe types.
     #[allow(clippy::type_complexity)]
-    pub fn change_nudge(self: &Rc<Self>) -> (Box<dyn Fn() -> bool>, Box<dyn Fn()>, Box<dyn Fn()>) {
+    pub fn change_nudge(
+        self: &Rc<Self>,
+    ) -> (
+        Box<dyn Fn() -> bool>,
+        Box<dyn Fn()>,
+        Box<dyn Fn()>,
+        Box<dyn Fn()>,
+    ) {
         let alive = Rc::downgrade(self);
         let ns = Rc::downgrade(self);
         let ana = Rc::downgrade(self);
+        let disc = Rc::downgrade(self);
         (
             Box::new(move || alive.strong_count() > 0),
             Box::new(move || {
@@ -275,6 +287,11 @@ impl<B: Backend> ConnCtx<B> {
             Box::new(move || {
                 if let Some(ctx) = ana.upgrade() {
                     ctx.fire_ana_changed();
+                }
+            }),
+            Box::new(move || {
+                if let Some(ctx) = disc.upgrade() {
+                    ctx.fire_disc_changed();
                 }
             }),
         )
@@ -301,6 +318,25 @@ impl<B: Backend> ConnCtx<B> {
         // AER result DW0: type Notice (2) | info ANA_CHANGE (3) <<8 | ANA log
         // page (0x0C) <<16.
         post_notice(admin, crate::AEN_CFG_ANA_CHANGE, 0x000C_0302);
+    }
+
+    /// The discovery log changed — a subsystem gained or lost a path, or the
+    /// storage bumped its own generation — so complete one parked AER with the
+    /// Discovery Log Page Change notice and send the host back to log 0x70.
+    ///
+    /// Discovery controllers only: they are the ones that have that log page,
+    /// the ones that advertise the event in OAES, and (with `nvme discover
+    /// --persistent` or nvme-stas) the ones that park an AER for it.
+    pub fn fire_disc_changed(&self) {
+        let Role::Admin(admin) = &self.role else {
+            return;
+        };
+        if !admin.discovery.get() {
+            return;
+        }
+        // AER result DW0: type Notice (2) | info DISC_CHANGED (0xF0) <<8 |
+        // Discovery log page (0x70) <<16.
+        post_notice(admin, crate::AEN_CFG_DISC_CHANGE, 0x0070_F002);
     }
 }
 

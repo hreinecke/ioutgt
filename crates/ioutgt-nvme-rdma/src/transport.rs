@@ -138,13 +138,14 @@ impl Transport for RdmaTransport {
         // Adapt the harness callback: hand it the queue's stats and weak
         // async-event nudges instead of the dispatch context.
         let adapted = |ctx: &std::rc::Rc<ioutgt_nvme::dispatch::ConnCtx<AnyBackend>>| {
-            let (alive, ns_changed, ana_changed) = ctx.change_nudge();
+            let (alive, ns_changed, ana_changed, disc_changed) = ctx.change_nudge();
             on_ctx(ConnHandles {
                 stats: std::rc::Rc::clone(&ctx.queue.stats),
                 changes: ChangeNudge {
                     alive,
                     ns_changed,
                     ana_changed,
+                    disc_changed,
                 },
                 stop: Box::new(move || stop.notify_one()),
             });

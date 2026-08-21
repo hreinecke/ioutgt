@@ -42,6 +42,10 @@ pub struct SheepdogAcl {
     pub cluster: SocketAddr,
     /// The ACL object's own vid — its cluster-wide identity.
     pub vid: u32,
+    /// The object's `vdi_epoch` when the cluster was enumerated: the version
+    /// the subsystem's discovery-log `GENCTR` starts from, before this target
+    /// has seen a path list change under it.
+    pub epoch: u64,
 }
 
 pub(crate) fn default_serial() -> String {

@@ -484,7 +484,10 @@ Namespace table — versioned for runtime add/remove:
   with one atomic load per command and refresh only when the control
   plane changed something.
 - Changes fire the NS_ATTR async event (note: Identify must advertise
-  OAES.NS_ATTR or Linux hosts never enable the notice).
+  OAES.NS_ATTR or Linux hosts never enable the notice). OAES is split by
+  controller type as nvmet's is: an NVM controller advertises NS_ATTR (plus
+  ANA Change where the subsystem reports ANA), a discovery controller
+  advertises only DISC_CHANGE (bit 31) — the two sets are disjoint.
 
 - Capacity in bytes comes off the same snapshot: `Namespace::capacity`
   (Identify Namespace `NVMCAP`) and its sum `Subsystem::total_capacity`
@@ -609,7 +612,7 @@ naming another ACL, as a half-completed `dog acl add vdi` leaves) is
 skipped with a warning, as is a volume naming an ACL that does not list it:
 the cluster resolves neither under that ACL. The same inode's `metadata[]`
 holds the ACL's other list — its *member names* (`dog acl add member`),
-fixed-width slots with zeroed holes, read by `read_acl_hosts` into
+fixed-width slots with zeroed holes, read by `read_acl_state` into
 `AclInfo::hosts` — and those become the subsystem's `allowed_hosts` with
 `allow_any_host` off: the cluster's ACL is the host ACL, and a Connect from
 a hostnqn it does not list is refused (`CONNECT_INVALID_HOST`,
@@ -617,7 +620,7 @@ a hostnqn it does not list is refused (`CONNECT_INVALID_HOST`,
 that subsystem keeps `allow_any_host`. Membership is the administrator's to
 change while the target runs: `SubsystemConfig::sheepdog_acl` records which
 ACL object (cluster address + vid) a subsystem came from, and the 10 s refresh
-thread re-reads its member names (`acl_hosts` → `Subsystem::set_host_acl`,
+thread re-reads its member names (`acl_state` → `Subsystem::set_host_acl`,
 alongside the holder lists and object locality it already re-reads), so a `dog
 acl add member` takes effect within a tick. It decides the *next* Connect: a
 host dropped from the ACL keeps the controllers it already has, as unlinking a
@@ -673,6 +676,42 @@ than flapping, and a cluster that will not take the registration costs the
 target its extra entries — it falls back to advertising itself, exactly as a
 non-cluster subsystem does (empty port list) — not its ability to serve IO.
 All of it is blocking TCP on the control plane, never on a queue thread.
+
+**When the log changed — GENCTR and the discovery AEN.** A path list that
+moves under a connected host is worth nothing unless the host is told, and
+the discovery log's own two mechanisms are the generation counter in its
+header and the Discovery Log Page Change notice. Both come off one number
+per subsystem, `Subsystem::disc_genctr` (`ioutgt-core`), and the log's
+GENCTR is the sum over the subsystems it reports — which, for the usual
+one-subsystem discovery port, *is* that subsystem's counter. Two things
+move it, because neither alone sees every change. The cluster's own version
+of the ACL is the inode header's **`vdi_epoch`**, read alongside the member
+names by the same `READ_OBJ` (`AclState { hosts, epoch }`), and every
+refresh feeds it to `observe_disc_genctr` — a `fetch_max`, so an epoch that
+went backwards (a rebuilt cluster) cannot walk a host's view back. But
+`sheep` bumps `vdi_epoch` only on `dog acl add`/`remove vdi` and at VDI
+creation, *not* when a target registers or unregisters as a holder — so the
+change most visible in the discovery log, a peer target appearing, would
+never move it. A path list that actually changed therefore also calls
+`bump_disc_genctr` locally (`Subsystem::set_ports` reports whether it did),
+and the counter is the monotonic maximum of the two. Seeding the list at
+startup is not a change: `refresh_cluster_paths` takes an `announce` flag
+that is false on the initial read, so the first GENCTR a host ever sees is
+exactly the ACL's `vdi_epoch`.
+
+Either move also raises the notice. The refresh thread is a plain thread and
+cannot touch a queue thread's controllers, so it goes the same way the ANA
+change does — through the admin thread's mailbox — but discovery
+controllers live on the admin thread of whichever target the host reached,
+not on a per-subsystem list, so the hop is a process-wide notifier
+(`DISC_NOTIFY`, installed by `track_discovery_changes` at control-loop
+start and cleared by `stop_cluster_refresh`) sending `AdminMsg::DiscChanged`
+to the admin pool. Each live connection's `ChangeNudge::disc_changed`
+upgrades to its `ConnCtx` and calls `fire_disc_changed`, which is a no-op on
+anything but a discovery controller and otherwise posts a parked AER with
+DW0 `0x0070_F002` — Notice (type 2), Discovery Log Page Changed (F0h), log
+page 70h — masked as always against the host's AEC and the controller's
+OAES.
 
 **Whose cntlids are whose — partitioning by holder slot.** Several targets
 fronting one subsystem raises a second collision, the same one multi-port

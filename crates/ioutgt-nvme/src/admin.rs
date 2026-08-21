@@ -184,9 +184,17 @@ fn build_id_ctrl<B: Backend>(
     }
     id.cntlid.set(admin.cntlid.get());
     id.ver.set(0x0001_0300);
-    // OAES: the host masks its AEC against this; without the NS_ATTR
-    // bit it never enables namespace-change notices.
-    let mut oaes = crate::AEN_CFG_NS_ATTR;
+    // OAES: the host masks its AEC against this; without the NS_ATTR bit it
+    // never enables namespace-change notices, and without DISC_CHANGE a
+    // persistent discovery controller parks an AER it would never get back.
+    // The two are disjoint, as in nvmet (NVMET_AEN_CFG_OPTIONAL vs
+    // NVMET_DISC_AEN_CFG_OPTIONAL): a discovery controller has no namespaces
+    // to report changes to, and an NVM controller no discovery log page.
+    let mut oaes = if discovery {
+        crate::AEN_CFG_DISC_CHANGE
+    } else {
+        crate::AEN_CFG_NS_ATTR
+    };
     id.cntrltype = if discovery { 2 } else { 1 };
     if !discovery {
         // Advertise multi-controller capability so the host's NVMe-multipath
@@ -498,6 +506,11 @@ fn build_ana_log<B: Backend>(subsys: &Subsystem<B>, rgo: bool) -> Vec<u8> {
 /// entry per path, so a host learns every target serving it, not only the one
 /// it happened to ask. For Sheepdog that list is the set of targets
 /// registered on the subsystem's cluster ACL.
+///
+/// `GENCTR` is the sum of the subsystems' own discovery generations
+/// (`Subsystem::disc_genctr`): a host that reads the log in parts can tell the
+/// read raced a change, and one that parked an AER re-reads when the Discovery
+/// Log Page Change notice tells it the value moved.
 fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
     let subsystems = &ctx.port.subsystems;
     // The port's own transport and address, for subsystems with no path list.
@@ -509,7 +522,12 @@ fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
     };
 
     let mut entries = Vec::with_capacity(subsystems.len());
+    let mut genctr = 0u64;
     for (nqn, subsys) in subsystems {
+        // Each subsystem versions its own entries; the log's GENCTR is their
+        // sum, which moves whenever any of them does and — for the usual
+        // one-subsystem discovery port — *is* the subsystem's own counter.
+        genctr = genctr.wrapping_add(subsys.disc_genctr());
         let ports = subsys.ports();
         if ports.is_empty() {
             entries.push(discovery_entry(nqn, &local));
@@ -520,7 +538,7 @@ fn build_discovery_log<B: Backend>(ctx: &Rc<ConnCtx<B>>) -> Vec<u8> {
 
     let mut log = Vec::with_capacity(1024 * (1 + entries.len()));
     let header = DiscoveryLogHeader {
-        genctr: 1.into(),
+        genctr: genctr.into(),
         numrec: (entries.len() as u64).into(),
         recfmt: 0.into(),
         resv: [0; 1006],

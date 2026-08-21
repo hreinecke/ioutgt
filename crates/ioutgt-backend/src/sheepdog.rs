@@ -65,7 +65,7 @@
 //! that is not a member of the ACL cannot connect to the subsystem the ACL
 //! becomes. An empty list names nobody to keep out either, and leaves the
 //! subsystem open to any host. Membership is not frozen at startup — the
-//! target's refresh thread re-reads it with [`acl_hosts`], so a `dog acl add
+//! target's refresh thread re-reads it with [`acl_state`], so a `dog acl add
 //! member` reaches the running target.
 //!
 //! # Fit with the engine
@@ -240,6 +240,7 @@ const INO_OFF_TAG: usize = SD_MAX_VDI_LEN;
 const INO_OFF_SNAP_CTIME: usize = 520;
 const INO_OFF_MAX_DATA_ID_NR: usize = 528;
 const INO_OFF_VDI_SIZE: usize = 536;
+const INO_OFF_VDI_EPOCH: usize = 544;
 const INO_OFF_NR_COPIES: usize = 554;
 const INO_OFF_BLOCK_SIZE_SHIFT: usize = 555;
 const INO_OFF_ACL_ID: usize = 572;
@@ -1081,6 +1082,9 @@ pub struct AclInfo {
     /// hostnqns allowed to connect to the subsystem this ACL becomes. Empty
     /// for an ACL nobody has been added to, which constrains no host.
     pub hosts: Vec<String>,
+    /// The ACL object's `vdi_epoch`: the cluster's own version counter for it
+    /// (see [`AclState::epoch`]).
+    pub epoch: u64,
 }
 
 impl AclInfo {
@@ -1092,9 +1096,37 @@ impl AclInfo {
     }
 }
 
+/// One ACL object's mutable state, as a single read of its inode header sees
+/// it: who may connect, and the cluster's version counter for the object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclState {
+    /// The ACL's member names, in slot order ([`AclInfo::hosts`]).
+    pub hosts: Vec<String>,
+    /// The inode header's `vdi_epoch`, which the cluster bumps whenever the
+    /// ACL's *volume* membership changes (`dog acl add vdi` / `dog acl remove
+    /// vdi`) and sets when the object is created.
+    ///
+    /// The one version number a Sheepdog cluster keeps for the thing a
+    /// subsystem is made of, and so what a target reports as the discovery
+    /// log's `GENCTR` (`Subsystem::observe_disc_genctr`). It says nothing
+    /// about the *members* (`dog acl add member` leaves it alone) and nothing
+    /// about who holds the volumes' locks — a target joining or leaving does
+    /// not move it — so a target that watches those advances the counter past
+    /// the epoch on its own.
+    pub epoch: u64,
+}
+
+impl AclState {
+    /// The host ACL this member list expresses.
+    #[must_use]
+    pub fn host_acl(&self) -> HostAcl {
+        host_acl(self.hosts.clone())
+    }
+}
+
 /// Turn an ACL object's member names into a subsystem host ACL — the one
 /// place that decides what a member list *means*, so the startup snapshot and
-/// the refresh ([`acl_hosts`]) can never drift apart.
+/// the refresh ([`acl_state`]) can never drift apart.
 ///
 /// The members are the hostnqns admitted and nobody else may connect. No
 /// members at all is not a closed door but no door: an ACL nobody has been
@@ -1108,21 +1140,22 @@ fn host_acl(hosts: Vec<String>) -> HostAcl {
     }
 }
 
-/// Re-read one ACL object's host ACL: the member names in its inode, as the
-/// cluster holds them *now*.
+/// Re-read one ACL object's mutable state: the member names in its inode and
+/// its `vdi_epoch`, as the cluster holds them *now*.
 ///
 /// The targeted form of what [`list_acls`] reads for every ACL at startup —
 /// one lookup-free `READ_OBJ` on a control connection of its own — for the
-/// refresh thread to keep a running subsystem's [`Subsystem::set_host_acl`]
-/// current. `vid` is the ACL object's own vid ([`AclInfo::vid`]), which is
-/// stable for its life; an ACL deleted and recreated under the same name gets
-/// a new one, and this keeps reading the old object until the target restarts.
+/// refresh thread to keep a running subsystem's `Subsystem::set_host_acl` and
+/// discovery-log generation current. `vid` is the ACL object's own vid
+/// ([`AclInfo::vid`]), which is stable for its life; an ACL deleted and
+/// recreated under the same name gets a new one, and this keeps reading the
+/// old object until the target restarts.
 ///
 /// Blocking cluster IO, like the other control-plane enumerations: never call
 /// it from a queue thread.
-pub fn acl_hosts(cluster: SocketAddr, vid: u32) -> io::Result<HostAcl> {
+pub fn acl_state(cluster: SocketAddr, vid: u32) -> io::Result<AclState> {
     let conn = Conn::connect(cluster)?;
-    Ok(host_acl(read_acl_hosts(&conn, vid)?))
+    read_acl_state(&conn, vid)
 }
 
 /// One live entry of the cluster's VDI table, as [`scan_vdi_table`] reads it.
@@ -1164,7 +1197,7 @@ pub fn list_vdis(addr: SocketAddr) -> io::Result<Vec<VdiInfo>> {
 ///
 /// The member *names* ([`AclInfo::hosts`], `dog acl add member`) come from the
 /// same inode's `metadata[]` table — the host side of the ACL, read by
-/// [`read_acl_hosts`].
+/// [`read_acl_state`], which also picks up the object's `vdi_epoch`.
 ///
 /// A listed vid that is not a volume on the cluster, or whose inode names some
 /// other ACL, is dropped with a warning — `dog acl add vdi` writes the array
@@ -1220,12 +1253,14 @@ pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
             );
         }
         vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+        let state = read_acl_state(&conn, entry.info.vid)?;
         acls.push(AclInfo {
             name: entry.info.name.clone(),
             vid: entry.info.vid,
             max_data_id_nr: entry.max_data_id_nr,
             vdis,
-            hosts: read_acl_hosts(&conn, entry.info.vid)?,
+            hosts: state.hosts,
+            epoch: state.epoch,
         });
     }
     for entry in entries.iter().filter(|e| {
@@ -1258,33 +1293,43 @@ fn read_acl_members(conn: &Conn, vid: u32, max_data_id_nr: u32) -> io::Result<Ve
 }
 
 /// Read an ACL object's member *names* — the list `dog acl add member` /
-/// `dog acl remove member` maintain and `dog acl info` prints as `member …`.
+/// `dog acl remove member` maintain and `dog acl info` prints as `member …` —
+/// together with the `vdi_epoch` that versions the object.
 ///
-/// They live in the ACL inode header's `metadata[]` area
+/// The names live in the ACL inode header's `metadata[]` area
 /// ([`INO_OFF_METADATA`]) as [`SD_ACL_MAX_MEMBERS`] fixed-width, NUL-padded
 /// [`SD_MAX_VDI_LEN`] slots. A removal zeroes a slot in place, so an empty one
 /// is a hole rather than the end of the list; the holes are dropped here and
 /// the surviving names returned in slot order.
 ///
-/// One extra `READ_OBJ` per ACL object, on the enumeration's own connection:
-/// the caller turns the names into the subsystem's host ACL ([`host_acl`]), so
-/// this is what decides who may connect to the group. Like everything else
-/// `list_acls` reads, it is the state at enumeration time; [`acl_hosts`] is
-/// the same read on its own, which is how the refresh thread keeps a running
-/// target's host ACL up with `dog acl add member`.
-fn read_acl_hosts(conn: &Conn, vid: u32) -> io::Result<Vec<String>> {
-    let mut bytes = vec![0u8; SD_ACL_MAX_MEMBERS * SD_MAX_VDI_LEN];
+/// One `READ_OBJ` per ACL object, on the enumeration's own connection, and one
+/// spanning both fields ([`INO_OFF_VDI_EPOCH`] up to the end of `metadata[]`)
+/// rather than one each: the epoch is the version *of* the member list as much
+/// as of anything else, and reading them apart would let one round trip land
+/// either side of a change. The caller turns the names into the subsystem's
+/// host ACL ([`host_acl`]), so this is what decides who may connect to the
+/// group. Like everything else `list_acls` reads, it is the state at
+/// enumeration time; [`acl_state`] is the same read on its own, which is how
+/// the refresh thread keeps a running target up with `dog acl add member` and
+/// `dog acl add vdi`.
+fn read_acl_state(conn: &Conn, vid: u32) -> io::Result<AclState> {
+    // Where `metadata[]` starts within the window read below.
+    const MEMBERS_AT: usize = INO_OFF_METADATA - INO_OFF_VDI_EPOCH;
+    let mut bytes = vec![0u8; MEMBERS_AT + SD_ACL_MAX_MEMBERS * SD_MAX_VDI_LEN];
     read_obj(
         conn,
         vid_to_vdi_oid(vid),
-        INO_OFF_METADATA as u64,
+        INO_OFF_VDI_EPOCH as u64,
         &mut bytes,
     )?;
-    Ok(bytes
-        .chunks_exact(SD_MAX_VDI_LEN)
-        .map(read_cstr)
-        .filter(|host| !host.is_empty())
-        .collect())
+    Ok(AclState {
+        epoch: read_u64(&bytes, 0),
+        hosts: bytes[MEMBERS_AT..]
+            .chunks_exact(SD_MAX_VDI_LEN)
+            .map(read_cstr)
+            .filter(|host| !host.is_empty())
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2029,6 +2074,9 @@ mod tests {
         assert_eq!(INO_OFF_SNAP_CTIME, 520);
         assert_eq!(INO_OFF_MAX_DATA_ID_NR, 528);
         assert_eq!(INO_OFF_VDI_SIZE, 536);
+        // vdi_epoch sits between vdi_size and copy_policy/store_policy/
+        // nr_copies; the ACL genctr is read from there.
+        assert_eq!(INO_OFF_VDI_EPOCH, INO_OFF_VDI_SIZE + 8);
         assert_eq!(INO_OFF_NR_COPIES, 554);
         assert_eq!(INO_OFF_BLOCK_SIZE_SHIFT, 555);
         // acl_id (572) + uuid[16] (576) + vdi_flags (592) were carved out of

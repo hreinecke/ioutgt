@@ -67,6 +67,9 @@ pub struct ChangeNudge {
     /// Fire the ANA-changed async event (a no-op once dead, and on a
     /// connection whose subsystem does not report ANA).
     pub ana_changed: Box<dyn Fn()>,
+    /// Fire the discovery-log-page-changed async event (a no-op once dead, and
+    /// on anything but a discovery controller).
+    pub disc_changed: Box<dyn Fn()>,
 }
 
 /// Install callback, run once a connection's dispatch context exists: the admin
@@ -595,6 +598,9 @@ enum AdminMsg<C> {
     NsChanged,
     /// A namespace changed ANA group: same, with the ANA Change notice.
     AnaChanged,
+    /// The discovery log changed: same, with the Discovery Log Page Change
+    /// notice, which only the discovery controllers among them take.
+    DiscChanged,
     Stats {
         reply: StatsRequest,
         clear: bool,
@@ -906,6 +912,9 @@ fn make_admin_thread<T: Transport>(
                         }
                         Ok(AdminMsg::NsChanged) => nudge_live(&live, |n| n.ns_changed.as_ref()),
                         Ok(AdminMsg::AnaChanged) => nudge_live(&live, |n| n.ana_changed.as_ref()),
+                        Ok(AdminMsg::DiscChanged) => {
+                            nudge_live(&live, |n| n.disc_changed.as_ref());
+                        }
                         Ok(AdminMsg::Stats { reply, clear }) => {
                             reply_thread_stats(&name, &queues, &mut retired, reply, clear);
                         }
@@ -1162,6 +1171,45 @@ fn cluster_paths() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterPaths>>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Raise a Discovery Log Page Change notice on this target's live discovery
+/// controllers.
+///
+/// A single hook rather than one per tracked cluster object: the discovery log
+/// is per *port*, not per subsystem — every subsystem on the port contributes
+/// entries to the same page — so whatever moved, the notice is the same one and
+/// goes to the same controllers. `None` before [`control_loop`] installs it
+/// (the seeding reads in [`build_port`] run first, and have nobody to tell) and
+/// again after [`shutdown`] clears it.
+static DISC_NOTIFY: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// [`DISC_NOTIFY`], recovered from poisoning (see [`live_ports`]).
+fn disc_notify() -> std::sync::MutexGuard<'static, Option<Box<dyn Fn() + Send + Sync>>> {
+    DISC_NOTIFY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Wire the discovery-change notice to the target's queue-thread pool, which
+/// [`control_loop`] owns and may currently have torn down — then the notice
+/// no-ops, correctly: a pool that is down has no controllers to tell, and a
+/// host that connects later reads the new log outright.
+fn track_discovery_changes<C: Send + 'static>(senders: &Arc<Mutex<Option<PoolSenders<C>>>>) {
+    let pool = Arc::clone(senders);
+    *disc_notify() = Some(Box::new(move || {
+        if let Some(pool) = pool.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            pool.admin.send(AdminMsg::DiscChanged);
+        }
+    }));
+}
+
+/// Tell the hosts the discovery log moved, if there is a pool to tell them
+/// through ([`track_discovery_changes`]).
+fn notify_discovery_changed() {
+    if let Some(notify) = disc_notify().as_ref() {
+        notify();
+    }
+}
+
 /// How often the refresh thread re-reads the holder lists, object locality
 /// and ACL membership. All three are cold paths — a target joining or leaving
 /// is rare, a volume's objects move only on a cluster rebalance, and a `dog
@@ -1221,7 +1269,9 @@ fn track_cluster_paths(
         trtype,
         subsystem: Arc::clone(subsystem),
     });
-    let slot = refresh_cluster_paths(&paths);
+    // Seeding, not a change: the counter should still read as the generation
+    // the cluster states, and there is no controller to notify yet anyway.
+    let slot = refresh_cluster_paths(&paths, false);
     cluster_paths().push(paths);
     start_cluster_refresh();
     slot
@@ -1310,7 +1360,14 @@ fn holder_cntlid_slice(range: (u16, u16), holder: Option<HolderSlot>) -> (u16, u
 /// controller exists — turns into this target's cntlid partition
 /// ([`holder_cntlid_slice`]). Later calls, from the refresh thread, have
 /// nowhere to put it: the partition is fixed for the process.
-fn refresh_cluster_paths(paths: &ClusterPaths) -> Option<HolderSlot> {
+///
+/// A holder joining or leaving is a change to what the discovery log says, and
+/// one no cluster counter records — a `vdi_epoch` moves with the ACL's volume
+/// membership, not with who holds the volumes. So when the path list really
+/// changes, `announce` bumps the subsystem's discovery generation and tells the
+/// hosts. It is off for the seeding call above, where the list goes from empty
+/// to whatever the cluster says and nobody has read it yet.
+fn refresh_cluster_paths(paths: &ClusterPaths, announce: bool) -> Option<HolderSlot> {
     let vids: Vec<u32> = paths
         .namespaces
         .iter()
@@ -1375,7 +1432,7 @@ fn refresh_cluster_paths(paths: &ClusterPaths) -> Option<HolderSlot> {
     // Every holder is another ioutgt target fronting the same cluster, so it
     // speaks the fabric this one does; the cluster records an address, not a
     // transport.
-    paths.subsystem.set_ports(
+    let changed = paths.subsystem.set_ports(
         addrs
             .iter()
             .enumerate()
@@ -1387,6 +1444,15 @@ fn refresh_cluster_paths(paths: &ClusterPaths) -> Option<HolderSlot> {
             })
             .collect(),
     );
+    if changed && announce {
+        // The log's GENCTR must move before any host can be told to re-read it,
+        // or the re-read looks unchanged and the notice is wasted.
+        paths.subsystem.bump_disc_genctr();
+        info!(subsystem = %paths.subsystem.nqn, paths = addrs.len(),
+              genctr = paths.subsystem.disc_genctr(),
+              "sheepdog: subsystem path list changed");
+        notify_discovery_changed();
+    }
     slot
 }
 
@@ -1501,7 +1567,7 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
 /// Whole-cluster mode builds a subsystem out of each ACL object, so the two
 /// access-control scopes coincide: the names `dog acl add member` writes into
 /// the ACL inode are the hostnqns the subsystem admits
-/// ([`ioutgt_backend::acl_hosts`]). The administrator edits that list on the
+/// ([`ioutgt_backend::acl_state`]). The administrator edits that list on the
 /// cluster, not here — so this target re-reads it rather than treating what it
 /// saw at startup as final.
 struct ClusterHosts {
@@ -1531,8 +1597,14 @@ fn cluster_hosts() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterHosts>>> {
 /// No read here, unlike [`track_cluster_paths`]: the config already carries
 /// the members as they were when it enumerated the cluster, and the subsystem
 /// was built with them. The first re-read is the refresh thread's.
+///
+/// It carries the ACL object's `vdi_epoch` too, and that *is* applied now: it
+/// is where the subsystem's discovery-log generation starts, so a host reading
+/// the log before the first refresh already gets the cluster's number rather
+/// than a placeholder.
 fn track_cluster_hosts(subsystem: &Arc<Subsystem<AnyBackend>>, acl: Option<SheepdogAcl>) {
     let Some(acl) = acl else { return };
+    subsystem.observe_disc_genctr(acl.epoch);
     cluster_hosts().push(Arc::new(ClusterHosts {
         cluster: acl.cluster,
         vid: acl.vid,
@@ -1541,7 +1613,8 @@ fn track_cluster_hosts(subsystem: &Arc<Subsystem<AnyBackend>>, acl: Option<Sheep
     start_cluster_refresh();
 }
 
-/// Re-read one ACL object's member names into its subsystem's host ACL.
+/// Re-read one ACL object's member names into its subsystem's host ACL, and its
+/// `vdi_epoch` into the subsystem's discovery-log generation.
 ///
 /// Best-effort, like the path and ANA refreshes: a cluster that will not
 /// answer leaves the host list as it was — the last membership the cluster
@@ -1551,14 +1624,24 @@ fn track_cluster_hosts(subsystem: &Arc<Subsystem<AnyBackend>>, acl: Option<Sheep
 /// A host dropped from the ACL keeps the controllers it already has (see
 /// [`Subsystem::set_host_acl`]); what changes is who may Connect next.
 fn refresh_cluster_hosts(hosts: &ClusterHosts) {
-    let acl = match ioutgt_backend::acl_hosts(hosts.cluster, hosts.vid) {
-        Ok(acl) => acl,
+    let state = match ioutgt_backend::acl_state(hosts.cluster, hosts.vid) {
+        Ok(state) => state,
         Err(err) => {
             cluster_unreachable(&hosts.subsystem.nqn, hosts.cluster, &err, "ACL member list");
             return;
         }
     };
-    if !hosts.subsystem.set_host_acl(acl) {
+    // The cluster moved its own version of the ACL — `dog acl add vdi` or
+    // `remove vdi`, the volumes the subsystem is made of. Nothing this target
+    // serves changes under it (its namespaces were fixed when it opened them),
+    // but the group a host discovers is not the one it discovered before, so
+    // send the discovery hosts back to the log.
+    if hosts.subsystem.observe_disc_genctr(state.epoch) {
+        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
+              genctr = state.epoch, "sheepdog: ACL epoch advanced");
+        notify_discovery_changed();
+    }
+    if !hosts.subsystem.set_host_acl(state.host_acl()) {
         return;
     }
     let acl = hosts.subsystem.host_acl();
@@ -1592,7 +1675,7 @@ pub fn refresh_clusters() -> usize {
     for paths in &paths {
         // The holder slot it reports is startup-only: the cntlid partition it
         // keys is fixed for the process (see [`holder_cntlid_slice`]).
-        let _ = refresh_cluster_paths(paths);
+        let _ = refresh_cluster_paths(paths, true);
     }
     for ana in &ana {
         refresh_cluster_ana(ana);
@@ -1640,6 +1723,9 @@ fn stop_cluster_refresh() {
     cluster_paths().clear();
     cluster_ana().clear();
     cluster_hosts().clear();
+    // The pool it posts to is going away with everything else; a notice raised
+    // from here on would only be a message nobody reads.
+    *disc_notify() = None;
 }
 
 /// The live mailbox senders for a spawned queue-thread pool: the admin
@@ -2041,6 +2127,9 @@ async fn control_loop<T: Transport>(
     // Cluster-backed namespaces: seed their ANA state now — before the first
     // host can ask — and keep it current from the refresh thread.
     track_cluster_ana(ana_specs, &senders);
+    // ...and the discovery log they and the path lists feed: from here on, a
+    // change to it reaches the parked AERs of the live discovery controllers.
+    track_discovery_changes(&senders);
     if let Some(path) = &config.control_socket
         && let Err(err) = spawn_control_api(
             path,
