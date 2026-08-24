@@ -64,8 +64,12 @@ impl AnyBackend {
     }
 
     /// Hand back whatever this backend holds *outside* the process, ahead of
-    /// an exit that will not drop it (the queue threads still own `Arc`s to
-    /// their namespaces when the target is asked to stop).
+    /// a teardown that may not drop it — at process exit (the queue threads
+    /// still own `Arc`s to their namespaces when the target is asked to
+    /// stop) and at `Subsystem::remove_namespace`, for the same reason: an
+    /// IO queue's cached table snapshot (`NsCache`) keeps its own `Arc` until
+    /// that queue's next command notices the generation moved on, which on
+    /// an idle or failed-over-away-from path may never happen.
     ///
     /// Only a Sheepdog VDI holds any: its cluster lock, which would otherwise
     /// keep the next opener out until the cluster reclaims it (see

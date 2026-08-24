@@ -1802,12 +1802,20 @@ fn refresh_cluster_namespaces(acl: &ClusterAcl) {
         if sd.cluster() != acl.cluster {
             continue;
         }
-        if acl.subsystem.remove_namespace(nsid).is_err() {
+        let Ok(removed) = acl.subsystem.remove_namespace(nsid) else {
             continue;
-        }
+        };
+        // Release the cluster lock now rather than trust the table's last
+        // `Arc` to drop it: an IO queue that cached an older snapshot
+        // (`NsCache`) keeps this namespace's backend alive for as long as it
+        // goes without another command to notice the table moved on — on an
+        // idle or failed-over-away-from path, that can be indefinitely, and
+        // the VDI would stay locked long after the ACL, and `nvme list-ns`,
+        // both agree it is gone.
+        removed.backend.shutdown();
         info!(subsystem = %acl.subsystem.nqn, nsid, vid = format_args!("{:x}", sd.vid()),
               acl = format_args!("{:x}", acl.vid), "sheepdog VDI unexported");
-        untrack_cluster_backend(&acl.subsystem, &ns.backend);
+        untrack_cluster_backend(&acl.subsystem, &removed.backend);
         (acl.notify)();
     }
 
@@ -1840,21 +1848,18 @@ fn refresh_cluster_namespaces(acl: &ClusterAcl) {
         let uuid = vdi.uuid.unwrap_or_else(|| {
             ioutgt_core::subsystem::namespace_uuid(&format!("sheepdog:{}", vdi.name), vdi.vid)
         });
-        let backend = Arc::new(backend);
-        let namespace = Namespace::new(nsid, Arc::clone(&backend), uuid);
-        if let Err(err) = acl.subsystem.add_namespace(namespace) {
-            warn!(subsystem = %acl.subsystem.nqn, nsid, vdi = %vdi.name, %err,
-                  "sheepdog: newly added VDI's nsid is already in use");
-            continue;
-        }
+        let namespace = Namespace::new(nsid, Arc::new(backend), uuid);
+        let ns = match acl.subsystem.add_namespace(namespace) {
+            Ok(ns) => ns,
+            Err(err) => {
+                warn!(subsystem = %acl.subsystem.nqn, nsid, vdi = %vdi.name, %err,
+                      "sheepdog: newly added VDI's nsid is already in use");
+                continue;
+            }
+        };
         info!(nsid, vdi = %vdi.name, acl = %acl.subsystem.nqn, bytes = vdi.size,
               "sheepdog VDI exported");
-        // The table now owns the namespace under its own Arc; fetch that one
-        // back rather than wrapping the same backend a second time, so path
-        // and ANA tracking share the identical Arc the IO path will see.
-        if let Some(ns) = acl.subsystem.snapshot().get(&nsid) {
-            track_cluster_backend(&acl.subsystem, ns, acl.trtype);
-        }
+        track_cluster_backend(&acl.subsystem, &ns, acl.trtype);
         (acl.notify)();
     }
 }
@@ -1981,8 +1986,20 @@ fn untrack_cluster_backend(subsystem: &Arc<Subsystem<AnyBackend>>, backend: &Arc
 /// no point re-reading state that is being released, and the refresh thread
 /// takes the zero as its cue to end.
 ///
+/// Serialized against itself ([`REFRESH_LOCK`]): production only ever has one
+/// caller (the background thread's own loop, one tick after the last
+/// finishes), but this is `pub` precisely so a caller that wants a change
+/// visible *now* — a test, or a future "refresh now" control op — does not
+/// have to wait out the full interval, and a second pass genuinely
+/// overlapping the first is not merely redundant work. `refresh_cluster_namespaces`'s
+/// add path reads the subsystem's current table, decides a vid is missing,
+/// and only *then* opens and registers it — two overlapping passes can both
+/// make that decision before either commits, open the same VDI twice, and
+/// leave the loser's `Drop` releasing a cluster lock the winner still holds.
+///
 /// Blocking cluster IO — call it from a plain thread, never a queue thread.
 pub fn refresh_clusters() -> usize {
+    let _guard = REFRESH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if shutting_down() {
         return 0;
     }
@@ -2002,6 +2019,11 @@ pub fn refresh_clusters() -> usize {
     }
     paths.len() + ana.len() + acls.len()
 }
+
+/// Guards the whole body of [`refresh_clusters`] against a second pass
+/// starting before the first finishes — see its doc comment for why that
+/// matters beyond wasted work.
+static REFRESH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Start the one thread that keeps every cluster path list, ANA state and
 /// host ACL current, if it is not running already.

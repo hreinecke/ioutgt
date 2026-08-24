@@ -278,9 +278,17 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 Ok(subsys) => subsys,
                 Err(response) => return response,
             };
-            if let Err(err) = subsys.remove_namespace(nsid) {
-                return Response::err(err);
-            }
+            let ns = match subsys.remove_namespace(nsid) {
+                Ok(ns) => ns,
+                Err(err) => return Response::err(err),
+            };
+            // Give up whatever the backend holds outside the process now,
+            // rather than trust the table's last `Arc` to drop it: an IO
+            // queue that cached an older snapshot (`NsCache`) keeps this
+            // namespace alive for as long as it goes without another
+            // command to notice the table moved on — indefinitely, on an
+            // idle or failed-over-away-from path.
+            ns.backend.shutdown();
             info!(nsid, subsys = %subsys.nqn, "namespace removed");
             (state.notify_ns_changed)();
             Response::ok(None)
