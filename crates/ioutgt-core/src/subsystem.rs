@@ -488,31 +488,46 @@ impl<B: Backend> Subsystem<B> {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Add a namespace. Errors if the NSID is taken.
-    pub fn add_namespace(&self, ns: Namespace<B>) -> Result<(), String> {
+    /// Add a namespace. Errors if the NSID is taken. Returns the namespace's
+    /// own `Arc`, the one every reader of the table from here on shares —
+    /// callers that need to do something else with it (wire it into
+    /// path/ANA tracking, say) use this one rather than fetching it back out
+    /// of a fresh [`Subsystem::snapshot`].
+    pub fn add_namespace(&self, ns: Namespace<B>) -> Result<Arc<Namespace<B>>, String> {
         let mut guard = self.namespaces.write().expect("ns table poisoned");
         if guard.contains_key(&ns.nsid) {
             return Err(format!("nsid {} already exists", ns.nsid));
         }
+        let ns = Arc::new(ns);
         let mut table = BTreeMap::clone(guard.as_ref());
-        table.insert(ns.nsid, Arc::new(ns));
+        table.insert(ns.nsid, Arc::clone(&ns));
         *guard = Arc::new(table);
         self.generation.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(ns)
     }
 
-    /// Remove a namespace; in-flight IO holding the old snapshot
-    /// completes against the still-alive backend Arc.
-    pub fn remove_namespace(&self, nsid: u32) -> Result<(), String> {
+    /// Remove a namespace and return it, so the caller can hand its backend
+    /// a definitive [`Backend::shutdown`] rather than trust a `Drop`.
+    ///
+    /// The table itself only ever drops its *own* reference: an IO queue
+    /// that cached an older table snapshot (`NsCache`, one atomic generation
+    /// check per command) keeps its `Arc` — and the backend behind it —
+    /// alive for as long as that queue goes without another command to
+    /// notice the table moved on, which on an idle or failed-over-away-from
+    /// path can be indefinitely. A backend that must give something up on
+    /// removal (a Sheepdog namespace releasing the cluster's shared lock)
+    /// cannot wait for that; the caller shuts it down explicitly instead of
+    /// relying on every last `Arc` finding its way to zero.
+    pub fn remove_namespace(&self, nsid: u32) -> Result<Arc<Namespace<B>>, String> {
         let mut guard = self.namespaces.write().expect("ns table poisoned");
-        if !guard.contains_key(&nsid) {
+        let Some(ns) = guard.get(&nsid).cloned() else {
             return Err(format!("nsid {nsid} not found"));
-        }
+        };
         let mut table = BTreeMap::clone(guard.as_ref());
         table.remove(&nsid);
         *guard = Arc::new(table);
         self.generation.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(ns)
     }
 
     /// Highest allocated NSID (Identify Controller `nn`): the largest NSID a

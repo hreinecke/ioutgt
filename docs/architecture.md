@@ -641,7 +641,19 @@ and `--recv-buf-mb` setting, the ACL's own `lock`) and added
 startup path does; one the ACL no longer lists is removed
 (`Subsystem::remove_namespace`, `"sheepdog VDI unexported"`) — only ever an
 nsid this same ACL's cluster could have added, so a namespace `ADD_NAMESPACE`
-put there by hand is not this refresh's to take back. Either edge posts the
+put there by hand is not this refresh's to take back.
+`Subsystem::add_namespace`/`remove_namespace` hand back the `Arc<Namespace>`
+they just inserted or took out, and both this refresh and the
+`REMOVE_NAMESPACE` control-socket handler use the removed one to call
+`AnyBackend::shutdown()` (`release_lock` for a locked Sheepdog volume)
+*before* logging or notifying, rather than trust its `Drop` — an IO queue's
+`NsCache` can hold the old table's `Arc` (and so the backend) alive
+indefinitely if that queue happens to see no further command after the
+removal, which otherwise left the cluster lock held forever with the
+namespace already gone from every Identify/discovery view. `refresh_clusters`
+itself is serialized against concurrent invocation (`REFRESH_LOCK`) so two
+overlapping refreshes can never both decide the same vid is missing and race
+to add it twice. Either edge posts the
 NS_ATTR async event to the live controllers, the same notice `ADD_NAMESPACE`/
 `REMOVE_NAMESPACE` raise over the control socket — a host sees the new or
 missing nsid without reconnecting. A namespace hot-added this way also joins
