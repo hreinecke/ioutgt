@@ -17,8 +17,8 @@ pub use memory::MemoryBackend;
 pub use null::NullBackend;
 pub use sheepdog::{
     AclInfo, AclState, AnaPlacement, ClusterAnaState, SD_LISTEN_PORT, SheepdogBackend,
-    VDI_MAX_HOLDERS, VdiHolder, VdiInfo, acl_state, cluster_ana_state, list_acls, list_vdis,
-    vdi_holders,
+    VDI_MAX_HOLDERS, VdiHolder, VdiInfo, acl_members, acl_state, cluster_ana_state, list_acls,
+    list_vdis, vdi_holders,
 };
 
 use ioutgt_core::pool::Seg;

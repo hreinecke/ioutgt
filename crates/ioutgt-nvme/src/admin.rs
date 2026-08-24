@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
     IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
-    ctratt, nsfeat, nmic, oncs, u128_le,
+    ctratt, nmic, nsfeat, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;

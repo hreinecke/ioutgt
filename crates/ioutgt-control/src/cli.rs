@@ -226,6 +226,7 @@ fn acl_subsystem(addr: &str, cluster: SocketAddr, acl: &AclInfo, lock: bool) -> 
             cluster,
             vid: acl.vid,
             epoch: acl.epoch,
+            lock,
         }),
         // The cluster's own count of the volumes in this ACL
         // (`max_data_id_nr`), rather than one derived from the namespaces

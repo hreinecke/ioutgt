@@ -617,16 +617,41 @@ fixed-width slots with zeroed holes, read by `read_acl_state` into
 `allow_any_host` off: the cluster's ACL is the host ACL, and a Connect from
 a hostnqn it does not list is refused (`CONNECT_INVALID_HOST`,
 `Subsystem::admits`). An ACL with no members names nobody to keep out, so
-that subsystem keeps `allow_any_host`. Membership is the administrator's to
-change while the target runs: `SubsystemConfig::sheepdog_acl` records which
-ACL object (cluster address + vid) a subsystem came from, and the 10 s refresh
+that subsystem keeps `allow_any_host`. Membership — of hosts *and* of
+volumes — is the administrator's to change while the target runs:
+`SubsystemConfig::sheepdog_acl` records which ACL object (cluster address +
+vid, plus its `lock` setting) a subsystem came from, and the 10 s refresh
 thread re-reads its member names (`acl_state` → `Subsystem::set_host_acl`,
 alongside the holder lists and object locality it already re-reads), so a `dog
 acl add member` takes effect within a tick. It decides the *next* Connect: a
 host dropped from the ACL keeps the controllers it already has, as unlinking a
 host in nvmet's configfs does. Only cluster mode tracks this — under `%ACL` the
 ACL is a lookup scope, not the subsystem, and the host list stays the config
-file's. Each namespace takes its VDI's bitmap position (its vid) as its NSID
+file's.
+
+The same refresh re-reads the ACL's *volume* membership too
+(`ioutgt_backend::acl_members`, `refresh_cluster_namespaces`'s scoped,
+one-ACL form of what `list_acls` does for every ACL at startup): `dog acl add
+vdi`/`remove vdi` on a running cluster adds or removes a namespace on this
+target, not only a discovery-log path entry or a `vdi_epoch` bump. A vid the
+ACL now lists that this subsystem does not yet export is opened exactly as
+`acl_subsystem` opens one at startup (`build_backend`, the same fabric address
+and `--recv-buf-mb` setting, the ACL's own `lock`) and added
+(`Subsystem::add_namespace`), logging `"sheepdog VDI exported"` as the
+startup path does; one the ACL no longer lists is removed
+(`Subsystem::remove_namespace`, `"sheepdog VDI unexported"`) — only ever an
+nsid this same ACL's cluster could have added, so a namespace `ADD_NAMESPACE`
+put there by hand is not this refresh's to take back. Either edge posts the
+NS_ATTR async event to the live controllers, the same notice `ADD_NAMESPACE`/
+`REMOVE_NAMESPACE` raise over the control socket — a host sees the new or
+missing nsid without reconnecting. A namespace hot-added this way also joins
+the subsystem's path-list and ANA tracking alongside the ones opened at
+startup (`track_cluster_backend`), with one gap: a subsystem that had zero
+cluster namespaces at startup has nowhere to attach ANA tracking to when its
+first one arrives later (the notifier closure needs the queue-thread pool,
+which by then no longer has a construction site to hand it one from), so that
+namespace's ANA state stays at its optimized placeholder until the target
+restarts — logged, not silent. Each namespace takes its VDI's bitmap position (its vid) as its NSID
 so the map is a pure function of the cluster — sparse, large NSIDs in
 exchange for a numbering no other VDI's creation can disturb — and reports
 the VDI's inode `uuid[16]`, the cluster's own identity for the volume, as
