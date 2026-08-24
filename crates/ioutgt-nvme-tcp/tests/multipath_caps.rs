@@ -8,7 +8,7 @@
 mod common;
 
 use common::{Client, NQN};
-use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, cmic, nmic};
+use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, cmic, nsfeat, nmic};
 use ioutgt_nvme::spec;
 use zerocopy::FromBytes;
 
@@ -47,5 +47,10 @@ fn advertises_multipath_caps() {
         ns.nmic & nmic::SHARED,
         nmic::SHARED,
         "NMIC must mark the namespace shared across controllers"
+    );
+    assert_eq!(
+        ns.nsfeat & nsfeat::THINP,
+        nsfeat::THINP,
+        "NSFEAT must mark the namespace as thin-provisioned across controllers"
     );
 }
