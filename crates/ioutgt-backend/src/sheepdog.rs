@@ -200,6 +200,7 @@ const SD_VDI_FLAG_ACL: u32 = 0x0000_0001;
 const SD_FLAG_CMD_WRITE: u16 = 0x01;
 const SD_FLAG_CMD_COW: u16 = 0x02;
 const SD_FLAG_CMD_DIRECT: u16 = 0x08;
+const SD_FLAG_CMD_TGT: u16 = 0x20;
 
 const SD_RES_SUCCESS: u32 = 0x00;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
@@ -870,7 +871,7 @@ impl SheepdogBackend {
                 return self
                     .obj_request(
                         SD_OP_WRITE_OBJ,
-                        SD_FLAG_CMD_WRITE | SD_FLAG_CMD_DIRECT,
+                        SD_FLAG_CMD_WRITE | SD_FLAG_CMD_DIRECT | SD_FLAG_CMD_TGT,
                         vid_to_data_oid(self.vid, idx),
                         0,
                         in_obj,
@@ -944,7 +945,7 @@ impl SheepdogBackend {
         let inode_off = SD_INODE_HEADER_SIZE + idx * 4;
         self.obj_request(
             SD_OP_WRITE_OBJ,
-            SD_FLAG_CMD_WRITE | SD_FLAG_CMD_DIRECT,
+            SD_FLAG_CMD_WRITE | SD_FLAG_CMD_DIRECT | SD_FLAG_CMD_TGT,
             vid_to_vdi_oid(self.vid),
             0,
             inode_off,
