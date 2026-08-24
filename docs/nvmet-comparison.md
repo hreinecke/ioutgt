@@ -196,10 +196,14 @@ actually changes (`docs/architecture.md` §7). **ANA** is reported
 (CMIC bit 3, ANA log page 0Ch, ANAGRPID, ANA Change AER) for
 cluster-backed subsystems only, and where nvmet lets configfs assign a
 namespace to any of `NVMET_MAX_ANAGRPS` groups whose states an admin
-sets by hand, ioutgt has two fixed groups — optimized and
-non-optimized — and derives the membership itself from Sheepdog object
-locality (`docs/architecture.md` §7). A subsystem with no cluster storage leaves CMIC bit 3
-clear and the host runs plain (non-ANA) multipath, all paths equal.
+sets by hand, ioutgt derives both the group and its state from Sheepdog's
+own hash ring: `ANAGRPID` is the zone of the node that owns a volume's
+inode object — the same value from every target, unlike an earlier
+locality-flag design that gave each path its own opinion of a namespace's
+group — and a group's state is optimized exactly when this target's own
+gateway is in that zone (`docs/architecture.md` §7). A subsystem with no
+cluster storage leaves CMIC bit 3 clear and the host runs plain (non-ANA)
+multipath, all paths equal.
 
 ## 5. IO backends
 

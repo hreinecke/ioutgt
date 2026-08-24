@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::backend::Backend;
@@ -25,53 +25,19 @@ pub enum TransportType {
     Rdma,
 }
 
-/// Asymmetric Namespace Access state of a namespace, as reported in the ANA
-/// log page (NVMe base spec, Asymmetric Namespace Access Log).
-///
-/// Only the two states a working path can be in are modelled: a namespace we
-/// cannot serve at all is removed from the table rather than parked in
-/// `Inaccessible`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnaState {
-    /// `01h` — this path is a preferred path to the namespace. For a Sheepdog
-    /// namespace: the gateway we talk to stores the VDI object itself.
-    Optimized,
-    /// `02h` — usable, but not preferred; the host uses it only when no
-    /// optimized path is available. For Sheepdog: reaching the object costs
-    /// this gateway another network hop.
-    NonOptimized,
-}
+/// The wire value of an ANA group descriptor's `01h` (Optimized) state.
+pub const ANA_STATE_OPTIMIZED: u8 = 0x01;
+/// The wire value of an ANA group descriptor's `02h` (Non-Optimized) state.
+pub const ANA_STATE_NON_OPTIMIZED: u8 = 0x02;
 
-/// ANA group holding the [`AnaState::Optimized`] namespaces.
-pub const ANA_GRPID_OPTIMIZED: u32 = 1;
-/// ANA group holding the [`AnaState::NonOptimized`] namespaces.
-pub const ANA_GRPID_NONOPTIMIZED: u32 = 2;
-/// Every ANA group an ioutgt subsystem has, in ascending group-id order.
-///
-/// Groups are fixed and state-defined rather than allocated per namespace
-/// (nvmet's model): a namespace's state *is* its group, so a locality flip is
-/// a move between the two. Both descriptors are always reported, so
-/// `ANAGRPMAX` = `NANAGRPID` = this length and the host's log-page allocation
-/// never has to grow.
-pub const ANA_GROUPS: [AnaState; 2] = [AnaState::Optimized, AnaState::NonOptimized];
-
-impl AnaState {
-    /// The wire value in an ANA group descriptor's state field.
-    pub fn code(self) -> u8 {
-        match self {
-            AnaState::Optimized => 0x01,
-            AnaState::NonOptimized => 0x02,
-        }
-    }
-
-    /// The ANA group id namespaces in this state belong to.
-    pub fn grpid(self) -> u32 {
-        match self {
-            AnaState::Optimized => ANA_GRPID_OPTIMIZED,
-            AnaState::NonOptimized => ANA_GRPID_NONOPTIMIZED,
-        }
-    }
-}
+/// Placeholder ANA group id a namespace starts in, before the control plane
+/// has ever computed its real one (a Sheepdog zone id — see
+/// `ioutgt-backend::cluster_ana_state`). Any nonzero value works: it is only
+/// ever visible in the brief window between a subsystem turning ANA on and
+/// its first (synchronous, pre-serving) placement refresh completing, or if
+/// that refresh cannot reach the cluster at startup — the same best-effort
+/// class of gap the path and host-ACL refreshes have.
+const ANA_GRPID_PLACEHOLDER: u32 = 1;
 
 /// One namespace: an NSID bound to a backend.
 #[allow(missing_docs)]
@@ -80,37 +46,57 @@ pub struct Namespace<B> {
     pub backend: Arc<B>,
     /// Namespace UUID (Identify CNS 0x03 descriptor).
     pub uuid: [u8; 16],
-    /// ANA group id, i.e. the namespace's ANA state. Written by the control
-    /// plane as path locality changes, read by Identify Namespace and the ANA
-    /// log page — never on the IO path.
+    /// ANA group id (Identify Namespace `ANAGRPID`): which zone of the
+    /// cluster owns this namespace's placement. Fixed by the cluster's
+    /// topology and the object id — the same value however many targets ask,
+    /// and through whichever gateway (`ioutgt-backend::cluster_ana_state`) —
+    /// so unlike `ana_optimized` it does not depend on which path this is.
+    /// Written by the control plane as the ring reshapes under a topology
+    /// change, read by Identify Namespace and the ANA log page — never on
+    /// the IO path.
     ana_grpid: AtomicU32,
+    /// Whether *this* path is a preferred one to the namespace's group: the
+    /// gateway this target's cluster connection reaches is itself in
+    /// `ana_grpid`'s zone, so reaching the object here costs no extra hop.
+    /// Per path by nature — two targets fronting the same cluster through
+    /// different gateways can and normally do disagree on this while still
+    /// agreeing on `ana_grpid`.
+    ana_optimized: AtomicBool,
 }
 
 impl<B> Namespace<B> {
-    /// Bind `nsid` to `backend`. The namespace starts
-    /// [`AnaState::Optimized`]: until something knows better, this path is as
-    /// good as any (and for a subsystem that never reports ANA, the group is
-    /// simply never looked at).
+    /// Bind `nsid` to `backend`. Starts in the placeholder group, optimized:
+    /// until something knows better, this path is as good as any (and for a
+    /// subsystem that never reports ANA, neither field is ever looked at).
     pub fn new(nsid: u32, backend: Arc<B>, uuid: [u8; 16]) -> Self {
         Namespace {
             nsid,
             backend,
             uuid,
-            ana_grpid: AtomicU32::new(ANA_GRPID_OPTIMIZED),
+            ana_grpid: AtomicU32::new(ANA_GRPID_PLACEHOLDER),
+            ana_optimized: AtomicBool::new(true),
         }
     }
 
-    /// Current ANA state.
-    pub fn ana_state(&self) -> AnaState {
-        match self.ana_grpid.load(Ordering::Relaxed) {
-            ANA_GRPID_NONOPTIMIZED => AnaState::NonOptimized,
-            _ => AnaState::Optimized,
+    /// Whether this path is a preferred one to the namespace (see
+    /// `ana_optimized`'s field doc).
+    pub fn ana_optimized(&self) -> bool {
+        self.ana_optimized.load(Ordering::Relaxed)
+    }
+
+    /// The wire value of [`Namespace::ana_optimized`] in an ANA group
+    /// descriptor's state field.
+    pub fn ana_state_code(&self) -> u8 {
+        if self.ana_optimized() {
+            ANA_STATE_OPTIMIZED
+        } else {
+            ANA_STATE_NON_OPTIMIZED
         }
     }
 
     /// Current ANA group id (Identify Namespace `ANAGRPID`).
     pub fn ana_grpid(&self) -> u32 {
-        self.ana_state().grpid()
+        self.ana_grpid.load(Ordering::Relaxed)
     }
 }
 
@@ -254,6 +240,12 @@ pub struct Subsystem<B> {
     mnan: Option<u32>,
     ana: bool,
     ana_chgcnt: AtomicU64,
+    /// Every ANA group id this subsystem might report, ascending and
+    /// deduplicated (`NANAGRPID`/`ANAGRPMAX`) — a cluster's zones, which
+    /// unlike the fixed 2-group design this replaced can be any count and any
+    /// value, so unlike `ports` or `hosts` it can only ever grow (see
+    /// [`Subsystem::merge_ana_zones`]).
+    ana_zones: RwLock<Arc<Vec<u32>>>,
     namespaces: RwLock<NsMap<B>>,
     generation: AtomicU64,
     ports: RwLock<PortList>,
@@ -277,6 +269,7 @@ impl<B: Backend> Subsystem<B> {
             mnan: None,
             ana: false,
             ana_chgcnt: AtomicU64::new(1),
+            ana_zones: RwLock::new(Arc::new(Vec::new())),
             namespaces: RwLock::new(Arc::new(namespaces)),
             generation: AtomicU64::new(1),
             ports: RwLock::new(Arc::new(Vec::new())),
@@ -303,14 +296,23 @@ impl<B: Backend> Subsystem<B> {
     /// page, and the ANA Change async event.
     ///
     /// Enable it where the paths to a namespace are genuinely unequal and we
-    /// can tell which is which — Sheepdog, where a target whose gateway stores
-    /// the VDI object locally is a better path than one that has to hop. A
-    /// subsystem with no such knowledge leaves it off: advertising ANA with
+    /// can tell which is which — Sheepdog, where a namespace's ANA group is
+    /// the zone of the cluster that owns its placement, and this path is
+    /// optimized for it exactly when the gateway we talk to is in that zone.
+    /// A subsystem with no such knowledge leaves it off: advertising ANA with
     /// every namespace optimized tells the host nothing and only adds a log
     /// page to poll.
+    ///
+    /// Seeds [`Subsystem::ana_zones`] with the same placeholder group every
+    /// new [`Namespace`] starts in, so `NANAGRPID`/`ANAGRPMAX` are never zero
+    /// even in the brief window before the first placement refresh lands (see
+    /// `ANA_GRPID_PLACEHOLDER`'s doc).
     #[must_use]
     pub fn with_ana(mut self, ana: bool) -> Self {
         self.ana = ana;
+        if ana {
+            self.ana_zones = RwLock::new(Arc::new(vec![ANA_GRPID_PLACEHOLDER]));
+        }
         self
     }
 
@@ -319,19 +321,55 @@ impl<B: Backend> Subsystem<B> {
         self.ana
     }
 
-    /// ANA change count: bumped whenever a namespace changes ANA group, and
-    /// reported in the log page header and every group descriptor so a host
-    /// can tell a re-read raced a change.
+    /// ANA change count: bumped whenever a namespace's group or state
+    /// changes, or the group set itself grows, and reported in the log page
+    /// header and every group descriptor so a host can tell a re-read raced a
+    /// change.
     pub fn ana_chgcnt(&self) -> u64 {
         self.ana_chgcnt.load(Ordering::Acquire)
     }
 
-    /// Move `ns` into the ANA group for `state`, bumping the change count if
-    /// this is a change. Returns whether the state changed — the caller uses
+    /// Every ANA group id this subsystem might report
+    /// ([`Subsystem::merge_ana_zones`]), ascending and deduplicated.
+    pub fn ana_zones(&self) -> Arc<Vec<u32>> {
+        Arc::clone(&self.ana_zones.read().expect("ana zones poisoned"))
+    }
+
+    /// Union `zones` into the group set every ANA log page descriptor is
+    /// built from. Returns whether this grew the set — the caller turns that
+    /// into an ANA Change notice, since a host that already read the log
+    /// needs to know a group it never saw now exists.
+    ///
+    /// Union rather than replace: a subsystem's cluster namespaces can span
+    /// more than one Sheepdog cluster, each refreshed independently and each
+    /// knowing only its own zones, so no single refresh may drop what another
+    /// one contributed. This means the set does not shrink when a cluster's
+    /// own zone count does — a rarer event than growth (nodes joining a
+    /// cluster is routine; zones disappearing implies nodes leaving for
+    /// good), and one a host copes with the same way it copes with any group
+    /// a subsystem's current namespaces simply do not use: an empty
+    /// descriptor.
+    pub fn merge_ana_zones(&self, zones: &[u32]) -> bool {
+        let mut guard = self.ana_zones.write().expect("ana zones poisoned");
+        if zones.iter().all(|z| guard.contains(z)) {
+            return false;
+        }
+        let mut merged = (**guard).clone();
+        merged.extend(zones);
+        merged.sort_unstable();
+        merged.dedup();
+        *guard = Arc::new(merged);
+        self.ana_chgcnt.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// Set `ns`'s ANA group and per-path state, bumping the change count if
+    /// either changed. Returns whether anything changed — the caller uses
     /// that to decide whether hosts need an ANA Change notice.
-    pub fn set_ana_state(&self, ns: &Namespace<B>, state: AnaState) -> bool {
-        let prev = ns.ana_grpid.swap(state.grpid(), Ordering::Relaxed);
-        let changed = prev != state.grpid();
+    pub fn set_ana_state(&self, ns: &Namespace<B>, grpid: u32, optimized: bool) -> bool {
+        let prev_grpid = ns.ana_grpid.swap(grpid, Ordering::Relaxed);
+        let prev_optimized = ns.ana_optimized.swap(optimized, Ordering::Relaxed);
+        let changed = prev_grpid != grpid || prev_optimized != optimized;
         if changed {
             self.ana_chgcnt.fetch_add(1, Ordering::Release);
         }

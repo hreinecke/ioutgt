@@ -28,7 +28,7 @@ use ioutgt_core::permit::ConnPermit;
 use ioutgt_core::queue::{QueueStats, QueueStatsSnapshot};
 use ioutgt_core::registry::Registry;
 pub use ioutgt_core::subsystem::TransportType;
-use ioutgt_core::subsystem::{AnaState, HostAcl, Namespace, PortConfig, Subsystem, SubsystemPort};
+use ioutgt_core::subsystem::{HostAcl, Namespace, PortConfig, Subsystem, SubsystemPort};
 use ioutgt_cpus::{CpuTopology, spread_cpus};
 use ioutgt_uring::mailbox::{Mailbox, MailboxSender, mailbox};
 use ioutgt_uring::{QueueRuntime, RingConfig};
@@ -1522,34 +1522,35 @@ where
     start_cluster_refresh();
 }
 
-/// Re-derive the ANA state of a subsystem's cluster namespaces: a volume whose
-/// inode object the gateway we talk to stores itself is reached without a hop,
-/// so this target is an optimized path to it; any other volume is reachable
-/// here, just not preferentially.
+/// Re-derive the ANA placement of a subsystem's cluster namespaces: each
+/// volume's group is the zone of the cluster that owns its inode object's
+/// placement on the hash ring — the same value however many targets ask, and
+/// through whichever gateway — and this target's path to that group is
+/// optimized exactly when the gateway it talks to is itself in that zone.
 ///
 /// Best-effort, like the path refresh: a cluster that will not answer leaves
 /// every namespace in the state it was last known to be in rather than
-/// flapping the hosts' path choice on a transient failure.
+/// flapping the hosts' path choice on a transient failure. A namespace whose
+/// group the ring could not resolve (`ClusterAnaState::grpids`, an empty-ring
+/// cluster) is skipped the same way — there is nothing sound to report for it
+/// this round, not a reason to distrust the rest.
 fn refresh_cluster_ana(ana: &ClusterAna) {
     let spec = &ana.spec;
     let vids: Vec<u32> = spec.namespaces.iter().map(|&(_, vid)| vid).collect();
-    let local = match ioutgt_backend::vdi_objects_local(spec.cluster, &vids) {
-        Ok(local) => local,
+    let state = match ioutgt_backend::cluster_ana_state(spec.cluster, &vids) {
+        Ok(state) => state,
         Err(err) => {
-            cluster_unreachable(&spec.subsystem.nqn, spec.cluster, &err, "object locality");
+            cluster_unreachable(&spec.subsystem.nqn, spec.cluster, &err, "ANA placement");
             return;
         }
     };
-    let mut changed = false;
-    for ((ns, vid), local) in spec.namespaces.iter().zip(local) {
-        let state = if local {
-            AnaState::Optimized
-        } else {
-            AnaState::NonOptimized
-        };
-        if spec.subsystem.set_ana_state(ns, state) {
+    let mut changed = spec.subsystem.merge_ana_zones(&state.zones);
+    for ((ns, vid), grpid) in spec.namespaces.iter().zip(state.grpids) {
+        let Some(grpid) = grpid else { continue };
+        let optimized = state.own_zone == Some(grpid);
+        if spec.subsystem.set_ana_state(ns, grpid, optimized) {
             info!(subsystem = %spec.subsystem.nqn, nsid = ns.nsid,
-                  vid = format_args!("{vid:x}"), ?state, "ANA state changed");
+                  vid = format_args!("{vid:x}"), grpid, optimized, "ANA state changed");
             changed = true;
         }
     }

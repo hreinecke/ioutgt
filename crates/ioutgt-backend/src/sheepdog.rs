@@ -84,7 +84,7 @@
 //! Everything else the backend says to the cluster — the lookups and inode
 //! read at [`SheepdogBackend::open`], the VDI registration and its release,
 //! the enumerations ([`list_vdis`], [`list_acls`], [`vdi_holders`],
-//! [`vdi_objects_local`]) — goes over the ring too, on a connection of its own
+//! [`cluster_ana_state`]) — goes over the ring too, on a connection of its own
 //! ([`ctl`]). Those callers are synchronous, may hold no scheduler at all (the
 //! ACL refresh thread) or sit inside someone else's runtime (the control
 //! server), so a control connection carries its own
@@ -181,12 +181,11 @@ const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
 const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
 const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
-/// `SD_OP_EXIST` — "do *you* store this object?", answered by the gateway we
-/// are connected to out of its own store and never forwarded (`SD_OP_TYPE_LOCAL`
-/// with `.force`, so it is answered even while the cluster is not in a
-/// serviceable state). `dog vdi object` asks every node this to print an
-/// object's locations; we ask only ours, to learn whether we are a local path.
-const SD_OP_EXIST: u8 = 0xBD;
+/// `SD_OP_GET_NODE_LIST` — the node/zone topology this connection's `sheep`
+/// currently sees (`SD_OP_TYPE_LOCAL` with `.force`, so it is answered even
+/// while the cluster is not in a serviceable state). The ANA placement ring
+/// ([`HashRing`]) is built from it.
+const SD_OP_GET_NODE_LIST: u8 = 0x82;
 
 /// `LOCK_TYPE_NORMAL` — the ACL id of a VDI belonging to no ACL, and the
 /// exclusive (single-holder) VDI lock such an open takes. Any non-zero ACL id
@@ -203,7 +202,6 @@ const SD_FLAG_CMD_COW: u16 = 0x02;
 const SD_FLAG_CMD_DIRECT: u16 = 0x08;
 
 const SD_RES_SUCCESS: u32 = 0x00;
-const SD_RES_NO_OBJ: u32 = 0x02;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_NO_VDI: u32 = 0x08;
 const SD_RES_NO_TAG: u32 = 0x0E;
@@ -269,6 +267,24 @@ const SD_ACL_MAX_MEMBERS: usize = SD_INODE_METADATA_SIZE / SD_MAX_VDI_LEN;
 const SD_NODE_ID_SIZE: usize = 40;
 const NID_OFF_ADDR: usize = 0;
 const NID_OFF_PORT: usize = 16;
+
+// `struct sd_node` (include/internal_proto.h), the GET_NODE_LIST payload: a
+// 24-byte `rb_node` (in-memory tree linkage — `sheep` serializes its live
+// struct verbatim, so the bytes are there, but they mean nothing off this
+// process and are never read), then a `node_id`, then `nr_vnodes` (u16),
+// 2 bytes of alignment padding, `zone` (u32), and `space` (u64, unread here).
+// `SD_NODE_SIZE` (80) is the non-diskvnodes build's record size, the one
+// `docker/start_cluster.sh`'s cluster and every other assumption in this
+// module (`SD_MAX_COPIES`, `SD_NODE_ID_SIZE`'s no-`io_transport_type` layout)
+// already commit to.
+const SD_NODE_SIZE: usize = 80;
+const NODE_OFF_NID: usize = 24;
+const NODE_OFF_NR_VNODES: usize = 64;
+const NODE_OFF_ZONE: usize = 68;
+/// `SD_MAX_NODES` (non-diskvnodes build): a ceiling generous enough that one
+/// `GET_NODE_LIST` read never has to retry at a larger size, the same choice
+/// `dog`'s own node-list read makes.
+const SD_MAX_NODES: usize = 6144;
 
 // `struct vdi_state` (include/internal_proto.h), the GET_VDI_COPIES payload:
 // one fixed-size record per VDI the cluster knows.
@@ -412,17 +428,6 @@ fn encode_sheep_req(hdr: &mut [u8; SD_HDR_SIZE], opcode: u8, data_length: u32) {
     hdr[0] = SD_SHEEP_PROTO_VER;
     hdr[1] = opcode;
     hdr[12..16].copy_from_slice(&data_length.to_le_bytes());
-}
-
-/// Encode a 48-byte sheep-internal *object* request header: the sheep-internal
-/// version byte over an `obj` body, which is the shape the local object ops
-/// take ([`SD_OP_EXIST`]). The epoch stays zero — `sheep` stamps its own on a
-/// local op before running it.
-fn encode_sheep_obj_req(hdr: &mut [u8; SD_HDR_SIZE], opcode: u8, oid: u64) {
-    hdr.fill(0);
-    hdr[0] = SD_SHEEP_PROTO_VER;
-    hdr[1] = opcode;
-    hdr[16..24].copy_from_slice(&oid.to_le_bytes());
 }
 
 /// A node id's `addr[16]`: an IPv4 address in the last four bytes with the
@@ -1421,48 +1426,228 @@ fn parse_holders(vs: &[u8]) -> Vec<VdiHolder> {
         .collect()
 }
 
-/// Whether the `sheep` we are connected to stores each vid's *inode* object
-/// itself, rather than having to fetch it from another node. One answer per
-/// requested vid, in the order asked.
-///
-/// This is the locality that decides a namespace's ANA state: sheepdog places
-/// every object on `nr_copies` nodes by consistent hash, and a gateway that is
-/// one of them serves reads and writes of it out of its own store, while any
-/// other gateway adds a network hop each way. The inode object stands in for
-/// the volume as a whole — data objects hash independently, so no single node
-/// is local to all of them, but a node local to the inode is on the volume's
-/// hash neighbourhood and is the better path on average, which is exactly the
-/// preference ANA expresses.
-///
-/// `SD_OP_EXIST` is a local op: the gateway answers out of its own object
-/// store and never forwards, so the reply describes *this* node — which is
-/// what makes the question answerable at all. `SD_RES_NO_OBJ` (not local, or
-/// this node holds no objects because it is a gateway-only node) is a normal
-/// answer, not an error.
-///
-/// Blocking; called from the control plane only (startup and the periodic
-/// path refresh).
-pub fn vdi_objects_local(cluster: SocketAddr, vids: &[u32]) -> io::Result<Vec<bool>> {
-    if vids.is_empty() {
-        return Ok(Vec::new());
+// ---------------------------------------------------------------------------
+// The hash ring (include/sheep.h, include/sheepdog_proto.h): FNV-1a, applied
+// twice, is sheepdog's placement function end to end — from a node's address
+// to its virtual nodes' hash slots, and from an object id to the slot it
+// lands on. Reproduced byte for byte (checked against the C implementation
+// in `sd_hash_matches_the_reference_implementation`), because a node's
+// answer to "which zone owns this object" must be the one every other node
+// in the cluster — and every other *target* asking the same question through
+// a different gateway — computes too. That is the fix this whole module
+// exists for: the old design asked "do I store this locally", which only
+// this connection could answer and so gave every path its own opinion of a
+// namespace's ANA group; this asks "whose ring position does this object
+// hash to", which is a fact about the cluster, not about the gateway asked.
+const FNV1A_64_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_64a_buf(buf: &[u8], mut hval: u64) -> u64 {
+    for &b in buf {
+        hval ^= u64::from(b);
+        hval = hval.wrapping_mul(FNV_64_PRIME);
     }
-    let conn = Conn::connect(cluster)?;
-    vids.iter()
-        .map(|&vid| oid_is_local(&conn, vid_to_vdi_oid(vid)))
-        .collect()
+    hval
 }
 
-/// One `EXIST` round trip.
-fn oid_is_local(conn: &Conn, oid: u64) -> io::Result<bool> {
-    let mut hdr = [0u8; SD_HDR_SIZE];
-    encode_sheep_obj_req(&mut hdr, SD_OP_EXIST, oid);
-    match conn.request_discard(&hdr, &[])?.result() {
-        SD_RES_SUCCESS => Ok(true),
-        SD_RES_NO_OBJ => Ok(false),
-        res => Err(io::Error::other(format!(
-            "EXIST({oid:#x}) failed: SD_RES {res:#x}"
-        ))),
+/// `fnv_64a_64`: the specialized 8-byte form — equivalent to
+/// `fnv_64a_buf(&oid.to_le_bytes(), hval)`, which is how it is reproduced
+/// here (the C source shifts `oid` a byte at a time from the low end, which
+/// is exactly a little-endian byte walk).
+fn fnv_64a_64(oid: u64, hval: u64) -> u64 {
+    fnv_64a_buf(&oid.to_le_bytes(), hval)
+}
+
+/// `sd_hash`: the buffer hash that seeds a node's vnode chain.
+fn sd_hash(buf: &[u8]) -> u64 {
+    let hval = fnv_64a_buf(buf, FNV1A_64_INIT);
+    fnv_64a_64(hval, hval)
+}
+
+/// `sd_hash_next`: one more vnode along a node's chain.
+fn sd_hash_next(hval: u64) -> u64 {
+    fnv_64a_64(hval, hval)
+}
+
+/// `sd_hash_oid`: where an object id lands on the ring.
+fn sd_hash_oid(oid: u64) -> u64 {
+    let hval = fnv_64a_64(oid, FNV1A_64_INIT);
+    fnv_64a_64(hval, hval)
+}
+
+/// One node's placement identity: enough to walk its vnode chain
+/// (`node_to_vnodes`) and to answer "is this the node we are connected to".
+struct SheepNode {
+    addr: SocketAddr,
+    /// `0` for a pure gateway: it stores nothing and so contributes no
+    /// vnodes — [`get_zones_nr_from`] and `sheep`'s own zone count agree on
+    /// excluding it.
+    nr_vnodes: u16,
+    zone: u32,
+}
+
+impl SheepNode {
+    /// The 18 bytes `node_to_vnodes` hashes to seed a node's chain:
+    /// `addr[16]` plus `port`, i.e. `node_id` up to (not including)
+    /// `io_addr` (`offsetof(struct node_id, io_addr)`).
+    fn hash_seed(&self) -> [u8; 18] {
+        let mut seed = [0u8; 18];
+        seed[..16].copy_from_slice(&encode_node_addr(self.addr.ip()));
+        seed[16..18].copy_from_slice(&self.addr.port().to_le_bytes());
+        seed
     }
+}
+
+/// One virtual node on the ring: its hash slot, and the zone of the real node
+/// behind it — all placement ever needs once the ring is built.
+struct VNode {
+    hash: u64,
+    zone: u32,
+}
+
+/// A cluster's placement ring, snapshotted from one `GET_NODE_LIST` reply.
+struct HashRing {
+    /// Ascending by hash: [`HashRing::zone_of`] is a binary search over this,
+    /// the same structure `oid_to_first_vnode`'s red-black tree walk gives an
+    /// ordered rb-tree lookup over.
+    vnodes: Vec<VNode>,
+}
+
+impl HashRing {
+    /// Build the ring exactly as `nodes_to_vnodes` does: every node's chain,
+    /// concatenated, in whatever order — the ring is sorted by hash right
+    /// after, and hash collisions are as vanishingly unlikely here as they
+    /// are in the C implementation, which does not guard against them either.
+    fn build(nodes: &[SheepNode]) -> HashRing {
+        let mut vnodes = Vec::new();
+        for node in nodes {
+            let mut hval = sd_hash(&node.hash_seed());
+            for _ in 0..node.nr_vnodes {
+                hval = sd_hash_next(hval);
+                vnodes.push(VNode {
+                    hash: hval,
+                    zone: node.zone,
+                });
+            }
+        }
+        vnodes.sort_unstable_by_key(|v| v.hash);
+        HashRing { vnodes }
+    }
+
+    /// The zone owning `oid`: `oid_to_first_vnode`'s rule ("if `v1.hash <
+    /// oid.hash <= v2.hash`, then `oid` is resident on `v2`") is "the first
+    /// vnode whose hash is at least `oid`'s", wrapping past the end of the
+    /// ring to its smallest hash. `None` only for a ring with no vnodes at
+    /// all — every node in the cluster a pure gateway, or no nodes at all.
+    fn zone_of(&self, oid: u64) -> Option<u32> {
+        let target = sd_hash_oid(oid);
+        let idx = self.vnodes.partition_point(|v| v.hash < target);
+        self.vnodes
+            .get(idx)
+            .or_else(|| self.vnodes.first())
+            .map(|v| v.zone)
+    }
+}
+
+/// Fetch the cluster's current node/zone topology (`GET_NODE_LIST`): every
+/// node this connection's `sheep` currently has in its own membership view.
+fn get_node_list(conn: &Conn) -> io::Result<Vec<SheepNode>> {
+    let mut buf = vec![0u8; SD_MAX_NODES * SD_NODE_SIZE];
+    let mut hdr = [0u8; SD_HDR_SIZE];
+    encode_sheep_req(&mut hdr, SD_OP_GET_NODE_LIST, buf.len() as u32);
+    let resp = conn.request(&hdr, &[], &mut buf)?;
+    if resp.result() != SD_RES_SUCCESS {
+        return Err(io::Error::other(format!(
+            "GET_NODE_LIST failed: SD_RES {:#x}",
+            resp.result()
+        )));
+    }
+    let len = resp.len;
+    if len % SD_NODE_SIZE != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("GET_NODE_LIST returned {len} bytes, not whole sd_node records"),
+        ));
+    }
+    Ok(buf[..len]
+        .chunks_exact(SD_NODE_SIZE)
+        .map(|rec| {
+            let nid = NODE_OFF_NID;
+            let addr: [u8; 16] = rec[nid + NID_OFF_ADDR..nid + NID_OFF_ADDR + 16]
+                .try_into()
+                .expect("16 bytes");
+            let port = u16::from_le_bytes(
+                rec[nid + NID_OFF_PORT..nid + NID_OFF_PORT + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            );
+            SheepNode {
+                addr: SocketAddr::new(decode_node_addr(&addr), port),
+                nr_vnodes: u16::from_le_bytes(
+                    rec[NODE_OFF_NR_VNODES..NODE_OFF_NR_VNODES + 2]
+                        .try_into()
+                        .expect("2 bytes"),
+                ),
+                zone: read_u32(rec, NODE_OFF_ZONE),
+            }
+        })
+        .collect())
+}
+
+/// The Sheepdog ANA placement facts one cluster's subsystem namespaces need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAnaState {
+    /// The zone of the node this connection reaches, if the node list names
+    /// it. Only `None` for a cluster that has stopped listing us mid-refresh
+    /// — no live connection fails this lookup.
+    pub own_zone: Option<u32>,
+    /// Every zone with any object placement (`nr_vnodes > 0`), ascending and
+    /// deduplicated: the cluster's whole set of possible ANA groups, and so
+    /// `NANAGRPID`/`ANAGRPMAX` for a subsystem reporting it.
+    pub zones: Vec<u32>,
+    /// Per requested vid, the zone owning its inode object — its ANA group.
+    /// `None` only when the ring has no vnodes at all (see
+    /// [`HashRing::zone_of`]).
+    pub grpids: Vec<Option<u32>>,
+}
+
+/// The ANA placement facts a subsystem's cluster namespaces need: which zone
+/// owns each volume's inode object (its ANA group — identical however many
+/// targets ask, and through whichever gateway, since it depends only on the
+/// cluster's topology and the object id), the full set of zones that exist
+/// (every ANA group the subsystem might ever report), and whether the
+/// gateway this connection reaches is itself in one of them (the "optimized"
+/// test: reaching a zone's objects through a node already in that zone costs
+/// no extra hop, reaching them through any other node does).
+///
+/// The inode object stands in for the volume as a whole: data objects hash
+/// independently, so no single zone is home to all of them, but the inode's
+/// zone is on the volume's hash neighbourhood and is the better path on
+/// average, which is exactly the preference ANA expresses.
+///
+/// Blocking; called from the control plane only (startup and the periodic
+/// ANA refresh).
+pub fn cluster_ana_state(cluster: SocketAddr, vids: &[u32]) -> io::Result<ClusterAnaState> {
+    let conn = Conn::connect(cluster)?;
+    let nodes = get_node_list(&conn)?;
+    let own_zone = nodes.iter().find(|n| n.addr == cluster).map(|n| n.zone);
+    let mut zones: Vec<u32> = nodes
+        .iter()
+        .filter(|n| n.nr_vnodes > 0)
+        .map(|n| n.zone)
+        .collect();
+    zones.sort_unstable();
+    zones.dedup();
+    let ring = HashRing::build(&nodes);
+    let grpids = vids
+        .iter()
+        .map(|&vid| ring.zone_of(vid_to_vdi_oid(vid)))
+        .collect();
+    Ok(ClusterAnaState {
+        own_zone,
+        zones,
+        grpids,
+    })
 }
 
 /// Take the cluster lock on the VDI named `vdi` within ACL `acl`, registering
@@ -2087,5 +2272,119 @@ mod tests {
         assert_eq!(SD_INODE_META_SIZE, INO_OFF_VDI_FLAGS + 4);
         // offsetof(sd_inode, data_vdi_id): 572 (btree_counter) + 4092 (__unused).
         assert_eq!(SD_INODE_HEADER_SIZE, 572 + 4 * 1023);
+    }
+
+    /// Reference vectors generated straight from sheepdog's own headers
+    /// (`include/sheepdog_proto.h`), compiled and run against this exact
+    /// input rather than transcribed by hand — the whole point of this
+    /// module's placement answer is that it must be the one the real
+    /// cluster's nodes compute too.
+    #[test]
+    fn sd_hash_matches_the_reference_implementation() {
+        assert_eq!(sd_hash_oid(0x8000_0000_4711_0000), 0xc35f_a8a2_c3f3_4221);
+
+        // node_to_vnodes's seed and its first five vnode hashes, for a node
+        // at 127.0.0.1:7000.
+        let node = SheepNode {
+            addr: "127.0.0.1:7000".parse().unwrap(),
+            nr_vnodes: 5,
+            zone: 0,
+        };
+        assert_eq!(sd_hash(&node.hash_seed()), 0x9cb3_d6dd_0a4c_0f9f);
+        let want = [
+            0x3af2_cba6_e538_cdf3u64,
+            0xfd38_432f_d111_924b,
+            0x2ad2_bef8_f506_e35d,
+            0x6725_098c_6c35_f186,
+            0xff09_693c_1cd9_eed1,
+        ];
+        let mut hval = sd_hash(&node.hash_seed());
+        for w in want {
+            hval = sd_hash_next(hval);
+            assert_eq!(hval, w);
+        }
+    }
+
+    #[test]
+    fn hash_ring_places_every_object_on_a_stored_zone() {
+        // A pure gateway (nr_vnodes 0) contributes no vnodes and so can never
+        // own an object, whatever zone it claims.
+        let nodes = [
+            SheepNode {
+                addr: "10.0.0.1:7000".parse().unwrap(),
+                nr_vnodes: 64,
+                zone: 1,
+            },
+            SheepNode {
+                addr: "10.0.0.2:7000".parse().unwrap(),
+                nr_vnodes: 64,
+                zone: 2,
+            },
+            SheepNode {
+                addr: "10.0.0.3:7000".parse().unwrap(),
+                nr_vnodes: 0,
+                zone: 3,
+            },
+        ];
+        let ring = HashRing::build(&nodes);
+        for vid in 0u32..256 {
+            let zone = ring.zone_of(vid_to_vdi_oid(vid)).expect("ring is nonempty");
+            assert_ne!(zone, 3, "a gateway-only zone owns nothing");
+            assert!(zone == 1 || zone == 2);
+        }
+        // Every zone with vnodes actually wins some objects — otherwise this
+        // "vid 0..256" spread (and the ring's balance in general) would be
+        // suspicious, not just this one assertion.
+        let zones: std::collections::HashSet<u32> = (0u32..256)
+            .filter_map(|vid| ring.zone_of(vid_to_vdi_oid(vid)))
+            .collect();
+        assert_eq!(zones, std::collections::HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn hash_ring_empty_or_gateway_only_owns_nothing() {
+        assert_eq!(HashRing::build(&[]).zone_of(vid_to_vdi_oid(1)), None);
+        let gateway_only = [SheepNode {
+            addr: "10.0.0.1:7000".parse().unwrap(),
+            nr_vnodes: 0,
+            zone: 1,
+        }];
+        assert_eq!(
+            HashRing::build(&gateway_only).zone_of(vid_to_vdi_oid(1)),
+            None
+        );
+    }
+
+    /// A `GET_NODE_LIST` record, as `nodes_to_buffer` writes it: the
+    /// (unread) `rb_node`, then `node_id`, `nr_vnodes`, alignment padding,
+    /// `zone`, and (unread) `space`.
+    fn node_record(addr: SocketAddr, nr_vnodes: u16, zone: u32) -> Vec<u8> {
+        let mut rec = vec![0u8; SD_NODE_SIZE];
+        let nid = NODE_OFF_NID;
+        rec[nid + NID_OFF_ADDR..nid + NID_OFF_ADDR + 16]
+            .copy_from_slice(&encode_node_addr(addr.ip()));
+        rec[nid + NID_OFF_PORT..nid + NID_OFF_PORT + 2].copy_from_slice(&addr.port().to_le_bytes());
+        rec[NODE_OFF_NR_VNODES..NODE_OFF_NR_VNODES + 2].copy_from_slice(&nr_vnodes.to_le_bytes());
+        rec[NODE_OFF_ZONE..NODE_OFF_ZONE + 4].copy_from_slice(&zone.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn node_list_offsets_match_struct() {
+        // rb_node(24) + node_id(40) = 64, then nr_vnodes(2) + pad(2) + zone(4)
+        // + space(8) = 16, for the 80-byte non-diskvnodes record.
+        assert_eq!(NODE_OFF_NID, 24);
+        assert_eq!(NODE_OFF_NR_VNODES, NODE_OFF_NID + SD_NODE_ID_SIZE);
+        assert_eq!(NODE_OFF_ZONE, NODE_OFF_NR_VNODES + 4);
+        assert_eq!(SD_NODE_SIZE, NODE_OFF_ZONE + 4 + 8);
+
+        let addr: SocketAddr = "10.9.8.7:7000".parse().unwrap();
+        let rec = node_record(addr, 128, 0x4711);
+        let nid = NODE_OFF_NID;
+        let parsed_addr: [u8; 16] = rec[nid + NID_OFF_ADDR..nid + NID_OFF_ADDR + 16]
+            .try_into()
+            .unwrap();
+        assert_eq!(decode_node_addr(&parsed_addr), addr.ip());
+        assert_eq!(read_u32(&rec, NODE_OFF_ZONE), 0x4711);
     }
 }

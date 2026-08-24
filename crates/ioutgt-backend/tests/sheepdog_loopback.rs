@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ioutgt_backend::{
-    SheepdogBackend, VdiHolder, list_acls, list_vdis, vdi_holders, vdi_objects_local,
+    SheepdogBackend, VdiHolder, cluster_ana_state, list_acls, list_vdis, vdi_holders,
 };
 use ioutgt_core::buf::AlignedBuf;
 use ioutgt_core::{Backend, BackendError, LbaRange};
@@ -37,10 +37,9 @@ const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
 const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
 const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
-/// Sheep-internal local op: "do you store this object yourself?".
-const SD_OP_EXIST: u8 = 0xBD;
+/// Sheep-internal local op: the node/zone topology this node currently sees.
+const SD_OP_GET_NODE_LIST: u8 = 0x82;
 const SD_SHEEP_PROTO_VER: u8 = 0x0a;
-const SD_RES_NO_OBJ: u32 = 0x02;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_VDI_DENIED: u32 = 0x1E;
@@ -65,10 +64,27 @@ const INO_OFF_METADATA: usize = 600;
 const SD_NR_VDIS: u32 = 1 << 24;
 const HDR: usize = 48;
 
-/// The oid of a vid's inode object — the object whose locality decides the
-/// namespace's ANA state.
-fn vdi_oid(vid: u32) -> u64 {
-    (u64::from(vid) << 32) | VDI_BIT
+// `struct sd_node` (GET_NODE_LIST): rb_node(24, unread) + node_id(40:
+// addr[16]@24, port@40) + nr_vnodes(u16)@64 + pad(2) + zone(u32)@68 +
+// space(u64, unread) = 80 bytes.
+const SD_NODE_SIZE: usize = 80;
+const NODE_OFF_ADDR: usize = 24;
+const NODE_OFF_PORT: usize = 40;
+const NODE_OFF_NR_VNODES: usize = 64;
+const NODE_OFF_ZONE: usize = 68;
+
+/// One `GET_NODE_LIST` record: only what the ANA placement ring reads.
+fn node_record(addr: SocketAddr, nr_vnodes: u16, zone: u32) -> [u8; SD_NODE_SIZE] {
+    let mut rec = [0u8; SD_NODE_SIZE];
+    if let std::net::IpAddr::V4(v4) = addr.ip() {
+        rec[NODE_OFF_ADDR + 12..NODE_OFF_ADDR + 16].copy_from_slice(&v4.octets());
+    } else {
+        panic!("test nodes are IPv4");
+    }
+    rec[NODE_OFF_PORT..NODE_OFF_PORT + 2].copy_from_slice(&addr.port().to_le_bytes());
+    rec[NODE_OFF_NR_VNODES..NODE_OFF_NR_VNODES + 2].copy_from_slice(&nr_vnodes.to_le_bytes());
+    rec[NODE_OFF_ZONE..NODE_OFF_ZONE + 4].copy_from_slice(&zone.to_le_bytes());
+    rec
 }
 
 /// The oid of data object `idx` of a vid.
@@ -232,11 +248,11 @@ struct Store {
     /// registration named, and how many it has (`sheep` refcounts repeats of
     /// one owner into a single entry rather than listing it twice).
     participants: BTreeMap<u32, Vec<(SocketAddr, u32)>>,
-    /// The oids this node keeps in its *own* store, as opposed to the ones it
-    /// serves by routing to the node that has them. A real cluster derives
-    /// this from the hash ring; the fake just lists them. Only `SD_OP_EXIST`
-    /// looks at it — every other op is answered cluster-wide, as a gateway.
-    local: HashSet<u64>,
+    /// The cluster's node/zone topology (`GET_NODE_LIST`), as `(addr, zone,
+    /// nr_vnodes)`: only [`SD_OP_GET_NODE_LIST`] looks at it — every other op
+    /// is answered cluster-wide, as a gateway, whatever this list says. Empty
+    /// by default: only tests exercising ANA placement need it.
+    nodes: Vec<(SocketAddr, u32, u16)>,
     /// Oids whose `READ_OBJ` is answered late, off a thread of its own, so a
     /// pipelining client gets its responses out of order — which a real
     /// `sheep` does routinely (each request goes to a worker and is answered
@@ -570,16 +586,19 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 st.objects.insert(oid, obj);
                 write_resp(&out, &resp(opcode, id, 0, 0))?;
             }
-            // A local op: answered out of this node's own store rather than
-            // routed to whichever node owns the object.
-            SD_OP_EXIST => {
-                assert_eq!(hdr[0], SD_SHEEP_PROTO_VER, "EXIST is a sheep-internal op");
-                let result = if st.local.contains(&oid) {
-                    0
-                } else {
-                    SD_RES_NO_OBJ
-                };
-                write_resp(&out, &resp(opcode, id, result, 0))?;
+            // A local op: answered out of this node's own membership view
+            // rather than routed anywhere.
+            SD_OP_GET_NODE_LIST => {
+                assert_eq!(
+                    hdr[0], SD_SHEEP_PROTO_VER,
+                    "GET_NODE_LIST is a sheep-internal op"
+                );
+                let bytes: Vec<u8> = st
+                    .nodes
+                    .iter()
+                    .flat_map(|&(addr, zone, nr_vnodes)| node_record(addr, nr_vnodes, zone))
+                    .collect();
+                send_slice(&out, opcode, id, &bytes, 0, data_length)?;
             }
             other => {
                 write_resp(&out, &resp(other, id, 0x01, 0))?; // UNKNOWN
@@ -640,7 +659,7 @@ fn fresh_store(block_size_shift: u8, vdi_size: u64) -> Arc<Mutex<Store>> {
         objects: HashMap::new(),
         locks: BTreeMap::new(),
         participants: BTreeMap::new(),
-        local: HashSet::new(),
+        nodes: Vec::new(),
         slow_reads: HashSet::new(),
     }))
 }
@@ -1250,40 +1269,62 @@ fn holder_list_survives_a_cluster_larger_than_one_buffer() {
     );
 }
 
-/// Object locality — the probe behind ANA. `EXIST` is a *local* op: the
-/// `sheep` we are connected to answers out of its own store, so a volume whose
-/// inode object it keeps is reachable here without a hop, and one stored
-/// elsewhere in the cluster is not.
+/// Object placement — the fact behind ANA. `GET_NODE_LIST` names every node's
+/// zone; the ring built from it decides which zone owns each vid's inode
+/// object — a fact about the cluster's topology and the object id, the same
+/// however many targets ask and through whichever gateway.
 #[test]
-fn object_locality_reports_which_inodes_this_node_stores() {
+fn cluster_ana_state_reports_the_placement_ring() {
     const REMOTE_VID: u32 = 0x00ab_cdf0;
     let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
     {
         let mut st = store.lock().unwrap();
         st.vdis
             .insert(REMOTE_VID, Vdi::new("remotevdi", 256 * 1024, 16));
-        st.local.insert(vdi_oid(TEST_VID));
+        st.nodes = vec![
+            // The node we are actually connected to: its zone is the
+            // "optimized" one.
+            (addr, 1, 128),
+            // A peer that stores data too, in a different zone.
+            (target(9), 2, 128),
+            // A pure gateway: it claims a zone but stores nothing
+            // (`nr_vnodes` 0), so no object should ever land on it.
+            (target(10), 3, 0),
+        ];
     }
-    let addr = spawn_fake_sheep(Arc::clone(&store));
 
-    // One answer per vid, in the order asked — the caller matches them up to
-    // namespaces positionally.
-    assert_eq!(
-        vdi_objects_local(addr, &[TEST_VID, REMOTE_VID]).unwrap(),
-        vec![true, false]
-    );
-    assert_eq!(
-        vdi_objects_local(addr, &[REMOTE_VID, TEST_VID]).unwrap(),
-        vec![false, true]
-    );
+    let vids: Vec<u32> = (0..128).collect();
+    let state = cluster_ana_state(addr, &vids).unwrap();
 
-    // A vid the cluster never heard of is simply not stored here.
-    assert_eq!(vdi_objects_local(addr, &[0x00_dead]).unwrap(), vec![false]);
+    // The zone we are connected through, straight out of the node list.
+    assert_eq!(state.own_zone, Some(1));
+    // Every zone that stores data — the gateway-only zone 3 is excluded, the
+    // same filter `sheep`'s own zone count applies.
+    assert_eq!(state.zones, vec![1, 2]);
+    // Every vid landed on one of the two data-storing zones, and — spread
+    // over two equally-weighted zones, 128 of them — both zones actually won
+    // some, not just one by chance.
+    let seen: std::collections::HashSet<u32> = state.grpids.iter().flatten().copied().collect();
+    assert_eq!(seen, std::collections::HashSet::from([1, 2]));
 
-    // Nothing to ask means nothing to connect to: an address that would refuse
-    // still answers empty.
+    // TEST_VID and REMOTE_VID answer too, positionally, same as any other vid.
+    let two = cluster_ana_state(addr, &[TEST_VID, REMOTE_VID]).unwrap();
+    assert!(two.grpids.iter().all(|g| matches!(g, Some(1) | Some(2))));
+
+    // A cluster with no data-storing nodes at all resolves nothing — the
+    // vid simply has no zone to report.
+    store.lock().unwrap().nodes.clear();
+    let none = cluster_ana_state(addr, &[TEST_VID]).unwrap();
+    assert_eq!(none.own_zone, None);
+    assert!(none.zones.is_empty());
+    assert_eq!(none.grpids, vec![None]);
+
+    // Unlike the old per-vid locality probe, there is no zero-vid fast path
+    // that skips connecting: the placement ring needs the node list even to
+    // answer nothing, so an address that would refuse fails outright.
     let nowhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    assert!(vdi_objects_local(nowhere, &[]).unwrap().is_empty());
+    assert!(cluster_ana_state(nowhere, &[]).is_err());
 }
 
 /// One connection per thread, pipelined: a queue thread runs every namespace's

@@ -16,8 +16,8 @@ pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use null::NullBackend;
 pub use sheepdog::{
-    AclInfo, AclState, SD_LISTEN_PORT, SheepdogBackend, VDI_MAX_HOLDERS, VdiHolder, VdiInfo,
-    acl_state, list_acls, list_vdis, vdi_holders, vdi_objects_local,
+    AclInfo, AclState, ClusterAnaState, SD_LISTEN_PORT, SheepdogBackend, VDI_MAX_HOLDERS,
+    VdiHolder, VdiInfo, acl_state, cluster_ana_state, list_acls, list_vdis, vdi_holders,
 };
 
 use ioutgt_core::pool::Seg;

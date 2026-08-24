@@ -1,13 +1,16 @@
 //! End-to-end ANA for cluster namespaces: a subsystem holding Sheepdog
-//! volumes reports Asymmetric Namespace Access, and each namespace lands in
-//! the optimized group exactly when the `sheep` this target talks to stores
-//! that volume's inode object itself.
+//! volumes reports Asymmetric Namespace Access, each namespace's group is the
+//! zone of the cluster that owns its inode object's placement on the hash
+//! ring, and a namespace's path is optimized exactly when the gateway this
+//! target talks to is itself in that zone.
 //!
-//! The cluster is a minimal in-process fake `sheep` answering the three
-//! requests this path makes — the name lookup, the inode read, and the
-//! `EXIST` locality probe — with one volume stored locally and one not.
-//! Locking is off (`lock: false`), which is also the point: ANA does not ride
-//! on VDI registration.
+//! The cluster is a minimal in-process fake `sheep` answering the requests
+//! this path makes — the name lookup, the inode read, and `GET_NODE_LIST` —
+//! with a fixed two-zone, two-node topology so [`NEAR`]'s and [`FAR`]'s
+//! groups are deterministic, and a mutable "zone we claim to be in" for the
+//! one node under test, which is what a locality change moves. Locking is
+//! off (`lock: false`), which is also the point: ANA does not ride on VDI
+//! registration.
 
 // Test-only offset arithmetic on a 64-bit host; values are small and bounded.
 #![allow(clippy::cast_possible_truncation)]
@@ -26,12 +29,11 @@ use ioutgt_nvme::spec::{self, ana};
 use ioutgt_nvme::status;
 use zerocopy::{FromBytes, IntoBytes};
 
-// --- wire constants (include/sheepdog_proto.h) -----------------------------
+// --- wire constants (include/sheepdog_proto.h, include/internal_proto.h) --
 const HDR: usize = 48;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
-const SD_OP_EXIST: u8 = 0xBD;
-const SD_RES_NO_OBJ: u32 = 0x02;
+const SD_OP_GET_NODE_LIST: u8 = 0x82;
 const SD_RES_NO_VDI: u32 = 0x08;
 const SD_RES_VDI_DENIED: u32 = 0x1E;
 const SD_VDI_FLAG_ACL: u32 = 0x01;
@@ -40,8 +42,20 @@ const SD_INODE_HEADER_SIZE: usize = 4664;
 const SD_MAX_VDI_LEN: usize = 256;
 const VDI_BIT: u64 = 1 << 63;
 
+// `struct sd_node` (GET_NODE_LIST): rb_node(24, unread) + node_id(40:
+// addr[16]@24, port@40) + nr_vnodes(u16)@64 + pad(2) + zone(u32)@68 +
+// space(u64, unread) = 80 bytes.
+const SD_NODE_SIZE: usize = 80;
+const NODE_OFF_ADDR: usize = 24;
+const NODE_OFF_PORT: usize = 40;
+const NODE_OFF_NR_VNODES: usize = 64;
+const NODE_OFF_ZONE: usize = 68;
+
 /// The vid of the ACL object naming a subsystem, and of the two volumes in
-/// it: one whose inode object this node stores, one whose it does not.
+/// it. Their placement is fixed by [`FIXED_NODES`], not by anything a test
+/// toggles — this vid pair lands one on each of that topology's two zones,
+/// which is what makes them useful names for "the optimized one" and "the
+/// other one".
 const ACL_VID: u32 = 0x0000_4711;
 const NEAR: &str = "near";
 const NEAR_VID: u32 = 0x0000_4712;
@@ -51,15 +65,27 @@ const FAR_VID: u32 = 0x0000_4713;
 const VOL_SIZE: u64 = 16 << 20;
 const VOL_SHIFT: u8 = 22;
 
-/// The fake cluster: one ACL object, the two volumes in it, and which volume's
-/// inode object this particular gateway keeps in its own store.
+/// The two-node, two-zone topology every test in this file places [`NEAR`]
+/// and [`FAR`] on: fixed synthetic addresses (never dialed — `GET_NODE_LIST`
+/// only ever answers out of this fake `sheep`'s own store), so the ring does
+/// not depend on this process's own ephemeral listen port and the zone each
+/// vid lands on — [`NEAR`] zone 1, [`FAR`] zone 2 — is the same every run.
+const FIXED_NODES: [(([u8; 4], u16), u32, u16); 2] = [
+    (([10, 0, 0, 1], 7000), 1, 128),
+    (([10, 0, 0, 10], 7000), 2, 128),
+];
+
+/// The fake cluster: one ACL object, the two volumes in it, and the zone this
+/// node claims to be in — the only thing a test here ever changes.
 struct Sheep {
     /// The ACL object's name — the NQN of the subsystem it belongs to. One per
     /// target, so tests in this binary do not share a subsystem.
     acl_nqn: String,
-    /// The vid whose inode object is stored here; every other object lives on
-    /// some other node. `0` for a gateway storing nothing itself.
-    local: AtomicU32,
+    /// The zone this gateway reports itself in, when a test asks `sheep` to
+    /// move. Contributes no vnodes of its own — see [`FIXED_NODES`] — so
+    /// changing it moves which zone's namespaces are optimized without
+    /// disturbing where any vid's inode object actually hashes to.
+    own_zone: AtomicU32,
 }
 
 fn u32le(b: &[u8], o: usize) -> u32 {
@@ -109,6 +135,19 @@ fn cstr(field: &[u8]) -> String {
     String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
+/// One `GET_NODE_LIST` record: only what the ANA placement ring reads.
+fn node_record(addr: SocketAddr, nr_vnodes: u16, zone: u32) -> [u8; SD_NODE_SIZE] {
+    let mut rec = [0u8; SD_NODE_SIZE];
+    let std::net::IpAddr::V4(v4) = addr.ip() else {
+        panic!("test nodes are IPv4");
+    };
+    rec[NODE_OFF_ADDR + 12..NODE_OFF_ADDR + 16].copy_from_slice(&v4.octets());
+    rec[NODE_OFF_PORT..NODE_OFF_PORT + 2].copy_from_slice(&addr.port().to_le_bytes());
+    rec[NODE_OFF_NR_VNODES..NODE_OFF_NR_VNODES + 2].copy_from_slice(&nr_vnodes.to_le_bytes());
+    rec[NODE_OFF_ZONE..NODE_OFF_ZONE + 4].copy_from_slice(&zone.to_le_bytes());
+    rec
+}
+
 /// The vid a name resolves to under `acl` (the ACL object itself is in none).
 fn resolve(sheep: &Sheep, name: &str, acl: u32) -> Result<u32, u32> {
     match (name, acl) {
@@ -153,19 +192,29 @@ fn serve_conn(mut sock: TcpStream, sheep: &Sheep) -> std::io::Result<()> {
                 sock.write_all(&resp(opcode, id, 0, slice.len() as u32))?;
                 sock.write_all(slice)?;
             }
-            // "Do you store this object yourself?" — a local op, answered out
-            // of this node's own store. Sheep-internal opcodes carry the sheep
+            // The node/zone topology: a local op, answered out of this node's
+            // own membership view. Sheep-internal opcodes carry the sheep
             // protocol version, not the client one.
-            SD_OP_EXIST => {
-                assert_eq!(hdr[0], SD_SHEEP_PROTO_VER, "EXIST is a sheep-internal op");
-                assert_eq!(oid & VDI_BIT, VDI_BIT, "locality is asked of the inode");
-                let vid = ((oid & !VDI_BIT) >> 32) as u32;
-                let result = if vid == sheep.local.load(Ordering::Relaxed) {
-                    0
-                } else {
-                    SD_RES_NO_OBJ
-                };
-                sock.write_all(&resp(opcode, id, result, 0))?;
+            SD_OP_GET_NODE_LIST => {
+                assert_eq!(
+                    hdr[0], SD_SHEEP_PROTO_VER,
+                    "GET_NODE_LIST is a sheep-internal op"
+                );
+                // Our own listen address, as the accepted socket's local half
+                // — exactly the address the target dialed to reach us — plus
+                // the two fixed nodes that own every vid's placement.
+                let mut nodes = vec![node_record(
+                    sock.local_addr()?,
+                    0,
+                    sheep.own_zone.load(Ordering::Relaxed),
+                )];
+                nodes.extend(FIXED_NODES.iter().map(|&((ip, port), zone, nr_vnodes)| {
+                    node_record(SocketAddr::from((ip, port)), nr_vnodes, zone)
+                }));
+                let bytes: Vec<u8> = nodes.into_iter().flatten().collect();
+                let end = data_length.min(bytes.len());
+                sock.write_all(&resp(opcode, id, 0, end as u32))?;
+                sock.write_all(&bytes[..end])?;
             }
             other => sock.write_all(&resp(other, id, 0x01, 0))?, // UNKNOWN
         }
@@ -204,12 +253,12 @@ fn sheepdog_ns(nsid: u32, cluster: SocketAddr, acl_nqn: &str, vdi: &str) -> Name
 }
 
 /// Start a target whose subsystem is `nqn`, serving `volumes` off a fake
-/// cluster that stores `local`'s inode object. Returns the target's address
-/// and the cluster, so a test can move an object under it.
-fn spawn_target(nqn: &str, volumes: &[&str], local: u32) -> (SocketAddr, Arc<Sheep>) {
+/// cluster in which this gateway claims `own_zone`. Returns the target's
+/// address and the cluster, so a test can move the claim later.
+fn spawn_target(nqn: &str, volumes: &[&str], own_zone: u32) -> (SocketAddr, Arc<Sheep>) {
     let sheep = Arc::new(Sheep {
         acl_nqn: nqn.into(),
-        local: AtomicU32::new(local),
+        own_zone: AtomicU32::new(own_zone),
     });
     let cluster = spawn_fake_sheep(Arc::clone(&sheep));
 
@@ -269,7 +318,9 @@ fn chgcnt(log: &[u8]) -> u64 {
 #[test]
 fn cluster_namespaces_report_ana_by_object_locality() {
     let nqn = "nqn.2026-06.io.ioutgt:ana";
-    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], NEAR_VID);
+    // Zone 1: the same zone NEAR's inode object hashes to, so NEAR starts
+    // optimized and FAR (zone 2) does not.
+    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], 1);
     let mut admin = admin_client(addr, nqn);
 
     // Identify Controller: the whole ANA field set, which the host validates
@@ -281,14 +332,22 @@ fn cluster_namespaces_report_ana_by_object_locality() {
         cmic::ANA_REPORTING,
         "a cluster subsystem reports ANA"
     );
-    assert_eq!(ctrl.anagrpmax.get(), 2, "one group per ANA state we report");
-    assert_eq!(ctrl.nanagrpid.get(), 2, "both groups are always reported");
+    assert_eq!(
+        ctrl.anagrpmax.get(),
+        2,
+        "the largest zone id in the cluster"
+    );
+    assert_eq!(
+        ctrl.nanagrpid.get(),
+        2,
+        "one group per zone the cluster has"
+    );
     assert_ne!(ctrl.anatt, 0, "ANATT must be a real transition timeout");
     assert_eq!(
         ctrl.anacap,
         anacap::OPTIMIZED | anacap::NON_OPTIMIZED,
-        "only the two states locality maps to, and no STATIC_GRPID: a \
-         namespace moves group when its locality changes"
+        "only the two states a path can be in, and no STATIC_GRPID: a \
+         namespace moves group when the cluster's topology does"
     );
     assert_eq!(
         ctrl.oaes.get() & ioutgt_nvme::AEN_CFG_ANA_CHANGE,
@@ -383,21 +442,22 @@ fn local_namespaces_report_no_ana() {
 }
 
 /// The host learns about a locality change from an async event, not by
-/// polling: move the volume's inode object onto this node and the parked AER
-/// completes with the ANA Change notice, after which the log page reads back
-/// optimized.
+/// polling: move this gateway into the volume's zone and the parked AER
+/// completes with the ANA Change notice, after which the log page reads that
+/// group back optimized.
 #[test]
 fn a_locality_change_raises_an_ana_change_notice() {
     let nqn = "nqn.2026-06.io.ioutgt:ana-change";
-    // Nothing stored here yet: the one volume is reachable, not preferred.
+    // Zone 0 matches nothing real: the one volume (FAR, zone 2) is reachable,
+    // not preferred.
     let (addr, sheep) = spawn_target(nqn, &[FAR], 0);
     let mut admin = admin_client(addr, nqn);
     let before = common::get_log_page(&mut admin, spec::log_page::ANA, 0, 3, 0, 4096);
     assert_eq!(groups(&before), vec![(1, 0x01, vec![]), (2, 0x02, vec![1])]);
 
     admin.post_aer(4);
-    // The volume's inode object lands on this node, and the refresh notices.
-    sheep.local.store(FAR_VID, Ordering::Relaxed);
+    // This gateway moves into FAR's zone, and the refresh notices.
+    sheep.own_zone.store(2, Ordering::Relaxed);
     assert!(
         ioutgt_harness::refresh_clusters() > 0,
         "a cluster is tracked"
@@ -412,8 +472,10 @@ fn a_locality_change_raises_an_ana_change_notice() {
     let after = common::get_log_page(&mut admin, spec::log_page::ANA, 0, 5, 0, 4096);
     assert_eq!(
         groups(&after),
-        vec![(1, 0x01, vec![1]), (2, 0x02, vec![])],
-        "the namespace moved to the optimized group"
+        vec![(1, 0x01, vec![]), (2, 0x01, vec![1])],
+        "FAR stays in its own zone's group (2) — the group is a placement \
+         fact, not a state — but that group's own state moved to optimized \
+         now that this gateway is in it too"
     );
     assert!(
         chgcnt(&after) > chgcnt(&before),

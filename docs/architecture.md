@@ -566,7 +566,7 @@ replaced) and the next request dials a fresh one.
 
 The backend's **control plane** — the lookups and inode read at open, the VDI
 registration and its release, and the cluster enumerations (`list_vdis`,
-`list_acls`, `vdi_holders`, `vdi_objects_local`) — runs on the ring too, but
+`list_acls`, `vdi_holders`, `cluster_ana_state`) — runs on the ring too, but
 over its own one-shot connections (`sheepdog::ctl`), not the multiplexed one.
 Its callers are synchronous and hold no scheduler (the CLI, the ACL refresh
 thread) or sit inside the control server's runtime, so each connection carries
@@ -735,41 +735,55 @@ index into the *sorted, hole-free* path list and so is not the slot: PORTID
 names a path in a list all targets compute identically, the slot names a
 seat in the cluster's array.
 
-**Which path is the good one — ANA.** Those paths are not equal. A `sheep`
-serves any object in the cluster, but only some of them out of its own
-store; the rest it fetches from the node that has them, one hop further.
-So a target whose gateway stores a volume's objects is the path a host
-should prefer for that namespace, and NVMe has exactly the vocabulary for
-saying so: **Asymmetric Namespace Access**. A subsystem with any Sheepdog
-namespace reports ANA — CMIC bit 3, the ANA fields of Identify Controller,
-`ANAGRPID` in Identify Namespace, Get Log Page 0Ch, and the ANA Change
-notice in OAES — and every other subsystem leaves the bit clear, so a
-local-storage target is unchanged. There are two ANA groups, fixed:
-group 1 *optimized*, group 2 *non-optimized*, and a namespace's group **is**
-its state (`AnaState` in `ioutgt-core`), which keeps `ANAGRPMAX` =
-`NANAGRPID` = 2 and the host's log-page buffer a constant size. Both
-descriptors are always emitted, empty ones included; NSIDs within one
+**Which path is the good one — ANA.** Those paths are not equal. Sheepdog
+places every object on the nodes its consistent-hash ring assigns it to, so
+a target whose own gateway is one of them serves it without a hop, and any
+other gateway adds one — and NVMe has exactly the vocabulary for saying so:
+**Asymmetric Namespace Access**. A subsystem with any Sheepdog namespace
+reports ANA — CMIC bit 3, the ANA fields of Identify Controller, `ANAGRPID`
+in Identify Namespace, Get Log Page 0Ch, and the ANA Change notice in OAES —
+and every other subsystem leaves the bit clear, so a local-storage target is
+unchanged.
+
+A namespace's ANA group is not a state, and not something this target picks:
+it is the **zone** of the cluster node whose vnode owns the volume's inode
+object on the hash ring (`oid_to_first_vnode`, reproduced bit-for-bit in
+`ioutgt-backend::sheepdog` and checked against the C implementation's own
+values) — a fact about the object and the cluster's topology, identical
+however many targets ask and through whichever gateway. That identity is
+exactly what the old design (one namespace's group flips between two fixed
+sentinels, "optimized" and "non-optimized", depending on which gateway asked)
+got backwards: two targets fronting the same volume reported it under two
+different `ANAGRPID`s, which is not a namespace two paths can agree is the
+same one. `NANAGRPID` is the cluster's zone count and `ANAGRPMAX` the largest
+zone id in use — both real cluster facts now, not a constant 2 — and a group
+absent from a subsystem's own namespaces is still reported, empty, so the
+shape `NANAGRPID` promised at Identify time never drifts; NSIDs within one
 ascend, as `nvme_update_ana_state` assumes.
 
-The state itself is one question per namespace, asked of the gateway this
-target is connected to: *do you store this volume's inode object?* That is
-`SD_OP_EXIST` on `vid_to_vdi_oid(vid)` — a **local** op, which `sheep`
-answers from its own store rather than routing (`dog vdi object`'s
-per-node probe) — SD_RES_SUCCESS meaning optimized, SD_RES_NO_OBJ
-non-optimized. The inode stands in for the volume: it is the one object
-every VDI has, and Sheepdog's hash ring places a volume's data objects
-around the same nodes. It rides the same 10 s refresh thread as the path
-list, per (subsystem, cluster) — unlike paths, namespaces on a second
-cluster are not dropped but asked of *their* gateway, since locality is a
-per-object, per-gateway fact. A state that changes bumps the subsystem's
-ANA change count and posts an ANA Change AER to the live controllers
-through the admin thread's mailbox, so hosts re-read 0Ch instead of
-polling it. Unlike the discovery paths this does not depend on the VDI
-lock: a namespace opened `?nolock` reports ANA like any other, because
-`EXIST` asks the cluster about an object, not about a registration. A
-cluster that will not answer leaves the states as they were — the same
-best-effort rule as the paths, and for the same reason: flapping a host's
-path choice is worse than a stale preference.
+What *is* per path is a group's **state**: optimized if the gateway this
+target's connection reaches is itself in that zone, non-optimized otherwise.
+Both facts — the zone topology (`GET_NODE_LIST`, a **local** op answered out
+of the connected node's own membership view) and, from it, the ring each vid
+resolves against — come from one refresh, `ioutgt_backend::cluster_ana_state`;
+`own_zone` is found by matching the connected address in the node list, the
+per-vid group by walking the ring the node list built. It rides the same 10 s
+refresh thread as the path list, per (subsystem, cluster) — unlike paths,
+namespaces on a second cluster are not dropped but asked of *their* gateway,
+since both the ring and this path's place on it are per-cluster facts. A
+group set that grows (a zone appearing) or a namespace's group or state
+changing bumps the subsystem's ANA change count and posts an ANA Change AER
+to the live controllers through the admin thread's mailbox, so hosts re-read
+0Ch instead of polling it. Unlike the discovery paths this does not depend on
+the VDI lock: a namespace opened `?nolock` reports ANA like any other, since
+placement is a fact about the object, not about a registration. A cluster
+that will not answer leaves the states as they were — the same best-effort
+rule as the paths, and for the same reason: flapping a host's path choice is
+worse than a stale preference. The group *set* only ever grows across such
+refreshes (`Subsystem::merge_ana_zones`) rather than being replaced, since a
+multi-cluster subsystem's refreshes are independent and none may erase what
+another contributed; a zone that later vanishes from a cluster is reported
+the same way any group without current members is — empty, not removed.
 
 ## 8. Buffer strategy: staged, measured
 

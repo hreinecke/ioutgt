@@ -16,7 +16,7 @@ use zerocopy::IntoBytes;
 
 use crate::dispatch::{AdminState, ConnCtx, Outcome};
 use ioutgt_core::backend::Backend;
-use ioutgt_core::subsystem::{ANA_GROUPS, Namespace, Subsystem, SubsystemPort, TransportType};
+use ioutgt_core::subsystem::{Namespace, Subsystem, SubsystemPort, TransportType};
 
 /// KAS granularity: 10 seconds in 100ms units, as nvmet.
 const KAS_UNITS: u16 = 100;
@@ -210,12 +210,21 @@ fn build_id_ctrl<B: Backend>(
         // if they disagree (`nvme_mpath_init_identify`).
         id.cmic |= cmic::ANA_REPORTING;
         id.anatt = ANATT_SECS;
-        // Only the two states we ever report. ANACAP bit 6 stays clear: a
-        // namespace changes group exactly when its path locality changes.
+        // ANACAP bit 6 stays clear: a namespace changes group exactly when
+        // the cluster's topology does, never gradually.
         id.anacap = anacap::OPTIMIZED | anacap::NON_OPTIMIZED;
-        let groups = u32::try_from(ANA_GROUPS.len()).expect("two groups");
-        id.anagrpmax.set(groups);
-        id.nanagrpid.set(groups);
+        // NANAGRPID is a count (how many groups exist); ANAGRPMAX is the
+        // largest valid ANAGRPID value a descriptor may carry. For the old
+        // fixed {1, 2} groups the two coincided; a Sheepdog zone id is an
+        // arbitrary u32 (by default the node's own IPv4 address), so they no
+        // longer do — the host only needs `grpid <= anagrpmax` and `grpid !=
+        // 0` per descriptor (`nvme_parse_ana_log`), not a dense range.
+        let zones = subsys
+            .as_ref()
+            .map_or_else(Default::default, |s| s.ana_zones());
+        id.nanagrpid
+            .set(u32::try_from(zones.len()).unwrap_or(u32::MAX));
+        id.anagrpmax.set(zones.iter().copied().max().unwrap_or(0));
         oaes |= crate::AEN_CFG_ANA_CHANGE;
     }
     id.oaes.set(oaes);
@@ -452,41 +461,49 @@ fn get_log_page<B: Backend>(
 /// ANA log page: the header, then one descriptor per ANA group listing the
 /// NSIDs currently in it (ascending, as the host's walk assumes).
 ///
-/// Both groups are always reported, empty ones included, so the log's shape
-/// never depends on where the namespaces happen to sit and `NANAGRPID` — from
-/// which the host sizes its buffer once, at Identify time — always matches.
-/// `rgo` drops the NSID lists.
+/// Every group in [`Subsystem::ana_zones`] is always reported, empty ones
+/// included, so the log's shape never depends on where the namespaces happen
+/// to sit and `NANAGRPID` — from which the host sizes its buffer once, at
+/// Identify time — always matches. A group's `state` comes from whichever of
+/// this subsystem's namespaces sits in it (uniform in the common case of one
+/// cluster, since it reduces to "is our one gateway in this zone"); an empty
+/// group defaults to Optimized, a value no NSID list ever makes the host act
+/// on. `rgo` drops the NSID lists.
 fn build_ana_log<B: Backend>(subsys: &Subsystem<B>, rgo: bool) -> Vec<u8> {
     let table = subsys.snapshot();
     let chgcnt = subsys.ana_chgcnt();
+    let zones = subsys.ana_zones();
     let mut log = Vec::with_capacity(
-        size_of::<ana::LogHeader>()
-            + ANA_GROUPS.len() * size_of::<ana::GroupDesc>()
-            + table.len() * 4,
+        size_of::<ana::LogHeader>() + zones.len() * size_of::<ana::GroupDesc>() + table.len() * 4,
     );
     let header = ana::LogHeader {
         chgcnt: chgcnt.into(),
-        ngrps: u16::try_from(ANA_GROUPS.len()).expect("two groups").into(),
+        ngrps: u16::try_from(zones.len()).unwrap_or(u16::MAX).into(),
         rsvd10: Default::default(),
     };
     log.extend_from_slice(header.as_bytes());
-    for state in ANA_GROUPS {
+    for &grpid in zones.iter() {
+        let members: Vec<&std::sync::Arc<Namespace<B>>> = table
+            .values()
+            .filter(|ns| ns.ana_grpid() == grpid)
+            .collect();
+        let state = members
+            .first()
+            .map_or(ioutgt_core::subsystem::ANA_STATE_OPTIMIZED, |ns| {
+                ns.ana_state_code()
+            });
         let nsids: Vec<u32> = if rgo {
             Vec::new()
         } else {
-            table
-                .values()
-                .filter(|ns| ns.ana_state() == state)
-                .map(|ns| ns.nsid)
-                .collect()
+            members.iter().map(|ns| ns.nsid).collect()
         };
         let desc = ana::GroupDesc {
-            grpid: state.grpid().into(),
+            grpid: grpid.into(),
             nnsids: u32::try_from(nsids.len())
                 .expect("namespace count fits")
                 .into(),
             chgcnt: chgcnt.into(),
-            state: state.code(),
+            state,
             rsvd17: [0; 15],
         };
         log.extend_from_slice(desc.as_bytes());
