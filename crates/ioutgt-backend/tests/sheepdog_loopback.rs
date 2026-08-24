@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ioutgt_backend::{
-    SheepdogBackend, VdiHolder, cluster_ana_state, list_acls, list_vdis, vdi_holders,
+    SheepdogBackend, VdiHolder, acl_members, cluster_ana_state, list_acls, list_vdis, vdi_holders,
 };
 use ioutgt_core::buf::AlignedBuf;
 use ioutgt_core::{Backend, BackendError, LbaRange};
@@ -1117,6 +1117,77 @@ fn acl_enumeration_follows_the_acls_member_array() {
         hosts,
         vec![vec![HOST_A.to_string(), HOST_B.to_string()], vec![]]
     );
+}
+
+/// [`acl_members`] is [`list_acls`]'s per-ACL member read, scoped to one ACL
+/// whose vid the caller already knows — what the namespace-membership refresh
+/// re-runs on a live target as `dog acl add vdi`/`remove vdi` changes what an
+/// ACL exports. Same validation, same result shape, without a full-cluster
+/// scan.
+#[test]
+fn acl_members_reflects_a_running_cluster() {
+    let store = enumeration_store();
+    {
+        let mut st = store.lock().unwrap();
+        // The same "listed but unresolvable" cases `list_acls` warns about
+        // and drops: a half-completed add, and a vid naming no VDI at all.
+        st.vdis
+            .insert(0x00_0041, Vdi::new("halfadded", 1 << 20, 22));
+        let acl = st.vdis.get_mut(&ACL_VID).unwrap();
+        acl.data_vdi_id.push(0x00_0041);
+        acl.data_vdi_id.push(0x00_0050);
+    }
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+
+    let seen: Vec<_> = acl_members(addr, ACL_VID)
+        .unwrap()
+        .iter()
+        .map(|v| (v.name.clone(), v.tag.clone(), v.vid))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("shared".to_string(), String::new(), 0x20),
+            ("shared".to_string(), "daily".to_string(), 0x21),
+        ],
+        "the same members list_acls reports for this ACL, unresolvable \
+         entries dropped the same way"
+    );
+
+    // `dog acl add vdi`: a running cluster's member list moves, and the next
+    // read sees it — this is the whole point of re-reading it at all, rather
+    // than trusting what a target saw at startup.
+    {
+        let mut st = store.lock().unwrap();
+        st.vdis
+            .insert(0x00_0043, Vdi::new("zulu", 1 << 20, 22).in_acl(ACL_VID));
+        st.vdis
+            .get_mut(&ACL_VID)
+            .unwrap()
+            .data_vdi_id
+            .push(0x00_0043);
+    }
+    let grown: Vec<_> = acl_members(addr, ACL_VID)
+        .unwrap()
+        .iter()
+        .map(|v| v.vid)
+        .collect();
+    assert_eq!(grown, vec![0x20, 0x21, 0x0043]);
+
+    // `dog acl remove vdi` zeroes the slot in place rather than compacting —
+    // the same hole-not-end-of-list shape `data_vdi_id[]` always has.
+    {
+        let mut st = store.lock().unwrap();
+        let acl = st.vdis.get_mut(&ACL_VID).unwrap();
+        let pos = acl.data_vdi_id.iter().position(|&v| v == 0x20).unwrap();
+        acl.data_vdi_id[pos] = 0;
+    }
+    let shrunk: Vec<_> = acl_members(addr, ACL_VID)
+        .unwrap()
+        .iter()
+        .map(|v| v.vid)
+        .collect();
+    assert_eq!(shrunk, vec![0x21, 0x0043]);
 }
 
 /// The discovery path: opening a volume under an ACL registers this target's

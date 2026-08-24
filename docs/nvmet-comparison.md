@@ -306,7 +306,11 @@ any thread spawns); a Unix-socket JSON API (ADD/REMOVE/LIST_NAMESPACE,
 LIST_CONTROLLER, GET_STATS) mutates the versioned namespace table at
 runtime and
 nudges controllers' AERs — verified end-to-end: a connected Linux
-host saw the hot-added namespace appear without reconnecting.
+host saw the hot-added namespace appear without reconnecting. Whole-cluster
+mode drives the same table from the cluster itself, with no socket call at
+all: the 10 s ACL refresh (`docs/architecture.md` §7) re-reads a Sheepdog ACL
+object's member VDIs and adds or removes a namespace to match `dog acl add
+vdi`/`remove vdi`, raising the identical NS_ATTR notice.
 
 **Differences/Risks.** Far smaller surface than configfs (no port
 management at runtime, no host ACL objects, no passthru). GET_STATS

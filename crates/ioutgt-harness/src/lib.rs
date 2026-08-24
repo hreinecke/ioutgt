@@ -1002,14 +1002,17 @@ fn spawn_pinned(
     Ok(())
 }
 
-/// What [`build_port`] hands back: the port itself, plus the two things
-/// opening cluster-backed namespaces reveals along the way.
+/// What [`build_port`] hands back: the port itself, plus the things opening
+/// cluster-backed namespaces reveals along the way.
 struct BuiltPort {
     /// The served port: subsystems, namespaces, and the transport limits.
     port: Arc<PortConfig<AnyBackend>>,
     /// The cluster namespaces whose ANA state wants tracking, one entry per
     /// (subsystem, cluster).
     ana_specs: Vec<AnaSpec>,
+    /// The subsystems that are a cluster ACL's export, whose host list,
+    /// namespace table and discovery generation want tracking.
+    acl_specs: Vec<ClusterAclSpec>,
     /// Where the cluster filed this target among the holders of its volumes,
     /// if any of them is cluster storage this target registered for.
     holder_slot: Option<HolderSlot>,
@@ -1031,6 +1034,7 @@ fn build_port(
 ) -> io::Result<BuiltPort> {
     let mut subsystems = BTreeMap::new();
     let mut ana_specs = Vec::new();
+    let mut acl_specs = Vec::new();
     let mut holder_slot: Option<HolderSlot> = None;
     for spec in &config.subsystems {
         let mut namespaces = BTreeMap::new();
@@ -1084,18 +1088,34 @@ fn build_port(
         // object's `max_data_id_nr`), report it as MNAN.
         .with_mnan(spec.mnan)
         // Cluster storage: the paths to a volume are unequal, and which one
-        // this is depends on where its objects live, so report ANA.
-        .with_ana(!cluster_ns.is_empty()),
+        // this is depends on where its objects live, so report ANA. A
+        // subsystem that *is* a cluster ACL's export reports it even with
+        // zero cluster namespaces open right now — one hot-added later
+        // (`refresh_cluster_namespaces`) needs `Subsystem::ana()` already on,
+        // since nothing here can flip it afterward.
+        .with_ana(!cluster_ns.is_empty() || spec.sheepdog_acl.is_some()),
         );
         ana_specs.extend(cluster_ns.into_iter().map(|(cluster, namespaces)| AnaSpec {
             cluster,
             subsystem: Arc::clone(&subsystem),
-            namespaces,
+            namespaces: Mutex::new(namespaces),
         }));
-        // A subsystem that *is* a cluster ACL object gets its host list from
-        // that object, and keeps getting it: the members may change under a
-        // running target.
-        track_cluster_hosts(&subsystem, spec.sheepdog_acl);
+        // A subsystem that *is* a cluster ACL object gets its host list and
+        // namespace table from that object, and keeps getting them: both may
+        // change under a running target. Seeding the discovery generation
+        // needs no queue-thread pool, so it happens now; the tracking entry
+        // itself (and its `notify` closure) waits for `track_cluster_acls`,
+        // called once `control_loop` has one.
+        if let Some(acl) = spec.sheepdog_acl {
+            subsystem.observe_disc_genctr(acl.epoch);
+            acl_specs.push(ClusterAclSpec {
+                acl,
+                subsystem: Arc::clone(&subsystem),
+                fabric: bound,
+                ring_enabled: config.recv_buf_bytes > 0,
+                trtype,
+            });
+        }
         // A subsystem holding cluster volumes advertises every target that
         // holds them too, itself included, as a path to it.
         let slot = track_cluster_paths(&subsystem, registered, trtype);
@@ -1127,6 +1147,7 @@ fn build_port(
     Ok(BuiltPort {
         port,
         ana_specs,
+        acl_specs,
         holder_slot,
     })
 }
@@ -1465,19 +1486,30 @@ type ClusterNamespaces = Vec<(Arc<Namespace<AnyBackend>>, u32)>;
 
 /// One subsystem's Sheepdog namespaces on one cluster, before the queue-thread
 /// pool that will carry their ANA notices exists ([`build_port`] runs first).
+///
+/// The namespace list is mutable so a namespace hot-added later
+/// ([`track_cluster_backend`]) can join it in place — this entry's `notify`
+/// closure ([`ClusterAna::notify`]) captures the one queue-thread pool this
+/// process actually has, and there is no way to reconstruct that closure from
+/// the refresh thread, which is why hot-add mutates through it instead of
+/// replacing the entry.
 struct AnaSpec {
     /// The cluster gateway those namespaces are served through.
     cluster: SocketAddr,
     /// The subsystem they belong to; the one whose ANA state they are.
     subsystem: Arc<Subsystem<AnyBackend>>,
     /// Each namespace and the vid behind it.
-    namespaces: ClusterNamespaces,
+    namespaces: Mutex<ClusterNamespaces>,
 }
 
 /// An [`AnaSpec`] wired to the target serving it.
 struct ClusterAna {
     spec: AnaSpec,
-    /// Raise an ANA Change notice on this target's live controllers.
+    /// Raise an ANA Change notice on this target's live controllers. Per
+    /// entry, not a shared global: a test binary (and in principle a future
+    /// multi-port target) can have more than one queue-thread pool alive in
+    /// one process, each with its own `senders`, and a single global closure
+    /// would silently hand one subsystem's notices to another's pool.
     notify: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -1536,7 +1568,17 @@ where
 /// this round, not a reason to distrust the rest.
 fn refresh_cluster_ana(ana: &ClusterAna) {
     let spec = &ana.spec;
-    let vids: Vec<u32> = spec.namespaces.iter().map(|&(_, vid)| vid).collect();
+    // Cloned out from under the lock: the cluster round trip below is
+    // blocking IO, and nothing else needs the lock held across it.
+    let namespaces = spec
+        .namespaces
+        .lock()
+        .expect("ana namespaces poisoned")
+        .clone();
+    let vids: Vec<u32> = namespaces
+        .iter()
+        .map(|&(_, vid)| vid)
+        .collect();
     let state = match ioutgt_backend::cluster_ana_state(spec.cluster, &vids) {
         Ok(state) => state,
         Err(err) => {
@@ -1545,7 +1587,7 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
         }
     };
     let mut changed = spec.subsystem.merge_ana_zones(&state.zones);
-    for ((ns, vid), grpid) in spec.namespaces.iter().zip(state.grpids) {
+    for ((ns, vid), grpid) in namespaces.iter().zip(state.grpids) {
         let Some(grpid) = grpid else { continue };
         let optimized = state.own_zone == Some(grpid);
         if spec.subsystem.set_ana_state(ns, grpid, optimized) {
@@ -1560,75 +1602,132 @@ fn refresh_cluster_ana(ana: &ClusterAna) {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster host ACLs: who the cluster says may connect
+// Cluster ACLs: who the cluster says may connect, and which volumes it says
+// the subsystem is made of
 // ---------------------------------------------------------------------------
 
-/// One subsystem whose host ACL is a cluster ACL object's member list.
+/// One subsystem that *is* the export of a cluster ACL object — whole-cluster
+/// mode's own subsystems, never a hand-configured one (`%ACL`'s single-VDI
+/// form leaves [`SubsystemConfig::sheepdog_acl`] `None`; see its doc).
 ///
-/// Whole-cluster mode builds a subsystem out of each ACL object, so the two
-/// access-control scopes coincide: the names `dog acl add member` writes into
-/// the ACL inode are the hostnqns the subsystem admits
-/// ([`ioutgt_backend::acl_state`]). The administrator edits that list on the
-/// cluster, not here — so this target re-reads it rather than treating what it
-/// saw at startup as final.
-struct ClusterHosts {
+/// Three things ride on the same ACL inode and so the same refresh: the host
+/// list (the names `dog acl add member` writes are the hostnqns the
+/// subsystem admits, [`ioutgt_backend::acl_state`]), the discovery-log
+/// generation (`vdi_epoch`), and — since the ACL's member *VDIs* are exactly
+/// this subsystem's namespaces — the namespace table itself: `dog acl add
+/// vdi`/`remove vdi` on a running cluster adds or removes a namespace here
+/// too, not only a discovery-log path entry.
+struct ClusterAcl {
     /// The cluster gateway the ACL object is read from.
     cluster: SocketAddr,
     /// The ACL object's own vid.
     vid: u32,
-    /// The subsystem the ACL became, whose host list this keeps current.
+    /// The subsystem the ACL became, whose host list and namespace table this
+    /// keeps current.
     subsystem: Arc<Subsystem<AnyBackend>>,
+    /// Whether a member VDI discovered here should take the cluster's shared
+    /// lock, matching every namespace this ACL exported at startup
+    /// ([`SheepdogAcl::lock`]).
+    lock: bool,
+    /// This target's own fabric address, for a hot-added namespace to
+    /// register as the volume's holder — the same address `build_port`
+    /// passed every namespace opened at startup.
+    fabric: SocketAddr,
+    /// Whether the port's queue threads use the io_uring provided-buffer
+    /// ring (`--recv-buf-mb`), for a hot-added namespace's backend to be
+    /// built identically to every other one (`build_backend`'s
+    /// `ring_enabled`).
+    ring_enabled: bool,
+    /// Transport of the port that opened them, for a hot-added namespace's
+    /// path-list entry ([`ClusterPaths::trtype`]).
+    trtype: TransportType,
+    /// Raise the changed-namespaces notice on this target's live controllers
+    /// when the ACL's member VDIs move. Per entry, not a shared global, for
+    /// the same reason [`ClusterAna::notify`] is: more than one queue-thread
+    /// pool can be alive in one process (every target a test binary spawns
+    /// has its own), and a single global closure would hand one subsystem's
+    /// notice to another's pool.
+    notify: Box<dyn Fn() + Send + Sync>,
 }
 
-/// Every subsystem whose host ACL comes off a cluster. Same lifetime rule as
-/// [`CLUSTER_PATHS`]: appended at startup, drained once by [`shutdown`].
-static CLUSTER_HOSTS: Mutex<Vec<Arc<ClusterHosts>>> = Mutex::new(Vec::new());
+/// A [`ClusterAcl`] before the queue-thread pool that will carry its
+/// namespace-changed notices exists ([`build_port`] runs first) — the same
+/// split [`AnaSpec`]/[`ClusterAna`] makes, for the same reason.
+struct ClusterAclSpec {
+    acl: SheepdogAcl,
+    subsystem: Arc<Subsystem<AnyBackend>>,
+    fabric: SocketAddr,
+    ring_enabled: bool,
+    trtype: TransportType,
+}
 
-/// [`CLUSTER_HOSTS`], recovered from poisoning (see [`live_ports`]).
-fn cluster_hosts() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterHosts>>> {
-    CLUSTER_HOSTS
+/// Every subsystem whose host ACL, namespace table, or discovery generation
+/// comes off a cluster ACL object. Same lifetime rule as [`CLUSTER_PATHS`]:
+/// appended at startup, drained once by [`shutdown`].
+static CLUSTER_ACLS: Mutex<Vec<Arc<ClusterAcl>>> = Mutex::new(Vec::new());
+
+/// [`CLUSTER_ACLS`], recovered from poisoning (see [`live_ports`]).
+fn cluster_acls() -> std::sync::MutexGuard<'static, Vec<Arc<ClusterAcl>>> {
+    CLUSTER_ACLS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Keep `subsystem`'s host ACL up with the cluster ACL object it came from,
-/// for a subsystem that came from one at all (`acl`; see
-/// [`SubsystemConfig::sheepdog_acl`]).
+/// Keep every `spec.subsystem` up with the cluster ACL object it came from.
 ///
 /// No read here, unlike [`track_cluster_paths`]: the config already carries
 /// the members as they were when it enumerated the cluster, and the subsystem
 /// was built with them. The first re-read is the refresh thread's.
 ///
-/// It carries the ACL object's `vdi_epoch` too, and that *is* applied now: it
-/// is where the subsystem's discovery-log generation starts, so a host reading
-/// the log before the first refresh already gets the cluster's number rather
-/// than a placeholder.
-fn track_cluster_hosts(subsystem: &Arc<Subsystem<AnyBackend>>, acl: Option<SheepdogAcl>) {
-    let Some(acl) = acl else { return };
-    subsystem.observe_disc_genctr(acl.epoch);
-    cluster_hosts().push(Arc::new(ClusterHosts {
-        cluster: acl.cluster,
-        vid: acl.vid,
-        subsystem: Arc::clone(subsystem),
-    }));
+/// `senders` is the target's queue-thread pool, still being built: a
+/// namespace add/remove reaches the hosts as an async event on the admin
+/// thread's live controllers, and one that happens before the pool exists
+/// needs no event at all (the table is already right when the host first
+/// reads it).
+fn track_cluster_acls<C>(specs: Vec<ClusterAclSpec>, senders: &Arc<Mutex<Option<PoolSenders<C>>>>)
+where
+    C: Send + 'static,
+{
+    if specs.is_empty() {
+        return;
+    }
+    for spec in specs {
+        let pool = Arc::clone(senders);
+        cluster_acls().push(Arc::new(ClusterAcl {
+            cluster: spec.acl.cluster,
+            vid: spec.acl.vid,
+            subsystem: spec.subsystem,
+            lock: spec.acl.lock,
+            fabric: spec.fabric,
+            ring_enabled: spec.ring_enabled,
+            trtype: spec.trtype,
+            notify: Box::new(move || {
+                if let Some(pool) = pool.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    pool.admin.send(AdminMsg::NsChanged);
+                }
+            }),
+        }));
+    }
     start_cluster_refresh();
 }
 
-/// Re-read one ACL object's member names into its subsystem's host ACL, and its
-/// `vdi_epoch` into the subsystem's discovery-log generation.
+/// Re-read one ACL object's member names into its subsystem's host ACL, its
+/// `vdi_epoch` into the subsystem's discovery-log generation, and its member
+/// VDIs into the subsystem's namespace table ([`refresh_cluster_namespaces`]).
 ///
 /// Best-effort, like the path and ANA refreshes: a cluster that will not
-/// answer leaves the host list as it was — the last membership the cluster
-/// did state, which is a better answer than either locking everyone out or
-/// letting everyone in because a gateway was briefly down.
+/// answer leaves the host list, generation and namespace table as they were —
+/// the last state the cluster did state, which is a better answer than
+/// either locking everyone out or letting everyone in because a gateway was
+/// briefly down.
 ///
 /// A host dropped from the ACL keeps the controllers it already has (see
 /// [`Subsystem::set_host_acl`]); what changes is who may Connect next.
-fn refresh_cluster_hosts(hosts: &ClusterHosts) {
-    let state = match ioutgt_backend::acl_state(hosts.cluster, hosts.vid) {
+fn refresh_cluster_acl(acl: &ClusterAcl) {
+    let state = match ioutgt_backend::acl_state(acl.cluster, acl.vid) {
         Ok(state) => state,
         Err(err) => {
-            cluster_unreachable(&hosts.subsystem.nqn, hosts.cluster, &err, "ACL member list");
+            cluster_unreachable(&acl.subsystem.nqn, acl.cluster, &err, "ACL member list");
             return;
         }
     };
@@ -1637,21 +1736,231 @@ fn refresh_cluster_hosts(hosts: &ClusterHosts) {
     // serves changes under it (its namespaces were fixed when it opened them),
     // but the group a host discovers is not the one it discovered before, so
     // send the discovery hosts back to the log.
-    if hosts.subsystem.observe_disc_genctr(state.epoch) {
-        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
+    if acl.subsystem.observe_disc_genctr(state.epoch) {
+        info!(subsystem = %acl.subsystem.nqn, vid = format_args!("{:x}", acl.vid),
               genctr = state.epoch, "sheepdog: ACL epoch advanced");
         notify_discovery_changed();
     }
-    if !hosts.subsystem.set_host_acl(state.host_acl()) {
-        return;
+    if acl.subsystem.set_host_acl(state.host_acl()) {
+        let host_acl = acl.subsystem.host_acl();
+        if host_acl.allow_any_host {
+            info!(subsystem = %acl.subsystem.nqn, vid = format_args!("{:x}", acl.vid),
+                  "sheepdog: ACL has no members left; the subsystem admits any host again");
+        } else {
+            info!(subsystem = %acl.subsystem.nqn, vid = format_args!("{:x}", acl.vid),
+                  hosts = ?host_acl.hosts, "sheepdog: ACL members changed");
+        }
     }
-    let acl = hosts.subsystem.host_acl();
-    if acl.allow_any_host {
-        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
-              "sheepdog: ACL has no members left; the subsystem admits any host again");
+    refresh_cluster_namespaces(acl);
+}
+
+/// Re-read the ACL's member VDI list and add or remove namespaces on
+/// `acl.subsystem` to match: `dog acl add vdi`/`remove vdi` on a running
+/// cluster changes what the subsystem exports, exactly as it does at
+/// startup ([`ioutgt_control::cli`]'s `acl_subsystem`) — the refresh just
+/// keeps doing what that did once.
+///
+/// Best-effort like the rest: a cluster that will not answer leaves the
+/// namespace table as it was. A member vid this target cannot open (the
+/// volume vanished between the ACL read and the open, or the cluster refuses
+/// the lock) is skipped with a warning rather than failing the whole
+/// refresh — the other members still need their turn. Only nsids this ACL
+/// could plausibly have added are ever removed: a namespace added some other
+/// way (`ADD_NAMESPACE`, or a different backend entirely) is not this
+/// refresh's to take back.
+fn refresh_cluster_namespaces(acl: &ClusterAcl) {
+    let members = match ioutgt_backend::acl_members(acl.cluster, acl.vid) {
+        Ok(members) => members,
+        Err(err) => {
+            cluster_unreachable(&acl.subsystem.nqn, acl.cluster, &err, "ACL member VDI list");
+            return;
+        }
+    };
+    // A snapshot's inode names the ACL too (its own vid stays acl_id), but a
+    // frozen VDI is read-only and past `acl_subsystem` skips it the same way.
+    let wanted: std::collections::BTreeMap<u32, &ioutgt_backend::VdiInfo> = members
+        .iter()
+        .filter(|vdi| !vdi.snapshot)
+        .map(|vdi| (vdi.vid, vdi))
+        .collect();
+    let existing = acl.subsystem.snapshot();
+
+    for (&nsid, ns) in existing.iter() {
+        if wanted.contains_key(&nsid) {
+            continue;
+        }
+        let Some(sd) = ns.backend.as_sheepdog() else {
+            continue;
+        };
+        if sd.cluster() != acl.cluster {
+            continue;
+        }
+        if acl.subsystem.remove_namespace(nsid).is_err() {
+            continue;
+        }
+        info!(subsystem = %acl.subsystem.nqn, nsid, vid = format_args!("{:x}", sd.vid()),
+              acl = format_args!("{:x}", acl.vid), "sheepdog VDI unexported");
+        untrack_cluster_backend(&acl.subsystem, &ns.backend);
+        (acl.notify)();
+    }
+
+    for (&nsid, vdi) in &wanted {
+        if existing.contains_key(&nsid) {
+            continue;
+        }
+        let backend = ioutgt_control::server::build_backend(
+            &BackendConfig::Sheepdog {
+                addr: acl.cluster.to_string(),
+                vdi: vdi.name.clone(),
+                tag: None,
+                // Whole-cluster mode names the subsystem after the ACL
+                // verbatim, so the subsystem's own NQN *is* the ACL's name —
+                // no other record of it is needed here.
+                acl: Some(acl.subsystem.nqn.clone()),
+                lock: acl.lock,
+            },
+            acl.ring_enabled,
+            Some(acl.fabric),
+        );
+        let backend = match backend {
+            Ok(backend) => backend,
+            Err(err) => {
+                warn!(subsystem = %acl.subsystem.nqn, nsid, vdi = %vdi.name, %err,
+                      "sheepdog: could not open a newly added VDI");
+                continue;
+            }
+        };
+        let uuid = vdi.uuid.unwrap_or_else(|| {
+            ioutgt_core::subsystem::namespace_uuid(&format!("sheepdog:{}", vdi.name), vdi.vid)
+        });
+        let backend = Arc::new(backend);
+        let namespace = Namespace::new(nsid, Arc::clone(&backend), uuid);
+        if let Err(err) = acl.subsystem.add_namespace(namespace) {
+            warn!(subsystem = %acl.subsystem.nqn, nsid, vdi = %vdi.name, %err,
+                  "sheepdog: newly added VDI's nsid is already in use");
+            continue;
+        }
+        info!(nsid, vdi = %vdi.name, acl = %acl.subsystem.nqn, bytes = vdi.size,
+              "sheepdog VDI exported");
+        // The table now owns the namespace under its own Arc; fetch that one
+        // back rather than wrapping the same backend a second time, so path
+        // and ANA tracking share the identical Arc the IO path will see.
+        if let Some(ns) = acl.subsystem.snapshot().get(&nsid) {
+            track_cluster_backend(&acl.subsystem, ns, acl.trtype);
+        }
+        (acl.notify)();
+    }
+}
+
+/// Add a namespace [`refresh_cluster_namespaces`] just opened into this
+/// subsystem's path and ANA tracking, alongside every namespace opened at
+/// startup — otherwise a hot-added volume would light up in `nvme list-ns`
+/// but never contribute a discovery-log path or ever get an ANA state past
+/// its placeholder.
+fn track_cluster_backend(
+    subsystem: &Arc<Subsystem<AnyBackend>>,
+    ns: &Arc<Namespace<AnyBackend>>,
+    trtype: TransportType,
+) {
+    let Some(sd) = ns.backend.as_sheepdog() else {
+        return;
+    };
+    if let Some(owner) = sd.owner() {
+        let mut paths = cluster_paths();
+        if let Some(pos) = paths
+            .iter()
+            .position(|p| Arc::ptr_eq(&p.subsystem, subsystem))
+        {
+            let old = Arc::clone(&paths[pos]);
+            let mut namespaces = old.namespaces.clone();
+            namespaces.push(Arc::clone(&ns.backend));
+            paths[pos] = Arc::new(ClusterPaths {
+                cluster: old.cluster,
+                owner: old.owner,
+                namespaces,
+                trtype: old.trtype,
+                subsystem: Arc::clone(subsystem),
+            });
+        } else {
+            // The subsystem's first locked Sheepdog namespace: nothing to
+            // append to yet, so seed a fresh entry the way
+            // `track_cluster_paths` does at startup.
+            drop(paths);
+            let fresh = Arc::new(ClusterPaths {
+                cluster: sd.cluster(),
+                owner,
+                namespaces: vec![Arc::clone(&ns.backend)],
+                trtype,
+                subsystem: Arc::clone(subsystem),
+            });
+            let _ = refresh_cluster_paths(&fresh, false);
+            cluster_paths().push(fresh);
+        }
+    }
+
+    let ana = cluster_ana();
+    if let Some(entry) = ana
+        .iter()
+        .find(|a| Arc::ptr_eq(&a.spec.subsystem, subsystem))
+    {
+        entry
+            .spec
+            .namespaces
+            .lock()
+            .expect("ana namespaces poisoned")
+            .push((Arc::clone(ns), sd.vid()));
     } else {
-        info!(subsystem = %hosts.subsystem.nqn, vid = format_args!("{:x}", hosts.vid),
-              hosts = ?acl.hosts, "sheepdog: ACL members changed");
+        // The subsystem's first Sheepdog namespace at all (ANA does not
+        // depend on locking, unlike the path list above) — and nothing this
+        // function can do about it: a fresh entry needs a `notify` closure
+        // over the queue-thread pool, which only exists where `senders` does
+        // (`track_cluster_ana`, called once from `control_loop` before this
+        // refresh thread starts). A subsystem that reaches this had zero
+        // cluster namespaces at startup, so restarting the target is what
+        // picks the new one up for ANA; its namespace-table entry (already
+        // added by the caller) and path-list entry (above) are unaffected.
+        warn!(subsystem = %subsystem.nqn, nsid = ns.nsid,
+              "sheepdog: first cluster namespace added after startup; ANA for it needs a restart");
+    }
+}
+
+/// Drop `backend` from this subsystem's path and ANA tracking, so a namespace
+/// [`Subsystem::remove_namespace`] just forgot does not linger — and keep
+/// serving IO through it, in either refresh.
+fn untrack_cluster_backend(subsystem: &Arc<Subsystem<AnyBackend>>, backend: &Arc<AnyBackend>) {
+    let mut paths = cluster_paths();
+    if let Some(pos) = paths
+        .iter()
+        .position(|p| Arc::ptr_eq(&p.subsystem, subsystem))
+    {
+        let old = Arc::clone(&paths[pos]);
+        let namespaces: Vec<_> = old
+            .namespaces
+            .iter()
+            .filter(|b| !Arc::ptr_eq(b, backend))
+            .cloned()
+            .collect();
+        paths[pos] = Arc::new(ClusterPaths {
+            cluster: old.cluster,
+            owner: old.owner,
+            namespaces,
+            trtype: old.trtype,
+            subsystem: Arc::clone(subsystem),
+        });
+    }
+    drop(paths);
+
+    let ana = cluster_ana();
+    if let Some(entry) = ana
+        .iter()
+        .find(|a| Arc::ptr_eq(&a.spec.subsystem, subsystem))
+    {
+        entry
+            .spec
+            .namespaces
+            .lock()
+            .expect("ana namespaces poisoned")
+            .retain(|(ns, ..)| !Arc::ptr_eq(&ns.backend, backend));
     }
 }
 
@@ -1672,7 +1981,7 @@ pub fn refresh_clusters() -> usize {
     }
     let paths = cluster_paths().clone();
     let ana = cluster_ana().clone();
-    let hosts = cluster_hosts().clone();
+    let acls = cluster_acls().clone();
     for paths in &paths {
         // The holder slot it reports is startup-only: the cntlid partition it
         // keys is fixed for the process (see [`holder_cntlid_slice`]).
@@ -1681,10 +1990,10 @@ pub fn refresh_clusters() -> usize {
     for ana in &ana {
         refresh_cluster_ana(ana);
     }
-    for hosts in &hosts {
-        refresh_cluster_hosts(hosts);
+    for acl in &acls {
+        refresh_cluster_acl(acl);
     }
-    paths.len() + ana.len() + hosts.len()
+    paths.len() + ana.len() + acls.len()
 }
 
 /// Start the one thread that keeps every cluster path list, ANA state and
@@ -1723,7 +2032,7 @@ fn start_cluster_refresh() {
 fn stop_cluster_refresh() {
     cluster_paths().clear();
     cluster_ana().clear();
-    cluster_hosts().clear();
+    cluster_acls().clear();
     // The pool it posts to is going away with everything else; a notice raised
     // from here on would only be a message nobody reads.
     *disc_notify() = None;
@@ -2111,6 +2420,7 @@ async fn control_loop<T: Transport>(
     let BuiltPort {
         port,
         ana_specs,
+        acl_specs,
         holder_slot,
     } = match build_port(&config, local, T::trtype()) {
         Ok(built) => built,
@@ -2131,6 +2441,10 @@ async fn control_loop<T: Transport>(
     // ...and the discovery log they and the path lists feed: from here on, a
     // change to it reaches the parked AERs of the live discovery controllers.
     track_discovery_changes(&senders);
+    // ...and the ACLs whose host list, namespace table or discovery
+    // generation the refresh thread keeps current: a namespace it adds or
+    // removes now reaches the connected hosts' changed-namespaces AER too.
+    track_cluster_acls(acl_specs, &senders);
     if let Some(path) = &config.control_socket
         && let Err(err) = spawn_control_api(
             path,

@@ -34,8 +34,9 @@ pub struct SubsystemConfig {
 }
 
 /// Where to find the ACL object behind a whole-cluster subsystem, for the
-/// refresh that keeps its host list current. Resolved at parse time, so the
-/// refresh never has to re-resolve a name that may have moved on.
+/// refresh that keeps its host list, namespace table and discovery
+/// generation current. Resolved at parse time, so the refresh never has to
+/// re-resolve a name that may have moved on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SheepdogAcl {
     /// Cluster gateway the ACL object is read from.
@@ -46,6 +47,13 @@ pub struct SheepdogAcl {
     /// the subsystem's discovery-log `GENCTR` starts from, before this target
     /// has seen a path list change under it.
     pub epoch: u64,
+    /// Whether this ACL's member VDIs take the cluster's shared lock —
+    /// `--backend sheepdog:HOST`'s own `lock` flag, applied uniformly to
+    /// every namespace the ACL exports. A member VDI the refresh discovers
+    /// later (`dog acl add vdi` on a running cluster) opens with the same
+    /// setting, so a hot-added namespace behaves exactly like one the target
+    /// started with.
+    pub lock: bool,
 }
 
 pub(crate) fn default_serial() -> String {

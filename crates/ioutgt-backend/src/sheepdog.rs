@@ -1283,6 +1283,70 @@ pub fn list_acls(addr: SocketAddr) -> io::Result<Vec<AclInfo>> {
     Ok(acls)
 }
 
+/// Re-read one ACL object's member VDIs — the volumes `dog acl add vdi`/
+/// `remove vdi` maintain — as [`list_acls`] does for every ACL at startup,
+/// but scoped to one ACL whose vid the caller already knows, and without a
+/// full-cluster VDI-bitmap scan: two rounds of `READ_OBJ` (the ACL's own
+/// header, then one per member) instead of one per vid on the cluster. For
+/// the refresh thread to add or remove namespaces on a running target as the
+/// list changes underneath it.
+///
+/// Same validation as [`list_acls`], vid by vid rather than against a
+/// pre-scanned table: a listed vid that does not resolve to a live volume, or
+/// whose inode names a different ACL, is dropped with a warning rather than
+/// exported — the cluster would refuse every lookup of it under this ACL
+/// anyway. Snapshots are included (unlike [`list_acls`]'s callers, which
+/// filter them out themselves — see `ioutgt-control::cli::acl_subsystem`).
+///
+/// Blocking cluster IO, like the other control-plane enumerations: never call
+/// it from a queue thread.
+pub fn acl_members(cluster: SocketAddr, vid: u32) -> io::Result<Vec<VdiInfo>> {
+    let conn = Conn::connect(cluster)?;
+    let mut header = vec![0u8; SD_INODE_META_SIZE];
+    read_obj(&conn, vid_to_vdi_oid(vid), 0, &mut header)?;
+    let max_data_id_nr = read_u32(&header, INO_OFF_MAX_DATA_ID_NR);
+    let members = read_acl_members(&conn, vid, max_data_id_nr)?;
+
+    let mut vdis = Vec::new();
+    let mut inode = vec![0u8; SD_INODE_META_SIZE];
+    for member_vid in members.into_iter().filter(|&v| v != 0) {
+        if try_read_obj(&conn, vid_to_vdi_oid(member_vid), 0, &mut inode)? != SD_RES_SUCCESS {
+            tracing::warn!(
+                acl = format_args!("{vid:x}"),
+                vid = format_args!("{member_vid:x}"),
+                "sheepdog: ACL lists a vid that is not a volume on the cluster"
+            );
+            continue;
+        }
+        let acl_id = read_u32(&inode, INO_OFF_ACL_ID);
+        if acl_id != vid {
+            tracing::warn!(
+                acl = format_args!("{vid:x}"),
+                vid = format_args!("{member_vid:x}"),
+                acl_id = format_args!("{acl_id:x}"),
+                "sheepdog: ACL lists a VDI whose inode names another ACL"
+            );
+            continue;
+        }
+        let name = read_cstr(&inode[INO_OFF_NAME..INO_OFF_NAME + SD_MAX_VDI_LEN]);
+        let size = read_u64(&inode, INO_OFF_VDI_SIZE);
+        if name.is_empty() || size == 0 {
+            continue;
+        }
+        vdis.push(VdiInfo {
+            name,
+            tag: read_cstr(&inode[INO_OFF_TAG..INO_OFF_TAG + SD_MAX_VDI_TAG_LEN]),
+            vid: member_vid,
+            size,
+            snapshot: read_u64(&inode, INO_OFF_SNAP_CTIME) != 0,
+            uuid: read_uuid(&inode),
+            acl: acl_id,
+        });
+    }
+    vdis.sort_by(|a, b| (&a.name, &a.tag).cmp(&(&b.name, &b.tag)));
+    Ok(vdis)
+}
+
 /// Read an ACL object's member list: `data_vdi_id[0..max_data_id_nr]`, which
 /// starts at [`SD_INODE_HEADER_SIZE`] in the inode object. Zero entries are
 /// holes and stay in the returned vector, so its length is the `nn` an ACL

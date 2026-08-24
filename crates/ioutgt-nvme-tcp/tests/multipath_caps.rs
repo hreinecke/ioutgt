@@ -8,7 +8,7 @@
 mod common;
 
 use common::{Client, NQN};
-use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, cmic, nsfeat, nmic};
+use ioutgt_nvme::identify::{IdentifyController, IdentifyNamespace, cmic, nmic, nsfeat};
 use ioutgt_nvme::spec;
 use zerocopy::FromBytes;
 
