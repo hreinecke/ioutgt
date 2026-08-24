@@ -69,10 +69,17 @@ const VOL_SHIFT: u8 = 22;
 /// and [`FAR`] on: fixed synthetic addresses (never dialed — `GET_NODE_LIST`
 /// only ever answers out of this fake `sheep`'s own store), so the ring does
 /// not depend on this process's own ephemeral listen port and the zone each
-/// vid lands on — [`NEAR`] zone 1, [`FAR`] zone 2 — is the same every run.
+/// vid lands on — [`NEAR`] Sheepdog zone 0, [`FAR`] zone 1 — is the same every
+/// run. Zone 0 is deliberate, not just a low number: it is Sheepdog's default
+/// for a cluster's first node (zoned by index) and the case that made ANA
+/// group id 0 — reserved, invalid — reach a real ANA log page before the
+/// zone-to-`ANAGRPID` shift existed. As `ANAGRPID` (`zone_to_grpid`, shifted
+/// by one) [`NEAR`] and [`FAR`] are groups 1 and 2 respectively — the values
+/// this file's assertions already used before the shift was needed, which is
+/// exactly why zone 0 was picked for [`NEAR`] rather than some other number.
 const FIXED_NODES: [(([u8; 4], u16), u32, u16); 2] = [
-    (([10, 0, 0, 1], 7000), 1, 128),
-    (([10, 0, 0, 10], 7000), 2, 128),
+    (([10, 0, 0, 1], 7000), 0, 128),
+    (([10, 0, 0, 10], 7000), 1, 128),
 ];
 
 /// The fake cluster: one ACL object, the two volumes in it, and the zone this
@@ -318,9 +325,9 @@ fn chgcnt(log: &[u8]) -> u64 {
 #[test]
 fn cluster_namespaces_report_ana_by_object_locality() {
     let nqn = "nqn.2026-06.io.ioutgt:ana";
-    // Zone 1: the same zone NEAR's inode object hashes to, so NEAR starts
-    // optimized and FAR (zone 2) does not.
-    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], 1);
+    // Zone 0: the same zone NEAR's inode object hashes to, so NEAR starts
+    // optimized and FAR (zone 1) does not.
+    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], 0);
     let mut admin = admin_client(addr, nqn);
 
     // Identify Controller: the whole ANA field set, which the host validates
@@ -448,16 +455,16 @@ fn local_namespaces_report_no_ana() {
 #[test]
 fn a_locality_change_raises_an_ana_change_notice() {
     let nqn = "nqn.2026-06.io.ioutgt:ana-change";
-    // Zone 0 matches nothing real: the one volume (FAR, zone 2) is reachable,
-    // not preferred.
-    let (addr, sheep) = spawn_target(nqn, &[FAR], 0);
+    // Zone 99 matches nothing in `FIXED_NODES`: the one volume (FAR, zone 1)
+    // is reachable, not preferred.
+    let (addr, sheep) = spawn_target(nqn, &[FAR], 99);
     let mut admin = admin_client(addr, nqn);
     let before = common::get_log_page(&mut admin, spec::log_page::ANA, 0, 3, 0, 4096);
     assert_eq!(groups(&before), vec![(1, 0x01, vec![]), (2, 0x02, vec![1])]);
 
     admin.post_aer(4);
     // This gateway moves into FAR's zone, and the refresh notices.
-    sheep.own_zone.store(2, Ordering::Relaxed);
+    sheep.own_zone.store(1, Ordering::Relaxed);
     assert!(
         ioutgt_harness::refresh_clusters() > 0,
         "a cluster is tracked"

@@ -1283,30 +1283,38 @@ fn cluster_ana_state_reports_the_placement_ring() {
         st.vdis
             .insert(REMOTE_VID, Vdi::new("remotevdi", 256 * 1024, 16));
         st.nodes = vec![
-            // The node we are actually connected to: its zone is the
-            // "optimized" one.
-            (addr, 1, 128),
+            // The node we are actually connected to, in Sheepdog's zone 0 —
+            // an everyday value (a cluster's first node, zoned by index),
+            // and the one that would report as the invalid ANAGRPID 0 if it
+            // were not shifted.
+            (addr, 0, 128),
             // A peer that stores data too, in a different zone.
-            (target(9), 2, 128),
+            (target(9), 1, 128),
             // A pure gateway: it claims a zone but stores nothing
             // (`nr_vnodes` 0), so no object should ever land on it.
-            (target(10), 3, 0),
+            (target(10), 2, 0),
         ];
     }
 
     let vids: Vec<u32> = (0..128).collect();
     let state = cluster_ana_state(addr, &vids).unwrap();
 
-    // The zone we are connected through, straight out of the node list.
+    // The zone we are connected through (Sheepdog zone 0), reported as
+    // ANAGRPID 1: NVMe reserves group id 0, so every zone id is shifted by
+    // one before it ever reaches a caller.
     assert_eq!(state.own_zone, Some(1));
-    // Every zone that stores data — the gateway-only zone 3 is excluded, the
-    // same filter `sheep`'s own zone count applies.
+    // Every zone that stores data — the gateway-only zone is excluded, the
+    // same filter `sheep`'s own zone count applies — shifted the same way.
     assert_eq!(state.zones, vec![1, 2]);
     // Every vid landed on one of the two data-storing zones, and — spread
     // over two equally-weighted zones, 128 of them — both zones actually won
     // some, not just one by chance.
     let seen: std::collections::HashSet<u32> = state.grpids.iter().flatten().copied().collect();
     assert_eq!(seen, std::collections::HashSet::from([1, 2]));
+    assert!(
+        state.grpids.iter().flatten().all(|&g| g != 0),
+        "ANAGRPID 0 is never reported, however Sheepdog zoned its nodes"
+    );
 
     // TEST_VID and REMOTE_VID answer too, positionally, same as any other vid.
     let two = cluster_ana_state(addr, &[TEST_VID, REMOTE_VID]).unwrap();

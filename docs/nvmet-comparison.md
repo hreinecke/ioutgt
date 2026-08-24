@@ -198,10 +198,12 @@ cluster-backed subsystems only, and where nvmet lets configfs assign a
 namespace to any of `NVMET_MAX_ANAGRPS` groups whose states an admin
 sets by hand, ioutgt derives both the group and its state from Sheepdog's
 own hash ring: `ANAGRPID` is the zone of the node that owns a volume's
-inode object — the same value from every target, unlike an earlier
-locality-flag design that gave each path its own opinion of a namespace's
-group — and a group's state is optimized exactly when this target's own
-gateway is in that zone (`docs/architecture.md` §7). A subsystem with no
+inode object, shifted by one so Sheepdog's everyday zone `0` never surfaces
+as the `ANAGRPID` NVMe hosts reject — the same value from every target,
+unlike an earlier locality-flag design that gave each path its own opinion
+of a namespace's group — and a group's state is optimized exactly when this
+target's own gateway is in that zone (`docs/architecture.md` §7). A subsystem
+with no
 cluster storage leaves CMIC bit 3 clear and the host runs plain (non-ANA)
 multipath, all paths equal.
 

@@ -756,9 +756,15 @@ sentinels, "optimized" and "non-optimized", depending on which gateway asked)
 got backwards: two targets fronting the same volume reported it under two
 different `ANAGRPID`s, which is not a namespace two paths can agree is the
 same one. `NANAGRPID` is the cluster's zone count and `ANAGRPMAX` the largest
-zone id in use — both real cluster facts now, not a constant 2 — and a group
-absent from a subsystem's own namespaces is still reported, empty, so the
-shape `NANAGRPID` promised at Identify time never drifts; NSIDs within one
+group id in use — both real cluster facts now, not a constant 2. A Sheepdog
+zone id is not directly an `ANAGRPID`, though: `0` is an everyday zone (the
+default for a cluster's first node, zoned by index — `sheep`'s own
+`docker/gen_sheep_cluster_yaml.sh` does this) but an NVMe host rejects it
+outright (`nvme_parse_ana_log`'s `WARN_ON_ONCE(desc->grpid == 0)`), so every
+zone id is shifted by one (`zone_to_grpid`) at the one place Sheepdog zones
+become `ANAGRPID`s. A group absent from a subsystem's own namespaces is
+still reported, empty, so the shape `NANAGRPID` promised at Identify time
+never drifts; NSIDs within one
 ascend, as `nvme_update_ana_state` assumes.
 
 What *is* per path is a group's **state**: optimized if the gateway this

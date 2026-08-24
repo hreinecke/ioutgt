@@ -1594,20 +1594,36 @@ fn get_node_list(conn: &Conn) -> io::Result<Vec<SheepNode>> {
         .collect())
 }
 
+/// A Sheepdog zone id, as `ANAGRPID`. NVMe reserves group id `0` as invalid
+/// (`nvme_parse_ana_log`'s `WARN_ON_ONCE(desc->grpid == 0)`), and `0` is an
+/// ordinary zone id in Sheepdog — clusters that assign zones by node index
+/// (Sheepdog's own `docker/gen_sheep_cluster_yaml.sh` does, `-z ${node}`)
+/// give their first node exactly that. Every zone id this module hands to a
+/// caller is shifted by one to dodge the reservation, `saturating` rather
+/// than wrapping so the shift itself can never produce `0` — a plain `+1`
+/// wraps `u32::MAX` straight back onto the value being avoided. Every target
+/// performs the same shift on the same input, so the mapping is still the
+/// one every asker agrees on; it stops being injective only at `u32::MAX`,
+/// which is not a realistic Sheepdog zone id (address-derived or
+/// administrator-assigned).
+fn zone_to_grpid(zone: u32) -> u32 {
+    zone.saturating_add(1)
+}
+
 /// The Sheepdog ANA placement facts one cluster's subsystem namespaces need.
+/// Every id here is `ANAGRPID` ([`zone_to_grpid`]), not the raw Sheepdog zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterAnaState {
-    /// The zone of the node this connection reaches, if the node list names
-    /// it. Only `None` for a cluster that has stopped listing us mid-refresh
-    /// — no live connection fails this lookup.
+    /// The ANA group of the node this connection reaches, if the node list
+    /// names it. Only `None` for a cluster that has stopped listing us
+    /// mid-refresh — no live connection fails this lookup.
     pub own_zone: Option<u32>,
-    /// Every zone with any object placement (`nr_vnodes > 0`), ascending and
-    /// deduplicated: the cluster's whole set of possible ANA groups, and so
-    /// `NANAGRPID`/`ANAGRPMAX` for a subsystem reporting it.
+    /// Every ANA group with any object placement (`nr_vnodes > 0`), ascending
+    /// and deduplicated: the cluster's whole set of possible ANA groups, and
+    /// so `NANAGRPID`/`ANAGRPMAX` for a subsystem reporting it.
     pub zones: Vec<u32>,
-    /// Per requested vid, the zone owning its inode object — its ANA group.
-    /// `None` only when the ring has no vnodes at all (see
-    /// [`HashRing::zone_of`]).
+    /// Per requested vid, the ANA group owning its inode object. `None` only
+    /// when the ring has no vnodes at all (see [`HashRing::zone_of`]).
     pub grpids: Vec<Option<u32>>,
 }
 
@@ -1630,18 +1646,21 @@ pub struct ClusterAnaState {
 pub fn cluster_ana_state(cluster: SocketAddr, vids: &[u32]) -> io::Result<ClusterAnaState> {
     let conn = Conn::connect(cluster)?;
     let nodes = get_node_list(&conn)?;
-    let own_zone = nodes.iter().find(|n| n.addr == cluster).map(|n| n.zone);
+    let own_zone = nodes
+        .iter()
+        .find(|n| n.addr == cluster)
+        .map(|n| zone_to_grpid(n.zone));
     let mut zones: Vec<u32> = nodes
         .iter()
         .filter(|n| n.nr_vnodes > 0)
-        .map(|n| n.zone)
+        .map(|n| zone_to_grpid(n.zone))
         .collect();
     zones.sort_unstable();
     zones.dedup();
     let ring = HashRing::build(&nodes);
     let grpids = vids
         .iter()
-        .map(|&vid| ring.zone_of(vid_to_vdi_oid(vid)))
+        .map(|&vid| ring.zone_of(vid_to_vdi_oid(vid)).map(zone_to_grpid))
         .collect();
     Ok(ClusterAnaState {
         own_zone,
@@ -2353,6 +2372,16 @@ mod tests {
             HashRing::build(&gateway_only).zone_of(vid_to_vdi_oid(1)),
             None
         );
+    }
+
+    #[test]
+    fn zone_to_grpid_never_reports_the_reserved_zero() {
+        // Zone 0 is Sheepdog's default for a cluster's first node — an
+        // everyday value, not a corner case — and NVMe reserves ANAGRPID 0.
+        assert_eq!(zone_to_grpid(0), 1);
+        assert_ne!(zone_to_grpid(u32::MAX), 0, "saturates, never wraps to zero");
+        // Distinct zones map to distinct groups outside the saturating edge.
+        assert_ne!(zone_to_grpid(0), zone_to_grpid(1));
     }
 
     /// A `GET_NODE_LIST` record, as `nodes_to_buffer` writes it: the
