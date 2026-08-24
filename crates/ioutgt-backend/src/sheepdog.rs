@@ -706,6 +706,14 @@ impl SheepdogBackend {
         self.vid
     }
 
+    /// The replication factor from the VDI's inode: how many of the
+    /// cluster's zones a copy of this volume's data lives in, which
+    /// [`cluster_ana_state`] needs to report every zone that is an optimized
+    /// path to it, not only the primary one.
+    pub fn nr_copies(&self) -> u8 {
+        self.nr_copies
+    }
+
     /// The address this backend registered as the volume's holder, or `None`
     /// if it took no lock. It is one of the addresses [`vdi_holders`] reports
     /// — this target's own path to the namespace.
@@ -1507,9 +1515,9 @@ struct VNode {
 
 /// A cluster's placement ring, snapshotted from one `GET_NODE_LIST` reply.
 struct HashRing {
-    /// Ascending by hash: [`HashRing::zone_of`] is a binary search over this,
-    /// the same structure `oid_to_first_vnode`'s red-black tree walk gives an
-    /// ordered rb-tree lookup over.
+    /// Ascending by hash: [`HashRing::zones_of`] is a binary search over
+    /// this, the same structure `oid_to_first_vnode`'s red-black tree walk
+    /// gives an ordered rb-tree lookup over.
     vnodes: Vec<VNode>,
 }
 
@@ -1534,18 +1542,37 @@ impl HashRing {
         HashRing { vnodes }
     }
 
-    /// The zone owning `oid`: `oid_to_first_vnode`'s rule ("if `v1.hash <
-    /// oid.hash <= v2.hash`, then `oid` is resident on `v2`") is "the first
-    /// vnode whose hash is at least `oid`'s", wrapping past the end of the
-    /// ring to its smallest hash. `None` only for a ring with no vnodes at
-    /// all — every node in the cluster a pure gateway, or no nodes at all.
-    fn zone_of(&self, oid: u64) -> Option<u32> {
+    /// The zones holding a replica of `oid`, up to `nr_copies` of them, in
+    /// ring order starting at the object's primary vnode — the first entry is
+    /// the zone `oid_to_first_vnode` names (and so the namespace's `ANAGRPID`
+    /// — see [`zone_to_grpid`]), the rest mirror `oid_to_vnodes`' replica
+    /// placement: walk the ring forward from there, one step at a time,
+    /// keeping the first vnode seen from each not-yet-collected zone, until
+    /// `nr_copies` distinct zones are found or a full lap of the ring
+    /// exhausts every zone it has. `oid_to_first_vnode`'s wraparound rule
+    /// ("if `v1.hash < oid.hash <= v2.hash`, then `oid` is resident on `v2`")
+    /// is "the first vnode whose hash is at least `oid`'s, wrapping past the
+    /// end of the ring to its smallest hash" — empty only for a ring with no
+    /// vnodes at all, every node in the cluster a pure gateway, or no nodes
+    /// at all.
+    fn zones_of(&self, oid: u64, nr_copies: usize) -> Vec<u32> {
+        if self.vnodes.is_empty() || nr_copies == 0 {
+            return Vec::new();
+        }
         let target = sd_hash_oid(oid);
         let idx = self.vnodes.partition_point(|v| v.hash < target);
-        self.vnodes
-            .get(idx)
-            .or_else(|| self.vnodes.first())
-            .map(|v| v.zone)
+        let first = if idx == self.vnodes.len() { 0 } else { idx };
+        let mut zones = Vec::with_capacity(nr_copies);
+        for step in 0..self.vnodes.len() {
+            if zones.len() >= nr_copies {
+                break;
+            }
+            let zone = self.vnodes[(first + step) % self.vnodes.len()].zone;
+            if !zones.contains(&zone) {
+                zones.push(zone);
+            }
+        }
+        zones
     }
 }
 
@@ -1610,63 +1637,81 @@ fn zone_to_grpid(zone: u32) -> u32 {
     zone.saturating_add(1)
 }
 
+/// One namespace's ANA placement: its group, and whether this connection's
+/// own gateway is a good path to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnaPlacement {
+    /// The namespace's ANA group (`ANAGRPID`, [`zone_to_grpid`]): the zone of
+    /// the object's *primary* vnode — the same value however many targets
+    /// ask, and through whichever gateway, since it depends only on the
+    /// cluster's topology and the object id.
+    pub grpid: u32,
+    /// Whether the gateway this connection reaches holds a copy of the
+    /// object — the primary zone `grpid` names, or any of the other zones
+    /// Sheepdog replicated it to — and so is an optimized path to it. Every
+    /// zone holding a copy serves the object without a hop, not only the
+    /// primary one, which is why this is not simply `own_zone == grpid`.
+    pub optimized: bool,
+}
+
 /// The Sheepdog ANA placement facts one cluster's subsystem namespaces need.
-/// Every id here is `ANAGRPID` ([`zone_to_grpid`]), not the raw Sheepdog zone.
+/// Every zone id here is `ANAGRPID` ([`zone_to_grpid`]), not the raw
+/// Sheepdog zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterAnaState {
-    /// The ANA group of the node this connection reaches, if the node list
-    /// names it. Only `None` for a cluster that has stopped listing us
-    /// mid-refresh — no live connection fails this lookup.
-    pub own_zone: Option<u32>,
     /// Every ANA group with any object placement (`nr_vnodes > 0`), ascending
     /// and deduplicated: the cluster's whole set of possible ANA groups, and
     /// so `NANAGRPID`/`ANAGRPMAX` for a subsystem reporting it.
     pub zones: Vec<u32>,
-    /// Per requested vid, the ANA group owning its inode object. `None` only
-    /// when the ring has no vnodes at all (see [`HashRing::zone_of`]).
-    pub grpids: Vec<Option<u32>>,
+    /// Per requested `(vid, nr_copies)`, its placement. `None` only when the
+    /// ring has no vnodes at all (see [`HashRing::zones_of`]).
+    pub placements: Vec<Option<AnaPlacement>>,
 }
 
 /// The ANA placement facts a subsystem's cluster namespaces need: which zone
-/// owns each volume's inode object (its ANA group — identical however many
-/// targets ask, and through whichever gateway, since it depends only on the
-/// cluster's topology and the object id), the full set of zones that exist
-/// (every ANA group the subsystem might ever report), and whether the
-/// gateway this connection reaches is itself in one of them (the "optimized"
-/// test: reaching a zone's objects through a node already in that zone costs
-/// no extra hop, reaching them through any other node does).
+/// owns each volume's inode object (its ANA group), whether this connection's
+/// own gateway holds a copy of it (the "optimized" test), and the full set of
+/// zones that exist (every ANA group the subsystem might ever report).
 ///
 /// The inode object stands in for the volume as a whole: data objects hash
 /// independently, so no single zone is home to all of them, but the inode's
-/// zone is on the volume's hash neighbourhood and is the better path on
-/// average, which is exactly the preference ANA expresses.
+/// placement — its primary zone, and the zones its `nr_copies` replicas land
+/// in (`oid_to_vnodes`, one replica per distinct zone) — is on the volume's
+/// hash neighbourhood and representative of it. `nr_copies` is clamped to the
+/// cluster's own zone count, exactly as Sheepdog's own placement does
+/// (`get_obj_copy_number`): asking for more replicas than there are zones to
+/// put them in is not a request any real write ever makes either.
 ///
 /// Blocking; called from the control plane only (startup and the periodic
 /// ANA refresh).
-pub fn cluster_ana_state(cluster: SocketAddr, vids: &[u32]) -> io::Result<ClusterAnaState> {
+pub fn cluster_ana_state(cluster: SocketAddr, vids: &[(u32, u8)]) -> io::Result<ClusterAnaState> {
     let conn = Conn::connect(cluster)?;
     let nodes = get_node_list(&conn)?;
-    let own_zone = nodes
-        .iter()
-        .find(|n| n.addr == cluster)
-        .map(|n| zone_to_grpid(n.zone));
-    let mut zones: Vec<u32> = nodes
+    let own_zone = nodes.iter().find(|n| n.addr == cluster).map(|n| n.zone);
+    let mut zones_raw: Vec<u32> = nodes
         .iter()
         .filter(|n| n.nr_vnodes > 0)
-        .map(|n| zone_to_grpid(n.zone))
+        .map(|n| n.zone)
         .collect();
-    zones.sort_unstable();
-    zones.dedup();
+    zones_raw.sort_unstable();
+    zones_raw.dedup();
+    let nr_zones = zones_raw.len().max(1);
+    let zones = zones_raw.into_iter().map(zone_to_grpid).collect();
+
     let ring = HashRing::build(&nodes);
-    let grpids = vids
+    let placements = vids
         .iter()
-        .map(|&vid| ring.zone_of(vid_to_vdi_oid(vid)).map(zone_to_grpid))
+        .map(|&(vid, nr_copies)| -> Option<AnaPlacement> {
+            let copies = usize::from(nr_copies).clamp(1, nr_zones);
+            let group_zones = ring.zones_of(vid_to_vdi_oid(vid), copies);
+            let &primary = group_zones.first()?;
+            Some(AnaPlacement {
+                grpid: zone_to_grpid(primary),
+                optimized: own_zone.is_some_and(|z| group_zones.contains(&z)),
+            })
+        })
         .collect();
-    Ok(ClusterAnaState {
-        own_zone,
-        zones,
-        grpids,
-    })
+    Ok(ClusterAnaState { zones, placements })
 }
 
 /// Take the cluster lock on the VDI named `vdi` within ACL `acl`, registering
@@ -2347,7 +2392,8 @@ mod tests {
         ];
         let ring = HashRing::build(&nodes);
         for vid in 0u32..256 {
-            let zone = ring.zone_of(vid_to_vdi_oid(vid)).expect("ring is nonempty");
+            let zones = ring.zones_of(vid_to_vdi_oid(vid), 1);
+            let &zone = zones.first().expect("ring is nonempty");
             assert_ne!(zone, 3, "a gateway-only zone owns nothing");
             assert!(zone == 1 || zone == 2);
         }
@@ -2355,22 +2401,70 @@ mod tests {
         // "vid 0..256" spread (and the ring's balance in general) would be
         // suspicious, not just this one assertion.
         let zones: std::collections::HashSet<u32> = (0u32..256)
-            .filter_map(|vid| ring.zone_of(vid_to_vdi_oid(vid)))
+            .filter_map(|vid| ring.zones_of(vid_to_vdi_oid(vid), 1).first().copied())
             .collect();
         assert_eq!(zones, std::collections::HashSet::from([1, 2]));
     }
 
     #[test]
     fn hash_ring_empty_or_gateway_only_owns_nothing() {
-        assert_eq!(HashRing::build(&[]).zone_of(vid_to_vdi_oid(1)), None);
+        assert!(
+            HashRing::build(&[])
+                .zones_of(vid_to_vdi_oid(1), 1)
+                .is_empty()
+        );
         let gateway_only = [SheepNode {
             addr: "10.0.0.1:7000".parse().unwrap(),
             nr_vnodes: 0,
             zone: 1,
         }];
+        assert!(
+            HashRing::build(&gateway_only)
+                .zones_of(vid_to_vdi_oid(1), 1)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hash_ring_zones_of_lists_every_replica_zone_in_ring_order() {
+        // Three data-storing zones: a replicated object (nr_copies 3) should
+        // land on all three, one per zone, primary first — the zone
+        // `zones_of(.., 1)` alone would report.
+        let nodes = [
+            SheepNode {
+                addr: "10.0.0.1:7000".parse().unwrap(),
+                nr_vnodes: 64,
+                zone: 1,
+            },
+            SheepNode {
+                addr: "10.0.0.2:7000".parse().unwrap(),
+                nr_vnodes: 64,
+                zone: 2,
+            },
+            SheepNode {
+                addr: "10.0.0.3:7000".parse().unwrap(),
+                nr_vnodes: 64,
+                zone: 3,
+            },
+        ];
+        let ring = HashRing::build(&nodes);
+        for vid in 0u32..64 {
+            let oid = vid_to_vdi_oid(vid);
+            let primary = ring.zones_of(oid, 1);
+            let all = ring.zones_of(oid, 3);
+            assert_eq!(all.len(), 3, "one replica per zone the cluster has");
+            assert_eq!(all[0], primary[0], "the primary zone leads the list");
+            let distinct: std::collections::HashSet<u32> = all.iter().copied().collect();
+            assert_eq!(distinct.len(), 3, "no zone holds two of an object's copies");
+        }
+        // More copies asked for than zones exist just exhausts the zones the
+        // cluster actually has — the clamp callers apply before this ever
+        // matters (`cluster_ana_state`), but the ring itself does not panic
+        // or loop forever either way.
         assert_eq!(
-            HashRing::build(&gateway_only).zone_of(vid_to_vdi_oid(1)),
-            None
+            ring.zones_of(vid_to_vdi_oid(0), 99).len(),
+            3,
+            "every zone once, not more"
         );
     }
 

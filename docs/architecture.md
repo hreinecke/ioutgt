@@ -768,13 +768,27 @@ never drifts; NSIDs within one
 ascend, as `nvme_update_ana_state` assumes.
 
 What *is* per path is a group's **state**: optimized if the gateway this
-target's connection reaches is itself in that zone, non-optimized otherwise.
-Both facts — the zone topology (`GET_NODE_LIST`, a **local** op answered out
-of the connected node's own membership view) and, from it, the ring each vid
-resolves against — come from one refresh, `ioutgt_backend::cluster_ana_state`;
-`own_zone` is found by matching the connected address in the node list, the
-per-vid group by walking the ring the node list built. It rides the same 10 s
-refresh thread as the path list, per (subsystem, cluster) — unlike paths,
+target's connection reaches holds a copy of the object, non-optimized
+otherwise — and "holds a copy" is not the same test as "is the primary
+zone". Sheepdog replicates a volume onto `nr_copies` zones, one per distinct
+zone along the ring from the primary vnode (`oid_to_vnodes`), and every one
+of them serves it without a hop — so a target whose own gateway is *any* of
+those zones is an optimized path, not only the one target whose gateway
+happens to be the primary. Reporting only the primary zone as optimized was
+the bug this replaced: with a cluster's usual `nr_copies` of 2 or 3, most
+targets fronting a replicated volume would show non-optimized forever, on
+paths a host could serve without a hop just as well as the "optimized" one.
+Both facts — the namespace's group (the primary zone alone) and its state
+(whether this connection's own zone is among *every* replica zone) — come
+from one refresh, `ioutgt_backend::cluster_ana_state::AnaPlacement`, which
+walks the same ring twice: once for the primary vnode (the group), once
+`nr_copies` vnodes deep, skipping zones already seen, for the full replica
+set the state test checks against. `nr_copies` is clamped to the cluster's
+own zone count first, exactly as Sheepdog's own placement clamps it
+(`get_obj_copy_number`) — asking the ring for more replicas than there are
+zones to put them in is not a request real placement ever makes either. It
+rides the same 10 s refresh thread as the path list, per (subsystem,
+cluster) — unlike paths,
 namespaces on a second cluster are not dropped but asked of *their* gateway,
 since both the ring and this path's place on it are per-cluster facts. A
 group set that grows (a zone appearing) or a namespace's group or state

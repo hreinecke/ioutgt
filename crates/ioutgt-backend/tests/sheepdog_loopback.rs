@@ -1270,67 +1270,89 @@ fn holder_list_survives_a_cluster_larger_than_one_buffer() {
 }
 
 /// Object placement — the fact behind ANA. `GET_NODE_LIST` names every node's
-/// zone; the ring built from it decides which zone owns each vid's inode
-/// object — a fact about the cluster's topology and the object id, the same
-/// however many targets ask and through whichever gateway.
+/// zone; the ring built from it decides which zone owns each vid's primary
+/// placement (its `ANAGRPID`) — a fact about the cluster's topology and the
+/// object id, the same however many targets ask and through whichever
+/// gateway — and, separately, every zone the object is actually replicated
+/// to, which is what "optimized" means: any of them, not only the primary.
 #[test]
 fn cluster_ana_state_reports_the_placement_ring() {
-    const REMOTE_VID: u32 = 0x00ab_cdf0;
     let store = fresh_store(16, 256 * 1024);
     let addr = spawn_fake_sheep(Arc::clone(&store));
     {
         let mut st = store.lock().unwrap();
-        st.vdis
-            .insert(REMOTE_VID, Vdi::new("remotevdi", 256 * 1024, 16));
         st.nodes = vec![
             // The node we are actually connected to, in Sheepdog's zone 0 —
             // an everyday value (a cluster's first node, zoned by index),
             // and the one that would report as the invalid ANAGRPID 0 if it
             // were not shifted.
             (addr, 0, 128),
-            // A peer that stores data too, in a different zone.
+            // Two more data-storing zones.
             (target(9), 1, 128),
-            // A pure gateway: it claims a zone but stores nothing
-            // (`nr_vnodes` 0), so no object should ever land on it.
-            (target(10), 2, 0),
+            (target(10), 2, 128),
         ];
     }
 
-    let vids: Vec<u32> = (0..128).collect();
+    // One copy each: a placement's primary zone is the only one holding it.
+    let vids: Vec<(u32, u8)> = (0..64).map(|vid| (vid, 1)).collect();
     let state = cluster_ana_state(addr, &vids).unwrap();
 
-    // The zone we are connected through (Sheepdog zone 0), reported as
-    // ANAGRPID 1: NVMe reserves group id 0, so every zone id is shifted by
-    // one before it ever reaches a caller.
-    assert_eq!(state.own_zone, Some(1));
-    // Every zone that stores data — the gateway-only zone is excluded, the
-    // same filter `sheep`'s own zone count applies — shifted the same way.
-    assert_eq!(state.zones, vec![1, 2]);
-    // Every vid landed on one of the two data-storing zones, and — spread
-    // over two equally-weighted zones, 128 of them — both zones actually won
-    // some, not just one by chance.
-    let seen: std::collections::HashSet<u32> = state.grpids.iter().flatten().copied().collect();
-    assert_eq!(seen, std::collections::HashSet::from([1, 2]));
+    // Every zone that stores data, shifted to ANAGRPID: NVMe reserves group
+    // id 0, so Sheepdog's own zone 0 (ours) never surfaces as one.
+    assert_eq!(state.zones, vec![1, 2, 3]);
+    let placements: Vec<_> = state
+        .placements
+        .iter()
+        .map(|p| p.expect("ring is nonempty"))
+        .collect();
+    for p in &placements {
+        assert_eq!(
+            p.optimized,
+            p.grpid == 1,
+            "one copy: optimized iff the primary zone is ours"
+        );
+    }
+    // Spread over three zones, 64 vids land some on ours and some not —
+    // otherwise the next assertion (replication reaching every zone) would
+    // prove nothing.
+    assert!(placements.iter().any(|p| p.optimized), "some land on us");
+    assert!(placements.iter().any(|p| !p.optimized), "and some do not");
+
+    // Replicated across every zone the cluster has (3 copies, 3 zones), an
+    // object is reachable from our own zone regardless of which zone is
+    // primary — the fix this test exists for: "optimized" is not only the
+    // primary zone, but every zone Sheepdog actually put a copy in.
+    let replicated: Vec<(u32, u8)> = (0..16).map(|vid| (vid, 3)).collect();
+    let state = cluster_ana_state(addr, &replicated).unwrap();
     assert!(
-        state.grpids.iter().flatten().all(|&g| g != 0),
-        "ANAGRPID 0 is never reported, however Sheepdog zoned its nodes"
+        state
+            .placements
+            .iter()
+            .all(|p| p.expect("ring is nonempty").optimized),
+        "every zone in the cluster holds a copy, including ours"
     );
 
-    // TEST_VID and REMOTE_VID answer too, positionally, same as any other vid.
-    let two = cluster_ana_state(addr, &[TEST_VID, REMOTE_VID]).unwrap();
-    assert!(two.grpids.iter().all(|g| matches!(g, Some(1) | Some(2))));
+    // Asking for more copies than the cluster has zones is clamped the same
+    // way Sheepdog's own placement clamps it (`get_obj_copy_number`): capped
+    // at the zone count, not an error.
+    let over_replicated: Vec<(u32, u8)> = (0..8).map(|vid| (vid, 250)).collect();
+    let state = cluster_ana_state(addr, &over_replicated).unwrap();
+    assert!(
+        state
+            .placements
+            .iter()
+            .all(|p| p.expect("ring is nonempty").optimized)
+    );
 
-    // A cluster with no data-storing nodes at all resolves nothing — the
-    // vid simply has no zone to report.
+    // A cluster with no data-storing nodes at all resolves nothing.
     store.lock().unwrap().nodes.clear();
-    let none = cluster_ana_state(addr, &[TEST_VID]).unwrap();
-    assert_eq!(none.own_zone, None);
+    let none = cluster_ana_state(addr, &[(TEST_VID, 1)]).unwrap();
     assert!(none.zones.is_empty());
-    assert_eq!(none.grpids, vec![None]);
+    assert_eq!(none.placements, vec![None]);
 
-    // Unlike the old per-vid locality probe, there is no zero-vid fast path
-    // that skips connecting: the placement ring needs the node list even to
-    // answer nothing, so an address that would refuse fails outright.
+    // There is no zero-vid fast path that skips connecting: the placement
+    // ring needs the node list even to answer nothing, so an address that
+    // would refuse fails outright.
     let nowhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
     assert!(cluster_ana_state(nowhere, &[]).is_err());
 }

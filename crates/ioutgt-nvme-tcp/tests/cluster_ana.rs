@@ -51,39 +51,57 @@ const NODE_OFF_PORT: usize = 40;
 const NODE_OFF_NR_VNODES: usize = 64;
 const NODE_OFF_ZONE: usize = 68;
 
-/// The vid of the ACL object naming a subsystem, and of the two volumes in
-/// it. Their placement is fixed by [`FIXED_NODES`], not by anything a test
-/// toggles — this vid pair lands one on each of that topology's two zones,
-/// which is what makes them useful names for "the optimized one" and "the
-/// other one".
+/// The vid of the ACL object naming a subsystem, and of the two single-copy
+/// volumes in it. Their placement is fixed by [`FIXED_NODES`], not by
+/// anything a test toggles — this vid pair lands one on each of that
+/// topology's first two zones, which is what makes them useful names for
+/// "the optimized one" and "the other one".
 const ACL_VID: u32 = 0x0000_4711;
 const NEAR: &str = "near";
 const NEAR_VID: u32 = 0x0000_4712;
 const FAR: &str = "far";
 const FAR_VID: u32 = 0x0000_4713;
+/// A volume replicated across every zone [`FIXED_NODES`] has: unlike
+/// [`NEAR`]/[`FAR`], no single zone is *the* optimized one for it — every
+/// zone holding one of its copies is.
+const WIDE: &str = "wide";
+const WIDE_VID: u32 = 0x0000_4714;
 /// 16 MiB in 4 MiB objects.
 const VOL_SIZE: u64 = 16 << 20;
 const VOL_SHIFT: u8 = 22;
 
-/// The two-node, two-zone topology every test in this file places [`NEAR`]
-/// and [`FAR`] on: fixed synthetic addresses (never dialed — `GET_NODE_LIST`
-/// only ever answers out of this fake `sheep`'s own store), so the ring does
-/// not depend on this process's own ephemeral listen port and the zone each
-/// vid lands on — [`NEAR`] Sheepdog zone 0, [`FAR`] zone 1 — is the same every
-/// run. Zone 0 is deliberate, not just a low number: it is Sheepdog's default
-/// for a cluster's first node (zoned by index) and the case that made ANA
-/// group id 0 — reserved, invalid — reach a real ANA log page before the
-/// zone-to-`ANAGRPID` shift existed. As `ANAGRPID` (`zone_to_grpid`, shifted
-/// by one) [`NEAR`] and [`FAR`] are groups 1 and 2 respectively — the values
-/// this file's assertions already used before the shift was needed, which is
-/// exactly why zone 0 was picked for [`NEAR`] rather than some other number.
+/// The three-node, three-zone topology every test in this file places
+/// [`NEAR`], [`FAR`], and [`WIDE`] on: fixed synthetic addresses (never
+/// dialed — `GET_NODE_LIST` only ever answers out of this fake `sheep`'s own
+/// store), so the ring does not depend on this process's own ephemeral
+/// listen port and the zone each vid lands on — [`NEAR`] Sheepdog zone 0,
+/// [`FAR`] zone 1 — is the same every run. Zone 0 is deliberate, not just a
+/// low number: it is Sheepdog's default for a cluster's first node (zoned by
+/// index) and the case that made ANA group id 0 — reserved, invalid — reach
+/// a real ANA log page before the zone-to-`ANAGRPID` shift existed. As
+/// `ANAGRPID` (`zone_to_grpid`, shifted by one) [`NEAR`] and [`FAR`] are
+/// groups 1 and 2 respectively — the values this file's assertions already
+/// used before the shift was needed, which is exactly why zone 0 was picked
+/// for [`NEAR`] rather than some other number.
 const FIXED_NODES: [(([u8; 4], u16), u32, u16); 2] = [
     (([10, 0, 0, 1], 7000), 0, 128),
     (([10, 0, 0, 10], 7000), 1, 128),
 ];
 
-/// The fake cluster: one ACL object, the two volumes in it, and the zone this
-/// node claims to be in — the only thing a test here ever changes.
+/// [`FIXED_NODES`] plus a third zone, for [`WIDE`]'s replication test — kept
+/// separate rather than folded into [`FIXED_NODES`] so the existing
+/// two-group tests' `NANAGRPID`/`ANAGRPMAX` expectations do not have to carry
+/// a zone none of their own namespaces use.
+const WIDE_NODES: [(([u8; 4], u16), u32, u16); 3] = [
+    (([10, 0, 0, 1], 7000), 0, 128),
+    (([10, 0, 0, 10], 7000), 1, 128),
+    (([10, 0, 0, 20], 7000), 2, 128),
+];
+
+type FixedNodes = &'static [(([u8; 4], u16), u32, u16)];
+
+/// The fake cluster: one ACL object, its volumes, and the zone this node
+/// claims to be in — the only thing a test here ever changes.
 struct Sheep {
     /// The ACL object's name — the NQN of the subsystem it belongs to. One per
     /// target, so tests in this binary do not share a subsystem.
@@ -93,6 +111,10 @@ struct Sheep {
     /// changing it moves which zone's namespaces are optimized without
     /// disturbing where any vid's inode object actually hashes to.
     own_zone: AtomicU32,
+    /// The cluster's node/zone topology this `sheep` reports — [`FIXED_NODES`]
+    /// for every test but [`WIDE`]'s, which needs a third zone to replicate
+    /// across.
+    nodes: FixedNodes,
 }
 
 fn u32le(b: &[u8], o: usize) -> u32 {
@@ -114,10 +136,16 @@ fn inode(sheep: &Sheep, vid: u32) -> Vec<u8> {
         b[592..596].copy_from_slice(&SD_VDI_FLAG_ACL.to_le_bytes());
         return b;
     }
-    let name = if vid == NEAR_VID { NEAR } else { FAR };
+    let (name, nr_copies) = match vid {
+        NEAR_VID => (NEAR, 1),
+        FAR_VID => (FAR, 1),
+        // Replicated across every zone WIDE_NODES has, so no single zone is
+        // *the* optimized one for it.
+        _ => (WIDE, 3),
+    };
     b[..name.len()].copy_from_slice(name.as_bytes());
     b[536..544].copy_from_slice(&VOL_SIZE.to_le_bytes());
-    b[554] = 1;
+    b[554] = nr_copies;
     b[555] = VOL_SHIFT;
     b[572..576].copy_from_slice(&ACL_VID.to_le_bytes()); // acl_id
     b.resize(
@@ -160,7 +188,8 @@ fn resolve(sheep: &Sheep, name: &str, acl: u32) -> Result<u32, u32> {
     match (name, acl) {
         (NEAR, ACL_VID) => Ok(NEAR_VID),
         (FAR, ACL_VID) => Ok(FAR_VID),
-        (NEAR | FAR, _) => Err(SD_RES_VDI_DENIED),
+        (WIDE, ACL_VID) => Ok(WIDE_VID),
+        (NEAR | FAR | WIDE, _) => Err(SD_RES_VDI_DENIED),
         _ if name == sheep.acl_nqn && acl == 0 => Ok(ACL_VID),
         _ if name == sheep.acl_nqn => Err(SD_RES_VDI_DENIED),
         _ => Err(SD_RES_NO_VDI),
@@ -209,13 +238,13 @@ fn serve_conn(mut sock: TcpStream, sheep: &Sheep) -> std::io::Result<()> {
                 );
                 // Our own listen address, as the accepted socket's local half
                 // — exactly the address the target dialed to reach us — plus
-                // the two fixed nodes that own every vid's placement.
+                // the fixed nodes that own every vid's placement.
                 let mut nodes = vec![node_record(
                     sock.local_addr()?,
                     0,
                     sheep.own_zone.load(Ordering::Relaxed),
                 )];
-                nodes.extend(FIXED_NODES.iter().map(|&((ip, port), zone, nr_vnodes)| {
+                nodes.extend(sheep.nodes.iter().map(|&((ip, port), zone, nr_vnodes)| {
                     node_record(SocketAddr::from((ip, port)), nr_vnodes, zone)
                 }));
                 let bytes: Vec<u8> = nodes.into_iter().flatten().collect();
@@ -260,12 +289,18 @@ fn sheepdog_ns(nsid: u32, cluster: SocketAddr, acl_nqn: &str, vdi: &str) -> Name
 }
 
 /// Start a target whose subsystem is `nqn`, serving `volumes` off a fake
-/// cluster in which this gateway claims `own_zone`. Returns the target's
-/// address and the cluster, so a test can move the claim later.
-fn spawn_target(nqn: &str, volumes: &[&str], own_zone: u32) -> (SocketAddr, Arc<Sheep>) {
+/// cluster topology `nodes` in which this gateway claims `own_zone`. Returns
+/// the target's address and the cluster, so a test can move the claim later.
+fn spawn_target(
+    nqn: &str,
+    volumes: &[&str],
+    own_zone: u32,
+    nodes: FixedNodes,
+) -> (SocketAddr, Arc<Sheep>) {
     let sheep = Arc::new(Sheep {
         acl_nqn: nqn.into(),
         own_zone: AtomicU32::new(own_zone),
+        nodes,
     });
     let cluster = spawn_fake_sheep(Arc::clone(&sheep));
 
@@ -327,7 +362,7 @@ fn cluster_namespaces_report_ana_by_object_locality() {
     let nqn = "nqn.2026-06.io.ioutgt:ana";
     // Zone 0: the same zone NEAR's inode object hashes to, so NEAR starts
     // optimized and FAR (zone 1) does not.
-    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], 0);
+    let (addr, _sheep) = spawn_target(nqn, &[NEAR, FAR], 0, &FIXED_NODES);
     let mut admin = admin_client(addr, nqn);
 
     // Identify Controller: the whole ANA field set, which the host validates
@@ -457,7 +492,7 @@ fn a_locality_change_raises_an_ana_change_notice() {
     let nqn = "nqn.2026-06.io.ioutgt:ana-change";
     // Zone 99 matches nothing in `FIXED_NODES`: the one volume (FAR, zone 1)
     // is reachable, not preferred.
-    let (addr, sheep) = spawn_target(nqn, &[FAR], 99);
+    let (addr, sheep) = spawn_target(nqn, &[FAR], 99, &FIXED_NODES);
     let mut admin = admin_client(addr, nqn);
     let before = common::get_log_page(&mut admin, spec::log_page::ANA, 0, 3, 0, 4096);
     assert_eq!(groups(&before), vec![(1, 0x01, vec![]), (2, 0x02, vec![1])]);
@@ -487,5 +522,37 @@ fn a_locality_change_raises_an_ana_change_notice() {
     assert!(
         chgcnt(&after) > chgcnt(&before),
         "the change count advanced with the change"
+    );
+}
+
+/// A volume Sheepdog replicates across every zone the cluster has is
+/// optimized through every one of them, not only whichever zone its primary
+/// vnode happens to land on — the fix this test exists for. A design that
+/// only ever reports the primary zone's own gateway as optimized would leave
+/// every other target fronting the same volume permanently non-optimized,
+/// however many copies of the object they actually hold.
+#[test]
+fn a_replicated_namespace_is_optimized_through_every_zone_holding_a_copy() {
+    let nqn = "nqn.2026-06.io.ioutgt:ana-wide";
+    // Zone 2: not necessarily WIDE's primary zone (that is whatever the ring
+    // computes), but one of the three zones WIDE is replicated to regardless.
+    let (addr, _sheep) = spawn_target(nqn, &[WIDE], 2, &WIDE_NODES);
+    let mut admin = admin_client(addr, nqn);
+
+    let log = common::get_log_page(&mut admin, spec::log_page::ANA, 0, 3, 0, 4096);
+    let all_groups = groups(&log);
+    assert_eq!(
+        all_groups.len(),
+        3,
+        "one descriptor per zone WIDE_NODES has, empty ones included"
+    );
+    let (_, state, nsids) = all_groups
+        .iter()
+        .find(|(_, _, nsids)| nsids.contains(&1))
+        .expect("nsid 1 (WIDE) is listed in whichever group is its primary");
+    assert_eq!(nsids, &vec![1]);
+    assert_eq!(
+        *state, 0x01,
+        "optimized: our zone holds one of WIDE's three copies, primary or not"
     );
 }
