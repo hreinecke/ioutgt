@@ -169,6 +169,12 @@ pub mod anacap {
     pub const STATIC_GRPID: u8 = 1 << 6;
 }
 
+/// NSFEAT bits (Identify Namespace: Namespaces features)
+pub mod nsfeat {
+    /// The namespace supports thin provisioning ('NVME_NS_NSFEAT_THINP').
+    pub const THINP: u8 = 1 << 0;
+}
+
 /// NMIC bits (Identify Namespace: multi-path I/O & namespace sharing).
 pub mod nmic {
     /// The namespace may be attached to two or more controllers at once

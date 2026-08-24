@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
     IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
-    ctratt, nmic, oncs, u128_le,
+    ctratt, nsfeat, nmic, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
@@ -324,6 +324,7 @@ fn build_id_ns<B: Backend>(subsys: &Subsystem<B>, ns: &Namespace<B>) -> Box<Iden
     id.nvmcap = u128_le(ns.capacity());
     id.nlbaf = 0;
     id.flbas = 0;
+    id.nsfeat = nsfeat::THINP;
     // Shared namespace: it may be attached to multiple controllers at once
     // (every ioutgt connection is its own controller serving this backend),
     // so the host folds the paths into one multipath head.
