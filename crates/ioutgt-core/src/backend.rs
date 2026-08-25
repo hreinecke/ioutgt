@@ -44,6 +44,9 @@ pub trait Backend: Send + Sync + 'static {
     /// Device capacity in logical blocks.
     fn nr_blocks(&self) -> u64;
 
+    /// Optimal I/O boundary for this backend
+    fn io_boundary(&self) -> u16;
+
     /// Read `buf.len()` bytes starting at logical block `slba`.
     fn read(&self, slba: u64, buf: &mut [u8]) -> impl Future<Output = Result<(), BackendError>>;
 

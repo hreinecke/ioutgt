@@ -93,6 +93,10 @@ impl Backend for MemoryBackend {
         self.nr_blocks
     }
 
+    fn io_boundary(&self) -> u16 {
+        (CHUNK_SIZE >> self.block_shift) as u16
+    }
+
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
         self.check_range(slba, (buf.len() as u64) >> self.block_shift)?;
         let offset = slba << self.block_shift;
