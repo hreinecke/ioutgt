@@ -336,6 +336,10 @@ impl Backend for FileBackend {
         self.nr_blocks
     }
 
+    fn io_boundary(&self) -> u16 {
+        0
+    }
+
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
         let mut iovs = [libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),

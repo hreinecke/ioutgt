@@ -315,6 +315,7 @@ fn build_id_ns<B: Backend>(subsys: &Subsystem<B>, ns: &Namespace<B>) -> Box<Iden
     let mut id = Box::new(IdentifyNamespace::zeroed());
     let backend = ns.backend.as_ref();
     let blocks = backend.nr_blocks();
+    let io_boundary = backend.io_boundary();
     id.nsze.set(blocks);
     id.ncap.set(blocks);
     id.nuse.set(blocks);
@@ -322,6 +323,7 @@ fn build_id_ns<B: Backend>(subsys: &Subsystem<B>, ns: &Namespace<B>) -> Box<Iden
     // share of the subsystem's TNVMCAP. Nothing here is thin-provisioned, so
     // allocated and total are one number.
     id.nvmcap = u128_le(ns.capacity());
+    id.noiob.set(io_boundary);
     id.nlbaf = 0;
     id.flbas = 0;
     id.nsfeat = nsfeat::THINP;

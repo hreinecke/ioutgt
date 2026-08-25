@@ -981,6 +981,10 @@ impl Backend for SheepdogBackend {
         self.nr_blocks
     }
 
+    fn io_boundary(&self) -> u16 {
+	(self.object_size >> BLOCK_SHIFT) as u16
+    }
+
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
         self.check_range(slba, (buf.len() as u64) >> BLOCK_SHIFT)?;
         let obj = u64::from(self.object_size);

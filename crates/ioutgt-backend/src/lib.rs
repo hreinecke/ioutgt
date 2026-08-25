@@ -89,6 +89,15 @@ impl Backend for AnyBackend {
         }
     }
 
+    fn io_boundary(&self) -> u16 {
+        match self {
+            AnyBackend::Null(b) => b.io_boundary(),
+            AnyBackend::Memory(b) => b.io_boundary(),
+            AnyBackend::File(b) => b.io_boundary(),
+            AnyBackend::Sheepdog(b) => b.io_boundary(),
+        }
+    }
+
     fn nr_blocks(&self) -> u64 {
         match self {
             AnyBackend::Null(b) => b.nr_blocks(),

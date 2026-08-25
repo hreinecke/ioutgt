@@ -93,6 +93,10 @@ impl Backend for MemoryBackend {
         self.nr_blocks
     }
 
+    fn io_boundary(&self) -> u16 {
+        u16::try_from(CHUNK_SIZE).expect("invalid chunk size") >> self.block_shift
+    }
+
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
         self.check_range(slba, (buf.len() as u64) >> self.block_shift)?;
         let offset = slba << self.block_shift;

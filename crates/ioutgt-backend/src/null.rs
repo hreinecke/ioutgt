@@ -6,6 +6,7 @@ use ioutgt_core::{Backend, BackendError, LbaRange};
 /// See module docs.
 pub struct NullBackend {
     block_shift: u8,
+    io_boundary: u16,
     nr_blocks: u64,
 }
 
@@ -14,6 +15,7 @@ impl NullBackend {
     pub fn new(size_bytes: u64, block_shift: u8) -> Self {
         NullBackend {
             block_shift,
+            io_boundary: 0,
             nr_blocks: size_bytes >> block_shift,
         }
     }
@@ -26,6 +28,10 @@ impl Backend for NullBackend {
 
     fn nr_blocks(&self) -> u64 {
         self.nr_blocks
+    }
+
+    fn io_boundary(&self) -> u16 {
+        self.io_boundary
     }
 
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
