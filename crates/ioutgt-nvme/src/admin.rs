@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
-    IOCSSIdentifyController, IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED,
-    SGLS_SAOS, anacap, cmic, ctratt, nmic, nsfeat, oncs, u128_le,
+    IOCSSIdentifyController, IdentifyController, IdentifyNamespace,
+    NVME_VER, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS,
+    anacap, cmic, ctratt, nmic, nsfeat, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
@@ -194,7 +195,7 @@ fn build_id_ctrl<B: Backend>(
         }
     }
     id.cntlid.set(admin.cntlid.get());
-    id.ver.set(0x0001_0300);
+    id.ver.set(NVME_VER);
     // OAES: the host masks its AEC against this; without the NS_ATTR bit it
     // never enables namespace-change notices, and without DISC_CHANGE a
     // persistent discovery controller parks an AER it would never get back.
@@ -327,6 +328,7 @@ fn build_id_ctrl_nvm<B: Backend>(admin: &AdminState<B>) -> Box<IOCSSIdentifyCont
         .borrow()
         .as_ref()
         .map_or(0, |s| s.min_io_boundary());
+    id.ver.set(NVME_VER);
     id.dmrl = 255;
     id.dmrsl.set(u32::from(dmrsl));
     id.dmsl.set(u64::from(dmrsl) * 256);
