@@ -6,6 +6,9 @@
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
+/// NVME_VER: the NVMe base spec version we claim to support
+pub const NVME_VER: u32 = 0x0002_0300;
+
 /// Identify Controller (CNS 0x01).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
@@ -133,7 +136,11 @@ pub struct IOCSSIdentifyController {
     /// Dataset Management Size Limit, in logical blocks: the most a single
     /// Dataset Management command may deallocate across all of its ranges.
     pub dmsl: U64,
-    pub rsvd16: [u8; 4080],
+    pub kpiocap: u8,
+    pub wzdsl: u8,
+    pub aocs: U16,
+    pub ver: U32,
+    pub rsvd16: [u8; 4072],
 }
 
 impl IOCSSIdentifyController {
