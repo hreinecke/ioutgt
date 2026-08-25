@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use crate::fabrics::{self, DiscoveryLogEntry, DiscoveryLogHeader};
 use crate::identify::{
-    IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED, SGLS_SAOS, anacap, cmic,
-    ctratt, nmic, nsfeat, oncs, u128_le,
+    IOCSSIdentifyController, IdentifyController, IdentifyNamespace, SGLS_BYTE_ALIGNED, SGLS_KEYED,
+    SGLS_SAOS, anacap, cmic, ctratt, nmic, nsfeat, oncs, u128_le,
 };
 use crate::spec::{Sqe, admin_opcode, ana, cns, feat, log_page};
 use crate::status;
@@ -91,6 +91,17 @@ fn identify<B: Backend>(
     match which {
         cns::CONTROLLER => {
             let id = build_id_ctrl(ctx, admin);
+            let len = fill_slot(ctx, tag, id.as_bytes());
+            Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
+        }
+        cns::IO_COMMAND_SET => {
+            // CSI (Command Set Identifier), CDW11 bits 31:24: we implement
+            // only the NVM command set.
+            let csi = (sqe.cdw11.get() >> 24) as u8;
+            if csi != 0 {
+                return Outcome::status(ctx.cqe(0, cid, status::INVALID_FIELD | status::DNR));
+            }
+            let id = build_id_ctrl_nvm(admin);
             let len = fill_slot(ctx, tag, id.as_bytes());
             Outcome::with_data(ctx.cqe(0, cid, status::SUCCESS), len)
         }
@@ -302,6 +313,23 @@ fn build_id_ctrl<B: Backend>(
         id.iorcsz.set(1);
         id.icdoff.set(0);
     }
+    id
+}
+
+/// The NVM Command Set specific Identify Controller data structure (CNS
+/// 0x06, CSI 0x00): the Dataset Management size limits, everything else
+/// zero (Verify and Write Uncorrectable are not implemented; Write Zeroes
+/// carries no size limit of its own).
+fn build_id_ctrl_nvm<B: Backend>(admin: &AdminState<B>) -> Box<IOCSSIdentifyController> {
+    let mut id = Box::new(IOCSSIdentifyController::zeroed());
+    let dmrsl = admin
+        .subsys
+        .borrow()
+        .as_ref()
+        .map_or(0, |s| s.min_io_boundary());
+    id.dmrl = 255;
+    id.dmrsl.set(u32::from(dmrsl));
+    id.dmsl.set(u64::from(dmrsl) * 256);
     id
 }
 

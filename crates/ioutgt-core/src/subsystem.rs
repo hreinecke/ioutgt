@@ -548,6 +548,21 @@ impl<B: Backend> Subsystem<B> {
     pub fn total_capacity(&self) -> u128 {
         self.snapshot().values().map(|ns| ns.capacity()).sum()
     }
+
+    /// The I/O Command Set specific Identify Controller's `DMRSL`, in logical
+    /// blocks: the smallest [`Backend::io_boundary`] among this subsystem's
+    /// namespaces, since the field is controller-wide but a namespace's
+    /// object-aligned Dataset Management limit is not. `0` (no limit) if any
+    /// namespace's backend reports no boundary of its own, or the subsystem
+    /// holds none — the same "unreported" convention `io_boundary` itself
+    /// uses.
+    pub fn min_io_boundary(&self) -> u16 {
+        self.snapshot()
+            .values()
+            .map(|ns| ns.backend.io_boundary())
+            .min()
+            .unwrap_or(0)
+    }
 }
 
 /// Per-connection generation-validated cache of a subsystem's table:
