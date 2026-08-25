@@ -846,6 +846,96 @@ fn write_zeroes_deallocates_whole_objects() {
     });
 }
 
+/// `discard` (DSM Deallocate) goes straight to object deletion — no
+/// zero-fill fallback the way `write_zeroes` has one — and refuses any range
+/// that is not exactly one whole object, validating the whole batch before
+/// touching any of it.
+#[test]
+fn discard_deallocates_whole_objects_and_rejects_misaligned_ranges() {
+    // 64 KiB data objects, 256 KiB volume (4 objects), 512-byte LBAs.
+    let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
+
+    let map_entry = |idx: usize| store.lock().unwrap().vdis[&TEST_VID].data_vdi_id[idx];
+    let obj_exists = |idx: u64| {
+        store
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key(&data_oid(TEST_VID, idx))
+    };
+    let obj_blocks: u32 = (64 * 1024) / 512;
+
+    rt.block_on(async move {
+        // Allocate objects 0, 1 and 2.
+        let pat = filled(192 * 1024, 5);
+        be.write(0, &pat[..]).await.unwrap();
+        assert!(obj_exists(0) && obj_exists(1) && obj_exists(2));
+
+        // A start offset off an object boundary is refused, and nothing is
+        // touched.
+        let err = be
+            .discard(&[LbaRange {
+                slba: 1,
+                nlb: obj_blocks,
+            }])
+            .await
+            .unwrap_err();
+        assert_eq!(err, BackendError::Unsupported);
+        assert!(obj_exists(0), "a rejected range leaves objects alone");
+
+        // A length other than exactly one object is refused too, whether
+        // short or a multiple of the object size.
+        for nlb in [obj_blocks - 1, obj_blocks * 2] {
+            let err = be.discard(&[LbaRange { slba: 0, nlb }]).await.unwrap_err();
+            assert_eq!(err, BackendError::Unsupported);
+            assert!(obj_exists(0));
+        }
+
+        // A batch where only the second range is bad discards nothing at
+        // all: the whole batch is validated up front, not as it goes.
+        let err = be
+            .discard(&[
+                LbaRange {
+                    slba: 0,
+                    nlb: obj_blocks,
+                },
+                LbaRange {
+                    slba: u64::from(obj_blocks),
+                    nlb: obj_blocks - 1,
+                },
+            ])
+            .await
+            .unwrap_err();
+        assert_eq!(err, BackendError::Unsupported);
+        assert!(
+            obj_exists(0),
+            "the good range in a rejected batch is untouched"
+        );
+
+        // Two whole, object-aligned ranges: both are deleted.
+        be.discard(&[
+            LbaRange {
+                slba: 0,
+                nlb: obj_blocks,
+            },
+            LbaRange {
+                slba: u64::from(obj_blocks),
+                nlb: obj_blocks,
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(map_entry(0), 0);
+        assert_eq!(map_entry(1), 0);
+        assert!(!obj_exists(0) && !obj_exists(1));
+        assert_ne!(map_entry(2), 0, "untouched object survives");
+        assert!(obj_exists(2));
+    });
+}
+
 /// Under an ACL the VDI lock is shared among the targets naming that ACL.
 #[test]
 fn shared_lock_stacks_across_targets_and_unwinds_on_drop() {

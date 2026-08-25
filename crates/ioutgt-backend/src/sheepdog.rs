@@ -152,6 +152,13 @@
 //! written under this VDI), falls back to a real zero-filled write — deleting
 //! only part of an object is not a thing, and an inherited object is not this
 //! VDI's to delete.
+//!
+//! [`SheepdogBackend::discard`] (DSM Deallocate) goes straight to
+//! [`SheepdogBackend::discard_object`] for every range — there is no
+//! zero-filling fallback here, since discard is a hint the caller has no
+//! reason to send unless it means to free the space. A range that is not
+//! exactly one whole object (start not object-aligned, or length not the
+//! object size) is refused rather than silently rounded or ignored.
 
 // This backend does object-offset and array-index arithmetic where u64 byte
 // offsets convert to usize slice indices and back: every such value is bounded
@@ -1104,6 +1111,28 @@ impl Backend for SheepdogBackend {
                     .await?;
             }
             off += chunk;
+        }
+        Ok(())
+    }
+
+    async fn discard(&self, ranges: &[LbaRange]) -> Result<(), BackendError> {
+        if self.read_only {
+            return Err(BackendError::Unsupported);
+        }
+        let obj = u64::from(self.object_size);
+        // Validate every range before touching any object, so a batch either
+        // discards in full or leaves every object untouched.
+        for range in ranges {
+            self.check_range(range.slba, u64::from(range.nlb))?;
+            let off = range.slba << BLOCK_SHIFT;
+            let len = u64::from(range.nlb) << BLOCK_SHIFT;
+            if !off.is_multiple_of(obj) || len != obj {
+                return Err(BackendError::Unsupported);
+            }
+        }
+        for range in ranges {
+            self.discard_object((range.slba << BLOCK_SHIFT) / obj)
+                .await?;
         }
         Ok(())
     }
