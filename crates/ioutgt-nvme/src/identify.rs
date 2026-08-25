@@ -112,6 +112,36 @@ impl IdentifyController {
     }
 }
 
+/// I/O Command Set specific Identify Controller data structure for the NVM
+/// Command Set (CNS 0x06, CSI 0x00) — `struct nvme_id_ctrl_nvm` in the Linux
+/// kernel headers.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub struct IOCSSIdentifyController {
+    /// Verify Size Limit.
+    pub vsl: u8,
+    /// Write Zeroes Size Limit.
+    pub wzsl: u8,
+    /// Write Uncorrectable Size Limit.
+    pub wusl: u8,
+    /// Dataset Management Ranges Limit: the largest number of ranges a
+    /// single Dataset Management command may specify (`0` = no limit).
+    pub dmrl: u8,
+    /// Dataset Management Range Size Limit, in logical blocks (`0` = no
+    /// limit).
+    pub dmrsl: U32,
+    /// Dataset Management Size Limit, in logical blocks: the most a single
+    /// Dataset Management command may deallocate across all of its ranges.
+    pub dmsl: U64,
+    pub rsvd16: [u8; 4080],
+}
+
+impl IOCSSIdentifyController {
+    pub fn zeroed() -> Self {
+        Self::new_zeroed()
+    }
+}
+
 /// Encode a 128-bit capacity field (`TNVMCAP`, `UNVMCAP`, `NVMCAP`), which
 /// the spec defines as a little-endian 16-byte integer of *bytes*.
 pub fn u128_le(bytes: u128) -> [u8; 16] {
@@ -262,6 +292,7 @@ impl IdentifyNamespace {
 
 const _: () = {
     assert!(size_of::<IdentifyController>() == 4096);
+    assert!(size_of::<IOCSSIdentifyController>() == 4096);
     assert!(size_of::<IdentifyNamespace>() == 4096);
     assert!(size_of::<LbaFormat>() == 4);
     // Spot-check critical offsets against the spec.

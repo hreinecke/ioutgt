@@ -497,11 +497,21 @@ Namespace table — versioned for runtime add/remove:
   two numbers as `capacity` on its namespace and subsystem bodies.
 
 Admin command surface (interop-minimal, values per nvmet): Identify CNS
-0x00/0x01/0x02/0x03, Get/Set Features (NUM_QUEUES, KATO, async event
-config), Keep Alive, AER, Get Log Page (error/SMART/firmware/discovery/ANA),
-Property Get/Set (CAP/VS/CC/CSTS), fabrics Connect. IO commands: Read,
-Write, Flush, then Write Zeroes and DSM-deallocate advertised via ONCS once
-backend support lands.
+0x00/0x01/0x02/0x03/0x06 (0x06, the NVM Command Set specific Identify
+Controller, only for CSI 0x00 — the only command set implemented), Get/Set
+Features (NUM_QUEUES, KATO, async event config), Keep Alive, AER, Get Log
+Page (error/SMART/firmware/discovery/ANA), Property Get/Set
+(CAP/VS/CC/CSTS), fabrics Connect. IO commands: Read, Write, Flush, Write
+Zeroes, and DSM-deallocate, all advertised via ONCS.
+
+CNS 0x06's Dataset Management size limits (`DMRL`/`DMRSL`/`DMSL`) are the one
+place a controller-wide Identify field is derived from per-backend geometry:
+`DMRSL` (and `DMSL`, `256 * DMRSL`) come from `Subsystem::min_io_boundary` —
+the smallest `Backend::io_boundary` among the subsystem's namespaces, which
+for a Sheepdog VDI is its object size over its LBA size (the same value
+`io_boundary` reports as Identify Namespace's `NOIOB`) and `0` (no limit) the
+moment any namespace's backend has no natural boundary of its own. `DMRL` is
+a fixed 255, independent of backend.
 
 ## 7. Backend trait
 

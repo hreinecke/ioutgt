@@ -32,6 +32,8 @@ pub mod cns {
     pub const CONTROLLER: u8 = 0x01;
     pub const ACTIVE_NS_LIST: u8 = 0x02;
     pub const NS_DESC_LIST: u8 = 0x03;
+    /// I/O Command Set specific Identify Controller data structure.
+    pub const IO_COMMAND_SET: u8 = 0x06;
 }
 
 /// Feature identifiers.

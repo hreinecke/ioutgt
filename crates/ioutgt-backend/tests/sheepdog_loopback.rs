@@ -731,6 +731,9 @@ fn read_hole_write_alloc_overwrite_roundtrip() {
     let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
     assert_eq!(be.block_shift(), 9);
     assert_eq!(be.nr_blocks(), 256 * 1024 / 512);
+    // io_boundary (Identify Namespace NOIOB, and what a controller-wide
+    // DMRSL is derived from): the VDI's object size over its LBA size.
+    assert_eq!(u32::from(be.io_boundary()), (64 * 1024) / 512);
 
     let map_entry = |idx: usize| store.lock().unwrap().vdis[&TEST_VID].data_vdi_id[idx];
 
