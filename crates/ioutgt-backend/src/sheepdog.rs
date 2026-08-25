@@ -142,6 +142,16 @@
 //! entry back into the inode; writing an object owned by a parent (snapshot)
 //! copies-on-write (`SD_FLAG_CMD_COW`). Overwrites of already-owned objects take
 //! the lock-free fast path (a single atomic load).
+//!
+//! [`SheepdogBackend::write_zeroes`] deallocates rather than overwrites
+//! whenever a request covers one of this VDI's own objects whole: `sheep`'s
+//! `DISCARD_OBJ` clears that object's `data_vdi_id[]` entry itself and removes
+//! the object, so the space comes back on a thin backing store instead of
+//! filling with zero data. A hole is already zero and costs nothing; a
+//! sub-object range, or an object still inherited from a parent (never
+//! written under this VDI), falls back to a real zero-filled write — deleting
+//! only part of an object is not a thing, and an inherited object is not this
+//! VDI's to delete.
 
 // This backend does object-offset and array-index arithmetic where u64 byte
 // offsets convert to usize slice indices and back: every such value is bounded
@@ -176,6 +186,7 @@ pub const SD_LISTEN_PORT: u16 = 7000;
 const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
+const SD_OP_DISCARD_OBJ: u8 = 0x05;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
@@ -963,6 +974,42 @@ impl SheepdogBackend {
         .await
     }
 
+    /// Deallocate one whole object: if this VDI owns it, `SD_OP_DISCARD_OBJ`
+    /// removes the object and clears its `data_vdi_id[]` entry on the cluster
+    /// side (`local_discard_obj` in `sheep`), and the local map cache is
+    /// cleared to match. A hole (`cur == 0`) or an object still inherited
+    /// from a parent (`cur` is a foreign vid) has nothing of this VDI's to
+    /// delete, so it is a no-op — the caller falls back to a real zero-filled
+    /// write when the logical content still needs to change.
+    async fn discard_object(&self, idx: u64) -> Result<(), BackendError> {
+        loop {
+            let cur = self.map_load(idx)?;
+            if cur == VID_INFLIGHT {
+                // Another task is creating this object; wait for it to settle
+                // before deciding whether there is anything to discard.
+                if let Ok(s) = ops::sleep(std::time::Duration::from_micros(50)) {
+                    let _ = s.await;
+                }
+                continue;
+            }
+            if cur != self.vid {
+                return Ok(());
+            }
+            self.obj_request(
+                SD_OP_DISCARD_OBJ,
+                0,
+                vid_to_data_oid(self.vid, idx),
+                0,
+                0,
+                None,
+                None,
+            )
+            .await?;
+            self.data_map[idx as usize].store(0, Ordering::Release);
+            return Ok(());
+        }
+    }
+
     fn map_load(&self, idx: u64) -> Result<u32, BackendError> {
         self.data_map
             .get(idx as usize)
@@ -990,7 +1037,7 @@ impl Backend for SheepdogBackend {
     }
 
     fn io_boundary(&self) -> u16 {
-	(self.object_size >> BLOCK_SHIFT) as u16
+        (self.object_size >> BLOCK_SHIFT) as u16
     }
 
     async fn read(&self, slba: u64, buf: &mut [u8]) -> Result<(), BackendError> {
@@ -1040,16 +1087,23 @@ impl Backend for SheepdogBackend {
             return Err(BackendError::Unsupported);
         }
         self.check_range(range.slba, u64::from(range.nlb))?;
+        let obj = u64::from(self.object_size);
+        let mut off = range.slba << BLOCK_SHIFT;
         let total = u64::from(range.nlb) << BLOCK_SHIFT;
-        let chunk_len = total.min(u64::from(self.object_size)) as usize;
-        let zeros = AlignedBuf::zeroed(chunk_len.max(1));
-        let mut slba = range.slba;
-        let mut remaining = total;
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            self.write(slba, &zeros[..n]).await?;
-            slba += (n as u64) >> BLOCK_SHIFT;
-            remaining -= n as u64;
+        let end = off + total;
+        let mut zeros: Option<AlignedBuf> = None;
+        while off < end {
+            let idx = off / obj;
+            let in_obj = off % obj;
+            let chunk = (end - off).min(obj - in_obj);
+            if in_obj == 0 && chunk == obj {
+                self.discard_object(idx).await?;
+            } else {
+                let buf = zeros.get_or_insert_with(|| AlignedBuf::zeroed(total.min(obj) as usize));
+                self.write_object(idx, in_obj, &buf[..chunk as usize])
+                    .await?;
+            }
+            off += chunk;
         }
         Ok(())
     }
