@@ -32,6 +32,7 @@ use ioutgt_uring::{QueueRuntime, RingConfig};
 const SD_OP_CREATE_AND_WRITE_OBJ: u8 = 0x01;
 const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_WRITE_OBJ: u8 = 0x03;
+const SD_OP_DISCARD_OBJ: u8 = 0x05;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
@@ -586,6 +587,21 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 st.objects.insert(oid, obj);
                 write_resp(&out, &resp(opcode, id, 0, 0))?;
             }
+            SD_OP_DISCARD_OBJ => {
+                // `local_discard_obj`: clear the inode's map entry and remove
+                // the object, but only if the entry was actually set — same
+                // "return success either way" shape as the real op.
+                let vid = oid_to_vid(oid);
+                let idx = (oid & 0xFFFF_FFFF) as usize;
+                if let Some(vdi) = st.vdis.get_mut(&vid)
+                    && idx < vdi.data_vdi_id.len()
+                    && vdi.data_vdi_id[idx] != 0
+                {
+                    vdi.data_vdi_id[idx] = 0;
+                    st.objects.remove(&oid);
+                }
+                write_resp(&out, &resp(opcode, id, 0, 0))?;
+            }
             // A local op: answered out of this node's own membership view
             // rather than routed anywhere.
             SD_OP_GET_NODE_LIST => {
@@ -760,6 +776,73 @@ fn read_hole_write_alloc_overwrite_roundtrip() {
         be.flush().await.unwrap();
         let err = be.read(be.nr_blocks(), &mut back[..512]).await.unwrap_err();
         assert_eq!(err, BackendError::OutOfRange);
+    });
+}
+
+/// `write_zeroes` covering a whole object deallocates it — `SD_OP_DISCARD_OBJ`
+/// clears the inode's map entry and removes the object — rather than writing
+/// 64 KiB of zero data over it. A range covering only part of an object still
+/// gets a real zero-filled write, since deleting part of an object is not a
+/// thing.
+#[test]
+fn write_zeroes_deallocates_whole_objects() {
+    // 64 KiB data objects, 256 KiB volume (4 objects), 512-byte LBAs.
+    let store = fresh_store(16, 256 * 1024);
+    let addr = spawn_fake_sheep(Arc::clone(&store));
+    let rt = QueueRuntime::new(RingConfig::default()).unwrap();
+    let be = SheepdogBackend::open(addr, "testvdi", None, None, Some(target(1))).unwrap();
+
+    let map_entry = |idx: usize| store.lock().unwrap().vdis[&TEST_VID].data_vdi_id[idx];
+    let obj_exists = |idx: u64| {
+        store
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key(&data_oid(TEST_VID, idx))
+    };
+
+    rt.block_on(async move {
+        // Allocate objects 0 and 1 (64 KiB each) with real data.
+        let pat = filled(128 * 1024, 42);
+        be.write(0, &pat[..]).await.unwrap();
+        assert_ne!(map_entry(0), 0);
+        assert_ne!(map_entry(1), 0);
+        assert!(obj_exists(0) && obj_exists(1));
+
+        // Zero object 0 whole and the first half of object 1: object 0 is
+        // deallocated outright, but object 1 — only partly covered — keeps
+        // its map entry and gets a real zero-filled write instead.
+        let obj_blocks = (64 * 1024) / 512;
+        be.write_zeroes(LbaRange {
+            slba: 0,
+            nlb: obj_blocks + obj_blocks / 2,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(map_entry(0), 0, "whole object discarded, map entry cleared");
+        assert!(!obj_exists(0), "the object itself is gone from the store");
+        assert_ne!(
+            map_entry(1),
+            0,
+            "partially-covered object keeps its map entry"
+        );
+        assert!(
+            obj_exists(1),
+            "partially-covered object is zero-filled, not deleted"
+        );
+
+        let mut back = AlignedBuf::zeroed(128 * 1024);
+        be.read(0, &mut back).await.unwrap();
+        assert!(
+            back[..96 * 1024].iter().all(|&b| b == 0),
+            "discarded object and zeroed half read back as zero"
+        );
+        assert_eq!(
+            &back[96 * 1024..],
+            &pat[96 * 1024..],
+            "untouched tail of object 1 survives"
+        );
     });
 }
 
