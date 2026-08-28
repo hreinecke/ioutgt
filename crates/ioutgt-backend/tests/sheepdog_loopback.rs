@@ -37,21 +37,25 @@ const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_READ_VDIS: u8 = 0x15;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
 const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
-const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
 /// Sheep-internal local op: the node/zone topology this node currently sees.
 const SD_OP_GET_NODE_LIST: u8 = 0x82;
+/// Sheep-internal local op: one VDI's shared-lock participant list, each with
+/// the owner string it registered under.
+const SD_OP_GET_VDI_LOCK_STATE: u8 = 0xD1;
 const SD_SHEEP_PROTO_VER: u8 = 0x0a;
 const SD_RES_VDI_LOCKED: u32 = 0x07;
 const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_VDI_DENIED: u32 = 0x1E;
-const SD_RES_BUFFER_SMALL: u32 = 0x88;
 /// `LOCK_TYPE_NORMAL`: no ACL, and the exclusive lock such an open takes.
 const SD_ACL_NONE: u32 = 0;
-/// `LOCK_STATE_UNLOCKED` / `LOCK_STATE_SHARED`.
-const LOCK_STATE_UNLOCKED: u32 = 1;
-const LOCK_STATE_SHARED: u32 = 3;
-/// `sizeof(struct vdi_state)`, the GET_VDI_COPIES record.
-const VDI_STATE: usize = 1432;
+/// `sizeof(struct vdi_lock_state)`, the `GET_VDI_LOCK_STATE` record: `vid`(4),
+/// `acl`(4), `count`(4), `index`(4), `owner`(`SD_MAX_VDI_LEN`),
+/// `sender`(`struct node_id`, 40) and `state`(4). `vid`/`acl`/`sender`/`state`
+/// are left zero — nothing here reads them back.
+const VDI_LOCK_STATE: usize = 316;
+const VLS_OFF_COUNT: usize = 8;
+const VLS_OFF_INDEX: usize = 12;
+const VLS_OFF_OWNER: usize = 16;
 /// `SD_MAX_COPIES`: participants a VDI's lock can have.
 const SD_MAX_COPIES: usize = 31;
 const SD_VDI_FLAG_ACL: u32 = 0x01;
@@ -347,51 +351,22 @@ impl Store {
         true
     }
 
-    /// The `GET_VDI_COPIES` payload: one `vdi_state` per VDI the cluster
-    /// knows, carrying its participant list.
-    fn vdi_states(&self) -> Vec<u8> {
-        let mut out = vec![0u8; self.vdis.len() * VDI_STATE];
-        for (i, vid) in self.vdis.keys().enumerate() {
-            let vs = &mut out[i * VDI_STATE..(i + 1) * VDI_STATE];
-            vs[0..4].copy_from_slice(&vid.to_le_bytes());
-            let empty = Vec::new();
-            let list = self.participants.get(vid).unwrap_or(&empty);
-            let state = if list.is_empty() {
-                LOCK_STATE_UNLOCKED
-            } else {
-                LOCK_STATE_SHARED
-            };
-            vs[20..24].copy_from_slice(&state.to_le_bytes());
-            vs[64..68].copy_from_slice(&(list.len() as u32).to_le_bytes());
-            for (j, (owner, count)) in list.iter().enumerate() {
-                // participants_state[j]: SHARED_LOCK_STATE_SHARED, count above.
-                let word = 2u32 | (count << 8);
-                vs[68 + j * 4..72 + j * 4].copy_from_slice(&word.to_le_bytes());
-                let nid = 192 + j * 40;
-                match owner.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        vs[nid + 12..nid + 16].copy_from_slice(&v4.octets());
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        vs[nid..nid + 16].copy_from_slice(&v6.octets());
-                    }
-                }
-                vs[nid + 16..nid + 18].copy_from_slice(&owner.port().to_le_bytes());
-            }
+    /// The `GET_VDI_LOCK_STATE` payload for one vid: one `vdi_lock_state`
+    /// record per current participant, in list order (this fake compacts on
+    /// removal rather than leaving holes, unlike the real `sheep`).
+    fn vdi_lock_state(&self, vid: u32) -> Vec<u8> {
+        let empty = Vec::new();
+        let list = self.participants.get(&vid).unwrap_or(&empty);
+        let mut out = vec![0u8; list.len() * VDI_LOCK_STATE];
+        for (i, (owner, count)) in list.iter().enumerate() {
+            let rec = &mut out[i * VDI_LOCK_STATE..(i + 1) * VDI_LOCK_STATE];
+            rec[VLS_OFF_COUNT..VLS_OFF_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+            rec[VLS_OFF_INDEX..VLS_OFF_INDEX + 4].copy_from_slice(&(i as u32).to_le_bytes());
+            let text = owner.to_string();
+            rec[VLS_OFF_OWNER..VLS_OFF_OWNER + text.len()].copy_from_slice(text.as_bytes());
         }
         out
     }
-}
-
-/// The owner a `vdi_lock` request names: addr[16] at 24, port at 40.
-fn req_owner(hdr: &[u8; HDR]) -> SocketAddr {
-    let addr: [u8; 16] = hdr[24..40].try_into().unwrap();
-    let ip = if addr[12] != 0 && addr[..12].iter().all(|&b| b == 0) {
-        std::net::IpAddr::V4(<[u8; 4]>::try_from(&addr[12..]).unwrap().into())
-    } else {
-        std::net::IpAddr::V6(addr.into())
-    };
-    SocketAddr::new(ip, u16le(hdr, 40))
 }
 
 fn resp(opcode: u8, id: u32, result: u32, data_len: u32) -> [u8; HDR] {
@@ -478,37 +453,38 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 }
             }
             SD_OP_REGISTER_VDI => {
-                // The lock op, looking its VDI up by name as GET_VDI_INFO does
-                // but naming its own owner: under an ACL it joins the volume's
-                // participant list, outside one it claims the volume alone.
+                // The vid is already resolved (no name lookup here); the
+                // owner — this target's fabric address — travels as the
+                // payload, `sheep`'s own `str_to_addr` parses it back.
+                // Under an ACL it joins the volume's participant list,
+                // outside one it claims the volume alone.
                 let mut p = vec![0u8; data_length];
                 sock.read_exact(&mut p)?;
-                let name = cstr(&p[..SD_MAX_VDI_LEN]);
-                let acl = u32le(&hdr, 44); // sd_req.vdi_lock.acl
-                let owner = req_owner(&hdr);
-                let named = st
-                    .vdis
-                    .iter()
-                    .find(|(_, vdi)| vdi.name == name && vdi.tag.is_empty())
-                    .map(|(&vid, vdi)| (vid, vdi.acl_id));
-                let result = match named {
-                    None => 0x08, // NO_VDI
-                    Some((_, vdi_acl)) if vdi_acl != acl => SD_RES_VDI_DENIED,
-                    Some((vid, _)) if !st.take_lock(vid, acl) => SD_RES_VDI_LOCKED,
-                    // The exclusive lock has one owner and no list; only a
-                    // shared one records its holders as participants.
-                    Some((vid, _)) if acl != SD_ACL_NONE && !st.add_participant(vid, owner) => {
-                        st.release_lock(vid, acl);
-                        0x15 // NO_SPACE: SD_MAX_COPIES participants already
-                    }
-                    Some(_) => 0,
+                let vid = u32le(&hdr, 16); // sd_req.vdi_lock.vid
+                let acl = u32le(&hdr, 24); // sd_req.vdi_lock.acl
+                let owner: SocketAddr = cstr(&p).parse().expect("test owner is ip:port");
+                let result = if !st.vdis.contains_key(&vid) {
+                    0x08 // NO_VDI
+                } else if !st.take_lock(vid, acl) {
+                    SD_RES_VDI_LOCKED
+                // The exclusive lock has one owner and no list; only a
+                // shared one records its holders as participants.
+                } else if acl != SD_ACL_NONE && !st.add_participant(vid, owner) {
+                    st.release_lock(vid, acl);
+                    0x15 // NO_SPACE: SD_MAX_COPIES participants already
+                } else {
+                    0
                 };
                 write_resp(&out, &resp(opcode, id, result, 0))?;
             }
             SD_OP_UNREGISTER_VDI => {
+                // Now a write op too: the owner travels as the payload here
+                // as well, the same shape REGISTER_VDI's carries.
+                let mut p = vec![0u8; data_length];
+                sock.read_exact(&mut p)?;
                 let vid = u32le(&hdr, 16); // sd_req.vdi_lock.vid
-                let acl = u32le(&hdr, 44);
-                let owner = req_owner(&hdr);
+                let acl = u32le(&hdr, 24);
+                let owner: SocketAddr = cstr(&p).parse().expect("test owner is ip:port");
                 let held = st.release_lock(vid, acl);
                 let listed = acl == SD_ACL_NONE || st.del_participant(vid, owner);
                 let result = if held && listed {
@@ -518,15 +494,10 @@ fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<Store>>) -> std::io::Result<
                 };
                 write_resp(&out, &resp(opcode, id, result, 0))?;
             }
-            SD_OP_GET_VDI_COPIES => {
-                // The whole table or nothing: a caller that asked for too
-                // small a buffer is told to come back with a bigger one.
-                let states = st.vdi_states();
-                if data_length < states.len() {
-                    write_resp(&out, &resp(opcode, id, SD_RES_BUFFER_SMALL, 0))?;
-                } else {
-                    send_slice(&out, opcode, id, &states, 0, data_length)?;
-                }
+            SD_OP_GET_VDI_LOCK_STATE => {
+                let vid = u32le(&hdr, 16); // sd_req.vdi_lock.vid
+                let states = st.vdi_lock_state(vid);
+                send_slice(&out, opcode, id, &states, 0, data_length)?;
             }
             SD_OP_READ_VDIS => {
                 let bitmap = st.vdi_bitmap();
@@ -1489,31 +1460,36 @@ fn a_dropped_registration_is_retaken() {
     assert!(store.lock().unwrap().participants.is_empty());
 }
 
-/// The holder list arrives whole however many VDIs the cluster has: the fetch
-/// retries with a bigger buffer for as long as `sheep` says it is too small.
+/// The holder list arrives whole for a VDI at the participant-count ceiling:
+/// `GET_VDI_LOCK_STATE`'s reply buffer is sized to `SD_MAX_COPIES` records up
+/// front — the same hard limit `sheep` enforces on one VDI's participant
+/// list (`add_participant`'s `SD_RES_NO_SPACE`) — so there is no buffer to
+/// grow, unlike the old whole-cluster `GET_VDI_COPIES` table read.
 #[test]
-fn holder_list_survives_a_cluster_larger_than_one_buffer() {
+fn holder_list_survives_a_vdi_at_the_participant_ceiling() {
     let store = acl_store(16, 256 * 1024);
-    {
-        // Past DEFAULT_VDI_STATE_COUNT (512), so the first request bounces.
-        let mut st = store.lock().unwrap();
-        for i in 0..600u32 {
-            st.vdis
-                .insert(0x10_0000 + i, Vdi::new("filler", 1 << 22, 22));
-        }
-    }
     let addr = spawn_fake_sheep(Arc::clone(&store));
-    let us = target(1);
 
-    let be = SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(us)).unwrap();
+    let backends: Vec<_> = (1..=SD_MAX_COPIES as u8)
+        .map(|n| {
+            SheepdogBackend::open(addr, "testvdi", None, Some(ACL_NQN), Some(target(n))).unwrap()
+        })
+        .collect();
+
+    let holders = vdi_holders(addr, &[TEST_VID]).unwrap();
     assert_eq!(
-        vdi_holders(addr, &[be.vid()]).unwrap()[0],
-        vec![VdiHolder {
-            addr: us,
-            index: 0,
-            registrations: 1
-        }]
+        holders[0].len(),
+        SD_MAX_COPIES,
+        "every participant is reported, none dropped for want of buffer room"
     );
+    let addrs: std::collections::HashSet<_> = holders[0].iter().map(|h| h.addr).collect();
+    assert_eq!(
+        addrs.len(),
+        SD_MAX_COPIES,
+        "every registered target is distinct"
+    );
+
+    drop(backends);
 }
 
 /// Object placement — the fact behind ANA. `GET_NODE_LIST` names every node's

@@ -31,7 +31,9 @@ const SD_OP_READ_OBJ: u8 = 0x02;
 const SD_OP_GET_VDI_INFO: u8 = 0x14;
 const SD_OP_REGISTER_VDI: u8 = 0x19;
 const SD_OP_UNREGISTER_VDI: u8 = 0x1A;
-const SD_OP_GET_VDI_COPIES: u8 = 0xAB;
+/// Sheep-internal local op: one VDI's shared-lock participant list, each with
+/// the owner string it registered under.
+const SD_OP_GET_VDI_LOCK_STATE: u8 = 0xD1;
 const SD_RES_NO_VDI: u32 = 0x08;
 const SD_RES_VDI_NOT_LOCKED: u32 = 0x10;
 const SD_RES_VDI_DENIED: u32 = 0x1E;
@@ -39,8 +41,11 @@ const SD_VDI_FLAG_ACL: u32 = 0x01;
 const SD_INODE_HEADER_SIZE: usize = 4664;
 const SD_MAX_VDI_LEN: usize = 256;
 const VDI_BIT: u64 = 1 << 63;
-const VDI_STATE: usize = 1432;
-const LOCK_STATE_SHARED: u32 = 3;
+/// `sizeof(struct vdi_lock_state)`, the `GET_VDI_LOCK_STATE` record.
+const VDI_LOCK_STATE: usize = 316;
+const VLS_OFF_COUNT: usize = 8;
+const VLS_OFF_INDEX: usize = 12;
+const VLS_OFF_OWNER: usize = 16;
 
 /// The ACL object this cluster holds, named after the subsystem NQN, and the
 /// one volume in it — the subsystem's single namespace.
@@ -64,9 +69,6 @@ const PEER2: &str = "10.9.8.9:4420";
 /// slot rather than taking a second).
 type Participants = Arc<Mutex<Vec<Option<(SocketAddr, u32)>>>>;
 
-fn u16le(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
-}
 fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
@@ -99,44 +101,26 @@ fn inode(vid: u32) -> Vec<u8> {
     b
 }
 
-/// The `GET_VDI_COPIES` payload: one `vdi_state` for the volume, carrying its
-/// participant slots. A free slot goes out as an all-zero state word — what
-/// `sheep` leaves behind when a holder unregisters, holes included.
-fn vdi_states(slots: &[Option<(SocketAddr, u32)>]) -> Vec<u8> {
-    let mut vs = vec![0u8; VDI_STATE];
-    vs[0..4].copy_from_slice(&VOL_VID.to_le_bytes());
-    if slots.iter().all(Option::is_none) {
-        return vs; // lock_state stays 0: nobody holds it
-    }
-    vs[20..24].copy_from_slice(&LOCK_STATE_SHARED.to_le_bytes());
-    vs[64..68].copy_from_slice(&(slots.len() as u32).to_le_bytes());
-    for (i, (owner, count)) in slots
+/// The `GET_VDI_LOCK_STATE` payload for the volume: one `vdi_lock_state`
+/// record per occupied participant slot — a free slot (a departed holder's
+/// hole, `sheep` clears rather than compacting the array) is skipped
+/// entirely rather than sent as a placeholder, since each record carries its
+/// own slot index and nothing here reads the records positionally.
+fn vdi_lock_states(slots: &[Option<(SocketAddr, u32)>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, owner, count) in slots
         .iter()
         .enumerate()
-        .filter_map(|(i, slot)| Some((i, slot.as_ref()?)))
+        .filter_map(|(i, slot)| slot.map(|(owner, count)| (i, owner, count)))
     {
-        // participants_state[i]: SHARED_LOCK_STATE_SHARED, count above it.
-        vs[68 + i * 4..72 + i * 4].copy_from_slice(&(2u32 | (count << 8)).to_le_bytes());
-        let nid = 192 + i * 40;
-        match owner.ip() {
-            std::net::IpAddr::V4(v4) => vs[nid + 12..nid + 16].copy_from_slice(&v4.octets()),
-            std::net::IpAddr::V6(v6) => vs[nid..nid + 16].copy_from_slice(&v6.octets()),
-        }
-        vs[nid + 16..nid + 18].copy_from_slice(&owner.port().to_le_bytes());
+        let mut rec = vec![0u8; VDI_LOCK_STATE];
+        rec[VLS_OFF_COUNT..VLS_OFF_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+        rec[VLS_OFF_INDEX..VLS_OFF_INDEX + 4].copy_from_slice(&(i as u32).to_le_bytes());
+        let text = owner.to_string();
+        rec[VLS_OFF_OWNER..VLS_OFF_OWNER + text.len()].copy_from_slice(text.as_bytes());
+        out.extend_from_slice(&rec);
     }
-    vs
-}
-
-/// The owner a `vdi_lock` request names: addr[16] at 24, port at 40 (IPv4 in
-/// the last four bytes, the leading twelve zero).
-fn req_owner(hdr: &[u8; HDR]) -> SocketAddr {
-    let addr: [u8; 16] = hdr[24..40].try_into().unwrap();
-    let ip = if addr[12] != 0 && addr[..12].iter().all(|&b| b == 0) {
-        std::net::IpAddr::V4(<[u8; 4]>::try_from(&addr[12..]).unwrap().into())
-    } else {
-        std::net::IpAddr::V6(addr.into())
-    };
-    SocketAddr::new(ip, u16le(hdr, 40))
+    out
 }
 
 fn resp(opcode: u8, id: u32, result: u32, data_len: u32) -> [u8; HDR] {
@@ -190,37 +174,37 @@ fn serve_conn(mut sock: TcpStream, holders: Participants) -> std::io::Result<()>
                     Err(res) => sock.write_all(&resp(opcode, id, res, 0))?,
                 }
             }
-            // The lock op: a lookup by name under the request's ACL, with the
-            // holder's address supplied by the client rather than the gateway.
+            // The lock op: the vid is already resolved (no name lookup
+            // here), and the holder's address travels as the payload —
+            // `sheep`'s own `str_to_addr` parses it back — rather than a
+            // header field.
             SD_OP_REGISTER_VDI => {
                 let mut p = vec![0u8; data_length];
                 sock.read_exact(&mut p)?;
-                let res = match resolve(&cstr(&p[..SD_MAX_VDI_LEN]), u32le(&hdr, 44)) {
-                    Err(res) => res,
-                    Ok(_) => {
-                        // add_participant: a repeat from one owner bumps its
-                        // count rather than taking a second slot; a new one
-                        // takes the lowest free slot, appending only when the
-                        // array has no hole to fill.
-                        let owner = req_owner(&hdr);
-                        let mut slots = holders.lock().unwrap();
-                        let mine = slots
-                            .iter()
-                            .position(|s| s.is_some_and(|(addr, _)| addr == owner));
-                        match mine {
-                            Some(i) => slots[i].as_mut().unwrap().1 += 1,
-                            None => match slots.iter().position(Option::is_none) {
-                                Some(free) => slots[free] = Some((owner, 1)),
-                                None => slots.push(Some((owner, 1))),
-                            },
-                        }
-                        0
-                    }
-                };
-                sock.write_all(&resp(opcode, id, res, 0))?;
+                // add_participant: a repeat from one owner bumps its count
+                // rather than taking a second slot; a new one takes the
+                // lowest free slot, appending only when the array has no
+                // hole to fill.
+                let owner: SocketAddr = cstr(&p).parse().expect("test owner is ip:port");
+                let mut slots = holders.lock().unwrap();
+                let mine = slots
+                    .iter()
+                    .position(|s| s.is_some_and(|(addr, _)| addr == owner));
+                match mine {
+                    Some(i) => slots[i].as_mut().unwrap().1 += 1,
+                    None => match slots.iter().position(Option::is_none) {
+                        Some(free) => slots[free] = Some((owner, 1)),
+                        None => slots.push(Some((owner, 1))),
+                    },
+                }
+                sock.write_all(&resp(opcode, id, 0, 0))?;
             }
             SD_OP_UNREGISTER_VDI => {
-                let owner = req_owner(&hdr);
+                // Now a write op too: the owner string travels as the
+                // payload here as well, the same shape REGISTER_VDI's does.
+                let mut p = vec![0u8; data_length];
+                sock.read_exact(&mut p)?;
+                let owner: SocketAddr = cstr(&p).parse().expect("test owner is ip:port");
                 let mut slots = holders.lock().unwrap();
                 let mine = slots
                     .iter()
@@ -244,8 +228,8 @@ fn serve_conn(mut sock: TcpStream, holders: Participants) -> std::io::Result<()>
                 drop(slots);
                 sock.write_all(&resp(opcode, id, result, 0))?;
             }
-            SD_OP_GET_VDI_COPIES => {
-                let states = vdi_states(&holders.lock().unwrap());
+            SD_OP_GET_VDI_LOCK_STATE => {
+                let states = vdi_lock_states(&holders.lock().unwrap());
                 sock.write_all(&resp(opcode, id, 0, states.len() as u32))?;
                 sock.write_all(&states)?;
             }

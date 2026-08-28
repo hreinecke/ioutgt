@@ -593,8 +593,12 @@ resolves a name only within it, so the backend's `open` takes the ACL as
 well as the VDI name. A writable VDI is opened under the cluster's VDI lock,
 taken with `REGISTER_VDI` — the lock op whose *owner* the client supplies
 (`LOCK_VDI` records the relaying `sheep` gateway, which is no use as a
-`traddr`), so the holder the cluster records is the address this target's
-fabric listens on. The lock is held on the connection that took it and
+`traddr`) — so the holder the cluster records is the address this target's
+fabric listens on. `REGISTER_VDI` takes the vid directly rather than
+resolving a name itself (`lookup_vdi`/`GET_VDI_INFO` already did that), and
+the owner travels as the request's *payload* (`owner.to_string()`,
+NUL-padded — `sheep`'s own `str_to_addr` parses it back), not a header
+field; `UNREGISTER_VDI` carries the same payload shape. The lock is held on the connection that took it and
 released with `UNREGISTER_VDI` from the backend's `Drop` — or, on the way
 out of a target whose namespaces the queue threads still own, from the
 shutdown walk (`ioutgt-harness`'s `install_shutdown_handler` /
@@ -699,8 +703,17 @@ bookkeeping: the `REGISTER_VDI` each locked namespace already issues at open
 volume's participant list *is* the list of targets serving it. There is no
 registration on the ACL object and no per-IO-thread registration —
 one per namespace open, which is what a holder's count normally reads.
-Reading the list back is `GET_VDI_COPIES` — the `dog vdi lock list` query —
-whose `vdi_state` record for a vid carries `participants[]`. A subsystem's
+Reading the list back is `GET_VDI_LOCK_STATE`, per vid — the `dog vdi lock
+detail` query. `GET_VDI_COPIES`'s own `vdi_state.participants[]` no longer
+serves this: it now carries the *sender*, the `sheep` gateway relaying each
+registration, not the owner string, so building the path list from it would
+advertise gateway addresses instead of fabric ones.
+`GET_VDI_LOCK_STATE`'s `vdi_lock_state` records carry the owner string
+directly, one per participant, in a reply sized to `SD_MAX_COPIES` records up
+front — the same hard ceiling the cluster enforces on one VDI's participant
+list, so there is no whole-cluster table to fetch and no buffer to grow, at
+the cost of one round trip per vid rather than one for the whole cluster.
+A subsystem's
 paths are the *union* of the holders of its Sheepdog volumes (a target that
 serves any of them is reachable for the subsystem), deduplicated and sorted
 by address so every target in the cluster computes the same order: each
