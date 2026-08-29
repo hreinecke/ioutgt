@@ -624,6 +624,14 @@ pub struct PortConfig<B> {
     /// queue thread instead of sleeping on events (one core per IO thread,
     /// SPDK-style; latency over CPU). Wired from the binary's `--poll`.
     pub poll: bool,
+    /// Override the address a Sheepdog namespace registers as the volume's
+    /// holder, instead of this port's own listen address (`--portaddr`) — for
+    /// a port whose listen address is not what the cluster's other targets,
+    /// or hosts reading the discovery log, should reach it at (a wildcard
+    /// bind behind a NAT, an ingress rewriting the port). `None` keeps the
+    /// existing behavior (the port's bound address, or a routing probe for a
+    /// wildcard one).
+    pub sheepdog_portaddr: Option<std::net::SocketAddr>,
     /// NQN → subsystem.
     pub subsystems: BTreeMap<String, Arc<Subsystem<B>>>,
 }

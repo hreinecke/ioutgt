@@ -594,7 +594,13 @@ well as the VDI name. A writable VDI is opened under the cluster's VDI lock,
 taken with `REGISTER_VDI` — the lock op whose *owner* the client supplies
 (`LOCK_VDI` records the relaying `sheep` gateway, which is no use as a
 `traddr`) — so the holder the cluster records is the address this target's
-fabric listens on. `REGISTER_VDI` takes the vid directly rather than
+fabric listens on, unless `--portaddr` overrides it
+(`TargetConfig::sheepdog_portaddr` → `PortConfig::sheepdog_portaddr` /
+`ClusterAcl::portaddr` → `build_backend`'s `portaddr.or(fabric)`): a port
+whose listen address is not what the rest of the
+cluster, or a host reading the discovery log, should reach it at — a
+wildcard bind behind a NAT, an ingress rewriting the port. `REGISTER_VDI`
+takes the vid directly rather than
 resolving a name itself (`lookup_vdi`/`GET_VDI_INFO` already did that), and
 the owner travels as the request's *payload* (`owner.to_string()`,
 NUL-padded — `sheep`'s own `str_to_addr` parses it back), not a header

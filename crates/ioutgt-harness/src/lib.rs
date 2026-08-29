@@ -175,6 +175,10 @@ pub struct TargetConfig {
     /// memory-backed namespaces, emulating a slow real disk so recv-side data
     /// buffers stay referenced across the write. `0` keeps writes synchronous.
     pub mem_write_delay_us: u64,
+    /// Override the address a Sheepdog namespace registers as the volume's
+    /// holder (`--portaddr`), instead of this port's own listen/bound
+    /// address. `None` keeps the existing behavior.
+    pub sheepdog_portaddr: Option<SocketAddr>,
 }
 
 impl TargetConfig {
@@ -193,6 +197,7 @@ impl TargetConfig {
             control_socket: None,
             idle_teardown: Some(Duration::from_secs(30)),
             mem_write_delay_us: 0,
+            sheepdog_portaddr: None,
             poll: false,
             cntlid_range: (1, ioutgt_core::registry::CNTLID_MAX),
             subsystems: vec![SubsystemConfig {
@@ -1046,8 +1051,13 @@ fn build_port(
         // has a home node, and this target is still either on it or not.
         let mut cluster_ns: BTreeMap<SocketAddr, ClusterNamespaces> = BTreeMap::new();
         for ns in &spec.namespaces {
-            let backend = build_backend(&ns.backend, config.recv_buf_bytes > 0, Some(bound))
-                .map_err(io::Error::other)?;
+            let backend = build_backend(
+                &ns.backend,
+                config.recv_buf_bytes > 0,
+                Some(bound),
+                config.sheepdog_portaddr,
+            )
+            .map_err(io::Error::other)?;
             // Test-only slow-disk emulation for memory namespaces.
             if config.mem_write_delay_us > 0
                 && let AnyBackend::Memory(m) = &backend
@@ -1115,6 +1125,7 @@ fn build_port(
                 fabric: bound,
                 ring_enabled: config.recv_buf_bytes > 0,
                 trtype,
+                portaddr: config.sheepdog_portaddr,
             });
         }
         // A subsystem holding cluster volumes advertises every target that
@@ -1140,6 +1151,7 @@ fn build_port(
         queue_buf_bytes: config.queue_buf_bytes,
         recv_buf_bytes: config.recv_buf_bytes,
         poll: config.poll,
+        sheepdog_portaddr: config.sheepdog_portaddr,
         subsystems,
     });
     // The backends are now open — and a Sheepdog one holds its VDI lock on
@@ -1648,6 +1660,10 @@ struct ClusterAcl {
     /// Transport of the port that opened them, for a hot-added namespace's
     /// path-list entry ([`ClusterPaths::trtype`]).
     trtype: TransportType,
+    /// Override the address a hot-added namespace registers as the volume's
+    /// holder (`--portaddr`), instead of `fabric` — the same override
+    /// `build_port` applied to every namespace opened at startup.
+    portaddr: Option<SocketAddr>,
     /// Raise the changed-namespaces notice on this target's live controllers
     /// when the ACL's member VDIs move. Per entry, not a shared global, for
     /// the same reason [`ClusterAna::notify`] is: more than one queue-thread
@@ -1666,6 +1682,7 @@ struct ClusterAclSpec {
     fabric: SocketAddr,
     ring_enabled: bool,
     trtype: TransportType,
+    portaddr: Option<SocketAddr>,
 }
 
 /// Every subsystem whose host ACL, namespace table, or discovery generation
@@ -1708,6 +1725,7 @@ where
             fabric: spec.fabric,
             ring_enabled: spec.ring_enabled,
             trtype: spec.trtype,
+            portaddr: spec.portaddr,
             notify: Box::new(move || {
                 if let Some(pool) = pool.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                     pool.admin.send(AdminMsg::NsChanged);
@@ -1836,6 +1854,7 @@ fn refresh_cluster_namespaces(acl: &ClusterAcl) {
             },
             acl.ring_enabled,
             Some(acl.fabric),
+            acl.portaddr,
         );
         let backend = match backend {
             Ok(backend) => backend,

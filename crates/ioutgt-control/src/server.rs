@@ -163,13 +163,16 @@ fn resolve<'a>(
 ///
 /// `fabric` is the address the port serves on, which a locked Sheepdog
 /// namespace registers as the volume's holder: the cluster's record of who to
-/// reach this namespace at. A backend that wants the lock and has no address
-/// to register is a configuration error rather than a silently unlocked
-/// volume.
+/// reach this namespace at. `portaddr`, when given, takes that place instead
+/// — an operator's `--portaddr` override for a port whose listen address is
+/// not what the rest of the cluster should reach it at. A backend that wants
+/// the lock and has neither is a configuration error rather than a silently
+/// unlocked volume.
 pub fn build_backend(
     config: &BackendConfig,
     ring_enabled: bool,
     fabric: Option<SocketAddr>,
+    portaddr: Option<SocketAddr>,
 ) -> Result<AnyBackend, String> {
     const BLOCK_SHIFT: u8 = 9;
     Ok(match config {
@@ -199,9 +202,9 @@ pub fn build_backend(
                 .map_err(|e| format!("sheepdog addr '{addr}': {e}"))?
                 .next()
                 .ok_or_else(|| format!("sheepdog addr '{addr}' resolved to no address"))?;
-            let register = match (*lock, fabric) {
+            let register = match (*lock, portaddr.or(fabric)) {
                 (false, _) => None,
-                (true, Some(fabric)) => Some(fabric),
+                (true, Some(addr)) => Some(addr),
                 (true, None) => {
                     return Err(format!(
                         "sheepdog {addr}/{vdi}: lock requested but the port has no \
@@ -253,6 +256,7 @@ async fn handle(state: &CtlState, request: Request) -> Response {
                 &backend,
                 state.port.recv_buf_bytes > 0,
                 state.port.listen_addr(),
+                state.port.sheepdog_portaddr,
             ) {
                 Ok(backend) => backend,
                 Err(err) => return Response::err(err),
