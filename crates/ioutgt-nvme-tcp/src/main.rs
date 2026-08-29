@@ -90,6 +90,14 @@ struct Args {
     #[arg(long)]
     control_socket: Option<std::path::PathBuf>,
 
+    /// Override the address a locked Sheepdog namespace registers as the
+    /// volume's holder, instead of --listen: for a port whose listen address
+    /// is not what the rest of the cluster (or a host reading the discovery
+    /// log) should reach it at — a wildcard bind behind a NAT, an ingress
+    /// rewriting the port.
+    #[arg(long)]
+    portaddr: Option<std::net::SocketAddr>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -184,6 +192,7 @@ fn main() -> std::io::Result<()> {
     config.idle_teardown = (args.idle_teardown_secs != 0)
         .then(|| std::time::Duration::from_secs(args.idle_teardown_secs));
     config.control_socket = Some(args.control_socket.unwrap_or_else(default_control_socket));
+    config.sheepdog_portaddr = args.portaddr;
     // A cluster-wide sheepdog backend names its own subsystems (one per ACL
     // object), so this replaces the whole flag-built list, not just its
     // namespaces.
